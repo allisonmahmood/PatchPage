@@ -1,0 +1,27 @@
+{
+  "name": "patchpage",
+  "version": "0.0.0",
+  "description": "Upload static HTML drafts to PatchPage.",
+  "type": "module",
+  "license": "MIT",
+  "bin": {
+    "patchpage": "./dist/index.js"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": ["dist", "README.md"],
+  "scripts": {
+    "build": "tsc -p tsconfig.json && node ../../scripts/mark-cli-executable.mjs dist/index.js",
+    "test": "vitest run --passWithNoTests",
+    "lint": "eslint src --ext .ts",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "@patchpage/core": "workspace:*",
+    "commander": "^14.0.0"
+  }
+}

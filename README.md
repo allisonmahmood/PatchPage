@@ -20,7 +20,24 @@ PatchPage is inspired by Postplan, the static HTML draft publishing tool created
 
 ## Status
 
-Planning repo. No production code has been implemented yet.
+Initial implementation in progress.
+
+## Local Quickstart
+
+```sh
+pnpm install
+PATCHPAGE_BOOTSTRAP_API_TOKEN=dev-token pnpm --filter @patchpage/server dev
+```
+
+In another shell:
+
+```sh
+pnpm --filter patchpage build
+PATCHPAGE_STATE_DIR=.local/cli node packages/cli/dist/index.js auth set dev-token --api-url http://localhost:3000
+PATCHPAGE_STATE_DIR=.local/cli node packages/cli/dist/index.js upload examples/plan.html
+```
+
+See [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md) for more detail.
 
 ## License
 

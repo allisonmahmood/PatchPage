@@ -1,0 +1,22 @@
+{
+  "name": "@patchpage/server",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "dev": "tsx watch src/start.ts",
+    "start": "node dist/start.js",
+    "test": "vitest run",
+    "lint": "eslint src --ext .ts",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "docker": "docker build -f apps/server/Dockerfile -t patchpage-server ."
+  },
+  "dependencies": {
+    "@patchpage/config": "workspace:*",
+    "@patchpage/core": "workspace:*",
+    "@patchpage/db": "workspace:*",
+    "@patchpage/storage": "workspace:*",
+    "fastify": "^5.5.0"
+  }
+}
