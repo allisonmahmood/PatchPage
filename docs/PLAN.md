@@ -276,7 +276,7 @@ Default deployment decision:
 - Region: East US unless the CLI/account context makes another US East region materially better.
 - DNS provider workflow: use Vercel CLI for `patchyhq.com` DNS records.
 - Host recommendation: Azure Container Apps.
-- Blob authentication recommendation: managed identity from day one.
+- Blob authentication: managed identity from day one for Patchy's Azure deployment.
 - Npm publish timing: do not publish until the local vertical slice works.
 
 Resources:
@@ -351,7 +351,9 @@ Fallback: storage connection string or account key.
 - Higher secret-handling risk because a long-lived credential has to be stored somewhere.
 - Should remain a local/dev fallback, not the default production path.
 
-Decision: design the storage adapter to support both, but provision Patchy's Azure deployment with managed identity first.
+Decision: design the storage adapter to support multiple providers, but provision Patchy's Azure deployment with managed identity from the start.
+
+This is a Patchy deployment decision, not an OSS lock-in. The server must remain portable as a Docker image. Self-hosters should be able to choose filesystem storage for local/dev installs, S3-compatible storage for generic deployments, and Azure Blob Storage only if they want Azure.
 
 ## OSS Hygiene
 
@@ -405,5 +407,5 @@ Done when `npx patchpage upload ./plan.html` returns a working `https://post.pat
 - Azure region: East US by default.
 - DNS access: available through Vercel CLI for `patchyhq.com`. Do not commit provider-specific verification values unless they are intentionally public DNS records.
 - Host: Azure Container Apps unless a blocker appears.
-- Blob auth: managed identity for production; secret-based auth only as local/dev fallback.
+- Blob auth: managed identity for Patchy's production deployment; secret-based auth only as local/dev or self-host fallback.
 - Npm publish: wait until the local system works end to end.
