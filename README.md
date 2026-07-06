@@ -4,6 +4,8 @@ Publisher-gated, link-viewable static HTML draft hosting.
 
 PatchPage is intended for agent-generated plans, briefs, architecture notes, reports, and other single-file HTML artifacts. Uploads require an authenticated token. Draft URLs are public/unlisted by default so anyone with the link can review the rendered artifact.
 
+The project is planned as a Turborepo monorepo with separate workspaces for the server, CLI, shared validation/core code, database migrations, storage adapters, Docker image, and Azure deployment templates.
+
 The default hosted endpoint for the Patchy deployment will be:
 
 ```sh

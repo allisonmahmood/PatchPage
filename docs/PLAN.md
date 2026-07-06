@@ -71,7 +71,7 @@ HTML file
 ### Recommended Stack
 
 - Runtime: Node.js 24 LTS, TypeScript, Express or Fastify.
-- Package manager: pnpm workspaces.
+- Monorepo: Turborepo with pnpm workspaces.
 - Database: Postgres.
 - Object storage: Azure Blob Storage first, generic adapter interface.
 - Production host: Azure Container Apps.
@@ -83,13 +83,88 @@ HTML file
 ## Repository Layout
 
 ```txt
-apps/server/          HTTP server, API, viewer rendering
-packages/cli/         npm CLI entrypoint
-packages/core/        validation, IDs, shared types
-packages/storage/     storage adapter interface and implementations
-infra/azure/          Azure deployment templates
-docs/                 plans, self-hosting, operations notes
+apps/server/              HTTP server, API, viewer rendering, Dockerfile
+packages/cli/             npm CLI entrypoint and bin
+packages/core/            validation, IDs, shared types
+packages/db/              schema, migrations, query helpers
+packages/storage/         storage adapter interface and implementations
+packages/config/          shared environment parsing
+infra/azure/              Azure deployment templates
+examples/                 sample HTML drafts and self-host examples
+docs/                     plans, self-hosting, operations notes
 ```
+
+## Monorepo Strategy
+
+PatchPage should be built as a proper Turborepo from the start because the product has several independently useful units: a server Docker image, a public npm CLI, shared validation logic, database migrations, storage adapters, and deployment templates.
+
+Root tooling:
+
+```txt
+package.json
+pnpm-workspace.yaml
+turbo.json
+tsconfig.base.json
+eslint.config.js
+prettier.config.js
+```
+
+Workspace package names:
+
+```txt
+@patchpage/server
+patchpage
+@patchpage/core
+@patchpage/db
+@patchpage/storage
+@patchpage/config
+```
+
+The public CLI package should be named `patchpage` if available, because users will run:
+
+```sh
+npx patchpage upload ./plan.html
+```
+
+The internal packages should use the `@patchpage/*` scope so imports stay clear without exposing unnecessary packages publicly.
+
+Turbo tasks:
+
+```txt
+build       compile packages and server
+dev         run local development processes
+test        run unit and integration tests
+lint        static checks
+typecheck   TypeScript checks
+db:migrate  run migrations
+docker      build the server image
+```
+
+Allowed import direction:
+
+```txt
+apps/server
+  -> packages/db
+  -> packages/storage
+  -> packages/config
+  -> packages/core
+
+packages/cli
+  -> packages/config
+  -> packages/core
+
+packages/db
+  -> packages/config
+
+packages/storage
+  -> packages/config
+```
+
+`packages/core` must not import server, db, or storage code. The HTML policy lives there so the CLI and server always enforce the same rules.
+
+`packages/db` owns migrations and schema setup. The server imports DB helpers, but deployment scripts should be able to run migrations without importing the HTTP server.
+
+`apps/server` owns the container boundary. The Dockerfile should build only what the server needs, while still using Turbo pruning or equivalent workspace-aware install behavior to avoid shipping the whole repo unnecessarily.
 
 ## Server API
 
@@ -236,7 +311,8 @@ Do not commit real values.
 
 ### Milestone 1: Local vertical slice
 
-- Create pnpm workspace.
+- Create pnpm workspace and Turborepo root config.
+- Add workspace boundaries for server, CLI, core, db, storage, and config.
 - Implement shared HTML validator with tests.
 - Implement server with local filesystem storage adapter.
 - Implement Postgres schema and migrations.
@@ -249,7 +325,7 @@ Done when a local HTML file can be uploaded and viewed through `http://localhost
 ### Milestone 2: Azure storage and deploy
 
 - Add Azure Blob storage adapter.
-- Add Dockerfile.
+- Add workspace-aware Dockerfile for `apps/server`.
 - Add Azure infrastructure templates.
 - Add GitHub Actions build/test workflow.
 - Deploy to Azure Container Apps.
