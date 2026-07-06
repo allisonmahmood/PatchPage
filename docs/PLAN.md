@@ -270,6 +270,15 @@ Config precedence:
 
 ## Azure Deployment
 
+Default deployment decision:
+
+- Cloud: Azure.
+- Region: East US unless the CLI/account context makes another US East region materially better.
+- DNS provider workflow: use Vercel CLI for `patchyhq.com` DNS records.
+- Host recommendation: Azure Container Apps.
+- Blob authentication recommendation: managed identity from day one.
+- Npm publish timing: do not publish until the local vertical slice works.
+
 Resources:
 
 - Azure Container Registry.
@@ -297,6 +306,52 @@ AZURE_STORAGE_CONTAINER=patchpage-drafts
 ```
 
 Do not commit real values.
+
+### Host Options
+
+PatchPage needs a long-running HTTP service with custom domain support, a Docker image, database connectivity, and clean deployment automation.
+
+Recommended: Azure Container Apps.
+
+- Good fit for a containerized Turborepo server app.
+- Supports custom domains and TLS.
+- Can scale to zero while traffic is low.
+- Keeps the Docker image as the production artifact, which also helps self-hosters.
+- Slightly more moving parts than App Service, but better aligned with an OSS self-hostable image.
+
+Alternative: Azure App Service.
+
+- Simpler mental model for a Node web app.
+- Good custom domain and managed certificate story.
+- Can run Node directly or from a container.
+- Less aligned with the "ship a Docker image others can run" path unless we use containerized App Service.
+
+Alternative: Azure Functions.
+
+- Strong for small serverless endpoints.
+- Less natural for a full viewer app plus CLI API plus migrations.
+- Cold starts and function packaging add complexity without much benefit for this product.
+
+Decision: use Azure Container Apps unless local testing reveals a concrete blocker.
+
+### Blob Auth Options
+
+Recommended: managed identity.
+
+- The Container App gets an Azure-managed identity.
+- Azure grants that identity access to the private Blob container.
+- The app uses `DefaultAzureCredential` in production.
+- No storage account key or connection string needs to exist in app settings, GitHub secrets, or docs.
+- Setup requires Azure role assignment plumbing, but that is the right tradeoff for a public OSS repo.
+
+Fallback: storage connection string or account key.
+
+- Faster to wire up.
+- Easier for local one-off testing.
+- Higher secret-handling risk because a long-lived credential has to be stored somewhere.
+- Should remain a local/dev fallback, not the default production path.
+
+Decision: design the storage adapter to support both, but provision Patchy's Azure deployment with managed identity first.
 
 ## OSS Hygiene
 
@@ -340,14 +395,15 @@ Done when `npx patchpage upload ./plan.html` returns a working `https://post.pat
 - Add package publish workflow.
 - Add security notes.
 - Add examples.
-- Publish first npm prerelease.
+- Publish first npm prerelease only after local upload/view/update works end to end.
 
-## Inputs Needed Before Execution
+## Execution Inputs
 
-- Confirm repo name and ownership. Current assumption: `allisonmahmood/PatchPage`, public.
-- Confirm npm package name: assumed `patchpage`.
-- Confirm Azure subscription and region.
-- Confirm who controls DNS for `patchyhq.com`.
-- Confirm whether to use Azure Container Apps or App Service. Current recommendation: Container Apps.
-- Confirm whether first production deploy should use managed identity for Blob access from the start.
-- Confirm if the first package should be prereleased as `0.1.0-alpha.0` or held unpublished until Azure is live.
+- Repo name and ownership: `allisonmahmood/PatchPage`, public.
+- Npm package name: `patchpage`.
+- Azure access: available through local Azure CLI. Do not commit Azure account, subscription, tenant, resource IDs, or generated secrets.
+- Azure region: East US by default.
+- DNS access: available through Vercel CLI for `patchyhq.com`. Do not commit provider-specific verification values unless they are intentionally public DNS records.
+- Host: Azure Container Apps unless a blocker appears.
+- Blob auth: managed identity for production; secret-based auth only as local/dev fallback.
+- Npm publish: wait until the local system works end to end.
