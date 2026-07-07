@@ -48,8 +48,10 @@ describe("PatchPage server", () => {
     const viewer = await app.inject({ method: "GET", url: `/d/${body.draftId}` });
     expect(viewer.statusCode).toBe(200);
     expect(viewer.headers["content-security-policy"]).toContain("default-src 'none'");
-    expect(viewer.body).toContain("PatchPage");
     expect(viewer.body).toContain("Test Draft");
+    expect(viewer.body).toContain("class=\"draft-frame\"");
+    expect(viewer.body).toContain("&lt;h1&gt;Hello&lt;/h1&gt;");
+    expect(viewer.body).not.toContain("patchpage-banner");
 
     await app.close();
     await db.close();

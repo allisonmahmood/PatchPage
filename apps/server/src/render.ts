@@ -59,7 +59,6 @@ export function renderDraftWrapper(options: {
   homeUrl: string;
 }): string {
   const title = escapeHtml(options.draft.title || "PatchPage Draft");
-  const homeUrl = escapeAttribute(options.homeUrl);
 
   return `<!doctype html>
 <html lang="en">
@@ -68,169 +67,27 @@ export function renderDraftWrapper(options: {
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>${title}</title>
   <style>
-    :root {
-      --paper: #fffdf4;
-      --paper-blue: #eaf5ff;
-      --white: #fffefa;
-      --ink: #12110f;
-      --ink-soft: #36332d;
-      --muted: #69645a;
-      --blue: #1263e6;
-      --blue-dark: #093b92;
-      --green: #64c83f;
-      --yellow: #ffbf35;
-      --radius: 8px;
-      --radius-pill: 999px;
-      --font-sans: system-ui, -apple-system, "Segoe UI", "Helvetica Neue", Arial, "Liberation Sans", sans-serif;
-    }
-
     html,
     body {
       height: 100%;
       margin: 0;
-      background: var(--paper);
-      color: var(--ink);
-      font-family: var(--font-sans);
+      background: #ffffff;
     }
 
     body {
-      display: flex;
-      flex-direction: column;
       overflow: hidden;
-    }
-
-    .patchpage-banner {
-      position: relative;
-      z-index: 2147483647;
-      display: flex;
-      flex: 0 0 auto;
-      flex-wrap: wrap;
-      align-items: center;
-      gap: 10px 14px;
-      min-height: 50px;
-      padding: 8px 12px;
-      box-sizing: border-box;
-      border-bottom: 2px solid var(--ink);
-      background:
-        linear-gradient(rgba(18, 17, 15, .035) 1px, transparent 1px),
-        linear-gradient(90deg, rgba(18, 17, 15, .035) 1px, transparent 1px),
-        linear-gradient(180deg, var(--paper-blue), var(--paper));
-      background-size: 32px 32px, 32px 32px, auto;
-      color: var(--ink);
-      font-size: 14px;
-      line-height: 1.3;
-      box-shadow: 0 4px 0 rgba(18, 17, 15, .10);
-    }
-
-    .patchpage-brand {
-      display: inline-flex;
-      align-items: center;
-      gap: 9px;
-      color: var(--ink);
-      font-weight: 900;
-      text-decoration: none;
-      white-space: nowrap;
-    }
-
-    .patchpage-glyph {
-      position: relative;
-      width: 26px;
-      height: 26px;
-      flex: none;
-      border: 2px solid var(--ink);
-      border-radius: 8px;
-      background: var(--green);
-      box-shadow: 3px 3px 0 var(--ink);
-      transform: rotate(-5deg);
-    }
-
-    .patchpage-glyph::after {
-      content: "";
-      position: absolute;
-      top: 5px;
-      right: 5px;
-      width: 9px;
-      height: 9px;
-      border-top: 2px solid var(--ink);
-      border-right: 2px solid var(--ink);
-    }
-
-    .patchpage-pill {
-      display: inline-flex;
-      align-items: center;
-      min-height: 26px;
-      padding: 2px 10px;
-      border: 2px solid var(--ink);
-      border-radius: var(--radius-pill);
-      background: var(--yellow);
-      box-shadow: 2px 2px 0 var(--ink);
-      color: var(--ink);
-      font-size: 12px;
-      font-weight: 850;
-      letter-spacing: 0;
-      text-transform: uppercase;
-      white-space: nowrap;
-    }
-
-    .patchpage-note {
-      color: var(--muted);
-      font-weight: 650;
-    }
-
-    .patchpage-banner a.patchpage-link {
-      display: inline-flex;
-      align-items: center;
-      min-height: 30px;
-      margin-left: auto;
-      padding: 0 12px;
-      border: 2px solid var(--ink);
-      border-radius: var(--radius-pill);
-      background: var(--white);
-      color: var(--blue-dark);
-      font-weight: 800;
-      text-decoration: none;
-      white-space: nowrap;
-    }
-
-    .patchpage-banner a.patchpage-link:hover {
-      background: var(--blue);
-      color: var(--white);
     }
 
     .draft-frame {
       display: block;
       width: 100%;
-      min-height: 0;
-      flex: 1 1 auto;
+      height: 100%;
       border: 0;
       background: #ffffff;
-    }
-
-    @media (max-width: 640px) {
-      .patchpage-banner {
-        padding: 8px 10px;
-      }
-
-      .patchpage-note {
-        width: 100%;
-      }
-
-      .patchpage-banner a.patchpage-link {
-        margin-left: 0;
-      }
     }
   </style>
 </head>
 <body>
-  <header class="patchpage-banner">
-    <a class="patchpage-brand" href="${homeUrl}" target="_blank" rel="noreferrer">
-      <span class="patchpage-glyph" aria-hidden="true"></span>
-      <span>PatchPage</span>
-    </a>
-    <span class="patchpage-pill">Hosted draft</span>
-    <span class="patchpage-note">Public, unlisted review link</span>
-    <a class="patchpage-link" href="${homeUrl}" target="_blank" rel="noreferrer">Learn more</a>
-  </header>
   <iframe
     class="draft-frame"
     title="${title}"
