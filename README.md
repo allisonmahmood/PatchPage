@@ -39,6 +39,16 @@ PATCHPAGE_STATE_DIR=.local/cli node packages/cli/dist/index.js upload examples/p
 
 See [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md) for more detail.
 
+## Patchy-Style Drafts
+
+The repo includes a Patchy-styled starter draft at [examples/plan.html](examples/plan.html).
+The npm package also ships an agent skill under
+[packages/cli/skills/patchpage/SKILL.md](packages/cli/skills/patchpage/SKILL.md) for creating
+safe PatchPage artifacts with the same visual system.
+
+The important visibility rule is unchanged: upload access is token-gated, but draft URLs are
+public and unlisted unless a self-hosted deployment adds viewer access controls.
+
 ## License
 
 MIT

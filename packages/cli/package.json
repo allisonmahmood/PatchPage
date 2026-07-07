@@ -13,7 +13,7 @@
       "import": "./dist/index.js"
     }
   },
-  "files": ["dist", "README.md"],
+  "files": ["dist", "README.md", "skills"],
   "scripts": {
     "build": "tsc -p tsconfig.json && node ../../scripts/mark-cli-executable.mjs dist/index.js",
     "test": "vitest run --passWithNoTests",
