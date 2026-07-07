@@ -65,6 +65,12 @@ terraform apply
 
 After apply, bind `post.patchyhq.com` to the Container App through Vercel DNS and Azure Container Apps custom domain commands.
 
+The hosted domain must allow Azure's managed certificate issuer. If the root domain has CAA records, include:
+
+```txt
+0 issue "digicert.com"
+```
+
 ## Security Notes
 
 - Do not commit `terraform.tfvars`, `backend.hcl`, `.terraform/`, or generated deployment notes.

@@ -102,6 +102,10 @@ resource "azurerm_postgresql_flexible_server" "patchpage" {
   sku_name                      = var.postgres_sku_name
   storage_mb                    = var.postgres_storage_mb
   public_network_access_enabled = true
+
+  lifecycle {
+    ignore_changes = [zone]
+  }
 }
 
 resource "azurerm_postgresql_flexible_server_database" "patchpage" {
