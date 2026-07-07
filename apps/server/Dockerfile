@@ -7,7 +7,7 @@ WORKDIR /repo
 
 RUN corepack enable
 
-COPY package.json pnpm-workspace.yaml turbo.json tsconfig.base.json ./
+COPY package.json pnpm-lock.yaml pnpm-workspace.yaml turbo.json tsconfig.base.json ./
 COPY eslint.config.js prettier.config.js ./
 COPY apps/server/package.json apps/server/package.json
 COPY packages/cli/package.json packages/cli/package.json
