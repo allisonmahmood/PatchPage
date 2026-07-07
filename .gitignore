@@ -9,3 +9,6 @@ coverage/
 *.log
 tmp/
 .local/
+
+# Local PatchPage HTML plan artifacts.
+.local/patchpage-plans/
