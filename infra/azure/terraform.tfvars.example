@@ -1,0 +1,7 @@
+subscription_id = "00000000-0000-0000-0000-000000000000"
+location        = "centralus"
+environment_name = "prod"
+public_base_url  = "https://post.patchyhq.com"
+
+# Fill after the first ACR build:
+# server_image = "acrpatchpageabc123.azurecr.io/patchpage-server:<git-sha>"

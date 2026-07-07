@@ -273,7 +273,7 @@ Config precedence:
 Default deployment decision:
 
 - Cloud: Azure.
-- Region: East US unless the CLI/account context makes another US East region materially better.
+- Region: Central US because Azure PostgreSQL Flexible Server is restricted in East US/East US 2 for the current subscription.
 - DNS provider workflow: use Vercel CLI for `patchyhq.com` DNS records.
 - Host recommendation: Azure Container Apps.
 - Blob authentication: managed identity from day one for Patchy's Azure deployment.
@@ -404,7 +404,7 @@ Done when `npx patchpage upload ./plan.html` returns a working `https://post.pat
 - Repo name and ownership: `allisonmahmood/PatchPage`, public.
 - Npm package name: `patchpage`.
 - Azure access: available through local Azure CLI. Do not commit Azure account, subscription, tenant, resource IDs, or generated secrets.
-- Azure region: East US by default.
+- Azure region: Central US for the hosted PatchPage stack.
 - DNS access: available through Vercel CLI for `patchyhq.com`. Do not commit provider-specific verification values unless they are intentionally public DNS records.
 - Host: Azure Container Apps unless a blocker appears.
 - Blob auth: managed identity for Patchy's production deployment; secret-based auth only as local/dev or self-host fallback.
