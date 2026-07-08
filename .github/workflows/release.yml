@@ -53,7 +53,7 @@ jobs:
       - run: pnpm typecheck
       - run: pnpm test
       - run: pnpm --filter patchpage build
-      - name: Pack and smoke test installed CLI
+      - name: Pack tarball and verify contents
         shell: bash
         run: |
           set -euo pipefail
@@ -88,15 +88,26 @@ jobs:
           console.log(path.resolve(process.cwd(), pack.filename));
           NODE
           )"
-          version="$(node -p "require('./package.json').version")"
-          tmp_dir="$(mktemp -d)"
+          echo "TARBALL=$tarball" >> "$GITHUB_ENV"
+          echo "CLI_VERSION=$(node -p "require('./package.json').version")" >> "$GITHUB_ENV"
+      # The published CLI claims engines.node >=20. Verify the packed artifact
+      # on actual Node 20 — the dev toolchain can't (pnpm 11 needs >=22.13),
+      # but end users install via npm/npx, which is exactly what this does.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Install and run tarball on Node 20
+        shell: bash
+        run: |
+          set -euo pipefail
 
+          tmp_dir="$(mktemp -d)"
           cd "$tmp_dir"
-          npm install "$tarball"
+          npm install "$TARBALL"
 
           output="$(./node_modules/.bin/patchpage --version)"
-          if [[ "$output" != "$version" ]]; then
-            echo "::error::Expected patchpage --version to print $version, got $output"
+          if [[ "$output" != "$CLI_VERSION" ]]; then
+            echo "::error::Expected patchpage --version to print $CLI_VERSION, got $output"
             exit 1
           fi
 
