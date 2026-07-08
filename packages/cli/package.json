@@ -20,6 +20,9 @@
     "patchpage": "./dist/index.js"
   },
   "files": ["dist", "README.md", "skills"],
+  "publishConfig": {
+    "provenance": true
+  },
   "scripts": {
     "build": "node ../../scripts/build-cli-bundle.mjs",
     "prepack": "node ../../scripts/build-cli-bundle.mjs",

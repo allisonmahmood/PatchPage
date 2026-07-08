@@ -10,7 +10,7 @@
     "test": "vitest run",
     "lint": "eslint src --ext .ts",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "docker": "docker build -f apps/server/Dockerfile -t patchpage-server ."
+    "docker": "docker build -f Dockerfile -t patchpage-server ../.."
   },
   "dependencies": {
     "@patchpage/config": "workspace:*",

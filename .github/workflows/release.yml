@@ -1,0 +1,267 @@
+# Tripwire: this filename (release.yml) is registered verbatim in npm's Trusted Publisher config for the "patchpage" package.
+# Renaming or moving this file silently breaks npm publishing until the npm-side config is updated.
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+jobs:
+  guard:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          version="$(node -p "require('./packages/cli/package.json').version")"
+          expected_ref="v${version}"
+
+          if [[ "$expected_ref" != "$GITHUB_REF_NAME" ]]; then
+            echo "::error::Tag ${GITHUB_REF_NAME} does not match packages/cli version ${expected_ref}"
+            exit 1
+          fi
+
+          if ! grep -Fq "## [${version}]" CHANGELOG.md; then
+            echo "::error::CHANGELOG.md is missing a ## [${version}] heading"
+            exit 1
+          fi
+
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+  verify:
+    needs: guard
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.5.2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm lint
+      - run: pnpm typecheck
+      - run: pnpm test
+      - run: pnpm --filter patchpage build
+      - name: Pack and smoke test installed CLI
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cd packages/cli
+          npm pack --json > "$RUNNER_TEMP/patchpage-pack.json"
+
+          node - "$RUNNER_TEMP/patchpage-pack.json" <<'NODE'
+          const fs = require("node:fs");
+
+          const pack = JSON.parse(fs.readFileSync(process.argv[2], "utf8"))[0];
+          const required = ["dist/index.js", "skills/patchpage/SKILL.md", "LICENSE", "README.md"];
+          const files = new Set(pack.files.map((file) => file.path));
+          const missing = required.filter((file) => !files.has(file));
+
+          if (missing.length > 0) {
+            console.error(`Missing files from npm pack: ${missing.join(", ")}`);
+            console.error("Packed files:");
+            for (const file of [...files].sort()) {
+              console.error(`- ${file}`);
+            }
+            process.exit(1);
+          }
+          NODE
+
+          tarball="$(
+            node - "$RUNNER_TEMP/patchpage-pack.json" <<'NODE'
+          const fs = require("node:fs");
+          const path = require("node:path");
+
+          const pack = JSON.parse(fs.readFileSync(process.argv[2], "utf8"))[0];
+          console.log(path.resolve(process.cwd(), pack.filename));
+          NODE
+          )"
+          version="$(node -p "require('./package.json').version")"
+          tmp_dir="$(mktemp -d)"
+
+          cd "$tmp_dir"
+          npm install "$tarball"
+
+          output="$(./node_modules/.bin/patchpage --version)"
+          if [[ "$output" != "$version" ]]; then
+            echo "::error::Expected patchpage --version to print $version, got $output"
+            exit 1
+          fi
+
+          if [[ "$output" == "0.0.0-dev" ]]; then
+            echo "::error::Installed patchpage binary reported 0.0.0-dev"
+            exit 1
+          fi
+
+          ./node_modules/.bin/patchpage validate "$GITHUB_WORKSPACE/examples/plan.html"
+
+  publish-npm:
+    needs: [guard, verify]
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      # Full repo checkout: prepack shells out to ../../scripts/build-cli-bundle.mjs and copies root skills/ and LICENSE.
+      # Do not use sparse checkout or path pruning here.
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.5.2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+          registry-url: https://registry.npmjs.org
+      # Runner-bundled npm can be below the 11.5.1 trusted-publishing floor.
+      - run: npm install -g npm@latest
+      - run: pnpm install --frozen-lockfile
+      - name: Publish to npm
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          version="${{ needs.guard.outputs.version }}"
+
+          if npm view "patchpage@${version}" version >/dev/null 2>&1; then
+            echo "patchpage@${version} already published, skipping"
+            exit 0
+          fi
+
+          cd packages/cli
+          # npm publish is required for OIDC trusted publishing; pnpm has no OIDC trusted-publishing support.
+          npm publish
+
+  github-release:
+    needs: publish-npm
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Create GitHub release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          version="${GITHUB_REF_NAME#v}"
+          notes_file="$RUNNER_TEMP/release-notes.md"
+
+          awk -v version="$version" '
+            index($0, "## [" version "]") == 1 { in_section = 1; next }
+            in_section && /^## \[/ { exit }
+            in_section { print }
+          ' CHANGELOG.md | sed -e '1{/^$/d;}' > "$notes_file"
+
+          if [[ ! -s "$notes_file" ]]; then
+            echo "::error::No changelog notes found for ${version}"
+            exit 1
+          fi
+
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            echo "GitHub release ${GITHUB_REF_NAME} already exists, skipping"
+            exit 0
+          fi
+
+          gh release create "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" --notes-file "$notes_file"
+
+  docker-ghcr:
+    needs: [guard, publish-npm]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ github.token }}
+      - name: Build, verify, and push image
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          image="patchpage-server:release"
+          container="patchpage-server-release-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          ghcr_image="ghcr.io/allisonmahmood/patchpage-server"
+
+          docker build -f apps/server/Dockerfile -t "$image" .
+
+          cleanup() {
+            docker rm -f "$container" >/dev/null 2>&1 || true
+          }
+          trap cleanup EXIT
+
+          docker run -d --name "$container" -p 3000:3000 "$image"
+
+          ok=""
+          for _ in {1..60}; do
+            body="$(curl -fsS http://localhost:3000/healthz 2>/dev/null || true)"
+            if [[ "$body" == *ok* ]]; then
+              ok="true"
+              break
+            fi
+            sleep 1
+          done
+
+          if [[ "$ok" != "true" ]]; then
+            docker logs "$container" || true
+            exit 1
+          fi
+
+          docker tag "$image" "${ghcr_image}:${GITHUB_REF_NAME}"
+          docker tag "$image" "${ghcr_image}:latest"
+          docker push "${ghcr_image}:${GITHUB_REF_NAME}"
+          docker push "${ghcr_image}:latest"
+
+  npx-smoke:
+    needs: publish-npm
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: Smoke test published npm package
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          version="${GITHUB_REF_NAME#v}"
+          tmp_dir="$(mktemp -d)"
+          cd "$tmp_dir"
+
+          for attempt in 1 2 3 4 5; do
+            if output="$(npx -y "patchpage@${version}" --version 2>npx-smoke.err)"; then
+              if [[ "$output" == "$version" ]]; then
+                exit 0
+              fi
+
+              echo "Attempt ${attempt}: expected ${version}, got ${output}"
+            else
+              echo "Attempt ${attempt}: npx failed"
+              cat npx-smoke.err || true
+            fi
+
+            if [[ "$attempt" != "5" ]]; then
+              sleep 30
+            fi
+          done
+
+          echo "::error::npx patchpage@${version} did not print the expected version"
+          exit 1

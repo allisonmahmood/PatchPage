@@ -8,8 +8,37 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
 jobs:
-  build-test:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node-version: [20, 24]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.5.2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+          cache: pnpm
+      - uses: actions/cache@v4
+        with:
+          path: .turbo
+          key: turbo-${{ runner.os }}-node${{ matrix.node-version }}-${{ github.sha }}
+          restore-keys: |
+            turbo-${{ runner.os }}-node${{ matrix.node-version }}-
+            turbo-${{ runner.os }}-
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm test
+
+  lint:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -23,5 +52,113 @@ jobs:
       - run: pnpm install --frozen-lockfile
       - run: pnpm lint
       - run: pnpm typecheck
-      - run: pnpm test
-      - run: pnpm build
+
+  cli-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.5.2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm --filter patchpage build
+      - name: Pack and smoke test installed CLI
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cd packages/cli
+          npm pack --json > "$RUNNER_TEMP/patchpage-pack.json"
+
+          node - "$RUNNER_TEMP/patchpage-pack.json" <<'NODE'
+          const fs = require("node:fs");
+
+          const pack = JSON.parse(fs.readFileSync(process.argv[2], "utf8"))[0];
+          const required = ["dist/index.js", "skills/patchpage/SKILL.md", "LICENSE", "README.md"];
+          const files = new Set(pack.files.map((file) => file.path));
+          const missing = required.filter((file) => !files.has(file));
+
+          if (missing.length > 0) {
+            console.error(`Missing files from npm pack: ${missing.join(", ")}`);
+            console.error("Packed files:");
+            for (const file of [...files].sort()) {
+              console.error(`- ${file}`);
+            }
+            process.exit(1);
+          }
+          NODE
+
+          tarball="$(
+            node - "$RUNNER_TEMP/patchpage-pack.json" <<'NODE'
+          const fs = require("node:fs");
+          const path = require("node:path");
+
+          const pack = JSON.parse(fs.readFileSync(process.argv[2], "utf8"))[0];
+          console.log(path.resolve(process.cwd(), pack.filename));
+          NODE
+          )"
+          version="$(node -p "require('./package.json').version")"
+          tmp_dir="$(mktemp -d)"
+
+          cd "$tmp_dir"
+          npm install "$tarball"
+
+          output="$(./node_modules/.bin/patchpage --version)"
+          if [[ "$output" != "$version" ]]; then
+            echo "::error::Expected patchpage --version to print $version, got $output"
+            exit 1
+          fi
+
+          if [[ "$output" == "0.0.0-dev" ]]; then
+            echo "::error::Installed patchpage binary reported 0.0.0-dev"
+            exit 1
+          fi
+
+          ./node_modules/.bin/patchpage validate "$GITHUB_WORKSPACE/examples/plan.html"
+
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build and boot server image
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          image="patchpage-server:ci"
+          container="patchpage-server-ci-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+
+          docker build -f apps/server/Dockerfile -t "$image" .
+
+          cleanup() {
+            docker rm -f "$container" >/dev/null 2>&1 || true
+          }
+          trap cleanup EXIT
+
+          docker run -d --name "$container" -p 3000:3000 "$image"
+
+          ok=""
+          for _ in {1..60}; do
+            body="$(curl -fsS http://localhost:3000/healthz 2>/dev/null || true)"
+            if [[ "$body" == *ok* ]]; then
+              ok="true"
+              break
+            fi
+            sleep 1
+          done
+
+          if [[ "$ok" != "true" ]]; then
+            docker logs "$container" || true
+            exit 1
+          fi
+
+  dependency-review:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/dependency-review-action@v4

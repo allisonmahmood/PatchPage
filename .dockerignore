@@ -1,6 +1,11 @@
 .git
 .github
 .local
+infra/
+*.tfstate
+*.tfvars
+.terraform/
+backend*.hcl
 .turbo
 coverage
 dist
