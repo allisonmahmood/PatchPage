@@ -12,3 +12,7 @@ tmp/
 
 # Local PatchPage HTML plan artifacts.
 .local/patchpage-plans/
+
+# Generated at build time from root skills/ and LICENSE.
+packages/cli/skills/
+packages/cli/LICENSE

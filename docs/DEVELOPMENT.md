@@ -34,7 +34,7 @@ Do not commit real database URLs or generated tokens.
 
 ## Production Storage
 
-Patchy's production Azure deployment should use:
+The maintainer's production Azure deployment uses:
 
 ```env
 PATCHPAGE_STORAGE_DRIVER=azure-blob
@@ -43,4 +43,4 @@ AZURE_STORAGE_CONTAINER=
 ```
 
 The server uses managed identity when `AZURE_STORAGE_CONNECTION_STRING` is absent.
-Connection-string auth remains available for local Azure testing and non-Patchy self-hosts.
+Connection-string auth remains available for local Azure testing and self-hosts that do not use Azure managed identity.

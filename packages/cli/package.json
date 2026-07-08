@@ -1,15 +1,29 @@
 {
   "name": "patchpage",
-  "version": "0.0.0",
+  "version": "0.1.0",
   "description": "Upload static HTML drafts to PatchPage.",
   "type": "module",
   "license": "MIT",
+  "author": "Allison Mahmood",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/allisonmahmood/PatchPage.git",
+    "directory": "packages/cli"
+  },
+  "homepage": "https://github.com/allisonmahmood/PatchPage#readme",
+  "bugs": "https://github.com/allisonmahmood/PatchPage/issues",
+  "keywords": ["html", "static-html", "drafts", "preview", "publish", "cli", "agents", "agent-skills", "claude"],
+  "engines": {
+    "node": ">=20"
+  },
   "bin": {
     "patchpage": "./dist/index.js"
   },
   "files": ["dist", "README.md", "skills"],
   "scripts": {
     "build": "node ../../scripts/build-cli-bundle.mjs",
+    "prepack": "node ../../scripts/build-cli-bundle.mjs",
+    "prepublishOnly": "pnpm run lint && pnpm run typecheck && pnpm run test",
     "test": "vitest run --passWithNoTests",
     "lint": "eslint src --ext .ts",
     "typecheck": "tsc -p tsconfig.json --noEmit"

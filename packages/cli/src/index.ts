@@ -6,8 +6,9 @@ import path from "node:path";
 import { Command } from "commander";
 import { sha256, validateHtml } from "@patchpage/core";
 
-const VERSION = "0.0.0";
+const VERSION = typeof __PATCHPAGE_VERSION__ === "string" ? __PATCHPAGE_VERSION__ : "0.0.0-dev";
 const DEFAULT_API_URL = "https://post.patchyhq.com";
+const SELF_HOST_DOCS_URL = "https://github.com/allisonmahmood/PatchPage/blob/main/docs/SELF_HOSTING.md";
 const STATE_DIR = process.env.PATCHPAGE_STATE_DIR || path.join(os.homedir(), ".patchpage");
 const CONFIG_PATH = path.join(STATE_DIR, "config.json");
 const CREDENTIALS_PATH = path.join(STATE_DIR, "credentials.json");
@@ -79,7 +80,8 @@ program
     });
     const body = await readResponseJson(response);
     if (!response.ok) {
-      throw new CliError(body.error || "Authentication failed.");
+      const hint = response.status === 401 || response.status === 403 ? defaultHostHint(apiUrl) : "";
+      throw new CliError(`${body.error || "Authentication failed."}${hint}`);
     }
 
     console.log(`Account: ${body.accountName} (${body.accountId})`);
@@ -148,7 +150,8 @@ program
     const body = await readResponseJson(response);
     if (!response.ok) {
       const details = body.errors?.length ? `\n- ${body.errors.join("\n- ")}` : "";
-      throw new CliError(`${body.error || "Upload failed."}${details}`);
+      const hint = response.status === 401 || response.status === 403 ? defaultHostHint(apiUrl) : "";
+      throw new CliError(`${body.error || "Upload failed."}${details}${hint}`);
     }
 
     drafts.files ||= {};
@@ -199,10 +202,15 @@ function readAuth(apiUrlOverride?: string): { apiUrl: string; apiToken: string }
   const apiToken = process.env.PATCHPAGE_API_TOKEN || credentials.apiToken;
 
   if (!apiToken) {
-    throw new CliError("Missing API token. Run: patchpage auth set <api-token>");
+    throw new CliError(`Missing API token. Run: patchpage auth set <api-token>${defaultHostHint(apiUrl)}`);
   }
 
   return { apiUrl, apiToken };
+}
+
+function defaultHostHint(apiUrl: string): string {
+  if (apiUrl !== DEFAULT_API_URL) return "";
+  return `\nNote: ${DEFAULT_API_URL} is the maintainer's private instance and does not issue public tokens.\nTo run your own server, see ${SELF_HOST_DOCS_URL} and point the CLI at it with --api-url or PATCHPAGE_API_URL.`;
 }
 
 function readHtmlFile(file: string): string {

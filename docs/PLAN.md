@@ -1,3 +1,5 @@
+> Note: This is the historical build plan, kept for reference. The [README](../README.md) is the source of truth for how PatchPage works now.
+
 # PatchPage Build Plan
 
 Last updated: 2026-07-07
