@@ -9,6 +9,11 @@ updates:
         update-types:
           - minor
           - patch
+    ignore:
+      # Deliberately pinned to the minimum supported runtime (engines >=20);
+      # typechecking against newer node types would undermine that claim.
+      - dependency-name: "@types/node"
+        update-types: ["version-update:semver-major"]
   - package-ecosystem: github-actions
     directory: /
     schedule:
