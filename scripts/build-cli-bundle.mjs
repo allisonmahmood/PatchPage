@@ -20,7 +20,7 @@ await esbuild.build({
   bundle: true,
   platform: "node",
   format: "esm",
-  target: "node20",
+  target: "node22",
   sourcemap: true,
   tsconfig: path.join(cliDir, "tsconfig.json"),
   external: ["commander", "parse5"],

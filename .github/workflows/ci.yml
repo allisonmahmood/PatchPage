@@ -18,9 +18,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # 22 is the dev-toolchain floor (pnpm 11 requires Node >=22.13).
-        # The published CLI's engines.node >=20 claim is verified in cli-smoke,
-        # which runs the packed artifact on actual Node 20.
+        # 22 is the minimum supported Node (engines >=22; pnpm 11 also
+        # requires >=22.13). cli-smoke additionally runs the packed artifact
+        # on Node 22 the way end users install it.
         node-version: [22, 24]
     steps:
       - uses: actions/checkout@v4
@@ -106,13 +106,13 @@ jobs:
           )"
           echo "TARBALL=$tarball" >> "$GITHUB_ENV"
           echo "CLI_VERSION=$(node -p "require('./package.json').version")" >> "$GITHUB_ENV"
-      # The published CLI claims engines.node >=20. Verify the packed artifact
-      # on actual Node 20 — the dev toolchain can't (pnpm 11 needs >=22.13),
-      # but end users install via npm/npx, which is exactly what this does.
+      # The published CLI claims engines.node >=22. Verify the packed artifact
+      # on the minimum supported Node the way end users get it: a clean
+      # npm install of the tarball, no pnpm or repo tooling involved.
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
-      - name: Install and run tarball on Node 20
+          node-version: 22
+      - name: Install and run tarball on minimum supported Node
         shell: bash
         run: |
           set -euo pipefail

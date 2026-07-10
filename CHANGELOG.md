@@ -4,6 +4,13 @@ All notable changes to PatchPage are documented in this file. The format is base
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project aims to follow
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- The `patchpage` CLI and server now require Node.js 22 or newer. Node 20 reached
+  end-of-life in April 2026 and is no longer supported.
+
 ## [0.1.0] - 2026-07-08
 
 Initial public release.

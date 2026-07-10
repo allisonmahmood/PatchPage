@@ -90,13 +90,13 @@ jobs:
           )"
           echo "TARBALL=$tarball" >> "$GITHUB_ENV"
           echo "CLI_VERSION=$(node -p "require('./package.json').version")" >> "$GITHUB_ENV"
-      # The published CLI claims engines.node >=20. Verify the packed artifact
-      # on actual Node 20 — the dev toolchain can't (pnpm 11 needs >=22.13),
-      # but end users install via npm/npx, which is exactly what this does.
+      # The published CLI claims engines.node >=22. Verify the packed artifact
+      # on the minimum supported Node the way end users get it: a clean
+      # npm install of the tarball, no pnpm or repo tooling involved.
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
-      - name: Install and run tarball on Node 20
+          node-version: 22
+      - name: Install and run tarball on minimum supported Node
         shell: bash
         run: |
           set -euo pipefail

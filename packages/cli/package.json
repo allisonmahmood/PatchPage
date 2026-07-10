@@ -14,7 +14,7 @@
   "bugs": "https://github.com/allisonmahmood/PatchPage/issues",
   "keywords": ["html", "static-html", "drafts", "preview", "publish", "cli", "agents", "agent-skills", "claude"],
   "engines": {
-    "node": ">=20"
+    "node": ">=22"
   },
   "bin": {
     "patchpage": "./dist/index.js"

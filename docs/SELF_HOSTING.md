@@ -6,7 +6,7 @@ Once your server is running, point the CLI at it and you have a private PatchPag
 
 ## Prerequisites
 
-- Node.js 22.13 or newer to build and run from source (pnpm 11 requires it). The published `patchpage` CLI itself runs on Node 20 or newer, and the Docker image bundles its own Node.
+- Node.js 22.13 or newer (the CLI and server require Node 22+, and pnpm 11 needs at least 22.13). The Docker image bundles its own Node.
 - pnpm (the repo pins `pnpm@11.5.2` via `packageManager`).
 - A PostgreSQL database, if you use the `postgres` metadata driver. The default `json` driver needs no database and is fine for small or single-user instances.
 - Git is optional; the CLI records repo/branch metadata with each upload when the file is inside a git repo.
