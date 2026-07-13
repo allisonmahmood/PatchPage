@@ -2,7 +2,7 @@
 
 PatchPage is a normal Node HTTP service and runs anywhere that supports Node or containers. Azure Container Apps is the maintainer's deployment target, not a requirement — this guide covers the container image contract that release automation will publish and running your own instance from source. The [Azure Terraform](../infra/azure) directory is a worked example you can adapt.
 
-Once your server is running, point the CLI at it and you have a private PatchPage: upload access is token-gated, but the draft URLs it returns are public and unlisted (anyone with the link can view them).
+Once your server is running, point the CLI at it and you have a self-hosted PatchPage. Upload access requires a token by default; an operator can opt in to anonymous creation. In either mode, draft viewer URLs are public and unlisted, so anyone with the link can view them.
 
 ## Prerequisites
 
@@ -38,6 +38,7 @@ docker run -d \
   -p 3000:3000 \
   -e PATCHPAGE_PUBLIC_BASE_URL=https://post.example.com \
   -e PATCHPAGE_BOOTSTRAP_API_TOKEN=change-me-to-a-long-random-string \
+  -e PATCHPAGE_ALLOW_ANONYMOUS_UPLOADS=false \
   -v patchpage-data:/data \
   ghcr.io/allisonmahmood/patchpage-server:1.2.3
 ```
@@ -107,7 +108,7 @@ Notes on values:
 - `PATCHPAGE_TRUST_PROXY` controls whether Fastify derives `request.ip` from `X-Forwarded-For`. Leave it undefined unless every route to the server has a verified trust boundary. See [Client IP attribution behind proxies](#client-ip-attribution-behind-proxies).
 - `PATCHPAGE_MAX_HTML_BYTES` caps the size of a single HTML document (default 524288 = 512 KiB).
 - `PATCHPAGE_PROTECTED_API_RATE_LIMIT_PER_MINUTE`, `PATCHPAGE_AUTHENTICATED_UPLOAD_RATE_LIMIT_PER_MINUTE`, and `PATCHPAGE_ANONYMOUS_CREATE_RATE_LIMIT_PER_MINUTE` are decimal integers from `1` through `10000`. Defaults are `60`, `20`, and `5`.
-- `PATCHPAGE_ALLOW_ANONYMOUS_UPLOADS` is parsed but not currently enforced — the upload endpoint always requires a token with the `upload` scope regardless of this setting. Keep it `false`.
+- `PATCHPAGE_ALLOW_ANONYMOUS_UPLOADS` is a strict `true`/`false` opt-in and defaults to `false`. When `true`, a request with no `Authorization` header may create a new unlisted draft only. Anonymous requests must omit `draftId`; they cannot update, list, disable, or delete drafts. Any present malformed, invalid, revoked, or insufficient credential remains an authentication or authorization failure and never falls back to anonymous access.
 - When running from source, the `json` metadata driver and `filesystem` storage driver write under `.local/` by default. The supported image overrides those path defaults to `/data` as shown above. Both modes need no external services and suit a quick or single-instance self-host. For a durable multi-instance deployment, use `postgres` and a shared object store (`azure-blob`).
 
 ### Abuse protection and rate limits
@@ -116,7 +117,7 @@ PatchPage applies deterministic fixed-window in-memory limits inside each server
 
 - Protected `/api` requests are limited to `PATCHPAGE_PROTECTED_API_RATE_LIMIT_PER_MINUTE` attempts per minute per canonical Fastify `request.ip`. That IP follows `PATCHPAGE_TRUST_PROXY`, so configure the proxy boundary before relying on IP-based buckets.
 - Authenticated upload requests are limited to `PATCHPAGE_AUTHENTICATED_UPLOAD_RATE_LIMIT_PER_MINUTE` attempts per minute per API token database identity. Rotating the raw bearer secret for the same token record does not create a fresh upload bucket.
-- A real anonymous-create limiter is configured at `PATCHPAGE_ANONYMOUS_CREATE_RATE_LIMIT_PER_MINUTE` attempts per minute per canonical `request.ip` for future anonymous upload support. Anonymous uploads are still disabled today; `POST /api/uploads` requires a token with the `upload` scope.
+- When anonymous uploads are enabled, anonymous create attempts are additionally limited to `PATCHPAGE_ANONYMOUS_CREATE_RATE_LIMIT_PER_MINUTE` attempts per minute per canonical `request.ip`. They consume the protected-IP bucket and this anonymous-create bucket, but never an authenticated token bucket.
 
 When a bucket is exceeded, PatchPage returns HTTP `429` with JSON `{ "ok": false, "code": "rate_limited", ... }` and an integer `Retry-After` header. Each limiter tracks up to `10000` live keys in memory. If all live key slots are occupied, an unseen key receives the same bounded `429` response until the earliest live bucket resets. Live buckets are never evicted to make room for an unseen key, because eviction would let an attacker bypass limits by cycling key values.
 
@@ -152,7 +153,7 @@ PATCHPAGE_BOOTSTRAP_API_TOKEN=change-me-to-a-long-random-string \
 pnpm db:migrate
 ```
 
-This creates the `accounts`, `api_tokens`, `drafts`, `draft_versions`, and `upload_events` tables (idempotently), and — when `PATCHPAGE_BOOTSTRAP_API_TOKEN` is set — provisions a bootstrap account and a bootstrap API token with `admin` and `upload` scopes. The `json` driver applies the same bootstrap step automatically on first startup, so no separate migration is needed for it.
+This creates the `accounts`, `api_tokens`, `drafts`, `draft_versions`, and `upload_events` tables (idempotently), initializes the dedicated internal anonymous owner/audit actor without a usable bearer credential, and — when `PATCHPAGE_BOOTSTRAP_API_TOKEN` is set — provisions a bootstrap account and a bootstrap API token with `admin` and `upload` scopes. The `json` driver applies the same initialization automatically on startup, so no separate migration is needed for it.
 
 ## Running the server
 
@@ -207,6 +208,8 @@ patchpage upload ./plan.html
 ```
 
 An upload without a draft ID creates a draft with a cryptographically generated server ID. To add a version to a specific draft, use `patchpage upload ./plan.html --draft <draft-id>`. The `--draft` option is update-only: the target must already be active and owned by the authenticated account, and unknown, deleted, disabled, or unowned targets all return the same generic unavailable response without creating a draft. Use `--new` for an explicit create; `--new` and `--draft` cannot be combined.
+
+When neither `PATCHPAGE_API_TOKEN` nor a stored token exists, `patchpage upload` attempts an anonymous create. It ignores cached draft IDs and does not write anonymous results to the update cache. This succeeds only when the target self-hosted server has explicitly set `PATCHPAGE_ALLOW_ANONYMOUS_UPLOADS=true`; the default is `false`. Pass `--anonymous` to force create-only anonymous mode and bypass available credentials, or combine `--anonymous --new` for an explicit new anonymous draft. `--draft` is incompatible with anonymous mode because all updates require authentication. Authentication failures are returned directly and are never retried anonymously.
 
 `auth set` reads the token from a non-echoing terminal prompt. Automation that needs to persist credentials must explicitly pipe one token to `--token-stdin`:
 
@@ -279,4 +282,4 @@ The [`infra/azure`](../infra/azure) Terraform directory is an Azure-specific wor
 
 ## Security
 
-Uploads currently always require a token with the `upload` scope. `PATCHPAGE_ALLOW_ANONYMOUS_UPLOADS` is parsed but not enforced, so keep it `false`, treat `PATCHPAGE_BOOTSTRAP_API_TOKEN` as a secret, and remember that draft view URLs are public and unlisted — anyone with a link can view the rendered HTML unless you add your own viewer access controls.
+Keep `PATCHPAGE_ALLOW_ANONYMOUS_UPLOADS=false` unless you intentionally accept public create traffic and have an appropriate external abuse-control layer. Anonymous access is create-only; authenticated owners retain updates, and admin-scoped credentials can disable or delete anonymous drafts. Treat `PATCHPAGE_BOOTSTRAP_API_TOKEN` as a secret, and remember that draft viewer URLs are public and unlisted — anyone with a link can view the rendered HTML unless you add your own viewer access controls.

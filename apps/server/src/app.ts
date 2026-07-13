@@ -4,6 +4,7 @@ import Fastify from "fastify";
 import type { ServerConfig } from "@patchpage/config";
 import { isUploadTargetError } from "@patchpage/db";
 import type {
+  AnonymousUploadPrincipal,
   ApiTokenAuth,
   PatchPageDb,
   RecordUploadInput,
@@ -51,6 +52,8 @@ declare module "fastify" {
     auth?: ApiTokenAuth;
     authState?: ApiRequestAuthState;
     preBodyAuthorizedScopes?: Set<string>;
+    anonymousUploadPrincipal?: AnonymousUploadPrincipal;
+    preBodyAnonymousLimiterConsumed?: boolean;
     preBodyUploadLimiterConsumed?: boolean;
   }
 }
@@ -66,6 +69,7 @@ export type AuthorizationCredential =
   | { kind: "bearer"; token: string };
 
 interface ProtectedApiHookOptions {
+  anonymousCreateLimiter?: FixedWindowRateLimiter;
   uploadLimiter?: FixedWindowRateLimiter;
 }
 
@@ -73,7 +77,12 @@ type ApiPolicyScope = "admin" | "upload";
 
 type ApiRequestTargetPolicy =
   | { protected: false }
-  | { protected: true; requiredScope?: ApiPolicyScope; uploadLimit?: boolean };
+  | {
+      protected: true;
+      requiredScope?: ApiPolicyScope;
+      uploadLimit?: boolean;
+      anonymousCreate?: boolean;
+    };
 
 const FASTIFY_DEFAULT_MAX_PARAM_LENGTH = 100;
 const PRE_ROUTING_API_ERROR_TARGET = "/api/__patchpage_pre_routing_error__";
@@ -100,7 +109,13 @@ export function createApp(options: CreateAppOptions): FastifyInstance {
 
   app.addHook(
     "onRequest",
-    protectedApiPrefixGuard(options.db, rateLimiters.protectedApi, rateLimiters.authenticatedUpload)
+    protectedApiPrefixGuard(
+      options.db,
+      options.config.allowAnonymousUploads,
+      rateLimiters.protectedApi,
+      rateLimiters.authenticatedUpload,
+      rateLimiters.anonymousCreate
+    )
   );
 
   const protectedApi = (requiredScope?: string, hookOptions: ProtectedApiHookOptions = {}) =>
@@ -146,11 +161,25 @@ export function createApp(options: CreateAppOptions): FastifyInstance {
 
   app.post(
     "/api/uploads",
-    { onRequest: protectedApi("upload", { uploadLimiter: rateLimiters.authenticatedUpload }) },
+    {
+      onRequest: protectedApi("upload", {
+        uploadLimiter: rateLimiters.authenticatedUpload,
+        anonymousCreateLimiter: rateLimiters.anonymousCreate
+      })
+    },
     async (request, reply) => {
-      const auth = authenticatedRequest(request);
+      const principal = uploadRequestPrincipal(request);
 
       const body = (request.body || {}) as UploadBody;
+      if (
+        request.anonymousUploadPrincipal &&
+        Object.prototype.hasOwnProperty.call(body, "draftId")
+      ) {
+        return reply.status(400).send({
+          ok: false,
+          error: "Anonymous uploads must omit draftId."
+        });
+      }
       if (typeof body.html !== "string") {
         return reply.status(400).send({ ok: false, error: "Missing HTML document." });
       }
@@ -185,8 +214,8 @@ export function createApp(options: CreateAppOptions): FastifyInstance {
         intent: requestedDraftId ? "update" : "create",
         draftId,
         versionId,
-        accountId: auth.accountId,
-        apiTokenId: auth.id,
+        accountId: principal.accountId,
+        apiTokenId: principal.apiTokenId,
         title,
         objectKey,
         contentHash: contentHash(html),
@@ -237,7 +266,9 @@ export function createApp(options: CreateAppOptions): FastifyInstance {
       const draftId = (request.params as { draftId: string }).draftId;
       const reason =
         cleanText((request.body as { reason?: unknown } | null)?.reason) || "Disabled.";
-      const disabled = await options.db.disableDraft(draftId, auth.accountId, reason);
+      const disabled = await options.db.disableDraft(draftId, auth.accountId, reason, {
+        canModerateAnonymous: hasScope(auth, "admin")
+      });
       if (!disabled) return reply.status(404).send({ ok: false, error: "Draft not found." });
       return { ok: true };
     }
@@ -250,7 +281,9 @@ export function createApp(options: CreateAppOptions): FastifyInstance {
       const auth = authenticatedRequest(request);
 
       const draftId = (request.params as { draftId: string }).draftId;
-      const deleted = await options.db.deleteDraft(draftId, auth.accountId);
+      const deleted = await options.db.deleteDraft(draftId, auth.accountId, {
+        canModerateAnonymous: hasScope(auth, "admin")
+      });
       if (!deleted) return reply.status(404).send({ ok: false, error: "Draft not found." });
       return { ok: true };
     }
@@ -318,8 +351,10 @@ async function renderDraft(
 
 function protectedApiPrefixGuard(
   db: PatchPageDb,
+  allowAnonymousUploads: boolean,
   protectedApiLimiter: FixedWindowRateLimiter,
-  authenticatedUploadLimiter: FixedWindowRateLimiter
+  authenticatedUploadLimiter: FixedWindowRateLimiter,
+  anonymousCreateLimiter: FixedWindowRateLimiter
 ) {
   return async (request: FastifyRequest, reply: FastifyReply): Promise<void> => {
     const targetPolicy = classifyApiRequestTargetPolicy(request.url);
@@ -333,6 +368,34 @@ function protectedApiPrefixGuard(
 
     const authState = await authenticateApiRequest(db, request);
     request.authState = authState;
+
+    if (
+      authState.kind === "missing" &&
+      allowAnonymousUploads &&
+      targetPolicy.anonymousCreate &&
+      request.method === "POST"
+    ) {
+      const routingErrorStatus = (request.raw as MarkedIncomingMessage)[
+        preRoutingApiErrorStatus
+      ];
+      if (routingErrorStatus) {
+        sendPreRoutingApiError(reply, routingErrorStatus);
+        return;
+      }
+
+      const anonymousAttempt = anonymousCreateLimiter.consume(request.ip);
+      request.preBodyAnonymousLimiterConsumed = true;
+      if (!anonymousAttempt.allowed) {
+        sendRateLimited(reply, anonymousAttempt);
+        return;
+      }
+      request.anonymousUploadPrincipal = await db.getAnonymousUploadPrincipal();
+
+      if (request.is404) {
+        sendApiNotFound(reply);
+      }
+      return;
+    }
 
     if (authState.kind === "missing" || authState.kind === "invalid") {
       reply.status(401).send({ ok: false, error: "Missing or invalid API token." });
@@ -375,6 +438,17 @@ function protectedApiPrefixGuard(
 
 function protectedApiRouteHook(requiredScope: string | undefined, options: ProtectedApiHookOptions) {
   return async (request: FastifyRequest, reply: FastifyReply): Promise<void> => {
+    if (request.anonymousUploadPrincipal && options.anonymousCreateLimiter) {
+      if (!request.preBodyAnonymousLimiterConsumed) {
+        const anonymousAttempt = options.anonymousCreateLimiter.consume(request.ip);
+        request.preBodyAnonymousLimiterConsumed = true;
+        if (!anonymousAttempt.allowed) {
+          sendRateLimited(reply, anonymousAttempt);
+        }
+      }
+      return;
+    }
+
     const auth = request.auth;
     if (!auth) {
       reply.status(401).send({ ok: false, error: "Missing or invalid API token." });
@@ -495,7 +569,12 @@ function classifyApiRequestTargetPolicy(requestTarget: string): ApiRequestTarget
   const pathname = canonicalRequestTargetPath(requestTarget);
   if (pathname === null) return { protected: true };
   if (pathname === "/api/uploads") {
-    return { protected: true, requiredScope: "upload", uploadLimit: true };
+    return {
+      protected: true,
+      requiredScope: "upload",
+      uploadLimit: true,
+      anonymousCreate: true
+    };
   }
   if (pathname === "/api/tokens") {
     return { protected: true, requiredScope: "admin" };
@@ -622,6 +701,17 @@ function authenticatedRequest(request: FastifyRequest): ApiTokenAuth {
     throw new Error("Authenticated request is missing API token auth state.");
   }
   return request.auth;
+}
+
+function uploadRequestPrincipal(request: FastifyRequest): {
+  accountId: string;
+  apiTokenId: string;
+} {
+  if (request.auth) {
+    return { accountId: request.auth.accountId, apiTokenId: request.auth.id };
+  }
+  if (request.anonymousUploadPrincipal) return request.anonymousUploadPrincipal;
+  throw new Error("Upload request is missing an authenticated or anonymous principal.");
 }
 
 function normalizeMetadata(value: unknown): UploadMetadata {

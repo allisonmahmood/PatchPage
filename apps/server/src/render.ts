@@ -13,7 +13,7 @@ export function renderHome(options: { publicBaseUrl: string }): string {
             <span class="kicker">Live draft host</span>
           </div>
           <h1>Upload-gated HTML draft hosting.</h1>
-          <p class="lede">PatchPage turns one validated static HTML file into a public review link. Publishing is token-gated; viewing is public and unlisted by default.</p>
+          <p class="lede">PatchPage turns one validated static HTML file into a public review link. Publishing is authenticated by default; viewing is public and unlisted.</p>
           <div class="meta">
             <span class="pill pill-progress">Upload auth</span>
             <span class="pill pill-done">Sandboxed view</span>
@@ -43,7 +43,7 @@ npx patchpage upload ./plan.html</code></pre>
 
         <div class="note note-warn">
           <span class="note-title">Visibility rule</span>
-          <p>API tokens control who can publish. They do not make draft viewers private.</p>
+          <p>Upload controls govern publishing; they do not make draft viewers private.</p>
         </div>
 
         <p class="foot">Health check: <a href="/healthz">/healthz</a>. Inspired by Postplan, the static HTML draft publishing pattern created by Theo.</p>

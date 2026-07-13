@@ -1,11 +1,17 @@
 import pg from "pg";
 import { newInternalId, sha256 } from "@patchpage/core";
+import {
+  ANONYMOUS_INTERNAL_TOKEN_HASH,
+  ANONYMOUS_UPLOAD_PRINCIPAL
+} from "./internal-principals.js";
 import { POSTGRES_SCHEMA_SQL } from "./migrations.js";
 import { UploadTargetError } from "./types.js";
 import type {
+  AnonymousUploadPrincipal,
   ApiTokenAuth,
   CreateApiTokenInput,
   DraftRecord,
+  DraftModerationOptions,
   DraftVersionLookup,
   DraftVersionRecord,
   PatchPageDb,
@@ -28,6 +34,30 @@ export class PostgresPatchPageDb implements PatchPageDb {
     if (bootstrapApiToken) {
       await this.ensureBootstrapToken(bootstrapApiToken);
     }
+  }
+
+  async getAnonymousUploadPrincipal(): Promise<AnonymousUploadPrincipal> {
+    const result = await this.pool.query(
+      `
+        SELECT 1
+        FROM api_tokens
+        JOIN accounts ON accounts.id = api_tokens.account_id
+        WHERE api_tokens.id = $1
+          AND api_tokens.account_id = $2
+          AND api_tokens.token_hash = $3
+          AND api_tokens.revoked_at IS NOT NULL
+        LIMIT 1
+      `,
+      [
+        ANONYMOUS_UPLOAD_PRINCIPAL.apiTokenId,
+        ANONYMOUS_UPLOAD_PRINCIPAL.accountId,
+        ANONYMOUS_INTERNAL_TOKEN_HASH
+      ]
+    );
+    if (!result.rowCount) {
+      throw new Error("Anonymous upload principal is not initialized.");
+    }
+    return { ...ANONYMOUS_UPLOAD_PRINCIPAL };
   }
 
   async findApiTokenByToken(token: string): Promise<ApiTokenAuth | null> {
@@ -270,28 +300,52 @@ export class PostgresPatchPageDb implements PatchPageDb {
     };
   }
 
-  async disableDraft(draftId: string, accountId: string, reason: string): Promise<boolean> {
+  async disableDraft(
+    draftId: string,
+    accountId: string,
+    reason: string,
+    options: DraftModerationOptions = {}
+  ): Promise<boolean> {
     const result = await this.pool.query(
       `
         UPDATE drafts
         SET disabled_at = now(), disabled_reason = $3, updated_at = now()
-        WHERE id = $1 AND account_id = $2 AND deleted_at IS NULL
+        WHERE id = $1
+          AND (account_id = $2 OR ($4 AND account_id = $5))
+          AND deleted_at IS NULL
         RETURNING id
       `,
-      [draftId, accountId, reason]
+      [
+        draftId,
+        accountId,
+        reason,
+        options.canModerateAnonymous === true,
+        ANONYMOUS_UPLOAD_PRINCIPAL.accountId
+      ]
     );
     return Boolean(result.rowCount);
   }
 
-  async deleteDraft(draftId: string, accountId: string): Promise<boolean> {
+  async deleteDraft(
+    draftId: string,
+    accountId: string,
+    options: DraftModerationOptions = {}
+  ): Promise<boolean> {
     const result = await this.pool.query(
       `
         UPDATE drafts
         SET deleted_at = now(), updated_at = now()
-        WHERE id = $1 AND account_id = $2 AND deleted_at IS NULL
+        WHERE id = $1
+          AND (account_id = $2 OR ($3 AND account_id = $4))
+          AND deleted_at IS NULL
         RETURNING id
       `,
-      [draftId, accountId]
+      [
+        draftId,
+        accountId,
+        options.canModerateAnonymous === true,
+        ANONYMOUS_UPLOAD_PRINCIPAL.accountId
+      ]
     );
     return Boolean(result.rowCount);
   }

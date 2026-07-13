@@ -329,6 +329,13 @@ variable "max_html_bytes" {
   default     = 524288
 }
 
+variable "allow_anonymous_uploads" {
+  description = "Allow callers without an Authorization header to create new unlisted drafts."
+  type        = bool
+  default     = false
+  nullable    = false
+}
+
 variable "protected_api_rate_limit_per_minute" {
   description = "Protected API attempts allowed per canonical client IP per minute."
   type        = number
@@ -362,7 +369,7 @@ variable "authenticated_upload_rate_limit_per_minute" {
 }
 
 variable "anonymous_create_rate_limit_per_minute" {
-  description = "Future anonymous-create attempts allowed per canonical client IP per minute."
+  description = "Anonymous-create attempts allowed per canonical client IP per minute."
   type        = number
   default     = 5
   nullable    = false

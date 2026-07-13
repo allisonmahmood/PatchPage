@@ -19,6 +19,24 @@ describe("getServerConfig", () => {
     expect(config.anonymousCreateRateLimitPerMinute).toBe(5);
   });
 
+  it("requires an explicit true boolean to enable anonymous uploads", () => {
+    expect(getServerConfig({}).allowAnonymousUploads).toBe(false);
+    expect(
+      getServerConfig({ PATCHPAGE_ALLOW_ANONYMOUS_UPLOADS: "false" })
+        .allowAnonymousUploads
+    ).toBe(false);
+    expect(
+      getServerConfig({ PATCHPAGE_ALLOW_ANONYMOUS_UPLOADS: "true" })
+        .allowAnonymousUploads
+    ).toBe(true);
+
+    for (const value of ["1", "0", "yes", "no", "on", "off", "enabled"]) {
+      expect(() =>
+        getServerConfig({ PATCHPAGE_ALLOW_ANONYMOUS_UPLOADS: value })
+      ).toThrow(/PATCHPAGE_ALLOW_ANONYMOUS_UPLOADS/);
+    }
+  });
+
   it("parses configured abuse-protection limits per minute", () => {
     const config = getServerConfig({
       PATCHPAGE_PROTECTED_API_RATE_LIMIT_PER_MINUTE: "120",

@@ -2,7 +2,7 @@
 
 PatchPage is an open-source, self-hostable service for publishing static HTML drafts behind unlisted, link-viewable URLs. The default host, https://post.patchyhq.com, is the maintainer's private instance and does not offer public token signup. To use PatchPage yourself, deploy your own server (see [docs/SELF_HOSTING.md](docs/SELF_HOSTING.md)) and point the CLI at it with `--api-url` or the `PATCHPAGE_API_URL` environment variable.
 
-Upload access is token-gated, but draft URLs are public and unlisted: anyone with the link can view the rendered artifact. PatchPage is intended for agent-generated plans, briefs, architecture notes, reports, and other single-file HTML documents.
+Upload access requires a token by default. Self-hosters may explicitly enable anonymous, create-only uploads; authenticated credentials are still required for updates and moderation. Draft viewer URLs are public and unlisted in either mode: anyone with the link can view the rendered artifact. PatchPage is intended for agent-generated plans, briefs, architecture notes, reports, and other single-file HTML documents.
 
 ## Using the CLI
 
@@ -20,6 +20,8 @@ npx patchpage upload ./plan.html
 ```
 
 Because the default host is the maintainer's private instance, the token you enter at the hidden `auth set` prompt must come from a PatchPage server you control — that means your own self-hosted deployment. See [docs/SELF_HOSTING.md](docs/SELF_HOSTING.md) for deploying a server and minting tokens.
+
+If your self-hosted operator has explicitly enabled anonymous uploads, the CLI automatically attempts a create when no environment or stored token exists; `--anonymous` forces that create-only mode. The self-hosting default remains disabled, and this repository does not claim anonymous creation is enabled on the maintainer's hosted instance.
 
 Full command and flag reference: [packages/cli/README.md](packages/cli/README.md).
 

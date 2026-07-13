@@ -494,6 +494,9 @@ describe("patchpage upload", () => {
     expect(result.stdout).toContain(
       "--draft <draft-id>  Update an existing draft only; never creates a draft"
     );
+    expect(result.stdout).toContain(
+      "--anonymous         Create without credentials; never updates a draft"
+    );
   });
 
   it("rejects combining the update-only and create-only options", () => {
@@ -511,6 +514,13 @@ describe("patchpage upload", () => {
       "",
       "--new"
     ]);
+    const anonymousResult = runCli([
+      "upload",
+      "does-not-exist.html",
+      "--draft",
+      "abcdefghijkl",
+      "--anonymous"
+    ]);
 
     expect(result.status).toBe(1);
     expect(result.stdout).toBe("");
@@ -518,6 +528,369 @@ describe("patchpage upload", () => {
     expect(emptyTargetResult.status).toBe(1);
     expect(emptyTargetResult.stdout).toBe("");
     expect(emptyTargetResult.stderr).toBe("--draft and --new cannot be used together.\n");
+    expect(anonymousResult.status).toBe(1);
+    expect(anonymousResult.stdout).toBe("");
+    expect(anonymousResult.stderr).toBe(
+      "Anonymous uploads are create-only; --draft requires credentials.\n"
+    );
+  });
+
+  it("lets --anonymous bypass credentials and cached update state", async () => {
+    const stateDir = makeStateDir();
+    const htmlPath = path.join(stateDir, "anonymous-override.html");
+    const cachedDraftId = "abcdefghijkl";
+    writeFileSync(
+      htmlPath,
+      "<!doctype html><html><head><title>Anonymous override</title></head><body></body></html>"
+    );
+    writeFileSync(
+      path.join(stateDir, "credentials.json"),
+      "malformed stored credentials that anonymous mode must not read\n"
+    );
+    const cachedState = {
+      files: {
+        [htmlPath]: {
+          draftId: cachedDraftId,
+          publicUrl: `http://example.test/d/${cachedDraftId}`,
+          latestVersionNumber: 3,
+          updatedAt: "2026-07-13T00:00:00.000Z"
+        }
+      }
+    };
+    writeFileSync(
+      path.join(stateDir, "drafts.json"),
+      `${JSON.stringify(cachedState, null, 2)}\n`
+    );
+    let authorization: string | undefined;
+    let requestBody: Record<string, unknown> | undefined;
+    const server = createServer(async (request, response) => {
+      authorization = request.headers.authorization;
+      let body = "";
+      for await (const chunk of request) body += chunk;
+      requestBody = JSON.parse(body) as Record<string, unknown>;
+      response.statusCode = 201;
+      response.setHeader("Content-Type", "application/json");
+      response.end(
+        JSON.stringify({
+          ok: true,
+          draftId: "mnopqrstuvwx",
+          publicUrl: "http://example.test/d/mnopqrstuvwx",
+          versionNumber: 1,
+          warnings: []
+        })
+      );
+    });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+
+    try {
+      const address = server.address();
+      if (!address || typeof address === "string") throw new Error("Expected a TCP test server");
+      const result = await runCliAsync(
+        [
+          "upload",
+          htmlPath,
+          "--anonymous",
+          "--api-url",
+          `http://127.0.0.1:${address.port}`
+        ],
+        { PATCHPAGE_API_TOKEN: "environment-token" },
+        stateDir
+      );
+      const explicitNewResult = await runCliAsync(
+        [
+          "upload",
+          htmlPath,
+          "--anonymous",
+          "--new",
+          "--api-url",
+          `http://127.0.0.1:${address.port}`
+        ],
+        { PATCHPAGE_API_TOKEN: "environment-token" },
+        stateDir
+      );
+
+      expect([result.status, explicitNewResult.status]).toEqual([0, 0]);
+      expect(authorization).toBeUndefined();
+      expect(requestBody).not.toHaveProperty("draftId");
+      expect(
+        JSON.parse(readFileSync(path.join(stateDir, "drafts.json"), "utf8"))
+      ).toEqual(cachedState);
+    } finally {
+      await new Promise<void>((resolve, reject) =>
+        server.close((error) => (error ? reject(error) : resolve()))
+      );
+    }
+  });
+
+  it("rejects an explicit update when automatic anonymous mode has no credentials", async () => {
+    const stateDir = makeStateDir();
+    const htmlPath = path.join(stateDir, "anonymous-update.html");
+    writeFileSync(
+      htmlPath,
+      "<!doctype html><html><head><title>Anonymous update</title></head><body></body></html>"
+    );
+    let requestCount = 0;
+    const server = createServer((_request, response) => {
+      requestCount += 1;
+      response.statusCode = 201;
+      response.setHeader("Content-Type", "application/json");
+      response.end(
+        JSON.stringify({
+          ok: true,
+          draftId: "mnopqrstuvwx",
+          publicUrl: "http://example.test/d/mnopqrstuvwx",
+          versionNumber: 1,
+          warnings: []
+        })
+      );
+    });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+
+    try {
+      const address = server.address();
+      if (!address || typeof address === "string") throw new Error("Expected a TCP test server");
+      const result = await runCliAsync(
+        [
+          "upload",
+          htmlPath,
+          "--draft",
+          "abcdefghijkl",
+          "--api-url",
+          `http://127.0.0.1:${address.port}`
+        ],
+        {},
+        stateDir
+      );
+
+      expect(result.status).toBe(1);
+      expect(result.stderr).toBe(
+        "Anonymous uploads are create-only; --draft requires credentials.\n"
+      );
+      expect(requestCount).toBe(0);
+    } finally {
+      await new Promise<void>((resolve, reject) =>
+        server.close((error) => (error ? reject(error) : resolve()))
+      );
+    }
+  });
+
+  it("selects environment, stored, then automatic anonymous upload credentials", async () => {
+    const authorizations: Array<string | undefined> = [];
+    const requestBodies: Array<Record<string, unknown>> = [];
+    const server = createServer(async (request, response) => {
+      authorizations.push(request.headers.authorization);
+      let body = "";
+      for await (const chunk of request) body += chunk;
+      requestBodies.push(JSON.parse(body) as Record<string, unknown>);
+      response.statusCode = 201;
+      response.setHeader("Content-Type", "application/json");
+      response.end(
+        JSON.stringify({
+          ok: true,
+          draftId: "mnopqrstuvwx",
+          publicUrl: "http://example.test/d/mnopqrstuvwx",
+          versionNumber: 1,
+          warnings: []
+        })
+      );
+    });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+
+    try {
+      const address = server.address();
+      if (!address || typeof address === "string") throw new Error("Expected a TCP test server");
+      const apiArgs = ["--api-url", `http://127.0.0.1:${address.port}`];
+
+      const environmentState = makeStateDir();
+      const environmentHtml = path.join(environmentState, "environment.html");
+      writeFileSync(environmentHtml, "<!doctype html><title>Environment</title>");
+      writeFileSync(
+        path.join(environmentState, "credentials.json"),
+        '{"apiToken":"stored-token"}\n'
+      );
+      const environmentResult = await runCliAsync(
+        ["upload", environmentHtml, "--new", ...apiArgs],
+        { PATCHPAGE_API_TOKEN: "environment-token" },
+        environmentState
+      );
+
+      const storedState = makeStateDir();
+      const storedHtml = path.join(storedState, "stored.html");
+      writeFileSync(storedHtml, "<!doctype html><title>Stored</title>");
+      writeFileSync(
+        path.join(storedState, "credentials.json"),
+        '{"apiToken":"stored-token"}\n'
+      );
+      const storedResult = await runCliAsync(
+        ["upload", storedHtml, "--new", ...apiArgs],
+        {},
+        storedState
+      );
+
+      const anonymousState = makeStateDir();
+      const anonymousHtml = path.join(anonymousState, "anonymous.html");
+      writeFileSync(anonymousHtml, "<!doctype html><title>Automatic anonymous</title>");
+      const cachedState = {
+        files: {
+          [anonymousHtml]: {
+            draftId: "abcdefghijkl",
+            publicUrl: "http://example.test/d/abcdefghijkl",
+            latestVersionNumber: 2,
+            updatedAt: "2026-07-13T00:00:00.000Z"
+          }
+        }
+      };
+      writeFileSync(
+        path.join(anonymousState, "drafts.json"),
+        `${JSON.stringify(cachedState, null, 2)}\n`
+      );
+      const anonymousResult = await runCliAsync(
+        ["upload", anonymousHtml, ...apiArgs],
+        {},
+        anonymousState
+      );
+
+      expect([
+        environmentResult.status,
+        storedResult.status,
+        anonymousResult.status
+      ]).toEqual([0, 0, 0]);
+      expect(authorizations).toEqual([
+        "Bearer environment-token",
+        "Bearer stored-token",
+        undefined
+      ]);
+      expect(requestBodies[2]).not.toHaveProperty("draftId");
+      expect(
+        JSON.parse(readFileSync(path.join(anonymousState, "drafts.json"), "utf8"))
+      ).toEqual(cachedState);
+    } finally {
+      await new Promise<void>((resolve, reject) =>
+        server.close((error) => (error ? reject(error) : resolve()))
+      );
+    }
+  });
+
+  it("keeps repeated no-credential uploads create-only without persisting update intent", async () => {
+    const stateDir = makeStateDir();
+    const htmlPath = path.join(stateDir, "repeat-anonymous.html");
+    writeFileSync(htmlPath, "<!doctype html><title>Repeat anonymous</title>");
+    const authorizations: Array<string | undefined> = [];
+    const requestBodies: Array<Record<string, unknown>> = [];
+    const responseDraftIds = ["mnopqrstuvwx", "yzabcdefghij"];
+    const server = createServer(async (request, response) => {
+      authorizations.push(request.headers.authorization);
+      let body = "";
+      for await (const chunk of request) body += chunk;
+      requestBodies.push(JSON.parse(body) as Record<string, unknown>);
+      const draftId = responseDraftIds[requestBodies.length - 1];
+      response.statusCode = 201;
+      response.setHeader("Content-Type", "application/json");
+      response.end(
+        JSON.stringify({
+          ok: true,
+          draftId,
+          publicUrl: `http://example.test/d/${draftId}`,
+          versionNumber: 1,
+          warnings: []
+        })
+      );
+    });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+
+    try {
+      const address = server.address();
+      if (!address || typeof address === "string") throw new Error("Expected a TCP test server");
+      const args = ["upload", htmlPath, "--api-url", `http://127.0.0.1:${address.port}`];
+
+      const first = await runCliAsync(args, {}, stateDir);
+      const second = await runCliAsync(args, {}, stateDir);
+
+      expect([first.status, second.status]).toEqual([0, 0]);
+      expect(authorizations).toEqual([undefined, undefined]);
+      expect(requestBodies).toHaveLength(2);
+      for (const requestBody of requestBodies) {
+        expect(requestBody).not.toHaveProperty("draftId");
+      }
+      expect(first.stdout).toContain("Draft ID: mnopqrstuvwx");
+      expect(second.stdout).toContain("Draft ID: yzabcdefghij");
+      expect(existsSync(path.join(stateDir, "drafts.json"))).toBe(false);
+    } finally {
+      await new Promise<void>((resolve, reject) =>
+        server.close((error) => (error ? reject(error) : resolve()))
+      );
+    }
+  });
+
+  it("does not downgrade a present empty environment credential to anonymous", async () => {
+    const stateDir = makeStateDir();
+    const htmlPath = path.join(stateDir, "empty-environment-token.html");
+    writeFileSync(htmlPath, "<!doctype html><title>Empty environment token</title>");
+    let requestCount = 0;
+    let authorization: string | undefined;
+    const server = createServer((request, response) => {
+      requestCount += 1;
+      authorization = request.headers.authorization;
+      response.statusCode = 401;
+      response.setHeader("Content-Type", "application/json");
+      response.end(JSON.stringify({ ok: false, error: "Missing or invalid API token." }));
+    });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+
+    try {
+      const address = server.address();
+      if (!address || typeof address === "string") throw new Error("Expected a TCP test server");
+      const result = await runCliAsync(
+        ["upload", htmlPath, "--api-url", `http://127.0.0.1:${address.port}`],
+        { PATCHPAGE_API_TOKEN: "" },
+        stateDir
+      );
+
+      expect(result.status).toBe(1);
+      expect(requestCount).toBe(1);
+      expect(authorization).toBeDefined();
+      expect(existsSync(path.join(stateDir, "drafts.json"))).toBe(false);
+    } finally {
+      await new Promise<void>((resolve, reject) =>
+        server.close((error) => (error ? reject(error) : resolve()))
+      );
+    }
+  });
+
+  it("does not retry an authenticated upload failure anonymously", async () => {
+    const token = "pp_rejected_environment_token";
+    const stateDir = makeStateDir();
+    const htmlPath = path.join(stateDir, "rejected-auth.html");
+    writeFileSync(htmlPath, "<!doctype html><title>Rejected auth</title>");
+    let requestCount = 0;
+    let authorization: string | undefined;
+    const server = createServer((request, response) => {
+      requestCount += 1;
+      authorization = request.headers.authorization;
+      response.statusCode = 401;
+      response.setHeader("Content-Type", "application/json");
+      response.end(JSON.stringify({ ok: false, error: "Missing or invalid API token." }));
+    });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+
+    try {
+      const address = server.address();
+      if (!address || typeof address === "string") throw new Error("Expected a TCP test server");
+      const result = await runCliAsync(
+        ["upload", htmlPath, "--api-url", `http://127.0.0.1:${address.port}`],
+        { PATCHPAGE_API_TOKEN: token },
+        stateDir
+      );
+
+      expect(result.status).toBe(1);
+      expect(requestCount).toBe(1);
+      expect(authorization).toBe(`Bearer ${token}`);
+      expect(existsSync(path.join(stateDir, "drafts.json"))).toBe(false);
+    } finally {
+      await new Promise<void>((resolve, reject) =>
+        server.close((error) => (error ? reject(error) : resolve()))
+      );
+    }
   });
 
   it("omits the draft ID field when creating a draft", async () => {
