@@ -35,9 +35,10 @@ resource "azurerm_container_app" "server" {
   }
 
   ingress {
-    external_enabled = true
-    target_port      = 3000
-    transport        = "auto"
+    external_enabled           = true
+    allow_insecure_connections = false
+    target_port                = 3000
+    transport                  = "auto"
 
     traffic_weight {
       latest_revision = true

@@ -58,7 +58,7 @@ AZURE_STORAGE_CONNECTION_STRING=
 
 Notes on values:
 
-- `PATCHPAGE_PUBLIC_BASE_URL` is used to build the public draft URLs returned by uploads and rendered in the viewer. Set it to the externally reachable origin (scheme + host, no trailing slash).
+- `PATCHPAGE_PUBLIC_BASE_URL` is used to build the public draft URLs returned by uploads and rendered in the viewer. Set it to the externally reachable origin (scheme + host, no trailing slash). The Azure Terraform example requires a deployer-owned HTTPS origin; the application itself retains its `http://localhost:3000` default for local development.
 - `PATCHPAGE_MAX_HTML_BYTES` caps the size of a single HTML document (default 524288 = 512 KiB).
 - `PATCHPAGE_ALLOW_ANONYMOUS_UPLOADS` is parsed but not currently enforced — the upload endpoint always requires a token with the `upload` scope regardless of this setting. Keep it `false`.
 - The `json` metadata driver and `filesystem` storage driver write under `.local/` by default and need no external services — good for a quick self-host or local testing. For a durable multi-instance deployment, use `postgres` and a shared object store (`azure-blob`).
@@ -145,7 +145,7 @@ Alternatively, CI can set `PATCHPAGE_API_URL` and `PATCHPAGE_API_TOKEN` directly
 
 PatchPage serves plain HTTP and does not terminate TLS itself. Put it behind a reverse proxy or platform ingress (nginx, Caddy, a cloud load balancer, Azure Container Apps ingress, etc.) that terminates TLS and forwards to `$PORT`, and set `PATCHPAGE_PUBLIC_BASE_URL` to the public HTTPS origin. Provide `DATABASE_URL` and any storage credentials through your platform's secret management rather than committing them.
 
-The maintainer's hosted instance runs on Azure Container Apps with Azure Database for PostgreSQL and private Azure Blob Storage (blob access via managed identity), provisioned with the Terraform in [`infra/azure`](../infra/azure). That directory is a complete, if Azure-specific, worked example of the full production shape — container registry, database, private blob storage, and custom-domain ingress — and its [README](../infra/azure/README.md) walks through the deploy.
+The [`infra/azure`](../infra/azure) Terraform directory is an Azure-specific worked example for the platform resources: Container Apps and external ingress, a container registry, PostgreSQL, Blob Storage with a private container, managed identity, and server configuration. It intentionally does not provision the deployer's DNS records, Container App custom hostname, Azure managed certificate, or certificate binding. Its [README](../infra/azure/README.md) separates those resources from the complete manual custom-domain and certificate flow.
 
 ## Security
 

@@ -1,7 +1,10 @@
 subscription_id = "00000000-0000-0000-0000-000000000000"
-location        = "centralus"
+location         = "centralus"
 environment_name = "prod"
-public_base_url  = "https://post.patchyhq.com"
+
+# Required: replace this deliberately invalid value with an HTTPS origin on a
+# public DNS hostname you own. Do not include a port, path, or trailing slash.
+public_base_url = "https://patchpage.your-domain.invalid"
 
 # Fill after the first ACR build:
-# server_image = "acrpatchpageabc123.azurecr.io/patchpage-server:<git-sha>"
+# server_image = "acrpatchpageabc123.azurecr.io/patchpage-server:git-sha"
