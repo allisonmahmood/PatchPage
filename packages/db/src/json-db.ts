@@ -271,8 +271,8 @@ export class JsonFilePatchPageDb implements PatchPageDb {
   private async mutateState<T>(
     mutate: (state: JsonDbState) => StateMutationResult<T>
   ): Promise<T> {
-    const mutationIdentity = await canonicalMutationIdentity(this.filePath);
-    return serializeJsonMutation(mutationIdentity, async () => {
+    const mutationIdentities = await canonicalMutationIdentities(this.filePath);
+    return serializeJsonMutation(mutationIdentities, async () => {
       const state = await this.readState();
       const result = mutate(state);
       if (result.changed) await this.writeState(state);
@@ -372,42 +372,46 @@ export class JsonFilePatchPageDb implements PatchPageDb {
 
 async function inspectDatabaseFilePath(filePath: string): Promise<Stats | null> {
   try {
-    const fileStats = await lstat(filePath);
-    if (fileStats.isSymbolicLink()) {
-      throw new Error("JSON metadata file path must not be a symbolic link.");
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      const fileStats = await lstat(filePath);
+      if (fileStats.isSymbolicLink()) {
+        throw new Error("JSON metadata file path must not be a symbolic link.");
+      }
+      if (!fileStats.isFile()) {
+        throw new Error("JSON metadata file path must be a regular file.");
+      }
+      if (fileStats.nlink === 1) return fileStats;
+      // Some filesystems briefly report the replacement inode with two links
+      // during an atomic rename. Confirm before rejecting a persistent hard link.
     }
-    if (!fileStats.isFile()) {
-      throw new Error("JSON metadata file path must be a regular file.");
-    }
-    if (fileStats.nlink !== 1) {
-      throw new Error("JSON metadata file path must not have multiple hard links.");
-    }
-    return fileStats;
+    throw new Error("JSON metadata file path must not have multiple hard links.");
   } catch (error) {
     if (hasErrorCode(error, "ENOENT")) return null;
     throw error;
   }
 }
 
-async function canonicalMutationIdentity(filePath: string): Promise<string> {
-  let existingAncestor = path.dirname(filePath);
+async function canonicalMutationIdentities(filePath: string): Promise<string[]> {
+  let ancestorPath = path.dirname(filePath);
   const unresolvedComponents = [path.basename(filePath)];
+  const identities: string[] = [];
 
   while (true) {
     try {
-      const ancestorStats = await stat(existingAncestor, { bigint: true });
-      // Device/inode identity collapses symlink, case-insensitive, and bind-mount
-      // aliases that textual canonicalization cannot reliably recognize.
+      const ancestorStats = await stat(ancestorPath, { bigint: true });
+      // Every existing ancestor contributes a key. The higher keys remain stable
+      // when missing directories appear, while device/inode identity collapses
+      // symlink, case-insensitive, and bind-mount aliases.
       const unresolvedSuffix = foldMutationIdentity(path.join(...unresolvedComponents));
-      return `${ancestorStats.dev}:${ancestorStats.ino}:${unresolvedSuffix}`;
+      identities.push(`${ancestorStats.dev}:${ancestorStats.ino}:${unresolvedSuffix}`);
     } catch (error) {
       if (!hasErrorCode(error, "ENOENT")) throw error;
-
-      const parent = path.dirname(existingAncestor);
-      if (parent === existingAncestor) throw error;
-      unresolvedComponents.unshift(path.basename(existingAncestor));
-      existingAncestor = parent;
     }
+
+    const parent = path.dirname(ancestorPath);
+    if (parent === ancestorPath) return identities;
+    unresolvedComponents.unshift(path.basename(ancestorPath));
+    ancestorPath = parent;
   }
 }
 
@@ -525,24 +529,33 @@ function assertJsonDataProperty(
 }
 
 async function serializeJsonMutation<T>(
-  mutationIdentity: string,
+  mutationIdentities: string[],
   task: () => Promise<T>
 ): Promise<T> {
-  const previous = mutationQueues.get(mutationIdentity);
+  const previous = new Set<Promise<void>>();
+  for (const identity of mutationIdentities) {
+    const pending = mutationQueues.get(identity);
+    if (pending) previous.add(pending);
+  }
+
   let release = (): void => undefined;
   const current = new Promise<void>((resolve) => {
     release = resolve;
   });
-  mutationQueues.set(mutationIdentity, current);
+  for (const identity of mutationIdentities) {
+    mutationQueues.set(identity, current);
+  }
 
-  if (previous) await previous;
+  if (previous.size > 0) await Promise.all(previous);
 
   try {
     return await task();
   } finally {
     release();
-    if (mutationQueues.get(mutationIdentity) === current) {
-      mutationQueues.delete(mutationIdentity);
+    for (const identity of mutationIdentities) {
+      if (mutationQueues.get(identity) === current) {
+        mutationQueues.delete(identity);
+      }
     }
   }
 }

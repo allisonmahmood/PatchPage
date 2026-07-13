@@ -1,4 +1,5 @@
 import { execFile as execFileCallback } from "node:child_process";
+import type { Stats } from "node:fs";
 import * as fsPromises from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -238,6 +239,155 @@ describe("JsonFilePatchPageDb", () => {
       }
     }
   );
+
+  it("keeps the mutation queue stable when a missing parent appears mid-transaction", async () => {
+    const directoryPath = path.join(tempDir, "staggered-parent");
+    const filePath = path.join(directoryPath, "db.json");
+    const cachedIdentityStats = new Map<string, Stats>();
+    let ancestorPath = tempDir;
+    while (true) {
+      cachedIdentityStats.set(
+        path.resolve(ancestorPath),
+        await fsPromises.stat(ancestorPath)
+      );
+      const parentPath = path.dirname(ancestorPath);
+      if (parentPath === ancestorPath) break;
+      ancestorPath = parentPath;
+    }
+
+    let parentExists = false;
+    let resolveParentCreated = (): void => undefined;
+    const parentCreated = new Promise<void>((resolve) => {
+      resolveParentCreated = resolve;
+    });
+    let resolveSecondIdentity = (): void => undefined;
+    const secondIdentityObserved = new Promise<void>((resolve) => {
+      resolveSecondIdentity = resolve;
+    });
+    let resolveRenameBlocked = (): void => undefined;
+    const renameBlocked = new Promise<void>((resolve) => {
+      resolveRenameBlocked = resolve;
+    });
+    let releaseRename = (): void => undefined;
+    const renameRelease = new Promise<void>((resolve) => {
+      releaseRename = resolve;
+    });
+    let primaryExists = false;
+    let primaryReads = 0;
+    let renameCalls = 0;
+
+    const trackedMkdir = (async (...args: Parameters<typeof fsPromises.mkdir>) => {
+      const result = await Reflect.apply(fsPromises.mkdir, fsPromises, args);
+      if (path.resolve(String(args[0])) === directoryPath) {
+        cachedIdentityStats.set(directoryPath, await fsPromises.stat(directoryPath));
+        parentExists = true;
+        resolveParentCreated();
+      }
+      return result;
+    }) as typeof fsPromises.mkdir;
+    const trackedStat = (async (...args: Parameters<typeof fsPromises.stat>) => {
+      const requestedPath = path.resolve(String(args[0]));
+      const cached = cachedIdentityStats.get(requestedPath);
+      if (cached) {
+        if (parentExists && requestedPath === directoryPath && primaryReads === 1) {
+          resolveSecondIdentity();
+        }
+        return cached;
+      }
+      throw Object.assign(new Error("missing identity path"), { code: "ENOENT" });
+    }) as typeof fsPromises.stat;
+    const trackedLstat = (async (...args: Parameters<typeof fsPromises.lstat>) => {
+      if (path.resolve(String(args[0])) === filePath && !primaryExists) {
+        throw Object.assign(new Error("missing primary"), { code: "ENOENT" });
+      }
+      return Reflect.apply(fsPromises.lstat, fsPromises, args);
+    }) as typeof fsPromises.lstat;
+    const trackedReadFile = (async (...args: Parameters<typeof fsPromises.readFile>) => {
+      if (path.resolve(String(args[0])) === filePath && !primaryExists) {
+        primaryReads += 1;
+        throw Object.assign(new Error("missing primary"), { code: "ENOENT" });
+      }
+      return Reflect.apply(fsPromises.readFile, fsPromises, args);
+    }) as typeof fsPromises.readFile;
+    const trackedRename = (async (...args: Parameters<typeof fsPromises.rename>) => {
+      const replacesPrimary = path.resolve(String(args[1])) === filePath;
+      if (replacesPrimary && renameCalls === 0) {
+        renameCalls += 1;
+        resolveRenameBlocked();
+        await renameRelease;
+      }
+      const result = await Reflect.apply(fsPromises.rename, fsPromises, args);
+      if (replacesPrimary) primaryExists = true;
+      return result;
+    }) as typeof fsPromises.rename;
+
+    vi.resetModules();
+    vi.doMock("node:fs/promises", () => ({
+      ...fsPromises,
+      lstat: trackedLstat,
+      mkdir: trackedMkdir,
+      readFile: trackedReadFile,
+      rename: trackedRename,
+      stat: trackedStat
+    }));
+
+    try {
+      // A static import cannot observe the per-test mocked filesystem boundary.
+      const { JsonFilePatchPageDb: StaggeredJsonFilePatchPageDb } = await import(
+        "./json-db.js"
+      );
+      const firstDb = new StaggeredJsonFilePatchPageDb(filePath);
+      const first = firstDb.recordUpload({
+        draftId: "staggered_first",
+        versionId: "staggered_ver_first",
+        accountId: "acct_test",
+        apiTokenId: "tok_test",
+        title: "Staggered first",
+        objectKey: "drafts/staggered-first/version.html",
+        contentHash: "sha256:staggered-first",
+        fileSize: 1,
+        filename: "first.html",
+        metadata: {},
+        sourceIp: null,
+        userAgent: "vitest"
+      });
+      await Promise.all([parentCreated, renameBlocked]);
+
+      const secondDb = new StaggeredJsonFilePatchPageDb(filePath);
+      const second = secondDb.recordUpload({
+        draftId: "staggered_second",
+        versionId: "staggered_ver_second",
+        accountId: "acct_test",
+        apiTokenId: "tok_test",
+        title: "Staggered second",
+        objectKey: "drafts/staggered-second/version.html",
+        contentHash: "sha256:staggered-second",
+        fileSize: 1,
+        filename: "second.html",
+        metadata: {},
+        sourceIp: null,
+        userAgent: "vitest"
+      });
+      await secondIdentityObserved;
+      for (let turn = 0; turn < 64 && primaryReads < 2; turn += 1) {
+        await Promise.resolve();
+      }
+
+      releaseRename();
+      await Promise.all([first, second]);
+
+      expect((await firstDb.findDraftVersion("staggered_first")).version?.id).toBe(
+        "staggered_ver_first"
+      );
+      expect((await firstDb.findDraftVersion("staggered_second")).version?.id).toBe(
+        "staggered_ver_second"
+      );
+    } finally {
+      releaseRename();
+      vi.doUnmock("node:fs/promises");
+      vi.resetModules();
+    }
+  });
 
   it("serializes fresh-file mutations through case aliases on case-insensitive filesystems", async () => {
     const parentPath = path.join(tempDir, "CaseParent");
