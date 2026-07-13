@@ -308,12 +308,20 @@ async function promptForApiToken(): Promise<string> {
     try {
       cleanup();
     } finally {
+      const requiresControlledExit =
+        process.listenerCount(signal) > 0 ||
+        (process.platform === "win32" && (signal === "SIGHUP" || signal === "SIGBREAK"));
+      if (requiresControlledExit) {
+        const signalNumber =
+          os.constants.signals[signal] ?? (signal === "SIGBREAK" ? 21 : 1);
+        process.exit(128 + signalNumber);
+      }
       process.kill(process.pid, signal);
     }
   };
 
   try {
-    for (const signal of ["SIGINT", "SIGTERM", "SIGHUP"] as const) {
+    for (const signal of ["SIGINT", "SIGTERM", "SIGHUP", "SIGBREAK"] as const) {
       const handler = () => onExternalSignal(signal);
       signalHandlers.set(signal, handler);
       process.on(signal, handler);

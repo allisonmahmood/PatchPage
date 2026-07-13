@@ -22,15 +22,19 @@ const argvPreloadUrl = pathToFileURL(
   path.join(packageDir, "test/record-argv.mjs")
 ).href;
 const ttyPreloadUrl = pathToFileURL(path.join(packageDir, "test/mock-tty.mjs")).href;
+const signalListenerPreloadUrl = pathToFileURL(
+  path.join(packageDir, "test/preinstalled-signal-listener.mjs")
+).href;
 const ptyDriverPath = path.join(packageDir, "test/pty-driver.py");
 const supportsPythonPty =
   process.platform !== "win32" &&
   spawnSync("python3", ["-c", "import pty, signal, termios"], { stdio: "ignore" }).status === 0;
 const externalSignals = ["SIGINT", "SIGTERM", "SIGHUP"] as const;
+const promptSignals = [...externalSignals, "SIGBREAK"] as const;
 interface TerminalReport {
   finalRaw: boolean;
   rawModeChanges: boolean[];
-  signalHandlerCounts: Record<(typeof externalSignals)[number], number>;
+  signalHandlerCounts: Record<(typeof promptSignals)[number], number>;
 }
 const stateDirs: string[] = [];
 
@@ -175,6 +179,27 @@ describe("patchpage auth set", () => {
   }
 
   it.runIf(supportsPythonPty)(
+    "runs a preinstalled signal listener once before restoring the terminal and controlling SIGTERM termination",
+    () => {
+      const stateDir = makeStateDir();
+      const signalReportPath = path.join(stateDir, "signal-listener.json");
+      const result = runCliInPty(["auth", "set"], "signal:SIGTERM", "", stateDir, {
+        NODE_OPTIONS: `--import=${signalListenerPreloadUrl}`,
+        PATCHPAGE_TEST_SIGNAL_REPORT: signalReportPath
+      });
+
+      expect(result.rawDuringInteraction).toBe(true);
+      expect(JSON.parse(readFileSync(signalReportPath, "utf8"))).toEqual({
+        signal: "SIGTERM",
+        count: 1
+      });
+      expect(result.status).toBe(128 + os.constants.signals.SIGTERM);
+      expect(result.terminalRestored).toBe(true);
+      expect(existsSync(path.join(result.stateDir, "credentials.json"))).toBe(false);
+    }
+  );
+
+  it.runIf(supportsPythonPty)(
     "rejects an empty interactive token and restores the terminal",
     () => {
       const result = runCliInPty(["auth", "set"], "line");
@@ -316,7 +341,9 @@ describe("patchpage auth set terminal boundary", () => {
 
   it("handles readline input errors through the CLI boundary and restores cooked mode", async () => {
     const errorDetail = "injected stream failure must stay private";
-    const result = await runCliWithMockTtyAsync(["auth", "set"], errorDetail);
+    const result = await runCliWithMockTtyAsync(["auth", "set"], {
+      PATCHPAGE_TEST_TTY_INPUT_ERROR: errorDetail
+    });
 
     expect(result.status).toBe(1);
     expect(result.stdout).toBe("");
@@ -326,6 +353,24 @@ describe("patchpage auth set terminal boundary", () => {
     expectTerminalRestored(result.terminal);
     expect(existsSync(path.join(result.stateDir, "credentials.json"))).toBe(false);
   });
+
+  for (const [signalName, exitCode] of [
+    ["SIGHUP", 129],
+    ["SIGBREAK", 149]
+  ] as const) {
+    it(`controls Windows ${signalName} termination after restoring cooked mode`, async () => {
+      const result = await runCliWithMockTtyAsync(["auth", "set"], {
+        PATCHPAGE_TEST_WINDOWS_SIGNAL: signalName
+      });
+
+      expect(result.stderr).not.toContain("ENOSYS");
+      expect(result.stderr).not.toContain("uncaught");
+      expect(result.status).toBe(exitCode);
+      expect(result.signal).toBeNull();
+      expectTerminalRestored(result.terminal);
+      expect(existsSync(path.join(result.stateDir, "credentials.json"))).toBe(false);
+    });
+  }
 
   it("restores cooked mode after empty input is rejected", () => {
     const result = runCliWithMockTty(["auth", "set"], "\n");
@@ -466,6 +511,8 @@ function cliEnv(overrides: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv {
   delete env.PATCHPAGE_TEST_ARGV_RECORD;
   delete env.PATCHPAGE_TEST_TTY_INPUT_ERROR;
   delete env.PATCHPAGE_TEST_TTY_REPORT;
+  delete env.PATCHPAGE_TEST_SIGNAL_REPORT;
+  delete env.PATCHPAGE_TEST_WINDOWS_SIGNAL;
   return { ...env, ...overrides };
 }
 
@@ -514,7 +561,11 @@ function runCliWithMockTty(args: string[], input: string, stateDir = makeStateDi
   };
 }
 
-function runCliWithMockTtyAsync(args: string[], inputError: string, stateDir = makeStateDir()) {
+function runCliWithMockTtyAsync(
+  args: string[],
+  envOverrides: NodeJS.ProcessEnv,
+  stateDir = makeStateDir()
+) {
   const harnessDir = makeStateDir();
   const argvOutputPath = path.join(harnessDir, "argv.json");
   const ttyReportPath = path.join(harnessDir, "tty.json");
@@ -525,6 +576,7 @@ function runCliWithMockTtyAsync(args: string[], inputError: string, stateDir = m
     stdout: string;
     stderr: string;
     stateDir: string;
+    signal: NodeJS.Signals | null;
     terminal: TerminalReport;
   }>((resolve, reject) => {
     const child = spawn(
@@ -534,8 +586,8 @@ function runCliWithMockTtyAsync(args: string[], inputError: string, stateDir = m
         env: cliEnv({
           PATCHPAGE_STATE_DIR: stateDir,
           PATCHPAGE_TEST_ARGV_RECORD: argvOutputPath,
-          PATCHPAGE_TEST_TTY_INPUT_ERROR: inputError,
-          PATCHPAGE_TEST_TTY_REPORT: ttyReportPath
+          PATCHPAGE_TEST_TTY_REPORT: ttyReportPath,
+          ...envOverrides
         }),
         stdio: ["pipe", "pipe", "pipe"]
       }
@@ -557,7 +609,7 @@ function runCliWithMockTtyAsync(args: string[], inputError: string, stateDir = m
       clearTimeout(timeout);
       reject(error);
     });
-    child.once("close", (status) => {
+    child.once("close", (status, signal) => {
       clearTimeout(timeout);
       if (timedOut) {
         reject(new Error(`CLI timed out: patchpage ${args.join(" ")}`));
@@ -569,6 +621,7 @@ function runCliWithMockTtyAsync(args: string[], inputError: string, stateDir = m
         stdout,
         stderr,
         stateDir,
+        signal,
         terminal: JSON.parse(readFileSync(ttyReportPath, "utf8")) as TerminalReport
       });
     });
@@ -579,7 +632,7 @@ function expectTerminalRestored(report: TerminalReport) {
   expect(report.rawModeChanges.at(0)).toBe(true);
   expect(report.rawModeChanges.at(-1)).toBe(false);
   expect(report.finalRaw).toBe(false);
-  expect(report.signalHandlerCounts).toEqual({ SIGINT: 0, SIGTERM: 0, SIGHUP: 0 });
+  expect(report.signalHandlerCounts).toEqual({ SIGINT: 0, SIGTERM: 0, SIGHUP: 0, SIGBREAK: 0 });
 }
 
 function runCliInPty(
@@ -591,14 +644,15 @@ function runCliInPty(
     | "none"
     | `signal:${(typeof externalSignals)[number]}`,
   input = "",
-  stateDir = makeStateDir()
+  stateDir = makeStateDir(),
+  envOverrides: NodeJS.ProcessEnv = {}
 ) {
   const result = spawnSync(
     "python3",
     [ptyDriverPath, interaction, process.execPath, cliPath, ...args],
     {
       encoding: "utf8",
-      env: cliEnv({ PATCHPAGE_STATE_DIR: stateDir }),
+      env: cliEnv({ ...envOverrides, PATCHPAGE_STATE_DIR: stateDir }),
       input,
       timeout: 10_000
     }

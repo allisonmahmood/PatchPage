@@ -64,7 +64,7 @@ if prompt in output:
     elif interaction == "interrupt":
         os.write(master_fd, b"\x03")
     elif interaction.startswith("signal:"):
-        signal_name = interaction.removeprefix("signal:")
+        signal_name = interaction[len("signal:") :]
         os.kill(process.pid, getattr(signal, signal_name))
     else:
         raise ValueError(f"Unknown interaction: {interaction}")
@@ -76,7 +76,7 @@ while process.poll() is None and time.monotonic() < deadline:
         output.extend(read_pty())
 
 if process.poll() is None:
-    process.kill()
+    process.kill(signal.SIGKILL)
     process.wait()
 
 for _ in range(5):
