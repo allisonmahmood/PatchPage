@@ -2,6 +2,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { getServerConfig } from "@patchpage/config";
 import type { ServerConfig } from "@patchpage/config";
 import { JsonFilePatchPageDb } from "@patchpage/db";
 import { FileSystemHtmlStorage } from "@patchpage/storage";
@@ -18,6 +19,34 @@ afterEach(async () => {
 });
 
 describe("PatchPage server", () => {
+  it("returns uploaded draft URLs on the configured public origin", async () => {
+    const publicBaseUrl = "https://drafts.self-hoster.dev";
+    const apiToken = "configured-origin-token";
+    const config = getServerConfig({
+      PATCHPAGE_PUBLIC_BASE_URL: publicBaseUrl
+    });
+    const db = new JsonFilePatchPageDb(path.join(tempDir, "configured-origin-db.json"));
+    await db.initialize(apiToken);
+    const storage = new FileSystemHtmlStorage(path.join(tempDir, "configured-origin-drafts"));
+    const app = createApp({ config, db, storage });
+
+    const upload = await app.inject({
+      method: "POST",
+      url: "/api/uploads",
+      headers: { authorization: `Bearer ${apiToken}` },
+      payload: {
+        html: "<!doctype html><html><head><title>Configured Origin</title></head><body></body></html>"
+      }
+    });
+
+    expect(upload.statusCode).toBe(201);
+    const body = upload.json() as { draftId: string; publicUrl: string };
+    expect(body.publicUrl).toBe(`${publicBaseUrl}/d/${body.draftId}`);
+
+    await app.close();
+    await db.close();
+  });
+
   it("requires auth for upload and renders uploaded drafts publicly", async () => {
     const config = testConfig();
     const db = new JsonFilePatchPageDb(path.join(tempDir, "db.json"));

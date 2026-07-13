@@ -16,9 +16,34 @@ variable "environment_name" {
 }
 
 variable "public_base_url" {
-  description = "Public PatchPage base URL returned by upload responses."
+  description = "Deployer-owned public HTTPS origin returned by upload responses. Use only scheme and DNS hostname, with no trailing slash."
   type        = string
-  default     = "https://post.patchyhq.com"
+  nullable    = false
+
+  validation {
+    condition = (
+      length(var.public_base_url) <= 261 &&
+      can(regex(
+        "^https://(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\\.)+[A-Za-z](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?$",
+        var.public_base_url
+      ))
+    )
+    error_message = "public_base_url must be a deployer-owned HTTPS origin with no credentials, port, path, query, fragment, or trailing slash."
+  }
+
+  validation {
+    condition = (
+      !can(regex(
+        "^https://(?:[a-z0-9-]+\\.)*(?:patchyhq\\.com|example\\.(?:com|net|org)|example|invalid|localhost|local|test|internal|lan|home|home\\.arpa|corp)$",
+        lower(var.public_base_url)
+      )) &&
+      !can(regex(
+        "(?:^https://|\\.)(?:placeholder|replace|replace-me|replace-with-your-domain|your-domain|yourdomain|domain-you-control)(?:\\.|$)",
+        lower(var.public_base_url)
+      ))
+    )
+    error_message = "public_base_url must not use a PatchPage maintainer domain, a reserved hostname, or a placeholder value."
+  }
 }
 
 variable "server_image" {
