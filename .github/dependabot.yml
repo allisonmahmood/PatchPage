@@ -5,6 +5,11 @@ updates:
     schedule:
       interval: weekly
     groups:
+      # Keep changes to the CLI that runs inside the OIDC publication job
+      # isolated for supply-chain review.
+      publishing-cli:
+        patterns:
+          - npm
       minor-and-patch:
         update-types:
           - minor
