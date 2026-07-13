@@ -76,7 +76,7 @@ while process.poll() is None and time.monotonic() < deadline:
         output.extend(read_pty())
 
 if process.poll() is None:
-    process.kill(signal.SIGKILL)
+    process.kill()
     process.wait()
 
 for _ in range(5):

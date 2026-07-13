@@ -441,6 +441,26 @@ describe("CLI auth guidance", () => {
   });
 });
 
+describe("PTY test driver", () => {
+  it.runIf(supportsPythonPty)("hard-kills a child after the interaction deadline", () => {
+    const stateDir = makeStateDir();
+    const result = spawnSync(
+      "python3",
+      [ptyDriverPath, "none", process.execPath, cliPath, "auth", "set"],
+      {
+        encoding: "utf8",
+        env: cliEnv({ PATCHPAGE_STATE_DIR: stateDir }),
+        timeout: 10_000
+      }
+    );
+
+    expect(result.error).toBeUndefined();
+    expect(result.status).toBe(0);
+    const report = JSON.parse(result.stdout) as { status: number };
+    expect(report.status).toBe(-os.constants.signals.SIGKILL);
+  });
+});
+
 function runCli(args: string[], input?: string, stateDir = makeStateDir()) {
   const argvOutputPath = path.join(stateDir, "argv.json");
   const result = spawnSync(process.execPath, ["--import", argvPreloadUrl, cliPath, ...args], {
