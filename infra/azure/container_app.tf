@@ -32,6 +32,41 @@ resource "azurerm_container_app" "server" {
   # replacing the CLI-managed binding with Terraform's original ingress shape.
   lifecycle {
     ignore_changes = [ingress]
+
+    postcondition {
+      condition     = length(self.ingress) == 1
+      error_message = "Container App must retain exactly one ingress configuration."
+    }
+
+    postcondition {
+      condition     = try(self.ingress[0].external_enabled == true, false)
+      error_message = "Container App ingress must remain external."
+    }
+
+    postcondition {
+      condition     = try(self.ingress[0].allow_insecure_connections == false, false)
+      error_message = "Container App ingress must keep insecure HTTP disabled."
+    }
+
+    postcondition {
+      condition     = try(self.ingress[0].target_port == 3000, false)
+      error_message = "Container App ingress must target server port 3000."
+    }
+
+    postcondition {
+      condition     = try(lower(self.ingress[0].transport) == "auto", false)
+      error_message = "Container App ingress transport must remain auto."
+    }
+
+    postcondition {
+      condition = try(
+        length(self.ingress[0].traffic_weight) == 1 &&
+        one(self.ingress[0].traffic_weight).latest_revision == true &&
+        one(self.ingress[0].traffic_weight).percentage == 100,
+        false
+      )
+      error_message = "Container App ingress must route 100 percent of traffic to the latest revision."
+    }
   }
 
   identity {

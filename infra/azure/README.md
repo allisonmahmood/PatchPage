@@ -10,7 +10,7 @@ Terraform creates:
 - the Blob Storage account and private container, plus the PostgreSQL server/database; and
 - generated application secrets and the Container App environment variables, including `PATCHPAGE_PUBLIC_BASE_URL` and, when configured, `PATCHPAGE_TRUST_PROXY`.
 
-Terraform does **not** create or manage the remote-state resources, container image build, DNS zone or records, Container App custom hostname, managed certificate, or certificate binding. Those steps are deliberately manual and provider-neutral below. Terraform creates the initial Container App ingress and then ignores later changes to the whole ingress block so an apply cannot overwrite the CLI-managed hostname and certificate binding. Any intentional ingress change therefore remains HITL: update the lifecycle rule and restore the manual binding as one coordinated operation.
+Terraform does **not** create or manage the remote-state resources, container image build, DNS zone or records, Container App custom hostname, managed certificate, or certificate binding. Those steps are deliberately manual and provider-neutral below. Terraform creates the initial Container App ingress and then ignores later changes to the whole ingress block so an apply cannot overwrite the CLI-managed hostname and certificate binding. Resource postconditions and the live check below fail closed if any ignored security or routing invariant drifts. Any intentional ingress change therefore remains HITL: update the lifecycle rule and restore the manual binding as one coordinated operation.
 
 ## Prerequisites
 
@@ -61,16 +61,66 @@ if ! printf '%s' "$STATE_STORAGE_ACCOUNT" | grep -Eq '^[a-z0-9]{3,24}$'; then
   exit 1
 fi
 
-az group create \
+if ! az group create \
   --name "$STATE_RESOURCE_GROUP" \
-  --location "$STATE_LOCATION"
-az storage account create \
+  --location "$STATE_LOCATION" >/dev/null; then
+  printf 'Could not create Terraform state resource group %s.\n' \
+    "$STATE_RESOURCE_GROUP" >&2
+  exit 1
+fi
+if ! STATE_RESOURCE_GROUP_LOCATION="$(
+  az group show \
+    --name "$STATE_RESOURCE_GROUP" \
+    --query location \
+    --output tsv
+)"; then
+  printf 'Could not verify Terraform state resource group %s.\n' \
+    "$STATE_RESOURCE_GROUP" >&2
+  exit 1
+fi
+if test "$STATE_RESOURCE_GROUP_LOCATION" != "$STATE_LOCATION"; then
+  printf 'Terraform state resource group %s is in %s, expected %s.\n' \
+    "$STATE_RESOURCE_GROUP" \
+    "${STATE_RESOURCE_GROUP_LOCATION:-unknown}" \
+    "$STATE_LOCATION" >&2
+  exit 1
+fi
+if ! az storage account create \
   --name "$STATE_STORAGE_ACCOUNT" \
   --resource-group "$STATE_RESOURCE_GROUP" \
   --location "$STATE_LOCATION" \
   --sku Standard_LRS \
   --kind StorageV2 \
-  --allow-blob-public-access false
+  --min-tls-version TLS1_2 \
+  --https-only true \
+  --allow-blob-public-access false >/dev/null; then
+  printf 'Could not create Terraform state storage account %s.\n' \
+    "$STATE_STORAGE_ACCOUNT" >&2
+  exit 1
+fi
+if ! STATE_STORAGE_ACCOUNT_PROPERTIES="$(
+  az storage account show \
+    --name "$STATE_STORAGE_ACCOUNT" \
+    --resource-group "$STATE_RESOURCE_GROUP" \
+    --output json
+)"; then
+  printf 'Could not verify Terraform state storage account %s.\n' \
+    "$STATE_STORAGE_ACCOUNT" >&2
+  exit 1
+fi
+if ! printf '%s\n' "$STATE_STORAGE_ACCOUNT_PROPERTIES" |
+  jq -e \
+    --arg location "$STATE_LOCATION" \
+    '.location == $location and
+     .kind == "StorageV2" and
+     .sku.name == "Standard_LRS" and
+     .minimumTlsVersion == "TLS1_2" and
+     .enableHttpsTrafficOnly == true and
+     .allowBlobPublicAccess == false' >/dev/null; then
+  printf 'Terraform state storage account %s does not match the required location or security properties.\n' \
+    "$STATE_STORAGE_ACCOUNT" >&2
+  exit 1
+fi
 if ! az storage container create \
   --name "$STATE_CONTAINER" \
   --account-name "$STATE_STORAGE_ACCOUNT" \
@@ -118,6 +168,8 @@ cp terraform.tfvars.example terraform.tfvars
 
 Terraform rejects the maintainer's domains, localhost/private-style names, reserved example names, and common placeholder values. It also rejects unsafe or malformed trusted-proxy values. The first targeted apply still requires a valid deployer-owned origin even though it only creates the registry.
 
+<!-- guide-test:deploy-resources -->
+
 ```sh
 SUBSCRIPTION_ID="${SUBSCRIPTION_ID:?Set SUBSCRIPTION_ID to the subscription_id in terraform.tfvars}"
 if ! az account set --subscription "$SUBSCRIPTION_ID"; then
@@ -134,24 +186,61 @@ if test "$ACTIVE_SUBSCRIPTION_ID" != "$SUBSCRIPTION_ID"; then
   exit 1
 fi
 
-terraform init -backend-config=backend.hcl
-terraform apply -target=azurerm_container_registry.patchpage
+if ! terraform init -backend-config=backend.hcl; then
+  printf 'Terraform initialization failed.\n' >&2
+  exit 1
+fi
+if ! terraform apply -target=azurerm_container_registry.patchpage; then
+  printf 'Terraform could not create the container registry.\n' >&2
+  exit 1
+fi
 
-TAG="$(git -C ../.. rev-parse --short HEAD)"
-ACR="$(terraform output -raw acr_name)"
-LOGIN_SERVER="$(terraform output -raw acr_login_server)"
+if ! TAG="$(git -C ../.. rev-parse --short HEAD)"; then
+  printf 'Could not determine the server image tag from Git.\n' >&2
+  exit 1
+fi
+if ! printf '%s\n' "$TAG" | grep -Eq '^[0-9a-f]{7,40}$'; then
+  printf 'Git returned an unexpected server image tag: %s\n' "${TAG:-empty}" >&2
+  exit 1
+fi
+if ! ACR="$(terraform output -raw acr_name)"; then
+  printf 'Could not read the container registry name from Terraform.\n' >&2
+  exit 1
+fi
+if ! printf '%s\n' "$ACR" | grep -Eq '^[a-z0-9]{5,50}$'; then
+  printf 'Terraform returned an unexpected container registry name: %s\n' \
+    "${ACR:-empty}" >&2
+  exit 1
+fi
+if ! LOGIN_SERVER="$(terraform output -raw acr_login_server)"; then
+  printf 'Could not read the registry login server from Terraform.\n' >&2
+  exit 1
+fi
+if test "$LOGIN_SERVER" != "$ACR.azurecr.io"; then
+  printf 'Terraform returned registry login server %s, expected %s.azurecr.io.\n' \
+    "${LOGIN_SERVER:-empty}" "$ACR" >&2
+  exit 1
+fi
 
-az acr build \
+if ! az acr build \
   --registry "$ACR" \
   --image "patchpage-server:$TAG" \
   --file apps/server/Dockerfile \
-  ../..
+  ../..; then
+  printf 'ACR did not complete the server image build successfully.\n' >&2
+  exit 1
+fi
 
-cat > server-image.auto.tfvars <<EOF
-server_image = "$LOGIN_SERVER/patchpage-server:$TAG"
-EOF
+if ! printf 'server_image = "%s/patchpage-server:%s"\n' \
+  "$LOGIN_SERVER" "$TAG" > server-image.auto.tfvars; then
+  printf 'Could not write server-image.auto.tfvars.\n' >&2
+  exit 1
+fi
 
-terraform apply
+if ! terraform apply; then
+  printf 'Terraform could not complete the PatchPage deployment.\n' >&2
+  exit 1
+fi
 ```
 
 At this point Azure's generated Container App hostname is live over HTTPS, but the deployer-owned hostname and certificate are not configured yet.
@@ -165,15 +254,35 @@ Load the outputs and make sure the Azure CLI is using the same subscription:
 <!-- guide-test:custom-domain-context -->
 
 ```sh
-SUBSCRIPTION_ID="$(terraform output -raw subscription_id)"
-RESOURCE_GROUP="$(terraform output -raw resource_group_name)"
-CONTAINER_APP="$(terraform output -raw container_app_name)"
-CONTAINER_APP_ENVIRONMENT="$(terraform output -raw container_app_environment_name)"
-CONTAINER_APP_FQDN="$(terraform output -raw container_app_fqdn)"
-CONTAINER_APP_STATIC_IP="$(terraform output -raw container_app_environment_static_ip)"
-DOMAIN_VERIFICATION_ID="$(terraform output -raw custom_domain_verification_id)"
-PUBLIC_BASE_URL="$(terraform output -raw public_base_url)"
-CUSTOM_DOMAIN="$(terraform output -raw custom_domain_hostname)"
+if ! SUBSCRIPTION_ID="$(terraform output -raw subscription_id)" ||
+  ! RESOURCE_GROUP="$(terraform output -raw resource_group_name)" ||
+  ! CONTAINER_APP="$(terraform output -raw container_app_name)" ||
+  ! CONTAINER_APP_ENVIRONMENT="$(terraform output -raw container_app_environment_name)" ||
+  ! CONTAINER_APP_FQDN="$(terraform output -raw container_app_fqdn)" ||
+  ! CONTAINER_APP_STATIC_IP="$(terraform output -raw container_app_environment_static_ip)" ||
+  ! DOMAIN_VERIFICATION_ID="$(terraform output -raw custom_domain_verification_id)" ||
+  ! PUBLIC_BASE_URL="$(terraform output -raw public_base_url)" ||
+  ! CUSTOM_DOMAIN="$(terraform output -raw custom_domain_hostname)"; then
+  printf 'Could not load the required Terraform outputs.\n' >&2
+  exit 1
+fi
+
+for REQUIRED_OUTPUT in \
+  "$SUBSCRIPTION_ID" \
+  "$RESOURCE_GROUP" \
+  "$CONTAINER_APP" \
+  "$CONTAINER_APP_ENVIRONMENT" \
+  "$CONTAINER_APP_FQDN" \
+  "$CONTAINER_APP_STATIC_IP" \
+  "$DOMAIN_VERIFICATION_ID" \
+  "$PUBLIC_BASE_URL" \
+  "$CUSTOM_DOMAIN"; do
+  if test -z "$REQUIRED_OUTPUT"; then
+    printf 'Terraform returned an empty required deployment output.\n' >&2
+    exit 1
+  fi
+done
+unset REQUIRED_OUTPUT
 
 CUSTOM_DOMAIN="$(
   printf '%s\n' "$CUSTOM_DOMAIN" |
@@ -210,6 +319,38 @@ printf 'Custom hostname: %s\nCNAME target: %s\nA target: %s\nTXT verification va
   "$CONTAINER_APP_FQDN" \
   "$CONTAINER_APP_STATIC_IP" \
   "$DOMAIN_VERIFICATION_ID"
+```
+
+### Verify the Terraform-ignored ingress invariants
+
+Every Terraform plan and apply checks these invariants through resource postconditions. Because Terraform deliberately preserves the CLI-managed custom-domain state by ignoring the complete ingress block, also read the live Azure ingress before DNS or certificate work and after every intentional ingress change.
+
+<!-- guide-test:ingress-verification -->
+
+```sh
+if ! LIVE_INGRESS="$(
+  az containerapp ingress show \
+    --resource-group "$RESOURCE_GROUP" \
+    --name "$CONTAINER_APP" \
+    --output json
+)"; then
+  printf 'Could not read live Container App ingress.\n' >&2
+  exit 1
+fi
+if ! printf '%s\n' "$LIVE_INGRESS" |
+  jq -e '
+    type == "object" and
+    .external == true and
+    .allowInsecure == false and
+    .targetPort == 3000 and
+    (.transport | type == "string" and ascii_downcase == "auto") and
+    (.traffic | type == "array" and length == 1) and
+    .traffic[0].latestRevision == true and
+    .traffic[0].weight == 100
+  ' >/dev/null; then
+  printf 'Live ingress drifted from the required external HTTPS-only port 3000 auto-transport, latest-revision 100%% route.\n' >&2
+  exit 1
+fi
 ```
 
 ### 1. Create and verify DNS records
@@ -337,19 +478,106 @@ fi
 VALIDATION_METHOD="HTTP"
 ```
 
-Certificate authorities apply the first CAA RRset found while walking from the custom hostname toward the DNS root. The check continues to a parent only when the current label returns `NOERROR` without a CAA answer; any other DNS status is a hard failure. That effective policy, wherever it is inherited from, must allow DigiCert with an unparameterized `issue "digicert.com"` record. Parameterized DigiCert records fail this check because the guide cannot prove that Azure satisfies issuer-specific constraints. Any issuer-critical property outside the standard `issue`, `issuewild`, and `iodef` tags also fails closed because the guide cannot prove DigiCert supports it:
+Certificate authorities apply the first CAA RRset found while walking from the custom hostname toward the DNS root. At each original tree label, CAA lookup follows and normalizes its CNAME chain first; if that alias-aware lookup is empty, the walk resumes at the original label's parent, as required by RFC 8659. Ambiguous targets, loops, excessive alias depth, command errors, missing status, and every DNS status other than `NOERROR` fail closed. That effective policy, wherever it is inherited from, must allow DigiCert with an unparameterized `issue "digicert.com"` record. Parameterized DigiCert records fail this check because the guide cannot prove that Azure satisfies issuer-specific constraints. Any issuer-critical property outside the standard `issue`, `issuewild`, and `iodef` tags also fails closed because the guide cannot prove DigiCert supports it:
 
 <!-- guide-test:caa-policy -->
 
 ```sh
-CAA_LOOKUP_NAME="$CUSTOM_DOMAIN"
+CAA_TREE_NAME="$CUSTOM_DOMAIN"
+CAA_LOOKUP_NAME=""
 CAA_RECORDS=""
 
-while test -n "$CAA_LOOKUP_NAME"; do
+while test -n "$CAA_TREE_NAME"; do
+  CAA_QUERY_NAME="$CAA_TREE_NAME"
+  CAA_CNAME_SEEN="|"
+  CAA_CNAME_HOPS=0
+
+  while :; do
+    case "$CAA_CNAME_SEEN" in
+      *"|$CAA_QUERY_NAME|"*)
+        printf 'CAA lookup encountered a CNAME loop at %s.\n' "$CAA_QUERY_NAME" >&2
+        exit 1
+        ;;
+    esac
+    CAA_CNAME_SEEN="$CAA_CNAME_SEEN$CAA_QUERY_NAME|"
+    CAA_CNAME_HOPS=$((CAA_CNAME_HOPS + 1))
+    if test "$CAA_CNAME_HOPS" -gt 16; then
+      printf 'CAA lookup exceeded 16 CNAME hops from %s.\n' "$CAA_TREE_NAME" >&2
+      exit 1
+    fi
+
+    if ! CNAME_RESPONSE="$(
+      dig +noall +comments +answer CNAME "$CAA_QUERY_NAME"
+    )"; then
+      printf 'CNAME lookup failed for %s during CAA evaluation.\n' \
+        "$CAA_QUERY_NAME" >&2
+      exit 1
+    fi
+
+    CNAME_STATUS="$(
+      printf '%s\n' "$CNAME_RESPONSE" |
+        awk '
+          /^;; ->>HEADER<<-/ {
+            for (i = 1; i <= NF; i++) {
+              if ($i == "status:") {
+                status = $(i + 1)
+                sub(/,$/, "", status)
+                print status
+                exit
+              }
+            }
+          }
+        '
+    )"
+    if test "$CNAME_STATUS" != "NOERROR"; then
+      printf 'CNAME lookup for %s returned DNS status %s during CAA evaluation.\n' \
+        "$CAA_QUERY_NAME" "${CNAME_STATUS:-unknown}" >&2
+      exit 1
+    fi
+
+    CNAME_TARGETS="$(
+      printf '%s\n' "$CNAME_RESPONSE" |
+        awk -v expected="$CAA_QUERY_NAME" '
+          $1 !~ /^;/ && toupper($4) == "CNAME" {
+            owner = tolower($1)
+            sub(/\.$/, "", owner)
+            if (owner == expected) {
+              target = tolower($5)
+              sub(/\.$/, "", target)
+              print target
+            }
+          }
+        '
+    )"
+    CNAME_TARGET_COUNT="$(
+      printf '%s\n' "$CNAME_TARGETS" |
+        awk 'NF { count++ } END { print count + 0 }'
+    )"
+    case "$CNAME_TARGET_COUNT" in
+      0)
+        break
+        ;;
+      1)
+        CNAME_TARGET="$CNAME_TARGETS"
+        if test -z "$CNAME_TARGET"; then
+          printf 'CAA lookup received an empty CNAME target for %s.\n' \
+            "$CAA_QUERY_NAME" >&2
+          exit 1
+        fi
+        CAA_QUERY_NAME="$CNAME_TARGET"
+        ;;
+      *)
+        printf 'CAA lookup received ambiguous CNAME targets for %s.\n' \
+          "$CAA_QUERY_NAME" >&2
+        exit 1
+        ;;
+    esac
+  done
+
   if ! CAA_RESPONSE="$(
-    dig +noall +comments +answer CAA "$CAA_LOOKUP_NAME"
+    dig +noall +comments +answer CAA "$CAA_QUERY_NAME"
   )"; then
-    printf 'CAA lookup failed for %s.\n' "$CAA_LOOKUP_NAME" >&2
+    printf 'CAA lookup failed for %s.\n' "$CAA_QUERY_NAME" >&2
     exit 1
   fi
 
@@ -370,26 +598,47 @@ while test -n "$CAA_LOOKUP_NAME"; do
   )"
   if test "$CAA_STATUS" != "NOERROR"; then
     printf 'CAA lookup for %s returned DNS status %s.\n' \
-      "$CAA_LOOKUP_NAME" "${CAA_STATUS:-unknown}" >&2
+      "$CAA_QUERY_NAME" "${CAA_STATUS:-unknown}" >&2
+    exit 1
+  fi
+
+  CAA_UNEXPECTED_RECORD_OWNERS="$(
+    printf '%s\n' "$CAA_RESPONSE" |
+      awk -v expected="$CAA_QUERY_NAME" '
+        $1 !~ /^;/ && toupper($4) == "CAA" {
+          owner = tolower($1)
+          sub(/\.$/, "", owner)
+          if (owner != expected) print owner
+        }
+      '
+  )"
+  if test -n "$CAA_UNEXPECTED_RECORD_OWNERS"; then
+    printf 'CAA lookup for %s returned records for an unexpected owner.\n' \
+      "$CAA_QUERY_NAME" >&2
     exit 1
   fi
 
   CAA_RECORDS="$(
     printf '%s\n' "$CAA_RESPONSE" |
-      awk '
+      awk -v expected="$CAA_QUERY_NAME" '
         $1 !~ /^;/ && toupper($4) == "CAA" {
-          for (i = 5; i <= NF; i++) {
-            printf "%s%s", (i == 5 ? "" : " "), $i
+          owner = tolower($1)
+          sub(/\.$/, "", owner)
+          if (owner == expected) {
+            for (i = 5; i <= NF; i++) {
+              printf "%s%s", (i == 5 ? "" : " "), $i
+            }
+            print ""
           }
-          print ""
         }
       '
   )"
+  CAA_LOOKUP_NAME="$CAA_QUERY_NAME"
   test -z "$CAA_RECORDS" || break
 
-  case "$CAA_LOOKUP_NAME" in
-    *.*) CAA_LOOKUP_NAME="${CAA_LOOKUP_NAME#*.}" ;;
-    *) CAA_LOOKUP_NAME="" ;;
+  case "$CAA_TREE_NAME" in
+    *.*) CAA_TREE_NAME="${CAA_TREE_NAME#*.}" ;;
+    *) CAA_TREE_NAME="" ;;
   esac
 done
 
@@ -453,47 +702,74 @@ if test "$ACTIVE_SUBSCRIPTION_ID" != "$SUBSCRIPTION_ID"; then
   exit 1
 fi
 
-az containerapp hostname add \
+if ! az containerapp hostname add \
   --resource-group "$RESOURCE_GROUP" \
   --name "$CONTAINER_APP" \
-  --hostname "$CUSTOM_DOMAIN"
+  --hostname "$CUSTOM_DOMAIN" >/dev/null; then
+  printf 'Could not add custom hostname %s to the Container App.\n' \
+    "$CUSTOM_DOMAIN" >&2
+  exit 1
+fi
 
-az containerapp hostname bind \
+if ! MANAGED_CERTIFICATE_ID="$(
+  az containerapp hostname bind \
   --resource-group "$RESOURCE_GROUP" \
   --name "$CONTAINER_APP" \
   --hostname "$CUSTOM_DOMAIN" \
   --environment "$CONTAINER_APP_ENVIRONMENT" \
-  --validation-method "$VALIDATION_METHOD"
+  --validation-method "$VALIDATION_METHOD" \
+  --query "[?name=='$CUSTOM_DOMAIN'].certificateId | [0]" \
+  --output tsv
+)"; then
+  printf 'Could not create and bind the managed certificate for %s.\n' \
+    "$CUSTOM_DOMAIN" >&2
+  exit 1
+fi
+if test -z "$MANAGED_CERTIFICATE_ID"; then
+  printf 'Azure did not return the bound managed-certificate resource ID for %s.\n' \
+    "$CUSTOM_DOMAIN" >&2
+  exit 1
+fi
 ```
 
-Certificate issuance can take several minutes. Confirm both the managed certificate and SNI hostname binding in Azure:
+Certificate issuance can take several minutes. The bind command captured the exact managed-certificate resource ID selected by Azure. After issuance, confirm that this exact resource succeeded for the normalized hostname and that the SNI binding still points to the same ID:
 
 <!-- guide-test:certificate-binding -->
 
 ```sh
+MANAGED_CERTIFICATE_ID="${MANAGED_CERTIFICATE_ID:?Run the hostname binding block first}"
+
 if ! MANAGED_CERTIFICATES="$(
   az containerapp env certificate list \
     --resource-group "$RESOURCE_GROUP" \
     --name "$CONTAINER_APP_ENVIRONMENT" \
     --managed-certificates-only \
-    --query '[].[name,properties.subjectName,properties.provisioningState]' \
+    --certificate "$MANAGED_CERTIFICATE_ID" \
+    --query '[].[id,properties.subjectName,properties.provisioningState]' \
     --output tsv
 )"; then
-  printf 'Could not list Azure managed certificates.\n' >&2
+  printf 'Could not read bound managed certificate %s.\n' \
+    "$MANAGED_CERTIFICATE_ID" >&2
   exit 1
 fi
 printf '%s\n' "$MANAGED_CERTIFICATES"
 if ! printf '%s\n' "$MANAGED_CERTIFICATES" |
-  awk -v expected="$CUSTOM_DOMAIN" '
+  awk -F '\t' \
+    -v expected_domain="$CUSTOM_DOMAIN" \
+    -v expected_id="$MANAGED_CERTIFICATE_ID" '
     {
+      rows++
+      id = $1
       subject = tolower($2)
       sub(/^cn=/, "", subject)
       sub(/\.$/, "", subject)
-      if (subject == expected && tolower($3) == "succeeded") found = 1
+      if (id == expected_id && subject == expected_domain &&
+          tolower($3) == "succeeded") exact_matches++
     }
-    END { exit found ? 0 : 1 }
+    END { exit rows == 1 && exact_matches == 1 ? 0 : 1 }
   '; then
-  printf 'No succeeded managed certificate matches %s.\n' "$CUSTOM_DOMAIN" >&2
+  printf 'Bound managed certificate %s has not succeeded exactly for %s.\n' \
+    "$MANAGED_CERTIFICATE_ID" "$CUSTOM_DOMAIN" >&2
   exit 1
 fi
 
@@ -509,81 +785,158 @@ if ! HOSTNAME_BINDINGS="$(
 fi
 printf '%s\n' "$HOSTNAME_BINDINGS"
 if ! printf '%s\n' "$HOSTNAME_BINDINGS" |
-  awk -v expected="$CUSTOM_DOMAIN" '
+  awk -F '\t' \
+    -v expected_domain="$CUSTOM_DOMAIN" \
+    -v expected_id="$MANAGED_CERTIFICATE_ID" '
     {
       hostname = tolower($1)
       sub(/\.$/, "", hostname)
-      if (hostname == expected && tolower($2) == "snienabled" && $3 != "") found = 1
+      if (hostname == expected_domain) {
+        hostname_rows++
+        if (tolower($2) == "snienabled" && $3 == expected_id) exact_matches++
+      }
     }
-    END { exit found ? 0 : 1 }
+    END { exit hostname_rows == 1 && exact_matches == 1 ? 0 : 1 }
   '; then
-  printf 'No SNI certificate binding matches %s.\n' "$CUSTOM_DOMAIN" >&2
+  printf 'No SNI binding for %s uses exact certificate ID %s.\n' \
+    "$CUSTOM_DOMAIN" "$MANAGED_CERTIFICATE_ID" >&2
   exit 1
 fi
 ```
 
 ### 3. Verify HTTPS and the configured upload origin
 
-Terraform disables insecure ingress. Verify that HTTP redirects and that the deployer-owned hostname presents a valid HTTPS certificate:
+Terraform disables insecure ingress. Verify the exact HTTPS redirect, health response, authenticated upload response, configured draft origin, and fetched draft content as one fail-closed smoke. This uses the sensitive bootstrap token from Terraform state; do not enable shell tracing or paste its value into logs.
 
-```sh
-HTTP_STATUS="$(
-  curl --silent --output /dev/null --write-out '%{http_code}' \
-    "http://$CUSTOM_DOMAIN/healthz"
-)"
-case "$HTTP_STATUS" in
-  301|302|307|308) ;;
-  *)
-    printf 'Expected an HTTPS redirect, received HTTP %s\n' "$HTTP_STATUS" >&2
-    exit 1
-    ;;
-esac
-
-curl --proto '=https' --tlsv1.2 \
-  --fail --silent --show-error \
-  "$PUBLIC_BASE_URL/healthz"
-```
-
-Finally, perform one authenticated upload and assert that the server returns a draft URL on exactly the configured origin. This uses the sensitive bootstrap token from Terraform state; do not enable shell tracing or paste its value into logs.
-
-<!-- guide-test:upload-smoke -->
+<!-- guide-test:deployed-smoke -->
 
 ```sh
 set +x
-BOOTSTRAP_API_TOKEN="$(terraform output -raw bootstrap_api_token)"
+if ! SMOKE_TMP_DIR="$(mktemp -d)"; then
+  printf 'Could not create a temporary directory for the deployed smoke.\n' >&2
+  exit 1
+fi
+trap 'rm -rf "$SMOKE_TMP_DIR"' EXIT HUP INT TERM
 
-UPLOAD_RESPONSE="$(
+smoke_fail() {
+  printf '%s\n' "$1" >&2
+  unset BOOTSTRAP_API_TOKEN
+  rm -rf "$SMOKE_TMP_DIR"
+  exit 1
+}
+
+EXPECTED_HEALTH_URL="$PUBLIC_BASE_URL/healthz"
+if ! HTTP_STATUS="$(
+  curl --silent --show-error \
+    --output /dev/null \
+    --dump-header "$SMOKE_TMP_DIR/http.headers" \
+    --write-out '%{http_code}' \
+    "http://$CUSTOM_DOMAIN/healthz"
+)"; then
+  smoke_fail 'The HTTP health request failed.'
+fi
+case "$HTTP_STATUS" in
+  301|302|307|308) ;;
+  *) smoke_fail "Expected an HTTPS redirect, received HTTP $HTTP_STATUS." ;;
+esac
+if ! HTTP_LOCATION="$(
+  awk '
+    tolower($1) == "location:" {
+      value = $0
+      sub(/^[^:]*:[[:space:]]*/, "", value)
+      sub(/\r$/, "", value)
+      locations++
+      location = value
+    }
+    END {
+      if (locations != 1) exit 1
+      print location
+    }
+  ' "$SMOKE_TMP_DIR/http.headers"
+)"; then
+  smoke_fail 'The HTTP response did not contain exactly one Location header.'
+fi
+if test "$HTTP_LOCATION" != "$EXPECTED_HEALTH_URL"; then
+  smoke_fail "Expected redirect Location $EXPECTED_HEALTH_URL, received $HTTP_LOCATION."
+fi
+
+if ! HTTPS_HEALTH_STATUS="$(
   curl --proto '=https' --tlsv1.2 \
-    --fail-with-body --silent --show-error \
+    --silent --show-error \
+    --output "$SMOKE_TMP_DIR/health.body" \
+    --write-out '%{http_code}' \
+    "$EXPECTED_HEALTH_URL"
+)"; then
+  smoke_fail 'The HTTPS health request failed.'
+fi
+if test "$HTTPS_HEALTH_STATUS" != "200"; then
+  smoke_fail "Expected HTTPS health status 200, received $HTTPS_HEALTH_STATUS."
+fi
+if ! HTTPS_HEALTH_BODY="$(cat "$SMOKE_TMP_DIR/health.body")"; then
+  smoke_fail 'Could not read the HTTPS health response body.'
+fi
+if test "$HTTPS_HEALTH_BODY" != '{"ok":true}'; then
+  smoke_fail "Unexpected HTTPS health body: $HTTPS_HEALTH_BODY"
+fi
+
+if ! BOOTSTRAP_API_TOKEN="$(terraform output -raw bootstrap_api_token)"; then
+  smoke_fail 'Could not read the bootstrap API token from Terraform.'
+fi
+if test -z "$BOOTSTRAP_API_TOKEN"; then
+  smoke_fail 'Terraform returned an empty bootstrap API token.'
+fi
+
+if ! UPLOAD_STATUS="$(
+  curl --proto '=https' --tlsv1.2 \
+    --silent --show-error \
+    --output "$SMOKE_TMP_DIR/upload.json" \
+    --write-out '%{http_code}' \
     --request POST \
     --header "Authorization: Bearer $BOOTSTRAP_API_TOKEN" \
     --header "Content-Type: application/json" \
-    --data '{"html":"<!doctype html><html><head><title>Azure smoke test</title></head><body><h1>OK</h1></body></html>","filename":"azure-smoke.html"}' \
+    --data '{"html":"<!doctype html><html><head><title>Azure smoke test</title></head><body><h1>PATCHPAGE_AZURE_SMOKE_OK</h1></body></html>","filename":"azure-smoke.html"}' \
     "$PUBLIC_BASE_URL/api/uploads"
-)"
+)"; then
+  smoke_fail 'The authenticated upload request failed.'
+fi
+if test "$UPLOAD_STATUS" != "201"; then
+  smoke_fail "Expected upload status 201, received $UPLOAD_STATUS."
+fi
+if ! DRAFT_URL="$(
+  jq -er \
+    --arg origin "$PUBLIC_BASE_URL" \
+    'select(.ok == true) |
+     select((.draftId | type) == "string") |
+     select(.draftId | test("^[a-z0-9]{12}$")) |
+     select(.publicUrl == ($origin + "/d/" + .draftId)) |
+     .publicUrl' \
+    "$SMOKE_TMP_DIR/upload.json"
+)"; then
+  smoke_fail 'Upload response did not contain the exact configured-origin draft URL.'
+fi
 
-DRAFT_URL="$(printf '%s' "$UPLOAD_RESPONSE" | jq -er '.publicUrl')"
-case "$DRAFT_URL" in
-  "$PUBLIC_BASE_URL"/d/*) ;;
-  *)
-    printf 'Unexpected draft origin: %s\n' "$DRAFT_URL" >&2
-    exit 1
-    ;;
-esac
-
-if ! curl --proto '=https' --tlsv1.2 \
-  --fail --silent --show-error \
-  "$DRAFT_URL" >/dev/null; then
-  printf 'The uploaded draft could not be fetched.\n' >&2
-  unset BOOTSTRAP_API_TOKEN
-  exit 1
+if ! DRAFT_STATUS="$(
+  curl --proto '=https' --tlsv1.2 \
+    --silent --show-error \
+    --output "$SMOKE_TMP_DIR/draft.html" \
+    --write-out '%{http_code}' \
+    "$DRAFT_URL"
+)"; then
+  smoke_fail 'The uploaded draft fetch failed.'
+fi
+if test "$DRAFT_STATUS" != "200"; then
+  smoke_fail "Expected uploaded draft status 200, received $DRAFT_STATUS."
+fi
+if ! grep -Fq -- 'PATCHPAGE_AZURE_SMOKE_OK' "$SMOKE_TMP_DIR/draft.html"; then
+  smoke_fail 'The fetched draft did not contain the uploaded smoke marker.'
 fi
 
 printf '%s\n' "$DRAFT_URL"
 unset BOOTSTRAP_API_TOKEN
+rm -rf "$SMOKE_TMP_DIR"
 ```
 
-These DNS, certificate, HTTPS, and upload checks require the deployer's real Azure subscription and DNS zone. They are intentionally human-in-the-loop and are not performed by Terraform validation or repository tests.
+Repository tests execute these guide blocks against failure-injection stubs, but they do not contact Azure or public DNS. DNS, certificate, HTTPS, and upload acceptance against the deployer's real subscription and zone remains intentionally human-in-the-loop.
 
 ### 4. Verify and enable client IP attribution
 
