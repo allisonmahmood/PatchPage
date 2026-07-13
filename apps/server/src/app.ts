@@ -79,7 +79,7 @@ const FASTIFY_DEFAULT_MAX_PARAM_LENGTH = 100;
 const PRE_ROUTING_API_ERROR_TARGET = "/api/__patchpage_pre_routing_error__";
 const preRoutingApiErrorStatus = Symbol("preRoutingApiErrorStatus");
 
-type PreRoutingApiErrorStatus = 400 | 414;
+type PreRoutingApiErrorStatus = 400 | 404 | 414;
 type MarkedIncomingMessage = IncomingMessage & {
   [preRoutingApiErrorStatus]?: PreRoutingApiErrorStatus;
 };
@@ -415,41 +415,52 @@ function rawRequestTargetPath(requestTarget: string): string {
   return pathStart === -1 ? "/" : targetWithoutQuery.slice(pathStart);
 }
 
-function registeredApiParamExceedsRouterLimit(
+function registeredApiParamRoutingErrorStatus(
   method: string | undefined,
   rawPath: string
-): boolean {
-  if (method !== "POST" && method !== "DELETE") return false;
+): PreRoutingApiErrorStatus | undefined {
+  if (method !== "POST" && method !== "DELETE") return undefined;
 
-  const [leading, rawApi, rawDrafts, rawParameter] = rawPath.split("/");
+  const [leading, rawApi, rawDrafts, rawParameter, rawSuffix, ...extraSegments] =
+    rawPath.split("/");
   if (
     leading !== "" ||
     rawApi === undefined ||
     rawDrafts === undefined ||
     rawParameter === undefined ||
     decodeURI(rawApi) !== "api" ||
-    decodeURI(rawDrafts) !== "drafts"
+    decodeURI(rawDrafts) !== "drafts" ||
+    decodeURIComponent(rawParameter).length <= FASTIFY_DEFAULT_MAX_PARAM_LENGTH
   ) {
-    return false;
+    return undefined;
   }
 
-  return decodeURIComponent(rawParameter).length > FASTIFY_DEFAULT_MAX_PARAM_LENGTH;
+  if (method === "POST") {
+    const exactDisableRoute =
+      rawSuffix !== undefined &&
+      extraSegments.length === 0 &&
+      decodeURI(rawSuffix) === "disable";
+    return exactDisableRoute ? 414 : 404;
+  }
+
+  return rawSuffix === undefined ? 414 : 404;
 }
 
 function rewriteProtectedApiRoutingFailure(request: IncomingMessage): string {
   const requestTarget = request.url ?? "/";
   const rawPath = rawRequestTargetPath(requestTarget);
   const pathname = canonicalRequestTargetPath(requestTarget);
+  const routeErrorStatus =
+    pathname === null
+      ? undefined
+      : registeredApiParamRoutingErrorStatus(request.method, rawPath);
   let errorStatus: PreRoutingApiErrorStatus | undefined;
 
   if (pathname === null) {
     if (!hasLexicalProtectedApiPrefix(requestTarget)) return requestTarget;
     errorStatus = 400;
-  } else if (
-    isApiPolicyPath(pathname) &&
-    registeredApiParamExceedsRouterLimit(request.method, rawPath)
-  ) {
-    errorStatus = 414;
+  } else if (isApiPolicyPath(pathname) && routeErrorStatus) {
+    errorStatus = routeErrorStatus;
   }
 
   if (!errorStatus) return requestTarget;
@@ -512,10 +523,13 @@ function sendPreRoutingApiError(
   reply: FastifyReply,
   status: PreRoutingApiErrorStatus
 ): void {
-  reply.status(status).send({
-    ok: false,
-    error: status === 400 ? "Malformed request target." : "Request target is too long."
-  });
+  const error =
+    status === 400
+      ? "Malformed request target."
+      : status === 404
+        ? "Not found."
+        : "Request target is too long.";
+  reply.status(status).send({ ok: false, error });
 }
 
 function sendRateLimited(reply: FastifyReply, decision: RateLimitDecision): void {

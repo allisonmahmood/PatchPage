@@ -683,10 +683,23 @@ describe("PatchPage server", () => {
       protectedTarget: `/api/drafts/${"x".repeat(60)}%2F${"x".repeat(60)}/disable`,
       authenticatedStatus: 414,
       authenticatedError: "Request target is too long."
+    },
+    {
+      label: "DELETE overlong route parameter",
+      protectedTarget: `/api/drafts/${"x".repeat(101)}`,
+      method: "DELETE",
+      authenticatedStatus: 414,
+      authenticatedError: "Request target is too long."
     }
   ])(
     "authenticates and limits pre-routing API failure: $label",
-    async ({ label, protectedTarget, authenticatedStatus, authenticatedError }) => {
+    async ({
+      label,
+      protectedTarget,
+      method,
+      authenticatedStatus,
+      authenticatedError
+    }) => {
       let now = 1_000;
       const config = testConfig();
       const caseName = label.replaceAll(/[^a-z0-9]/gi, "-");
@@ -704,7 +717,13 @@ describe("PatchPage server", () => {
         expect(publicMalformed.statusCode).toBe(400);
 
         for (let attempt = 1; attempt <= 60; attempt += 1) {
-          const response = await rawHttpRequest(app, protectedTarget);
+          const response = await rawHttpRequest(
+            app,
+            protectedTarget,
+            "",
+            {},
+            { method }
+          );
           expect(response.statusCode).toBe(401);
           expect(response.json()).toEqual({
             ok: false,
@@ -712,7 +731,13 @@ describe("PatchPage server", () => {
           });
         }
 
-        const limited = await rawHttpRequest(app, protectedTarget);
+        const limited = await rawHttpRequest(
+          app,
+          protectedTarget,
+          "",
+          {},
+          { method }
+        );
         expect(limited.statusCode).toBe(429);
         expect(limited.headers["retry-after"]).toBe("60");
         expect(limited.json()).toEqual({
@@ -728,7 +753,7 @@ describe("PatchPage server", () => {
           protectedTarget,
           "",
           { Authorization: "Bearer dev-token" },
-          { closeAfterWrite: false }
+          { closeAfterWrite: false, method }
         );
         expect(authenticated.statusCode).toBe(authenticatedStatus);
         expect(authenticated.json()).toEqual({
@@ -755,6 +780,14 @@ describe("PatchPage server", () => {
     try {
       for (const { method, requestTarget } of [
         { method: "POST", requestTarget: `/api/unmatched/${longSegment}` },
+        {
+          method: "POST",
+          requestTarget: `/api/drafts/${longSegment}`
+        },
+        {
+          method: "DELETE",
+          requestTarget: `/api/drafts/${longSegment}/disable`
+        },
         {
           method: "PUT",
           requestTarget: `/api/drafts/${longSegment}/disable`
