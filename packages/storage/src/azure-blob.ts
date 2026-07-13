@@ -55,4 +55,9 @@ export class AzureBlobHtmlStorage implements HtmlStorage {
     }
     return Buffer.concat(chunks).toString("utf8");
   }
+
+  async deleteHtmlObject(key: string): Promise<void> {
+    const blob = this.containerClient.getBlobClient(key);
+    await blob.deleteIfExists();
+  }
 }

@@ -47,10 +47,14 @@ export interface CreateApiTokenInput {
   scopes: string[];
 }
 
-export interface RecordUploadInput {
+export interface UploadTargetInput {
+  intent: "create" | "update";
   draftId: string;
-  versionId: string;
   accountId: string;
+}
+
+export interface RecordUploadInput extends UploadTargetInput {
+  versionId: string;
   apiTokenId: string;
   title: string;
   objectKey: string;
@@ -60,6 +64,21 @@ export interface RecordUploadInput {
   metadata: UploadMetadata;
   sourceIp: string | null;
   userAgent: string | null;
+}
+
+export type UploadTargetErrorCode = "draft_unavailable" | "draft_conflict";
+
+export class UploadTargetError extends Error {
+  readonly statusCode: 404 | 409;
+
+  constructor(readonly code: UploadTargetErrorCode) {
+    super(code === "draft_unavailable" ? "Draft not found." : "Draft already exists.");
+    this.statusCode = code === "draft_unavailable" ? 404 : 409;
+  }
+}
+
+export function isUploadTargetError(error: unknown): error is UploadTargetError {
+  return error instanceof UploadTargetError;
 }
 
 export interface RecordUploadResult {
@@ -78,6 +97,7 @@ export interface PatchPageDb {
   initialize(bootstrapApiToken: string | null): Promise<void>;
   findApiTokenByToken(token: string): Promise<ApiTokenAuth | null>;
   createApiToken(input: CreateApiTokenInput): Promise<{ id: string; name: string }>;
+  assertUploadTarget(input: UploadTargetInput): Promise<void>;
   recordUpload(input: RecordUploadInput): Promise<RecordUploadResult>;
   findDraftVersion(draftId: string, versionNumber?: number): Promise<DraftVersionLookup>;
   disableDraft(draftId: string, accountId: string, reason: string): Promise<boolean>;

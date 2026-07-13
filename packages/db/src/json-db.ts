@@ -13,6 +13,7 @@ import {
 import path from "node:path";
 import { TextDecoder, types as utilTypes } from "node:util";
 import { newInternalId, sha256 } from "@patchpage/core";
+import { UploadTargetError } from "./types.js";
 import type {
   ApiTokenAuth,
   CreateApiTokenInput,
@@ -21,7 +22,8 @@ import type {
   DraftVersionRecord,
   PatchPageDb,
   RecordUploadInput,
-  RecordUploadResult
+  RecordUploadResult,
+  UploadTargetInput
 } from "./types.js";
 
 interface AccountRow {
@@ -134,20 +136,18 @@ export class JsonFilePatchPageDb implements PatchPageDb {
     });
   }
 
+  async assertUploadTarget(input: UploadTargetInput): Promise<void> {
+    return this.mutateState((state) => {
+      assertUploadTarget(state, input);
+      return { value: undefined, changed: false };
+    });
+  }
+
   async recordUpload(input: RecordUploadInput): Promise<RecordUploadResult> {
     return this.mutateState((state) => {
       assertLosslessJsonPersistenceValue(input.metadata);
+      const existingDraft = assertUploadTarget(state, input);
       const now = new Date().toISOString();
-      const existingDraft = state.drafts.find((draft) => draft.id === input.draftId) || null;
-
-      if (
-        existingDraft &&
-        (existingDraft.accountId !== input.accountId || existingDraft.deletedAt)
-      ) {
-        const error = new Error("Draft not found.");
-        (error as Error & { statusCode?: number }).statusCode = 404;
-        throw error;
-      }
 
       const versionNumber =
         Math.max(
@@ -824,6 +824,28 @@ function ensureBootstrapState(state: JsonDbState, bootstrapApiToken: string | nu
       revokedAt: null
     });
   }
+}
+
+function assertUploadTarget(
+  state: JsonDbState,
+  input: UploadTargetInput
+): DraftRecord | null {
+  const existingDraft = state.drafts.find((draft) => draft.id === input.draftId) || null;
+
+  if (input.intent === "create") {
+    if (existingDraft) throw new UploadTargetError("draft_conflict");
+    return null;
+  }
+
+  if (
+    !existingDraft ||
+    existingDraft.accountId !== input.accountId ||
+    existingDraft.deletedAt ||
+    existingDraft.disabledAt
+  ) {
+    throw new UploadTargetError("draft_unavailable");
+  }
+  return existingDraft;
 }
 
 function cleanText(value: unknown): string | null {

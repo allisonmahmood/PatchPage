@@ -186,6 +186,8 @@ patchpage whoami
 patchpage upload ./plan.html
 ```
 
+An upload without a draft ID creates a draft with a cryptographically generated server ID. To add a version to a specific draft, use `patchpage upload ./plan.html --draft <draft-id>`. The `--draft` option is update-only: the target must already be active and owned by the authenticated account, and unknown, deleted, disabled, or unowned targets all return the same generic unavailable response without creating a draft. Use `--new` for an explicit create; `--new` and `--draft` cannot be combined.
+
 `auth set` reads the token from a non-echoing terminal prompt. Automation that needs to persist credentials must explicitly pipe one token to `--token-stdin`:
 
 ```sh
