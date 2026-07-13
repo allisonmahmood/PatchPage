@@ -24,11 +24,92 @@ extract_block() {
 }
 
 HOSTNAME_MUTATION_BLOCK="$(extract_block hostname-mutation)"
+STATE_BOOTSTRAP_BLOCK="$(extract_block state-bootstrap)"
 CUSTOM_DOMAIN_CONTEXT_BLOCK="$(extract_block custom-domain-context)"
 APEX_DNS_BLOCK="$(extract_block apex-dns)"
 CAA_POLICY_BLOCK="$(extract_block caa-policy)"
 CERTIFICATE_BINDING_BLOCK="$(extract_block certificate-binding)"
 UPLOAD_SMOKE_BLOCK="$(extract_block upload-smoke)"
+
+run_state_bootstrap_block() {
+  scenario="$1"
+  scenario_root="$TMP_DIR/state-$scenario"
+  log="$TMP_DIR/state-$scenario.log"
+  rm -rf "$scenario_root"
+  mkdir -p "$scenario_root/infra/azure"
+  : > "$log"
+
+  (
+    SUBSCRIPTION_ID="00000000-0000-0000-0000-000000000000"
+    STATE_STORAGE_ACCOUNT="patchpagestate"
+
+    git() {
+      test "$*" = "rev-parse --show-toplevel" || return 1
+      printf '%s\n' "$scenario_root"
+    }
+
+    az() {
+      printf '%s\n' "$*" >> "$log"
+      case "$1 $2" in
+        "account set")
+          return 0
+          ;;
+        "account show")
+          printf '%s\n' "$SUBSCRIPTION_ID"
+          ;;
+        "group create"|"storage account")
+          return 0
+          ;;
+        "storage container")
+          case "$3" in
+            create)
+              test "$scenario" != "create_failure"
+              ;;
+            exists)
+              if test "$scenario" = "verification_failure"; then
+                return 1
+              elif test "$scenario" = "container_missing"; then
+                printf '%s\n' "false"
+              else
+                printf '%s\n' "true"
+              fi
+              ;;
+            *)
+              return 1
+              ;;
+          esac
+          ;;
+        *)
+          return 1
+          ;;
+      esac
+    }
+
+    eval "$STATE_BOOTSTRAP_BLOCK"
+  ) >/dev/null 2>&1
+}
+
+test_state_bootstrap() {
+  for scenario in create_failure verification_failure container_missing success; do
+    if run_state_bootstrap_block "$scenario"; then
+      status=0
+    else
+      status=$?
+    fi
+
+    backend="$TMP_DIR/state-$scenario/infra/azure/backend.hcl"
+    case "$scenario" in
+      success)
+        test "$status" -eq 0 || fail "state bootstrap failed after container verification"
+        test -f "$backend" || fail "state bootstrap did not create backend config after verification"
+        ;;
+      *)
+        test "$status" -ne 0 || fail "state bootstrap succeeded after $scenario"
+        test ! -e "$backend" || fail "state bootstrap created backend config after $scenario"
+        ;;
+    esac
+  done
+}
 
 test_custom_domain_context() {
   if ! (
@@ -173,13 +254,40 @@ run_caa_block() {
     DNS_ZONE="example.com"
 
     dig() {
-      name="$3"
+      for name do :; done
       printf '%s\n' "$name" >> "$log"
-      case "$scenario:$name" in
-        allow_parent:example.com) printf '%s\n' '0 issue "digicert.com"' ;;
-        deny_nearer:team.example.com) printf '%s\n' '0 issue "letsencrypt.org"' ;;
-        deny_nearer:example.com) printf '%s\n' '0 issue "digicert.com"' ;;
-        *) printf '%s' "" ;;
+      case "$1" in
+        +short)
+          case "$scenario:$name" in
+            inherit_noerror:example.com) printf '%s\n' '0 issue "digicert.com"' ;;
+            deny_nearer:team.example.com) printf '%s\n' '0 issue "letsencrypt.org"' ;;
+            deny_nearer:example.com) printf '%s\n' '0 issue "digicert.com"' ;;
+            *) printf '%s' "" ;;
+          esac
+          ;;
+        +noall)
+          test "$1 $2 $3 $4" = "+noall +comments +answer CAA" || return 1
+          case "$scenario:$name" in
+            servfail:team.example.com) status="SERVFAIL" ;;
+            refused:team.example.com) status="REFUSED" ;;
+            *) status="NOERROR" ;;
+          esac
+          printf '%s\n' ";; ->>HEADER<<- opcode: QUERY, status: $status, id: 12345"
+          case "$scenario:$name" in
+            inherit_noerror:example.com)
+              printf '%s\n' 'example.com. 300 IN CAA 0 issue "digicert.com"'
+              ;;
+            deny_nearer:team.example.com)
+              printf '%s\n' 'team.example.com. 300 IN CAA 0 issue "letsencrypt.org"'
+              ;;
+            deny_nearer:example.com)
+              printf '%s\n' 'example.com. 300 IN CAA 0 issue "digicert.com"'
+              ;;
+          esac
+          ;;
+        *)
+          return 1
+          ;;
       esac
     }
 
@@ -188,18 +296,29 @@ run_caa_block() {
 }
 
 test_caa_policy() {
-  run_caa_block allow_parent || fail "inherited DigiCert CAA policy was rejected"
+  run_caa_block inherit_noerror || fail "inherited DigiCert CAA policy was rejected"
 
   expected_queries="drafts.team.example.com
 team.example.com
 example.com"
-  if test "$(cat "$TMP_DIR/caa-allow_parent.log")" != "$expected_queries"; then
+  if test "$(cat "$TMP_DIR/caa-inherit_noerror.log")" != "$expected_queries"; then
     fail "CAA lookup did not walk from the hostname to the effective parent"
   fi
 
   if run_caa_block deny_nearer; then
     fail "CAA lookup skipped a nearer policy that denies DigiCert"
   fi
+
+  for scenario in servfail refused; do
+    if run_caa_block "$scenario"; then
+      fail "CAA lookup continued after DNS $scenario"
+    fi
+    expected_failure_queries="drafts.team.example.com
+team.example.com"
+    if test "$(cat "$TMP_DIR/caa-$scenario.log")" != "$expected_failure_queries"; then
+      fail "CAA lookup walked to a parent after DNS $scenario"
+    fi
+  done
 }
 
 run_certificate_block() {
@@ -284,6 +403,7 @@ test_upload_smoke() {
   fi
 }
 
+test_state_bootstrap
 test_custom_domain_context
 test_hostname_mutation_guard
 test_apex_dns
@@ -291,4 +411,4 @@ test_caa_policy
 test_certificate_binding
 test_upload_smoke
 
-printf 'guide_commands_test: 6 scenario groups passed\n'
+printf 'guide_commands_test: 7 scenario groups passed\n'

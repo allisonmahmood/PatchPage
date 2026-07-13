@@ -30,6 +30,8 @@ az account show --query '{subscription:id,tenant:tenantId,user:user.name}' --out
 
 Create remote Terraform state once. Set `STATE_STORAGE_ACCOUNT` to a globally unique name containing 3-24 lowercase letters and digits before running the block. Do not commit the generated backend config.
 
+<!-- guide-test:state-bootstrap -->
+
 ```sh
 AZURE_DIR="$(git rev-parse --show-toplevel)/infra/azure"
 cd "$AZURE_DIR"
@@ -69,10 +71,28 @@ az storage account create \
   --sku Standard_LRS \
   --kind StorageV2 \
   --allow-blob-public-access false
-az storage container create \
+if ! az storage container create \
   --name "$STATE_CONTAINER" \
   --account-name "$STATE_STORAGE_ACCOUNT" \
-  --auth-mode login
+  --auth-mode login; then
+  printf 'Could not create Terraform state container %s.\n' "$STATE_CONTAINER" >&2
+  exit 1
+fi
+if ! STATE_CONTAINER_EXISTS="$(
+  az storage container exists \
+    --name "$STATE_CONTAINER" \
+    --account-name "$STATE_STORAGE_ACCOUNT" \
+    --auth-mode login \
+    --query exists \
+    --output tsv
+)"; then
+  printf 'Could not verify Terraform state container %s.\n' "$STATE_CONTAINER" >&2
+  exit 1
+fi
+if test "$STATE_CONTAINER_EXISTS" != "true"; then
+  printf 'Terraform state container %s does not exist.\n' "$STATE_CONTAINER" >&2
+  exit 1
+fi
 
 cat > backend.hcl <<EOF
 resource_group_name  = "$STATE_RESOURCE_GROUP"
@@ -288,7 +308,7 @@ fi
 VALIDATION_METHOD="HTTP"
 ```
 
-Certificate authorities apply the first CAA RRset found while walking from the custom hostname toward the DNS root. That effective policy, wherever it is inherited from, must allow DigiCert with an `issue "digicert.com"` record:
+Certificate authorities apply the first CAA RRset found while walking from the custom hostname toward the DNS root. The check continues to a parent only when the current label returns `NOERROR` without a CAA answer; any other DNS status is a hard failure. That effective policy, wherever it is inherited from, must allow DigiCert with an `issue "digicert.com"` record:
 
 <!-- guide-test:caa-policy -->
 
@@ -297,14 +317,44 @@ CAA_LOOKUP_NAME="$CUSTOM_DOMAIN"
 CAA_RECORDS=""
 
 while test -n "$CAA_LOOKUP_NAME"; do
-  if ! CAA_RESPONSE="$(dig +short CAA "$CAA_LOOKUP_NAME")"; then
+  if ! CAA_RESPONSE="$(
+    dig +noall +comments +answer CAA "$CAA_LOOKUP_NAME"
+  )"; then
     printf 'CAA lookup failed for %s.\n' "$CAA_LOOKUP_NAME" >&2
+    exit 1
+  fi
+
+  CAA_STATUS="$(
+    printf '%s\n' "$CAA_RESPONSE" |
+      awk '
+        /^;; ->>HEADER<<-/ {
+          for (i = 1; i <= NF; i++) {
+            if ($i == "status:") {
+              status = $(i + 1)
+              sub(/,$/, "", status)
+              print status
+              exit
+            }
+          }
+        }
+      '
+  )"
+  if test "$CAA_STATUS" != "NOERROR"; then
+    printf 'CAA lookup for %s returned DNS status %s.\n' \
+      "$CAA_LOOKUP_NAME" "${CAA_STATUS:-unknown}" >&2
     exit 1
   fi
 
   CAA_RECORDS="$(
     printf '%s\n' "$CAA_RESPONSE" |
-      awk '$1 ~ /^[0-9]+$/'
+      awk '
+        $1 !~ /^;/ && toupper($4) == "CAA" {
+          for (i = 5; i <= NF; i++) {
+            printf "%s%s", (i == 5 ? "" : " "), $i
+          }
+          print ""
+        }
+      '
   )"
   test -z "$CAA_RECORDS" || break
 
