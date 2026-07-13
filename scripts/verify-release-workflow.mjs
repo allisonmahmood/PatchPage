@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
@@ -788,6 +789,31 @@ if (!releaseConcurrency) {
   );
 }
 
+if (
+  parsedWorkflow !== null &&
+  (!hasExactKeys(parsedWorkflow, [
+    "name",
+    "on",
+    "permissions",
+    "concurrency",
+    "jobs",
+  ]) ||
+    parsedWorkflow.name !== "Release" ||
+    !hasExactKeys(parsedWorkflow.on, ["push"]) ||
+    !hasExactKeys(parsedWorkflow.on.push, ["tags"]) ||
+    !hasExactArray(parsedWorkflow.on.push.tags, ["v*"]) ||
+    !hasExactMapping(parsedWorkflow.permissions, {}) ||
+    !hasExactMapping(parsedWorkflow.concurrency, {
+      group: "release-ghcr-patchpage-server",
+      queue: "max",
+      "cancel-in-progress": false,
+    }))
+) {
+  failures.push(
+    "release.yml root must contain exactly the reviewed trigger, permissions, concurrency, and jobs",
+  );
+}
+
 const guardJob = job("guard");
 const prepareNpmJob = job("prepare-npm");
 const verifyJob = job("verify");
@@ -807,11 +833,93 @@ const expectedReleaseJobs = [
   "ghcr-anonymous-smoke",
   "npx-smoke",
 ];
+const reviewedReleaseJobContracts = new Map([
+  [
+    "guard",
+    {
+      digest: "0d997fca5709187a66a6096e740de547c974114f580a134dfc5836798048ecb9",
+      permissions: { contents: "read" },
+    },
+  ],
+  [
+    "prepare-npm",
+    {
+      digest: "06cad8342bc8f91548af697e797fd95e7ae2d506f4cf94cb9ef1acfe93ae3ad0",
+      permissions: {},
+    },
+  ],
+  [
+    "verify",
+    {
+      digest: "34002413484b34b0da88bec19e43d65b88a99ea2e614fbece4b4c5eb9ebd6439",
+      permissions: { contents: "read" },
+    },
+  ],
+  [
+    "publish-npm",
+    {
+      digest: "d9407283578d65ac0b6415ab8730d37bdde1c654d615698e7a2b644a5d545443",
+      permissions: { "id-token": "write" },
+    },
+  ],
+  [
+    "github-release",
+    {
+      digest: "33a2d1d2592c5d0615da80eab88418df943ecc77d875506e220c3c1c26c013e2",
+      permissions: { contents: "write" },
+    },
+  ],
+  [
+    "verify-server-image",
+    {
+      digest: "067125da1d66d43b3bb3e1b45452fcde2a20549ac7c99725b7d3b4f1d1a32469",
+      permissions: { contents: "read" },
+    },
+  ],
+  [
+    "docker-ghcr",
+    {
+      digest: "ceacc2c26a95c02cd0877c0efdf1aca66f3935d46be0c90bb6b409f3206f7039",
+      permissions: { packages: "write" },
+    },
+  ],
+  [
+    "ghcr-anonymous-smoke",
+    {
+      digest: "1c844bf4b888f79c1201bb41f8b59a7616ef42bfb40f69b491b537411edb5dc1",
+      permissions: {},
+    },
+  ],
+  [
+    "npx-smoke",
+    {
+      digest: "17cd0764c9612c7446ca10b444d462f9e3aed5309a0799b7c4a52ac257f330b2",
+      permissions: {},
+    },
+  ],
+]);
 if (
   parsedWorkflow !== null &&
   !hasExactKeys(parsedWorkflow.jobs, expectedReleaseJobs)
 ) {
   failures.push("release.yml must contain exactly the reviewed release jobs");
+}
+if (parsedWorkflow !== null) {
+  for (const [jobName, contract] of reviewedReleaseJobContracts) {
+    const selectedJob = parsedWorkflow.jobs[jobName];
+    const digest = isMapping(selectedJob)
+      ? createHash("sha256").update(JSON.stringify(selectedJob)).digest("hex")
+      : null;
+    if (
+      !isMapping(selectedJob) ||
+      !hasExactMapping(selectedJob.permissions, contract.permissions) ||
+      digest !== contract.digest
+    ) {
+      failures.push(
+        `${jobName} must match the exact reviewed job map, permissions, and ordered steps`,
+      );
+    }
+  }
 }
 const guardSteps = parsedSteps("guard", parsedGuardJob);
 const prepareNpmSteps = parsedSteps("prepare-npm", parsedPrepareNpmJob);
@@ -3123,6 +3231,174 @@ async function runMutationChecks() {
         },
         expected:
           /publish-npm must contain exactly the reviewed privileged job map and ordered publication steps/,
+      },
+      {
+        name: "reject privileged run added to github-release",
+        env: {
+          PATCHPAGE_RELEASE_WORKFLOW_SOURCE: replaceOnce(
+            workflow,
+            "      - name: Create GitHub release",
+            '      - name: Attacker release step\n        shell: bash\n        run: echo attacker\n      - name: Create GitHub release',
+          ),
+        },
+        expected:
+          /github-release must match the exact reviewed job map, permissions, and ordered steps/,
+      },
+      {
+        name: "reject github-release permission elevation",
+        env: {
+          PATCHPAGE_RELEASE_WORKFLOW_SOURCE: replaceOnce(
+            workflow,
+            "  github-release:\n    needs: publish-npm\n    runs-on: ubuntu-latest\n    permissions:\n      contents: write",
+            '  github-release:\n    needs: publish-npm\n    runs-on: ubuntu-latest\n    permissions:\n      contents: write\n      "id-token": write\n      packages: write',
+          ),
+        },
+        expected:
+          /github-release must match the exact reviewed job map, permissions, and ordered steps/,
+      },
+      {
+        name: "reject github-release container",
+        env: {
+          PATCHPAGE_RELEASE_WORKFLOW_SOURCE: replaceOnce(
+            workflow,
+            "  github-release:\n    needs: publish-npm\n    runs-on: ubuntu-latest",
+            "  github-release:\n    needs: publish-npm\n    runs-on: ubuntu-latest\n    container: attacker/image:latest",
+          ),
+        },
+        expected:
+          /github-release must match the exact reviewed job map, permissions, and ordered steps/,
+      },
+      {
+        name: "reject github-release services",
+        env: {
+          PATCHPAGE_RELEASE_WORKFLOW_SOURCE: replaceOnce(
+            workflow,
+            "  github-release:\n    needs: publish-npm\n    runs-on: ubuntu-latest",
+            "  github-release:\n    needs: publish-npm\n    runs-on: ubuntu-latest\n    services:\n      attacker:\n        image: attacker/image:latest",
+          ),
+        },
+        expected:
+          /github-release must match the exact reviewed job map, permissions, and ordered steps/,
+      },
+      {
+        name: "reject privileged run added to docker-ghcr",
+        env: {
+          PATCHPAGE_RELEASE_WORKFLOW_SOURCE: replaceOnce(
+            workflow,
+            "      - name: Download the immutable verified server image artifact",
+            '      - name: Attacker package step\n        shell: bash\n        run: echo attacker\n      - name: Download the immutable verified server image artifact',
+          ),
+        },
+        expected:
+          /docker-ghcr must match the exact reviewed job map, permissions, and ordered steps/,
+      },
+      {
+        name: "reject docker-ghcr quoted permission elevation",
+        env: {
+          PATCHPAGE_RELEASE_WORKFLOW_SOURCE: replaceOnce(
+            workflow,
+            "  docker-ghcr:\n    name: Publish verified server image to GHCR (no checkout)\n    needs: [guard, publish-npm, verify-server-image]\n    runs-on: ubuntu-latest\n    permissions:\n      packages: write",
+            '  docker-ghcr:\n    name: Publish verified server image to GHCR (no checkout)\n    needs: [guard, publish-npm, verify-server-image]\n    runs-on: ubuntu-latest\n    permissions:\n      packages: write\n      "id-token": write',
+          ),
+        },
+        expected:
+          /docker-ghcr must match the exact reviewed job map, permissions, and ordered steps/,
+      },
+      {
+        name: "reject docker-ghcr container",
+        env: {
+          PATCHPAGE_RELEASE_WORKFLOW_SOURCE: replaceOnce(
+            workflow,
+            "  docker-ghcr:\n    name: Publish verified server image to GHCR (no checkout)\n    needs: [guard, publish-npm, verify-server-image]\n    runs-on: ubuntu-latest",
+            "  docker-ghcr:\n    name: Publish verified server image to GHCR (no checkout)\n    needs: [guard, publish-npm, verify-server-image]\n    runs-on: ubuntu-latest\n    container: attacker/image:latest",
+          ),
+        },
+        expected:
+          /docker-ghcr must match the exact reviewed job map, permissions, and ordered steps/,
+      },
+      {
+        name: "reject docker-ghcr services",
+        env: {
+          PATCHPAGE_RELEASE_WORKFLOW_SOURCE: replaceOnce(
+            workflow,
+            "  docker-ghcr:\n    name: Publish verified server image to GHCR (no checkout)\n    needs: [guard, publish-npm, verify-server-image]\n    runs-on: ubuntu-latest",
+            "  docker-ghcr:\n    name: Publish verified server image to GHCR (no checkout)\n    needs: [guard, publish-npm, verify-server-image]\n    runs-on: ubuntu-latest\n    services:\n      attacker:\n        image: attacker/image:latest",
+          ),
+        },
+        expected:
+          /docker-ghcr must match the exact reviewed job map, permissions, and ordered steps/,
+      },
+      {
+        name: "reject verify-server-image quoted permission elevation",
+        env: {
+          PATCHPAGE_RELEASE_WORKFLOW_SOURCE: replaceOnce(
+            workflow,
+            "  verify-server-image:\n    name: Build and verify server image without registry credentials\n    needs: guard\n    runs-on: ubuntu-latest\n    permissions:\n      contents: read",
+            '  verify-server-image:\n    name: Build and verify server image without registry credentials\n    needs: guard\n    runs-on: ubuntu-latest\n    permissions:\n      contents: read\n      "id-token": write',
+          ),
+        },
+        expected:
+          /verify-server-image must match the exact reviewed job map, permissions, and ordered steps/,
+      },
+      {
+        name: "reject guard permission elevation",
+        env: {
+          PATCHPAGE_RELEASE_WORKFLOW_SOURCE: replaceOnce(
+            workflow,
+            "  guard:\n    runs-on: ubuntu-latest\n    permissions:\n      contents: read",
+            "  guard:\n    runs-on: ubuntu-latest\n    permissions:\n      contents: read\n      id-token: write",
+          ),
+        },
+        expected:
+          /guard must match the exact reviewed job map, permissions, and ordered steps/,
+      },
+      {
+        name: "reject anonymous smoke permission elevation",
+        env: {
+          PATCHPAGE_RELEASE_WORKFLOW_SOURCE: replaceOnce(
+            workflow,
+            "  ghcr-anonymous-smoke:\n    name: Anonymous GHCR public-visibility gate (manual visibility required)\n    needs: [guard, docker-ghcr]\n    runs-on: ubuntu-latest\n    permissions: {}",
+            "  ghcr-anonymous-smoke:\n    name: Anonymous GHCR public-visibility gate (manual visibility required)\n    needs: [guard, docker-ghcr]\n    runs-on: ubuntu-latest\n    permissions:\n      id-token: write",
+          ),
+        },
+        expected:
+          /ghcr-anonymous-smoke must match the exact reviewed job map, permissions, and ordered steps/,
+      },
+      {
+        name: "reject npx smoke permission elevation",
+        env: {
+          PATCHPAGE_RELEASE_WORKFLOW_SOURCE: replaceOnce(
+            workflow,
+            "  npx-smoke:\n    needs: publish-npm\n    runs-on: ubuntu-latest\n    permissions: {}",
+            "  npx-smoke:\n    needs: publish-npm\n    runs-on: ubuntu-latest\n    permissions:\n      id-token: write",
+          ),
+        },
+        expected:
+          /npx-smoke must match the exact reviewed job map, permissions, and ordered steps/,
+      },
+      {
+        name: "reject top-level NODE_OPTIONS environment",
+        env: {
+          PATCHPAGE_RELEASE_WORKFLOW_SOURCE: replaceOnce(
+            workflow,
+            "permissions: {}\n\nconcurrency:",
+            "permissions: {}\nenv:\n  NODE_OPTIONS: --require=/tmp/attacker.cjs\n\nconcurrency:",
+          ),
+        },
+        expected:
+          /release\.yml root must contain exactly the reviewed trigger, permissions, concurrency, and jobs/,
+      },
+      {
+        name: "reject top-level run defaults",
+        env: {
+          PATCHPAGE_RELEASE_WORKFLOW_SOURCE: replaceOnce(
+            workflow,
+            "permissions: {}\n\nconcurrency:",
+            "permissions: {}\ndefaults:\n  run:\n    shell: bash -c attacker\n    working-directory: /tmp\n\nconcurrency:",
+          ),
+        },
+        expected:
+          /release\.yml root must contain exactly the reviewed trigger, permissions, concurrency, and jobs/,
       },
     ];
   } catch (error) {
