@@ -16,7 +16,7 @@ Once your server is running, point the CLI at it and you have a private PatchPag
 
 Release automation is configured to publish the supported image as `ghcr.io/allisonmahmood/patchpage-server`. Its tags are published from one verified image:
 
-- A semver tag without a `v` prefix, such as `1.2.3`, is immutable and is the recommended deployment tag.
+- A stable semver tag without a `v` prefix, such as `1.2.3`, is immutable and is the recommended deployment tag. Prerelease versions such as `1.2.3-rc.1` are rejected by the release guard before npm or GHCR publication can begin.
 - The full commit SHA is also an immutable tag for source-exact pinning.
 - The moving `latest` tag follows the newest release; use it only when automatic movement is intended.
 

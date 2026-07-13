@@ -336,9 +336,26 @@ const anonymousImageJob = job("ghcr-anonymous-smoke");
 const ciDockerJob = ciJob("docker");
 
 if (guardJob) {
+  const versionCommand = guardJob.indexOf('version="$(node -p');
+  const stableVersionGuard = failClosedGuardPosition(
+    guardJob,
+    'if [[ ! "$version" =~ ^(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)$ ]]; then',
+  );
+  const expectedRef = guardJob.indexOf('expected_ref="v${version}"');
+  const versionOutput = guardJob.indexOf('echo "version=$version" >> "$GITHUB_OUTPUT"');
   const revisionCommand = guardJob.indexOf('revision="$(git rev-parse HEAD)"');
   const revisionValidation = guardJob.indexOf('[[ ! "$revision" =~ ^[0-9a-f]{40}$ ]]');
   const revisionOutput = guardJob.indexOf('echo "revision=$revision" >> "$GITHUB_OUTPUT"');
+  if (
+    versionCommand === -1 ||
+    stableVersionGuard <= versionCommand ||
+    expectedRef <= stableVersionGuard ||
+    versionOutput <= expectedRef
+  ) {
+    failures.push(
+      "guard must reject prerelease or noncanonical versions before release fan-out",
+    );
+  }
   if (
     !guardJob.includes("revision: ${{ steps.version.outputs.revision }}") ||
     revisionCommand === -1 ||
@@ -1328,6 +1345,11 @@ if (!/non[- ]root/i.test(selfHosting)) {
 if (!/semver[^\n]*immutable/i.test(selfHosting) || !/full\s+commit\s+SHA/i.test(selfHosting)) {
   failures.push("self-hosting docs must document both immutable image tag forms");
 }
+if (!/stable semver[^\n]*prerelease/i.test(selfHosting)) {
+  failures.push(
+    "self-hosting docs must document the stable-only release policy and prerelease rejection",
+  );
+}
 if (!/(?:moving[^\n]*`latest`|`latest`[^\n]*(?:follows|moves))/i.test(selfHosting)) {
   failures.push("self-hosting docs must distinguish the moving latest tag");
 }
@@ -1469,6 +1491,24 @@ async function runMutationChecks() {
         },
         expected:
           /docker-ghcr publisher must not contain (?:docker build|scripts\/verify-server-image\.sh)/,
+      },
+      {
+        name: "reject stable SemVer validation deferred beyond the release guard",
+        env: {
+          PATCHPAGE_RELEASE_WORKFLOW_SOURCE: replaceOnce(
+            workflow,
+            [
+              '          if [[ ! "$version" =~ ^(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)$ ]]; then',
+              '            echo "::error::Release version must be exact stable SemVer, got ${version}"',
+              "            exit 1",
+              "          fi",
+              "",
+            ].join("\n"),
+            "",
+          ),
+        },
+        expected:
+          /guard must reject prerelease or noncanonical versions before release fan-out/,
       },
       {
         name: "reject image artifact selected by name instead of immutable ID",
