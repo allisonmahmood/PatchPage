@@ -1,5 +1,7 @@
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
+import { mkdir, open, readFile, rename, stat, unlink, type FileHandle } from "node:fs/promises";
 import path from "node:path";
+import { TextDecoder } from "node:util";
 import { newInternalId, sha256 } from "@patchpage/core";
 import type {
   ApiTokenAuth,
@@ -50,6 +52,15 @@ interface JsonDbState {
   uploadEvents: UploadEventRow[];
 }
 
+interface StateMutationResult<T> {
+  value: T;
+  changed: boolean;
+}
+
+// This serializer is intentionally process-local; interprocess locking is unsupported.
+const mutationQueues = new Map<string, Promise<void>>();
+const utf8Decoder = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
+
 export class JsonFilePatchPageDb implements PatchPageDb {
   private readonly filePath: string;
 
@@ -58,133 +69,143 @@ export class JsonFilePatchPageDb implements PatchPageDb {
   }
 
   async initialize(bootstrapApiToken: string | null): Promise<void> {
-    const state = await this.readState();
-    ensureBootstrapState(state, bootstrapApiToken);
-    await this.writeState(state);
+    await this.mutateState((state) => {
+      ensureBootstrapState(state, bootstrapApiToken);
+      return { value: undefined, changed: true };
+    });
   }
 
   async findApiTokenByToken(token: string): Promise<ApiTokenAuth | null> {
-    const state = await this.readState();
-    const tokenHash = sha256(token);
-    const apiToken = state.apiTokens.find((row) => row.tokenHash === tokenHash && !row.revokedAt);
-    if (!apiToken) return null;
+    return this.mutateState<ApiTokenAuth | null>((state) => {
+      const tokenHash = sha256(token);
+      const apiToken = state.apiTokens.find((row) => row.tokenHash === tokenHash && !row.revokedAt);
+      if (!apiToken) return { value: null, changed: false };
 
-    const account = state.accounts.find((row) => row.id === apiToken.accountId);
-    if (!account) return null;
+      const account = state.accounts.find((row) => row.id === apiToken.accountId);
+      if (!account) return { value: null, changed: false };
 
-    apiToken.lastUsedAt = new Date().toISOString();
-    await this.writeState(state);
+      apiToken.lastUsedAt = new Date().toISOString();
 
-    return {
-      id: apiToken.id,
-      accountId: apiToken.accountId,
-      accountName: account.name,
-      name: apiToken.name,
-      scopes: apiToken.scopes
-    };
+      return {
+        value: {
+          id: apiToken.id,
+          accountId: apiToken.accountId,
+          accountName: account.name,
+          name: apiToken.name,
+          scopes: apiToken.scopes
+        },
+        changed: true
+      };
+    });
   }
 
   async createApiToken(input: CreateApiTokenInput): Promise<{ id: string; name: string }> {
-    const state = await this.readState();
-    const account = state.accounts.find((row) => row.id === input.accountId);
-    if (!account) {
-      throw new Error("Account not found.");
-    }
+    return this.mutateState((state) => {
+      const account = state.accounts.find((row) => row.id === input.accountId);
+      if (!account) {
+        throw new Error("Account not found.");
+      }
 
-    const apiToken = {
-      id: newInternalId("tok"),
-      accountId: input.accountId,
-      name: cleanText(input.name) || "API Token",
-      tokenHash: sha256(input.token),
-      scopes: input.scopes,
-      createdAt: new Date().toISOString(),
-      lastUsedAt: null,
-      revokedAt: null
-    };
+      const apiToken = {
+        id: newInternalId("tok"),
+        accountId: input.accountId,
+        name: cleanText(input.name) || "API Token",
+        tokenHash: sha256(input.token),
+        scopes: input.scopes,
+        createdAt: new Date().toISOString(),
+        lastUsedAt: null,
+        revokedAt: null
+      };
 
-    state.apiTokens.push(apiToken);
-    await this.writeState(state);
+      state.apiTokens.push(apiToken);
 
-    return { id: apiToken.id, name: apiToken.name };
+      return { value: { id: apiToken.id, name: apiToken.name }, changed: true };
+    });
   }
 
   async recordUpload(input: RecordUploadInput): Promise<RecordUploadResult> {
-    const state = await this.readState();
-    const now = new Date().toISOString();
-    const existingDraft = state.drafts.find((draft) => draft.id === input.draftId) || null;
+    return this.mutateState((state) => {
+      const now = new Date().toISOString();
+      const existingDraft = state.drafts.find((draft) => draft.id === input.draftId) || null;
 
-    if (existingDraft && (existingDraft.accountId !== input.accountId || existingDraft.deletedAt)) {
-      const error = new Error("Draft not found.");
-      (error as Error & { statusCode?: number }).statusCode = 404;
-      throw error;
-    }
+      if (
+        existingDraft &&
+        (existingDraft.accountId !== input.accountId || existingDraft.deletedAt)
+      ) {
+        const error = new Error("Draft not found.");
+        (error as Error & { statusCode?: number }).statusCode = 404;
+        throw error;
+      }
 
-    const versionNumber =
-      Math.max(
-        0,
-        ...state.draftVersions
-          .filter((version) => version.draftId === input.draftId)
-          .map((version) => version.versionNumber)
-      ) + 1;
+      const versionNumber =
+        Math.max(
+          0,
+          ...state.draftVersions
+            .filter((version) => version.draftId === input.draftId)
+            .map((version) => version.versionNumber)
+        ) + 1;
 
-    const title = input.title || existingDraft?.title || input.filename || "Untitled Draft";
-    const repoOrg = cleanText(input.metadata.repoOrg);
-    const repoName = cleanText(input.metadata.repoName);
+      const title = input.title || existingDraft?.title || input.filename || "Untitled Draft";
+      const repoOrg = cleanText(input.metadata.repoOrg);
+      const repoName = cleanText(input.metadata.repoName);
 
-    if (!existingDraft) {
-      state.drafts.push({
-        id: input.draftId,
-        accountId: input.accountId,
-        title,
-        visibility: "unlisted",
-        currentVersionId: input.versionId,
-        repoOrg,
-        repoName,
-        createdAt: now,
-        updatedAt: now,
-        deletedAt: null,
-        disabledAt: null,
-        disabledReason: null
+      if (!existingDraft) {
+        state.drafts.push({
+          id: input.draftId,
+          accountId: input.accountId,
+          title,
+          visibility: "unlisted",
+          currentVersionId: input.versionId,
+          repoOrg,
+          repoName,
+          createdAt: now,
+          updatedAt: now,
+          deletedAt: null,
+          disabledAt: null,
+          disabledReason: null
+        });
+      } else {
+        existingDraft.title = title;
+        existingDraft.currentVersionId = input.versionId;
+        existingDraft.repoOrg = repoOrg || existingDraft.repoOrg;
+        existingDraft.repoName = repoName || existingDraft.repoName;
+        existingDraft.updatedAt = now;
+      }
+
+      state.draftVersions.push({
+        id: input.versionId,
+        draftId: input.draftId,
+        versionNumber,
+        objectKey: input.objectKey,
+        contentHash: input.contentHash,
+        fileSize: input.fileSize,
+        createdByApiTokenId: input.apiTokenId,
+        sourceIp: input.sourceIp,
+        userAgent: input.userAgent,
+        cliVersion: cleanText(input.metadata.cliVersion),
+        gitBranch: cleanText(input.metadata.gitBranch),
+        gitCommitSha: cleanText(input.metadata.gitCommitSha),
+        originalFilename: input.filename,
+        createdAt: now
       });
-    } else {
-      existingDraft.title = title;
-      existingDraft.currentVersionId = input.versionId;
-      existingDraft.repoOrg = repoOrg || existingDraft.repoOrg;
-      existingDraft.repoName = repoName || existingDraft.repoName;
-      existingDraft.updatedAt = now;
-    }
 
-    state.draftVersions.push({
-      id: input.versionId,
-      draftId: input.draftId,
-      versionNumber,
-      objectKey: input.objectKey,
-      contentHash: input.contentHash,
-      fileSize: input.fileSize,
-      createdByApiTokenId: input.apiTokenId,
-      sourceIp: input.sourceIp,
-      userAgent: input.userAgent,
-      cliVersion: cleanText(input.metadata.cliVersion),
-      gitBranch: cleanText(input.metadata.gitBranch),
-      gitCommitSha: cleanText(input.metadata.gitCommitSha),
-      originalFilename: input.filename,
-      createdAt: now
+      state.uploadEvents.push({
+        id: newInternalId("evt"),
+        draftId: input.draftId,
+        draftVersionId: input.versionId,
+        apiTokenId: input.apiTokenId,
+        eventType: existingDraft ? "draft.updated" : "draft.created",
+        sourceIp: input.sourceIp,
+        userAgent: input.userAgent,
+        metadataJson: input.metadata,
+        createdAt: now
+      });
+
+      return {
+        value: { draftId: input.draftId, versionId: input.versionId, versionNumber, title },
+        changed: true
+      };
     });
-
-    state.uploadEvents.push({
-      id: newInternalId("evt"),
-      draftId: input.draftId,
-      draftVersionId: input.versionId,
-      apiTokenId: input.apiTokenId,
-      eventType: existingDraft ? "draft.updated" : "draft.created",
-      sourceIp: input.sourceIp,
-      userAgent: input.userAgent,
-      metadataJson: input.metadata,
-      createdAt: now
-    });
-
-    await this.writeState(state);
-    return { draftId: input.draftId, versionId: input.versionId, versionNumber, title };
   }
 
   async findDraftVersion(draftId: string, versionNumber?: number): Promise<DraftVersionLookup> {
@@ -203,48 +224,279 @@ export class JsonFilePatchPageDb implements PatchPageDb {
   }
 
   async disableDraft(draftId: string, accountId: string, reason: string): Promise<boolean> {
-    const state = await this.readState();
-    const draft =
-      state.drafts.find((row) => row.id === draftId && row.accountId === accountId && !row.deletedAt) ||
-      null;
-    if (!draft) return false;
+    return this.mutateState((state) => {
+      const draft =
+        state.drafts.find(
+          (row) => row.id === draftId && row.accountId === accountId && !row.deletedAt
+        ) || null;
+      if (!draft) return { value: false, changed: false };
 
-    draft.disabledAt = new Date().toISOString();
-    draft.disabledReason = reason;
-    draft.updatedAt = draft.disabledAt;
-    await this.writeState(state);
-    return true;
+      draft.disabledAt = new Date().toISOString();
+      draft.disabledReason = reason;
+      draft.updatedAt = draft.disabledAt;
+      return { value: true, changed: true };
+    });
   }
 
   async deleteDraft(draftId: string, accountId: string): Promise<boolean> {
-    const state = await this.readState();
-    const draft =
-      state.drafts.find((row) => row.id === draftId && row.accountId === accountId && !row.deletedAt) ||
-      null;
-    if (!draft) return false;
+    return this.mutateState((state) => {
+      const draft =
+        state.drafts.find(
+          (row) => row.id === draftId && row.accountId === accountId && !row.deletedAt
+        ) || null;
+      if (!draft) return { value: false, changed: false };
 
-    draft.deletedAt = new Date().toISOString();
-    draft.updatedAt = draft.deletedAt;
-    await this.writeState(state);
-    return true;
+      draft.deletedAt = new Date().toISOString();
+      draft.updatedAt = draft.deletedAt;
+      return { value: true, changed: true };
+    });
   }
 
   async close(): Promise<void> {
     return;
   }
 
+  private async mutateState<T>(
+    mutate: (state: JsonDbState) => StateMutationResult<T>
+  ): Promise<T> {
+    return serializeJsonMutation(this.filePath, async () => {
+      const state = await this.readState();
+      const result = mutate(state);
+      if (result.changed) await this.writeState(state);
+      return result.value;
+    });
+  }
+
   private async readState(): Promise<JsonDbState> {
+    let bytes: Buffer;
     try {
-      return JSON.parse(await readFile(this.filePath, "utf8")) as JsonDbState;
-    } catch {
-      return emptyState();
+      bytes = await readFile(this.filePath);
+    } catch (error) {
+      if (hasErrorCode(error, "ENOENT")) return emptyState();
+      throw error;
     }
+
+    let serialized: string;
+    try {
+      serialized = utf8Decoder.decode(bytes);
+    } catch {
+      throw new Error("JSON metadata file is not valid UTF-8.");
+    }
+
+    let state: unknown;
+    try {
+      state = JSON.parse(serialized);
+    } catch {
+      throw new Error("JSON metadata file contains malformed JSON.");
+    }
+
+    if (!isJsonDbState(state)) {
+      throw new Error("JSON metadata file has an invalid state shape.");
+    }
+
+    return state;
   }
 
   private async writeState(state: JsonDbState): Promise<void> {
-    await mkdir(path.dirname(this.filePath), { recursive: true });
-    await writeFile(this.filePath, `${JSON.stringify(state, null, 2)}\n`, "utf8");
+    const directoryPath = path.dirname(this.filePath);
+    const existingMode = await readFileMode(this.filePath);
+    const temporaryPath = path.join(
+      directoryPath,
+      `.${path.basename(this.filePath)}.${process.pid}.${randomUUID()}.tmp`
+    );
+    let temporaryFile: FileHandle | null = null;
+    let renamed = false;
+
+    await mkdir(directoryPath, { recursive: true });
+
+    try {
+      temporaryFile = await open(temporaryPath, "wx", existingMode ?? 0o666);
+      await temporaryFile.writeFile(`${JSON.stringify(state, null, 2)}\n`, "utf8");
+      if (existingMode !== null) await temporaryFile.chmod(existingMode);
+      await temporaryFile.sync();
+      await temporaryFile.close();
+      temporaryFile = null;
+
+      await rename(temporaryPath, this.filePath);
+      renamed = true;
+      await syncDirectory(directoryPath);
+    } finally {
+      if (temporaryFile) {
+        await temporaryFile.close().catch(() => undefined);
+      }
+      if (!renamed) {
+        await unlink(temporaryPath).catch(() => undefined);
+      }
+    }
   }
+}
+
+async function serializeJsonMutation<T>(filePath: string, task: () => Promise<T>): Promise<T> {
+  const previous = mutationQueues.get(filePath);
+  let release = (): void => undefined;
+  const current = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  mutationQueues.set(filePath, current);
+
+  if (previous) await previous;
+
+  try {
+    return await task();
+  } finally {
+    release();
+    if (mutationQueues.get(filePath) === current) {
+      mutationQueues.delete(filePath);
+    }
+  }
+}
+
+function hasErrorCode(error: unknown, code: string): boolean {
+  return error instanceof Error && "code" in error && error.code === code;
+}
+
+async function readFileMode(filePath: string): Promise<number | null> {
+  try {
+    return (await stat(filePath)).mode & 0o777;
+  } catch (error) {
+    if (hasErrorCode(error, "ENOENT")) return null;
+    throw error;
+  }
+}
+
+async function syncDirectory(directoryPath: string): Promise<void> {
+  let directory: FileHandle | null = null;
+
+  try {
+    directory = await open(directoryPath, "r");
+    await directory.sync();
+  } catch (error) {
+    if (!isUnsupportedDirectorySyncError(error)) throw error;
+  } finally {
+    if (directory) await directory.close();
+  }
+}
+
+function isUnsupportedDirectorySyncError(error: unknown): boolean {
+  if (!(error instanceof Error) || !("code" in error)) return false;
+
+  return (
+    error.code === "EINVAL" ||
+    error.code === "ENOTSUP" ||
+    error.code === "EOPNOTSUPP" ||
+    error.code === "ENOSYS" ||
+    (process.platform === "win32" && (error.code === "EISDIR" || error.code === "EPERM"))
+  );
+}
+
+function isJsonDbState(value: unknown): value is JsonDbState {
+  if (!isRecord(value)) return false;
+
+  return (
+    Array.isArray(value.accounts) &&
+    value.accounts.every(isAccountRow) &&
+    Array.isArray(value.apiTokens) &&
+    value.apiTokens.every(isApiTokenRow) &&
+    Array.isArray(value.drafts) &&
+    value.drafts.every(isDraftRecord) &&
+    Array.isArray(value.draftVersions) &&
+    value.draftVersions.every(isDraftVersionRecord) &&
+    Array.isArray(value.uploadEvents) &&
+    value.uploadEvents.every(isUploadEventRow)
+  );
+}
+
+function isAccountRow(value: unknown): value is AccountRow {
+  return (
+    isRecord(value) &&
+    typeof value.id === "string" &&
+    typeof value.name === "string" &&
+    typeof value.createdAt === "string" &&
+    typeof value.updatedAt === "string"
+  );
+}
+
+function isApiTokenRow(value: unknown): value is ApiTokenRow {
+  return (
+    isRecord(value) &&
+    typeof value.id === "string" &&
+    typeof value.accountId === "string" &&
+    typeof value.name === "string" &&
+    typeof value.tokenHash === "string" &&
+    isStringArray(value.scopes) &&
+    typeof value.createdAt === "string" &&
+    isNullableString(value.lastUsedAt) &&
+    isNullableString(value.revokedAt)
+  );
+}
+
+function isDraftRecord(value: unknown): value is DraftRecord {
+  return (
+    isRecord(value) &&
+    typeof value.id === "string" &&
+    typeof value.accountId === "string" &&
+    typeof value.title === "string" &&
+    (value.visibility === "unlisted" ||
+      value.visibility === "public" ||
+      value.visibility === "private") &&
+    isNullableString(value.currentVersionId) &&
+    isNullableString(value.repoOrg) &&
+    isNullableString(value.repoName) &&
+    typeof value.createdAt === "string" &&
+    typeof value.updatedAt === "string" &&
+    isNullableString(value.deletedAt) &&
+    isNullableString(value.disabledAt) &&
+    isNullableString(value.disabledReason)
+  );
+}
+
+function isDraftVersionRecord(value: unknown): value is DraftVersionRecord {
+  return (
+    isRecord(value) &&
+    typeof value.id === "string" &&
+    typeof value.draftId === "string" &&
+    Number.isInteger(value.versionNumber) &&
+    (value.versionNumber as number) > 0 &&
+    typeof value.objectKey === "string" &&
+    typeof value.contentHash === "string" &&
+    Number.isInteger(value.fileSize) &&
+    (value.fileSize as number) >= 0 &&
+    typeof value.createdByApiTokenId === "string" &&
+    isNullableString(value.sourceIp) &&
+    isNullableString(value.userAgent) &&
+    isNullableString(value.cliVersion) &&
+    isNullableString(value.gitBranch) &&
+    isNullableString(value.gitCommitSha) &&
+    isNullableString(value.originalFilename) &&
+    typeof value.createdAt === "string"
+  );
+}
+
+function isUploadEventRow(value: unknown): value is UploadEventRow {
+  return (
+    isRecord(value) &&
+    typeof value.id === "string" &&
+    typeof value.draftId === "string" &&
+    typeof value.draftVersionId === "string" &&
+    typeof value.apiTokenId === "string" &&
+    typeof value.eventType === "string" &&
+    isNullableString(value.sourceIp) &&
+    isNullableString(value.userAgent) &&
+    isRecord(value.metadataJson) &&
+    typeof value.createdAt === "string"
+  );
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function isStringArray(value: unknown): value is string[] {
+  return Array.isArray(value) && value.every((item) => typeof item === "string");
+}
+
+function isNullableString(value: unknown): value is string | null {
+  return value === null || typeof value === "string";
 }
 
 function emptyState(): JsonDbState {

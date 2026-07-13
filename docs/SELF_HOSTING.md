@@ -63,6 +63,14 @@ Notes on values:
 - `PATCHPAGE_ALLOW_ANONYMOUS_UPLOADS` is parsed but not currently enforced — the upload endpoint always requires a token with the `upload` scope regardless of this setting. Keep it `false`.
 - The `json` metadata driver and `filesystem` storage driver write under `.local/` by default and need no external services — good for a quick self-host or local testing. For a durable multi-instance deployment, use `postgres` and a shared object store (`azure-blob`).
 
+### JSON metadata durability
+
+The `json` driver supports one PatchPage Node process. Within that process, all database objects targeting the same resolved `PATCHPAGE_DB_FILE` share a serializer: each mutation completes its read, state-shape validation, update, and commit before the next mutation starts. A genuinely missing file is initialized normally. If an existing file is not valid UTF-8, is malformed or truncated, has an invalid state shape, cannot be read because of permissions, or fails to read for any other reason, the operation fails and leaves the file untouched instead of replacing it with an empty database.
+
+Each commit writes a uniquely named temporary file in the same directory, flushes it, atomically replaces the primary file, and flushes the containing directory where the platform supports that operation. On filesystems that honor same-directory atomic replacement, readers see either the previous complete state or the new complete state, not a partially written primary. Crash and power-loss durability still depends on the operating system, filesystem, mount, and storage hardware honoring rename and flush semantics; network, FUSE, overlay/container, and synchronized filesystems may provide weaker guarantees. Keep backups.
+
+Do not share one JSON file between multiple PatchPage processes, workers, or replicas. The driver does not provide interprocess locking, so that setup can lose updates. Use `postgres` and a shared object store for a multi-process or multi-replica deployment.
+
 ### Storage drivers
 
 - `filesystem` — writes HTML objects to `PATCHPAGE_STORAGE_DIR` on local disk. Simplest option.
