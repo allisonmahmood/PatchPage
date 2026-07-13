@@ -5,19 +5,19 @@ locals {
   }
 
   app_plain_env = merge({
-    NODE_ENV                          = "production"
-    PORT                              = "3000"
-    PATCHPAGE_PUBLIC_BASE_URL         = var.public_base_url
-    PATCHPAGE_ALLOW_ANONYMOUS_UPLOADS = "false"
-    PATCHPAGE_MAX_HTML_BYTES          = tostring(var.max_html_bytes)
+    NODE_ENV                                             = "production"
+    PORT                                                 = "3000"
+    PATCHPAGE_PUBLIC_BASE_URL                            = var.public_base_url
+    PATCHPAGE_ALLOW_ANONYMOUS_UPLOADS                    = "false"
+    PATCHPAGE_MAX_HTML_BYTES                             = tostring(var.max_html_bytes)
     PATCHPAGE_PROTECTED_API_RATE_LIMIT_PER_MINUTE        = tostring(var.protected_api_rate_limit_per_minute)
     PATCHPAGE_AUTHENTICATED_UPLOAD_RATE_LIMIT_PER_MINUTE = tostring(var.authenticated_upload_rate_limit_per_minute)
     PATCHPAGE_ANONYMOUS_CREATE_RATE_LIMIT_PER_MINUTE     = tostring(var.anonymous_create_rate_limit_per_minute)
-    PATCHPAGE_DB_DRIVER               = "postgres"
-    PATCHPAGE_STORAGE_DRIVER          = "azure-blob"
-    AZURE_STORAGE_ACCOUNT             = azurerm_storage_account.drafts.name
-    AZURE_STORAGE_CONTAINER           = azurerm_storage_container.drafts.name
-    AZURE_CLIENT_ID                   = azurerm_user_assigned_identity.app.client_id
+    PATCHPAGE_DB_DRIVER                                  = "postgres"
+    PATCHPAGE_STORAGE_DRIVER                             = "azure-blob"
+    AZURE_STORAGE_ACCOUNT                                = azurerm_storage_account.drafts.name
+    AZURE_STORAGE_CONTAINER                              = azurerm_storage_container.drafts.name
+    AZURE_CLIENT_ID                                      = azurerm_user_assigned_identity.app.client_id
     }, var.trust_proxy == null ? {} : {
     PATCHPAGE_TRUST_PROXY = var.trust_proxy
   })
