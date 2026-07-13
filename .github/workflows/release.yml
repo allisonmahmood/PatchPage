@@ -8,6 +8,11 @@ on:
 
 permissions: {}
 
+concurrency:
+  group: release-ghcr-patchpage-server
+  queue: max
+  cancel-in-progress: false
+
 jobs:
   guard:
     runs-on: ubuntu-latest
@@ -15,6 +20,7 @@ jobs:
       contents: read
     outputs:
       version: ${{ steps.version.outputs.version }}
+      revision: ${{ steps.version.outputs.revision }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
       - id: version
@@ -23,6 +29,11 @@ jobs:
           set -euo pipefail
 
           version="$(node -p "require('./packages/cli/package.json').version")"
+          if [[ ! "$version" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            echo "::error::Release version must be exact stable SemVer, got ${version}"
+            exit 1
+          fi
+
           expected_ref="v${version}"
 
           if [[ "$expected_ref" != "$GITHUB_REF_NAME" ]]; then
@@ -35,7 +46,14 @@ jobs:
             exit 1
           fi
 
+          revision="$(git rev-parse HEAD)"
+          if [[ ! "$revision" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::Resolved release revision is not a full commit SHA: ${revision}"
+            exit 1
+          fi
+
           echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "revision=$revision" >> "$GITHUB_OUTPUT"
 
   prepare-npm:
     runs-on: ubuntu-latest
@@ -434,56 +452,530 @@ jobs:
 
           gh release create "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" --notes-file "$notes_file"
 
-  docker-ghcr:
-    needs: [guard, publish-npm]
+  verify-server-image:
+    name: Build and verify server image without registry credentials
+    needs: guard
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      packages: write
+    outputs:
+      image-tar-filename: ${{ steps.image.outputs.filename }}
+      image-tar-sha256: ${{ steps.image.outputs.sha256 }}
+      image-id: ${{ steps.image.outputs.image-id }}
+      config-id: ${{ steps.image.outputs.config-id }}
+      image-artifact-id: ${{ steps.image-artifact.outputs.artifact-id }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - name: Build, verify, and save exact server image
+        id: image
+        shell: bash
+        env:
+          VERSION: ${{ needs.guard.outputs.version }}
+          REVISION: ${{ needs.guard.outputs.revision }}
+        run: |
+          set -euo pipefail
+
+          if [[ ! "$REVISION" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::Release revision is not a full lowercase commit SHA: $REVISION"
+            exit 1
+          fi
+
+          ghcr_image="ghcr.io/allisonmahmood/patchpage-server"
+          image="${ghcr_image}:${VERSION}"
+          tar_filename="patchpage-server-${VERSION}-${REVISION}-${GITHUB_RUN_ATTEMPT}.tar"
+          tar_path="${RUNNER_TEMP}/${tar_filename}"
+
+          docker build \
+            --build-arg "VERSION=$VERSION" \
+            --build-arg "REVISION=$REVISION" \
+            -f apps/server/Dockerfile \
+            -t "$image" .
+
+          built_image_id="$(docker image inspect --format '{{.Id}}' "$image")"
+          scripts/verify-server-image.sh "$image" "$VERSION" "$REVISION"
+
+          verified_image_id="$(docker image inspect --format '{{.Id}}' "$image")"
+          if [[ "$verified_image_id" != "$built_image_id" ]]; then
+            echo "::error::Verified image changed before artifact handoff"
+            exit 1
+          fi
+          if [[ ! "$verified_image_id" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "::error::Verified image ID is not a sha256 digest: $verified_image_id"
+            exit 1
+          fi
+
+          rm -f "$tar_path"
+          docker save "$image" --output "$tar_path"
+          sha256="$(sha256sum "$tar_path" | awk '{print $1}')"
+          if [[ ! "$sha256" =~ ^[0-9a-f]{64}$ ]]; then
+            echo "::error::Saved image tar SHA-256 is invalid: $sha256"
+            exit 1
+          fi
+
+          # Docker image IDs are content digests of the image config object.
+          echo "filename=$tar_filename" >> "$GITHUB_OUTPUT"
+          echo "sha256=$sha256" >> "$GITHUB_OUTPUT"
+          echo "image-id=$verified_image_id" >> "$GITHUB_OUTPUT"
+          echo "config-id=$verified_image_id" >> "$GITHUB_OUTPUT"
+      - name: Upload exact verified server image raw tar
+        id: image-artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          path: ${{ runner.temp }}/${{ steps.image.outputs.filename }}
+          if-no-files-found: error
+          retention-days: 1
+          archive: false
+
+  docker-ghcr:
+    name: Publish verified server image to GHCR (no checkout)
+    needs: [guard, publish-npm, verify-server-image]
+    runs-on: ubuntu-latest
+    permissions:
+      packages: write
+    outputs:
+      manifest-digest: ${{ steps.publish-image.outputs.manifest-digest }}
+    steps:
+      - name: Download the immutable verified server image artifact
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          artifact-ids: ${{ needs.verify-server-image.outputs.image-artifact-id }}
+          path: ${{ runner.temp }}/server-image
+          skip-decompress: true
+      - name: Validate and load the verified server image artifact before login
+        id: load-image
+        shell: bash
+        env:
+          EXPECTED_CONFIG_ID: ${{ needs.verify-server-image.outputs.config-id }}
+          EXPECTED_FILENAME: ${{ needs.verify-server-image.outputs.image-tar-filename }}
+          EXPECTED_IMAGE_ID: ${{ needs.verify-server-image.outputs.image-id }}
+          EXPECTED_SHA256: ${{ needs.verify-server-image.outputs.image-tar-sha256 }}
+          EXPECTED_VERSION: ${{ needs.guard.outputs.version }}
+        run: |
+          set -euo pipefail
+
+          ghcr_image="ghcr.io/allisonmahmood/patchpage-server"
+          expected_local_tag="${ghcr_image}:${EXPECTED_VERSION}"
+
+          if [[ ! "$EXPECTED_IMAGE_ID" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "::error::Expected image ID is invalid: $EXPECTED_IMAGE_ID"
+            exit 1
+          fi
+          if [[ "$EXPECTED_CONFIG_ID" != "$EXPECTED_IMAGE_ID" ]]; then
+            echo "::error::Expected config ID does not match image ID"
+            exit 1
+          fi
+          if [[ ! "$EXPECTED_SHA256" =~ ^[0-9a-f]{64}$ ]]; then
+            echo "::error::Expected image artifact SHA-256 is invalid: $EXPECTED_SHA256"
+            exit 1
+          fi
+
+          shopt -s nullglob
+          tarballs=("$RUNNER_TEMP/server-image"/*.tar)
+          if [[ "${#tarballs[@]}" -ne 1 ]]; then
+            echo "::error::Expected exactly one downloaded server image tar, found ${#tarballs[@]}"
+            exit 1
+          fi
+
+          tar_path="${tarballs[0]}"
+          if [[ "$(basename "$tar_path")" != "$EXPECTED_FILENAME" ]]; then
+            echo "::error::Downloaded server image tar name does not match the verified artifact"
+            exit 1
+          fi
+
+          actual_sha256="$(sha256sum "$tar_path" | awk '{print $1}')"
+          if [[ "$actual_sha256" != "$EXPECTED_SHA256" ]]; then
+            echo "::error::Downloaded server image tar digest does not match the verified artifact"
+            exit 1
+          fi
+
+          docker load --input "$tar_path"
+          if ! loaded_image_id="$(
+            docker image inspect --format '{{.Id}}' "$expected_local_tag" 2>/dev/null
+          )"; then
+            echo "::error::Loaded artifact does not contain the expected local release tag"
+            exit 1
+          fi
+          if [[ "$loaded_image_id" != "$EXPECTED_IMAGE_ID" ]]; then
+            echo "::error::Loaded local release tag image ID does not match the verified artifact"
+            exit 1
+          fi
+
+          rm -f "$tar_path"
+          echo "local-tag=$expected_local_tag" >> "$GITHUB_OUTPUT"
       - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
         with:
           registry: ghcr.io
           username: ${{ github.repository_owner }}
           password: ${{ github.token }}
-      - name: Build, verify, and push image
+      - name: Publish or accept immutable GHCR tags, then reconcile latest
+        id: publish-image
         shell: bash
+        env:
+          EXPECTED_IMAGE_ID: ${{ needs.verify-server-image.outputs.image-id }}
+          EXPECTED_REVISION: ${{ needs.guard.outputs.revision }}
+          EXPECTED_VERSION: ${{ needs.guard.outputs.version }}
+          LOCAL_RELEASE_TAG: ${{ steps.load-image.outputs.local-tag }}
         run: |
           set -euo pipefail
 
-          image="patchpage-server:release"
-          container="patchpage-server-release-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
-          ghcr_image="ghcr.io/allisonmahmood/patchpage-server"
+          if [[ ! "$EXPECTED_REVISION" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::Expected revision is not a full lowercase commit SHA: $EXPECTED_REVISION"
+            exit 1
+          fi
+          if [[ ! "$EXPECTED_VERSION" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            echo "::error::Expected version is not exact stable semver: $EXPECTED_VERSION"
+            exit 1
+          fi
 
-          docker build -f apps/server/Dockerfile -t "$image" .
+          ghcr_image="ghcr.io/allisonmahmood/patchpage-server"
+          semver_target="${ghcr_image}:${EXPECTED_VERSION}"
+          revision_target="${ghcr_image}:${EXPECTED_REVISION}"
+          latest_target="${ghcr_image}:latest"
+          immutable_targets=("$semver_target" "$revision_target")
+          verified_manifest_digest=""
+          declare -A immutable_state
+
+          inspect_remote_target() {
+            local target="$1"
+            local digest_var="$2"
+            local config_var="$3"
+            local tag="${target##*:}"
+            local inspect_output="${RUNNER_TEMP}/ghcr-inspect-${tag}.txt"
+            local manifest_json="${RUNNER_TEMP}/ghcr-manifest-${tag}.json"
+            local inspect_error="${RUNNER_TEMP}/ghcr-inspect-${tag}.err"
+
+            if ! docker buildx imagetools inspect "$target" >"$inspect_output" 2>"$inspect_error"; then
+              if grep -Eiq "manifest unknown|no such manifest|not found|name unknown|404" "$inspect_error"; then
+                return 1
+              fi
+              echo "::error::Could not inspect GHCR tag state for ${target}"
+              cat "$inspect_error" >&2
+              exit 1
+            fi
+
+            local digest
+            digest="$(
+              sed -nE 's/^[[:space:]]*Digest:[[:space:]]+(sha256:[0-9a-f]{64}).*/\1/p' \
+                "$inspect_output" | head -n1
+            )"
+            if [[ ! "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+              echo "::error::Could not determine remote manifest digest for ${target}"
+              cat "$inspect_output" >&2
+              exit 1
+            fi
+
+            if ! docker buildx imagetools inspect --raw "$target" >"$manifest_json" 2>"$inspect_error"; then
+              echo "::error::Could not fetch raw remote manifest for ${target}"
+              cat "$inspect_error" >&2
+              exit 1
+            fi
+
+            local config_id
+            if ! config_id="$(
+              python3 - "$manifest_json" <<'PY'
+          import json
+          import sys
+
+          with open(sys.argv[1], "r", encoding="utf-8") as handle:
+              manifest = json.load(handle)
+
+          if "manifests" in manifest:
+              raise SystemExit("release tag points at an image index, not a single verified image")
+
+          config = manifest.get("config", {}).get("digest")
+          if not isinstance(config, str) or not config.startswith("sha256:"):
+              raise SystemExit("remote manifest is missing a config digest")
+
+          print(config)
+          PY
+            )"; then
+              echo "::error::Could not determine remote config digest for ${target}"
+              exit 1
+            fi
+
+            printf -v "$digest_var" '%s' "$digest"
+            printf -v "$config_var" '%s' "$config_id"
+            return 0
+          }
+
+          record_verified_digest() {
+            local target="$1"
+            local digest="$2"
+
+            if [[ -z "$verified_manifest_digest" ]]; then
+              verified_manifest_digest="$digest"
+              return
+            fi
+            if [[ "$digest" != "$verified_manifest_digest" ]]; then
+              echo "::error::${target} digest ${digest} does not match previously verified GHCR digest ${verified_manifest_digest}"
+              exit 1
+            fi
+          }
+
+          push_verified_target() {
+            local target="$1"
+            local push_output=""
+            local push_digest=""
+            local remote_digest=""
+            local remote_config_id=""
+
+            docker tag "$LOCAL_RELEASE_TAG" "$target"
+            target_image_id="$(docker image inspect --format '{{.Id}}' "$target")"
+            if [[ "$target_image_id" != "$EXPECTED_IMAGE_ID" ]]; then
+              echo "::error::${target} does not reference the verified image before push"
+              exit 1
+            fi
+
+            if ! push_output="$(docker push "$target" 2>&1)"; then
+              printf '%s\n' "$push_output" >&2
+              exit 1
+            fi
+            printf '%s\n' "$push_output"
+
+            push_digest="$(
+              sed -nE 's/.*digest: (sha256:[0-9a-f]{64}).*/\1/p' <<<"$push_output" | tail -n1
+            )"
+            if [[ ! "$push_digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+              echo "::error::Could not determine pushed digest for ${target}"
+              exit 1
+            fi
+
+            if ! inspect_remote_target "$target" remote_digest remote_config_id; then
+              echo "::error::Pushed GHCR tag is missing: ${target}"
+              exit 1
+            fi
+            if [[ "$remote_digest" != "$push_digest" ]]; then
+              echo "::error::${target} remote digest ${remote_digest} drifted from pushed digest ${push_digest}"
+              exit 1
+            fi
+            if [[ "$remote_config_id" != "$EXPECTED_IMAGE_ID" ]]; then
+              echo "::error::${target} remote config ${remote_config_id} does not match ${EXPECTED_IMAGE_ID}"
+              exit 1
+            fi
+
+            record_verified_digest "$target" "$remote_digest"
+          }
+
+          for target in "${immutable_targets[@]}"; do
+            remote_digest=""
+            remote_config_id=""
+            if inspect_remote_target "$target" remote_digest remote_config_id; then
+              if [[ "$remote_config_id" != "$EXPECTED_IMAGE_ID" ]]; then
+                echo "::error::Existing immutable GHCR tag ${target} has config ${remote_config_id}, expected ${EXPECTED_IMAGE_ID}"
+                exit 1
+              fi
+              if ! docker pull "$target"; then
+                echo "::error::Could not pull existing immutable GHCR tag ${target}"
+                exit 1
+              fi
+              pulled_image_id="$(docker image inspect --format '{{.Id}}' "$target")"
+              if [[ "$pulled_image_id" != "$EXPECTED_IMAGE_ID" ]]; then
+                echo "::error::Pulled immutable GHCR tag ${target} image ID ${pulled_image_id} does not match ${EXPECTED_IMAGE_ID}"
+                exit 1
+              fi
+
+              immutable_state["$target"]="present"
+              record_verified_digest "$target" "$remote_digest"
+              echo "Immutable GHCR tag ${target} already exists with verified image ID ${remote_config_id} and digest ${remote_digest}"
+            else
+              immutable_state["$target"]="missing"
+            fi
+          done
+
+          for target in "${immutable_targets[@]}"; do
+            if [[ "${immutable_state[$target]}" == "missing" ]]; then
+              push_verified_target "$target"
+            fi
+          done
+
+          if [[ ! "$verified_manifest_digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "::error::Immutable GHCR tags did not establish the current release manifest digest"
+            exit 1
+          fi
+
+          latest_remote_digest=""
+          latest_remote_config_id=""
+          if inspect_remote_target "$latest_target" latest_remote_digest latest_remote_config_id; then
+            if ! docker pull "$latest_target"; then
+              echo "::error::Could not pull existing latest GHCR tag ${latest_target}"
+              exit 1
+            fi
+            latest_pulled_image_id="$(docker image inspect --format '{{.Id}}' "$latest_target")"
+            if [[ "$latest_pulled_image_id" != "$latest_remote_config_id" ]]; then
+              echo "::error::Latest GHCR tag raw manifest config ${latest_remote_config_id} does not match pulled image ID ${latest_pulled_image_id}"
+              exit 1
+            fi
+
+            latest_version="$(docker image inspect --format '{{ index .Config.Labels "org.opencontainers.image.version" }}' "$latest_target")"
+            if [[ ! "$latest_version" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+              echo "::error::Existing latest GHCR tag version metadata is invalid: ${latest_version}"
+              exit 1
+            fi
+
+            if ! latest_comparison="$(
+              python3 - "$latest_version" "$EXPECTED_VERSION" <<'PY'
+          import re
+          import sys
+
+          existing, expected = sys.argv[1:3]
+          pattern = re.compile(r"^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$")
+          if not pattern.match(existing) or not pattern.match(expected):
+              raise SystemExit("versions must be exact stable semver")
+
+          existing_parts = [int(part) for part in existing.split(".")]
+          expected_parts = [int(part) for part in expected.split(".")]
+
+          if existing_parts < expected_parts:
+              print("older")
+          elif existing_parts == expected_parts:
+              print("equal")
+          elif existing_parts > expected_parts:
+              print("newer")
+          else:
+              raise SystemExit("unknown comparison")
+          PY
+            )"; then
+              echo "::error::Could not compare existing latest version ${latest_version} with ${EXPECTED_VERSION}"
+              exit 1
+            fi
+
+            case "$latest_comparison" in
+              older)
+                echo "Existing latest GHCR tag version ${latest_version} is older than current release ${EXPECTED_VERSION}; updating latest"
+                push_verified_target "$latest_target"
+                ;;
+              equal)
+                if [[ "$latest_remote_config_id" != "$EXPECTED_IMAGE_ID" ]]; then
+                  echo "::error::Existing latest GHCR tag for ${EXPECTED_VERSION} has config ${latest_remote_config_id}, expected ${EXPECTED_IMAGE_ID}"
+                  exit 1
+                fi
+                if [[ "$latest_remote_digest" != "$verified_manifest_digest" ]]; then
+                  echo "::error::Existing latest GHCR tag for ${EXPECTED_VERSION} has manifest digest ${latest_remote_digest}, expected current release digest ${verified_manifest_digest}"
+                  exit 1
+                fi
+                echo "Latest GHCR tag already points at current release ${EXPECTED_VERSION} with verified digest ${latest_remote_digest}"
+                ;;
+              newer)
+                newer_target="${ghcr_image}:${latest_version}"
+                newer_remote_digest=""
+                newer_remote_config_id=""
+                if ! inspect_remote_target "$newer_target" newer_remote_digest newer_remote_config_id; then
+                  echo "::error::Existing latest GHCR tag claims newer version ${latest_version}, but immutable tag ${newer_target} is missing"
+                  exit 1
+                fi
+                if ! docker pull "$newer_target"; then
+                  echo "::error::Could not pull immutable tag for newer latest version: ${newer_target}"
+                  exit 1
+                fi
+                newer_pulled_image_id="$(docker image inspect --format '{{.Id}}' "$newer_target")"
+                if [[ "$newer_pulled_image_id" != "$newer_remote_config_id" ]]; then
+                  echo "::error::Newer immutable GHCR tag ${newer_target} raw manifest config ${newer_remote_config_id} does not match pulled image ID ${newer_pulled_image_id}"
+                  exit 1
+                fi
+                if [[ "$newer_remote_digest" != "$latest_remote_digest" ]]; then
+                  echo "::error::Existing latest GHCR tag for newer version ${latest_version} has manifest digest ${latest_remote_digest}, but immutable tag ${newer_target} has ${newer_remote_digest}"
+                  exit 1
+                fi
+                if [[ "$newer_remote_config_id" != "$latest_remote_config_id" ]]; then
+                  echo "::error::Existing latest GHCR tag for newer version ${latest_version} has config ${latest_remote_config_id}, but immutable tag ${newer_target} has ${newer_remote_config_id}"
+                  exit 1
+                fi
+                echo "Existing latest GHCR tag version ${latest_version} is newer than current release ${EXPECTED_VERSION} and matches immutable tag ${newer_target} at ${latest_remote_digest}; leaving latest untouched"
+                ;;
+              *)
+                echo "::error::Unknown latest semver comparison result: ${latest_comparison}"
+                exit 1
+                ;;
+            esac
+          else
+            echo "Latest GHCR tag is absent; publishing current release ${EXPECTED_VERSION}"
+            push_verified_target "$latest_target"
+          fi
+
+          echo "manifest-digest=$verified_manifest_digest" >> "$GITHUB_OUTPUT"
+
+  ghcr-anonymous-smoke:
+    name: Anonymous GHCR public-visibility gate (manual visibility required)
+    needs: [guard, docker-ghcr]
+    runs-on: ubuntu-latest
+    permissions: {}
+    steps:
+      - name: Verify public pull, publisher digest, and health without credentials
+        shell: bash
+        env:
+          EXPECTED_DIGEST: ${{ needs.docker-ghcr.outputs.manifest-digest }}
+        run: |
+          set -euo pipefail
+
+          if [[ ! "$EXPECTED_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "::error::Publisher did not expose a valid GHCR manifest digest"
+            exit 1
+          fi
+
+          image="ghcr.io/allisonmahmood/patchpage-server:${{ needs.guard.outputs.version }}"
+          container="patchpage-server-anonymous-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          docker_config="$(mktemp -d)"
+          export DOCKER_CONFIG="$docker_config"
 
           cleanup() {
             docker rm -f "$container" >/dev/null 2>&1 || true
+            rm -rf "$docker_config"
           }
           trap cleanup EXIT
 
-          docker run -d --name "$container" -p 3000:3000 "$image"
-
-          ok=""
-          for _ in {1..60}; do
-            body="$(curl -fsS http://localhost:3000/healthz 2>/dev/null || true)"
-            if [[ "$body" == *ok* ]]; then
-              ok="true"
+          pulled=""
+          for attempt in 1 2 3 4 5; do
+            if docker pull "$image"; then
+              pulled="true"
               break
+            fi
+
+            if [[ "$attempt" != "5" ]]; then
+              sleep 15
+            fi
+          done
+
+          if [[ "$pulled" != "true" ]]; then
+            echo "::error::Published image was not anonymously pullable. The first GHCR package still requires the maintainer GHCR Public visibility step; this workflow does not change package visibility."
+            exit 1
+          fi
+
+          mapfile -t repo_digests < <(
+            docker image inspect --format '{{range .RepoDigests}}{{println .}}{{end}}' "$image" \
+              | grep -E '^ghcr\.io/allisonmahmood/patchpage-server@sha256:[0-9a-f]{64}$' || true
+          )
+          if [[ "${#repo_digests[@]}" -ne 1 ]]; then
+            echo "::error::Expected exactly one anonymous repo digest for ${image}, found ${#repo_digests[@]}"
+            exit 1
+          fi
+          actual_digest="${repo_digests[0]##*@}"
+          if [[ "$actual_digest" != "$EXPECTED_DIGEST" ]]; then
+            echo "::error::Anonymous repo digest ${actual_digest} does not match the publisher-verified GHCR digest ${EXPECTED_DIGEST}"
+            exit 1
+          fi
+
+          docker run -d --name "$container" -p 127.0.0.1::3000 "$image"
+          host_port="$(
+            docker container inspect \
+              --format '{{(index (index .NetworkSettings.Ports "3000/tcp") 0).HostPort}}' \
+              "$container"
+          )"
+          if [[ -z "$host_port" ]]; then
+            echo "::error::Docker did not publish the server port"
+            exit 1
+          fi
+
+          for _ in {1..60}; do
+            body="$(curl -fsS "http://127.0.0.1:${host_port}/healthz" 2>/dev/null || true)"
+            if [[ "$body" == '{"ok":true}' ]]; then
+              exit 0
             fi
             sleep 1
           done
 
-          if [[ "$ok" != "true" ]]; then
-            docker logs "$container" || true
-            exit 1
-          fi
-
-          docker tag "$image" "${ghcr_image}:${GITHUB_REF_NAME}"
-          docker tag "$image" "${ghcr_image}:latest"
-          docker push "${ghcr_image}:${GITHUB_REF_NAME}"
-          docker push "${ghcr_image}:latest"
+          docker logs "$container" || true
+          echo "::error::Published image did not return the expected /healthz response"
+          exit 1
 
   npx-smoke:
     needs: publish-npm

@@ -1,15 +1,48 @@
 # Self-Hosting PatchPage
 
-PatchPage is a normal Node HTTP service and runs anywhere that supports Node or containers. Azure Container Apps is the maintainer's deployment target, not a requirement — this guide covers running your own instance from source. The [Azure Terraform](../infra/azure) directory is a worked example you can adapt.
+PatchPage is a normal Node HTTP service and runs anywhere that supports Node or containers. Azure Container Apps is the maintainer's deployment target, not a requirement — this guide covers the container image contract that release automation will publish and running your own instance from source. The [Azure Terraform](../infra/azure) directory is a worked example you can adapt.
 
 Once your server is running, point the CLI at it and you have a private PatchPage: upload access is token-gated, but the draft URLs it returns are public and unlisted (anyone with the link can view them).
 
 ## Prerequisites
 
-- Node.js 22.13 or newer (the CLI and server require Node 22+, and pnpm 11 needs at least 22.13). The Docker image bundles its own Node.
-- pnpm (the repo pins `pnpm@11.5.2` via `packageManager`).
+- Docker or another OCI-compatible runtime when using the supported image.
+- Node.js 22.13 or newer when running from source (the CLI and server require Node 22+, and pnpm 11 needs at least 22.13). The container image bundles its own Node.
+- pnpm when running from source (the repo pins `pnpm@11.5.2` via `packageManager`).
 - A PostgreSQL database, if you use the `postgres` metadata driver. The default `json` driver needs no database and is fine for small or single-user instances.
 - Git is optional; the CLI records repo/branch metadata with each upload when the file is inside a git repo.
+
+## Supported container image contract
+
+Release automation is configured to publish the supported image as `ghcr.io/allisonmahmood/patchpage-server`. Its tags are published from one verified image:
+
+- A stable semver tag without a `v` prefix, such as `1.2.3`, is immutable and is the recommended deployment tag. Prerelease versions such as `1.2.3-rc.1` are rejected by the release guard before npm or GHCR publication can begin.
+- The full commit SHA is also an immutable tag for source-exact pinning.
+- The moving `latest` tag follows the newest release; use it only when automatic movement is intended. During a delayed release, a newer `latest` is left untouched only when its manifest digest and config match the immutable tag named by its stable version label; missing or mismatched state fails closed.
+
+First-package gate: the workflow does not change package visibility and does not fabricate the GHCR Public visibility transition. After the first authenticated push creates the package, a maintainer must set GHCR Public visibility in GitHub. Release acceptance for issue #17 stays open until the separate anonymous GHCR smoke job pulls the semver tag without credentials and verifies `/healthz`; until that gate passes, these docs describe the intended supported image, not proof that a public package is already live.
+
+The image runs as the non-root `node` user (UID/GID 1000). Its supported writable persistence mount is `/data`. With the default `json` metadata and `filesystem` storage drivers, the image sets:
+
+```env
+PATCHPAGE_DB_FILE=/data/patchpage-db.json
+PATCHPAGE_STORAGE_DIR=/data/drafts
+```
+
+After a release has published the image, start an instance with a named volume and an immutable release version:
+
+```sh
+docker volume create patchpage-data
+docker run -d \
+  --name patchpage \
+  -p 3000:3000 \
+  -e PATCHPAGE_PUBLIC_BASE_URL=https://post.example.com \
+  -e PATCHPAGE_BOOTSTRAP_API_TOKEN=change-me-to-a-long-random-string \
+  -v patchpage-data:/data \
+  ghcr.io/allisonmahmood/patchpage-server:1.2.3
+```
+
+Named volumes inherit the image's `/data` ownership. If you use a host bind mount instead, make that directory writable by UID/GID 1000 before starting the container. Persist `/data` for the single-instance JSON/filesystem setup; Postgres and Azure Blob deployments keep their durable data in those external services. Every configuration variable below is supported in the image and can be supplied with `-e` or your orchestrator's environment configuration.
 
 ## Clone, install, build
 
@@ -44,11 +77,16 @@ PATCHPAGE_MAX_HTML_BYTES=524288
 # Defaults to "postgres" if DATABASE_URL is set, otherwise "json".
 PATCHPAGE_DB_DRIVER=postgres
 DATABASE_URL=postgres://user:password@host:5432/patchpage
-# Only used by the "json" driver:
+# Only used by the "json" driver.
+# Source default: .local/patchpage-db.json
+# Container image default: /data/patchpage-db.json
 PATCHPAGE_DB_FILE=.local/patchpage-db.json
 
 # HTML object storage: "filesystem" or "azure-blob"
+# Defaults to "filesystem".
 PATCHPAGE_STORAGE_DRIVER=filesystem
+# Source default: .local/drafts
+# Container image default: /data/drafts
 PATCHPAGE_STORAGE_DIR=.local/drafts
 
 # Only used by the "azure-blob" storage driver:
@@ -64,7 +102,7 @@ Notes on values:
 - `PATCHPAGE_TRUST_PROXY` controls whether Fastify derives `request.ip` from `X-Forwarded-For`. Leave it undefined unless every route to the server has a verified trust boundary. See [Client IP attribution behind proxies](#client-ip-attribution-behind-proxies).
 - `PATCHPAGE_MAX_HTML_BYTES` caps the size of a single HTML document (default 524288 = 512 KiB).
 - `PATCHPAGE_ALLOW_ANONYMOUS_UPLOADS` is parsed but not currently enforced — the upload endpoint always requires a token with the `upload` scope regardless of this setting. Keep it `false`.
-- The `json` metadata driver and `filesystem` storage driver write under `.local/` by default and need no external services — good for a quick self-host or local testing. For a durable multi-instance deployment, use `postgres` and a shared object store (`azure-blob`).
+- When running from source, the `json` metadata driver and `filesystem` storage driver write under `.local/` by default. The supported image overrides those path defaults to `/data` as shown above. Both modes need no external services and suit a quick or single-instance self-host. For a durable multi-instance deployment, use `postgres` and a shared object store (`azure-blob`).
 
 ### JSON metadata durability
 
@@ -111,7 +149,7 @@ pnpm --filter @patchpage/server build
 pnpm --filter @patchpage/server start
 ```
 
-The server listens on `0.0.0.0:$PORT` and exposes a `GET /healthz` endpoint that returns `{"ok":true}` for health checks. A container image is also available via `pnpm --filter @patchpage/server docker` (see `apps/server/Dockerfile`).
+The server listens on `0.0.0.0:$PORT` and exposes a `GET /healthz` endpoint that returns exactly `{"ok":true}` for health checks. To build an image from your checkout instead of pulling the supported release, run `pnpm --filter @patchpage/server docker` (see `apps/server/Dockerfile`).
 
 ## Minting API tokens
 

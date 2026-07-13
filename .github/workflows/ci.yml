@@ -139,37 +139,22 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Build and boot server image
+      - name: Build and verify server image
         shell: bash
+        env:
+          VERSION: 0.0.0-ci
+          REVISION: "0000000000000000000000000000000000000000"
         run: |
           set -euo pipefail
 
           image="patchpage-server:ci"
-          container="patchpage-server-ci-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          docker build \
+            --build-arg "VERSION=$VERSION" \
+            --build-arg "REVISION=$REVISION" \
+            -f apps/server/Dockerfile \
+            -t "$image" .
 
-          docker build -f apps/server/Dockerfile -t "$image" .
-
-          cleanup() {
-            docker rm -f "$container" >/dev/null 2>&1 || true
-          }
-          trap cleanup EXIT
-
-          docker run -d --name "$container" -p 3000:3000 "$image"
-
-          ok=""
-          for _ in {1..60}; do
-            body="$(curl -fsS http://localhost:3000/healthz 2>/dev/null || true)"
-            if [[ "$body" == *ok* ]]; then
-              ok="true"
-              break
-            fi
-            sleep 1
-          done
-
-          if [[ "$ok" != "true" ]]; then
-            docker logs "$container" || true
-            exit 1
-          fi
+          scripts/verify-server-image.sh "$image" "$VERSION" "$REVISION"
 
   azure-infra:
     runs-on: ubuntu-latest

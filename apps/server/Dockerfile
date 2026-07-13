@@ -20,24 +20,57 @@ RUN pnpm install --frozen-lockfile
 
 COPY . .
 
-RUN pnpm --filter @patchpage/server... build
+RUN pnpm --filter @patchpage/server... build \
+  && find \
+    apps/server/dist \
+    packages/config/dist \
+    packages/core/dist \
+    packages/db/dist \
+    packages/storage/dist \
+    -type f \( -name '*.d.ts' -o -name '*.map' \) -delete \
+  && pnpm --filter @patchpage/server deploy --prod --legacy /runtime
 
 FROM node:24-slim AS runner
 
+ARG VERSION=0.0.0-dev
+ARG REVISION=unknown
+
+LABEL org.opencontainers.image.source="https://github.com/allisonmahmood/PatchPage" \
+  org.opencontainers.image.licenses="MIT" \
+  org.opencontainers.image.version="$VERSION" \
+  org.opencontainers.image.revision="$REVISION"
+
 ENV NODE_ENV=production
 ENV PORT=3000
+ENV PATCHPAGE_DB_FILE=/data/patchpage-db.json
+ENV PATCHPAGE_STORAGE_DIR=/data/drafts
 
-WORKDIR /repo
+WORKDIR /app
 
-COPY --from=builder /repo/package.json /repo/pnpm-workspace.yaml /repo/turbo.json ./
-COPY --from=builder /repo/node_modules ./node_modules
-COPY --from=builder /repo/apps/server ./apps/server
-COPY --from=builder /repo/packages/config ./packages/config
-COPY --from=builder /repo/packages/core ./packages/core
-COPY --from=builder /repo/packages/db ./packages/db
-COPY --from=builder /repo/packages/storage ./packages/storage
+RUN rm -rf \
+    /opt/yarn-* \
+    /usr/local/include/node \
+    /usr/local/lib/node_modules/corepack \
+    /usr/local/lib/node_modules/npm \
+    /usr/local/share/doc/node \
+    /usr/local/share/man/man1/node.1 \
+  && rm -f \
+    /usr/local/bin/corepack \
+    /usr/local/bin/npm \
+    /usr/local/bin/npx \
+    /usr/local/bin/pnpm \
+    /usr/local/bin/pnpx \
+    /usr/local/bin/yarn \
+    /usr/local/bin/yarnpkg \
+  && mkdir /data \
+  && chown node:node /data
 
-WORKDIR /repo/apps/server
+COPY --from=builder /runtime/ ./
+COPY LICENSE ./LICENSE
+
+VOLUME ["/data"]
+
+USER node
 
 EXPOSE 3000
 
