@@ -4,12 +4,16 @@ import { fileURLToPath } from "node:url";
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const workflowPath = path.join(repoRoot, ".github/workflows/release.yml");
-const [workflow, packageSource, lockfile, dependabot] = await Promise.all([
-  readFile(workflowPath, "utf8"),
-  readFile(path.join(repoRoot, "package.json"), "utf8"),
-  readFile(path.join(repoRoot, "pnpm-lock.yaml"), "utf8"),
-  readFile(path.join(repoRoot, ".github/dependabot.yml"), "utf8"),
-]);
+const [workflow, ciWorkflow, packageSource, lockfile, dependabot, selfHosting, readme] =
+  await Promise.all([
+    readFile(workflowPath, "utf8"),
+    readFile(path.join(repoRoot, ".github/workflows/ci.yml"), "utf8"),
+    readFile(path.join(repoRoot, "package.json"), "utf8"),
+    readFile(path.join(repoRoot, "pnpm-lock.yaml"), "utf8"),
+    readFile(path.join(repoRoot, ".github/dependabot.yml"), "utf8"),
+    readFile(path.join(repoRoot, "docs/SELF_HOSTING.md"), "utf8"),
+    readFile(path.join(repoRoot, "README.md"), "utf8"),
+  ]);
 const packageJson = JSON.parse(packageSource);
 const failures = [];
 const reviewedNodeVersion = "24.18.0";
@@ -122,6 +126,74 @@ function failClosedGuardPosition(source, guardLine) {
 
   return lines.slice(0, start).join("\n").length + (start === 0 ? 0 : 1);
 }
+function ciJob(name) {
+  const lines = ciWorkflow.split("\n");
+  const start = lines.findIndex((line) => line === `  ${name}:`);
+
+  if (start === -1) {
+    failures.push(`ci.yml must define the ${name} job`);
+    return "";
+  }
+
+  const end = lines.findIndex(
+    (line, index) => index > start && /^  [a-zA-Z0-9_-]+:$/.test(line),
+  );
+  return lines.slice(start, end === -1 ? undefined : end).join("\n");
+}
+
+function jobNeeds(jobSource) {
+  const lines = jobSource.split("\n");
+  const index = lines.findIndex((line) => /^ {4}needs\s*:/.test(line));
+  if (index === -1) return [];
+
+  const value = lines[index].replace(/^ {4}needs\s*:\s*/, "").trim();
+  if (value.startsWith("[") && value.endsWith("]")) {
+    return value
+      .slice(1, -1)
+      .split(",")
+      .map((item) => item.trim())
+      .filter(Boolean);
+  }
+  if (value) return [value];
+
+  const needs = [];
+  for (const line of lines.slice(index + 1)) {
+    const name = line.match(/^ {6}-\s+([a-zA-Z0-9_-]+)\s*$/)?.[1];
+    if (!name) break;
+    needs.push(name);
+  }
+  return needs;
+}
+
+function jobPermissions(jobSource) {
+  const lines = jobSource.split("\n");
+  const index = lines.findIndex((line) => /^ {4}permissions\s*:/.test(line));
+  if (index === -1) return null;
+
+  const value = lines[index].replace(/^ {4}permissions\s*:\s*/, "").trim();
+  if (value === "{}") return new Map();
+  if (value) return null;
+
+  const permissions = new Map();
+  for (const line of lines.slice(index + 1)) {
+    const match = line.match(/^ {6}([a-z-]+)\s*:\s*([a-z-]+)\s*$/);
+    if (!match) break;
+    permissions.set(match[1], match[2]);
+  }
+  return permissions;
+}
+
+function sameMembers(actual, expected) {
+  return actual.length === expected.length && expected.every((item) => actual.includes(item));
+}
+
+function sameEntries(actual, expected) {
+  return (
+    actual instanceof Map &&
+    actual.size === expected.size &&
+    [...expected].every(([key, value]) => actual.get(key) === value)
+  );
+}
 
 const actionLines = workflow
   .split("\n")
@@ -154,6 +226,25 @@ for (const { line, lineNumber } of actionLines) {
   if (reviewed.sha !== sha || reviewed.version !== version) {
     failures.push(
       `release.yml:${lineNumber} must use reviewed coordinate ${actionName}@${reviewed.sha} # ${reviewed.version}`,
+    );
+  }
+}
+
+const expectedActionCounts = new Map([
+  ["actions/checkout", 4],
+  ["actions/setup-node", 5],
+  ["pnpm/action-setup", 1],
+  ["actions/upload-artifact", 2],
+  ["actions/download-artifact", 3],
+  ["docker/login-action", 1],
+]);
+for (const [actionName, expectedCount] of expectedActionCounts) {
+  const actualCount = actionLines.filter(({ line }) =>
+    line.includes(`uses: ${actionName}@`),
+  ).length;
+  if (actualCount !== expectedCount) {
+    failures.push(
+      `release.yml must retain all ${expectedCount} reviewed ${actionName} Action uses`,
     );
   }
 }
@@ -197,6 +288,7 @@ for (const ecosystem of ["npm", "github-actions"]) {
   }
 }
 
+const guardJob = job("guard");
 const prepareNpmJob = job("prepare-npm");
 const verifyJob = job("verify");
 const publishJob = job("publish-npm");
@@ -205,6 +297,23 @@ const packageDownloadStep = stepContaining(
   publishJob,
   "- name: Download the exact tested tarball",
 );
+const dockerJob = job("docker-ghcr");
+const anonymousImageJob = job("ghcr-anonymous-smoke");
+const ciDockerJob = ciJob("docker");
+
+if (guardJob) {
+  const revisionCommand = guardJob.indexOf('revision="$(git rev-parse HEAD)"');
+  const revisionValidation = guardJob.indexOf('[[ ! "$revision" =~ ^[0-9a-f]{40}$ ]]');
+  const revisionOutput = guardJob.indexOf('echo "revision=$revision" >> "$GITHUB_OUTPUT"');
+  if (
+    !guardJob.includes("revision: ${{ steps.version.outputs.revision }}") ||
+    revisionCommand === -1 ||
+    revisionValidation <= revisionCommand ||
+    revisionOutput <= revisionValidation
+  ) {
+    failures.push("guard must expose the checked-out full commit SHA as the release revision");
+  }
+}
 
 if (prepareNpmJob) {
   if (!/^    permissions: \{\}$/m.test(prepareNpmJob)) {
@@ -751,6 +860,257 @@ if (
   );
 }
 
+if (dockerJob) {
+  if (!sameMembers(jobNeeds(dockerJob), ["guard", "publish-npm"])) {
+    failures.push("docker-ghcr must retain its guard and publish-npm dependencies");
+  }
+
+  if (
+    !sameEntries(
+      jobPermissions(dockerJob),
+      new Map([
+        ["contents", "read"],
+        ["packages", "write"],
+      ]),
+    )
+  ) {
+    failures.push("docker-ghcr must grant only contents: read and packages: write");
+  }
+
+  if (
+    !/^\s+VERSION\s*:\s*\$\{\{\s*needs\.guard\.outputs\.version\s*\}\}\s*$/m.test(
+      dockerJob,
+    ) ||
+    !/^\s+REVISION\s*:\s*\$\{\{\s*needs\.guard\.outputs\.revision\s*\}\}\s*$/m.test(
+      dockerJob,
+    )
+  ) {
+    failures.push("docker-ghcr must bind image metadata to guard version and revision outputs");
+  }
+
+  if ((dockerJob.match(/\bdocker build\b/g) ?? []).length !== 1) {
+    failures.push("docker-ghcr must build the server image exactly once");
+  }
+
+  const build = dockerJob.indexOf("docker build");
+  const builtImageId = dockerJob.search(
+    /built_image_id\s*=\s*"\$\(docker image inspect/,
+  );
+  const verifyImage = dockerJob.search(
+    /scripts\/verify-server-image\.sh\s+"\$image"\s+"\$VERSION"\s+"\$REVISION"/,
+  );
+  const tag = dockerJob.indexOf('docker tag "$image" "$target"');
+  const compareTagId = dockerJob.indexOf('"$target_image_id" != "$built_image_id"');
+  const immutableTagPreflight = dockerJob.indexOf('ensure_immutable_tag_absent "$target"');
+  const push = dockerJob.indexOf('docker push "$target"');
+  const digestParse = dockerJob.indexOf("sed -nE 's/.*digest: (sha256:[0-9a-f]{64}).*/\\1/p'");
+  const digestCompare = dockerJob.indexOf('"$digest" != "$pushed_digest"');
+  const buildCommand = dockerJob.slice(build, builtImageId);
+  if (
+    build === -1 ||
+    builtImageId <= build ||
+    !buildCommand.includes('--build-arg "VERSION=$VERSION"') ||
+    !buildCommand.includes('--build-arg "REVISION=$REVISION"') ||
+    !/-f\s+apps\/server\/Dockerfile/.test(buildCommand) ||
+    !/-t\s+"\$image"\s+\./.test(buildCommand) ||
+    verifyImage <= builtImageId ||
+    tag <= verifyImage ||
+    compareTagId <= tag ||
+    immutableTagPreflight <= compareTagId ||
+    push <= immutableTagPreflight ||
+    digestParse <= push ||
+    digestCompare <= digestParse
+  ) {
+    failures.push(
+      "docker-ghcr must verify one metadata-bound build before tagging, immutable-tag checks, digest-checked pushes",
+    );
+  }
+
+  if (
+    !dockerJob.includes('immutable_targets=(') ||
+    !dockerJob.includes('docker manifest inspect "$target"') ||
+    !dockerJob.includes("Immutable GHCR tag already exists") ||
+    !dockerJob.includes("manifest unknown|no such manifest|not found|name unknown") ||
+    !dockerJob.includes("Could not verify GHCR tag state") ||
+    !dockerJob.includes("Could not determine pushed digest") ||
+    !dockerJob.includes("pushed digest ${digest} differs")
+  ) {
+    failures.push("docker-ghcr must fail closed on immutable GHCR tag state and digest drift");
+  }
+
+  const targetsBody = dockerJob.match(/targets\s*=\s*\(([\s\S]*?)\)/)?.[1] ?? "";
+  const targets = [...targetsBody.matchAll(/"([^"\n]+)"/g)].map((match) => match[1]);
+  if (
+    !sameMembers(targets, [
+      "${ghcr_image}:${VERSION}",
+      "${ghcr_image}:${REVISION}",
+      "${ghcr_image}:latest",
+    ]) ||
+    !/ghcr_image\s*=\s*"ghcr\.io\/allisonmahmood\/patchpage-server"/.test(dockerJob)
+  ) {
+    failures.push("docker-ghcr must derive semver, full-revision, and latest tags");
+  }
+
+  const targetLoops = [
+    ...dockerJob.matchAll(
+      /for\s+target\s+in\s+"\$\{targets\[@\]\}"\s*;\s*do([\s\S]*?)\n\s+done/g,
+    ),
+  ].map((match) => match[1]);
+  const immutableTargetLoops = [
+    ...dockerJob.matchAll(
+      /for\s+target\s+in\s+"\$\{immutable_targets\[@\]\}"\s*;\s*do([\s\S]*?)\n\s+done/g,
+    ),
+  ].map((match) => match[1]);
+  if (
+    targetLoops.length !== 3 ||
+    immutableTargetLoops.length !== 1 ||
+    !targetLoops.some((body) => body.includes('docker tag "$image" "$target"')) ||
+    !targetLoops.some((body) => body.includes('"$target_image_id" != "$built_image_id"')) ||
+    !immutableTargetLoops.some((body) => body.includes('ensure_immutable_tag_absent "$target"')) ||
+    !targetLoops.some((body) => body.includes('docker push "$target"'))
+  ) {
+    failures.push("docker-ghcr must tag, identity-check, registry-check, and push release targets");
+  }
+
+  if (dockerJob.includes("GITHUB_REF_NAME")) {
+    failures.push("docker-ghcr must not publish the v-prefixed release ref");
+  }
+}
+
+if (ciDockerJob) {
+  if (
+    !/^\s+VERSION\s*:\s*0\.0\.0-ci\s*$/m.test(ciDockerJob) ||
+    !/^\s+REVISION\s*:\s*0000000000000000000000000000000000000000\s*$/m.test(ciDockerJob)
+  ) {
+    failures.push("CI must use deterministic image version and revision metadata");
+  }
+
+  const build = ciDockerJob.indexOf("docker build");
+  const verifyImage = ciDockerJob.search(
+    /scripts\/verify-server-image\.sh\s+"\$image"\s+"\$VERSION"\s+"\$REVISION"/,
+  );
+  const buildCommand = ciDockerJob.slice(build, verifyImage);
+  if (
+    (ciDockerJob.match(/\bdocker build\b/g) ?? []).length !== 1 ||
+    build === -1 ||
+    verifyImage <= build ||
+    !buildCommand.includes('--build-arg "VERSION=$VERSION"') ||
+    !buildCommand.includes('--build-arg "REVISION=$REVISION"') ||
+    !/-f\s+apps\/server\/Dockerfile/.test(buildCommand) ||
+    !/-t\s+"\$image"\s+\./.test(buildCommand)
+  ) {
+    failures.push("CI must run the behavioral contract on its one metadata-bound image build");
+  }
+
+  for (const forbidden of [
+    "docker login",
+    "docker pull",
+    "docker push",
+    "ghcr.io/allisonmahmood/patchpage-server",
+  ]) {
+    if (ciDockerJob.includes(forbidden)) {
+      failures.push(`CI's local image contract must not contain ${forbidden}`);
+    }
+  }
+}
+
+if (packageJson.scripts?.["test:server-image"] !== "bash scripts/verify-server-image.sh") {
+  failures.push("package.json must expose the focused server image contract verifier");
+}
+
+const supportedImage = "ghcr.io/allisonmahmood/patchpage-server";
+if (!readme.includes(supportedImage) || !readme.includes("`/data`")) {
+  failures.push("README must name the supported image and its persistence mount");
+}
+
+for (const required of [
+  supportedImage,
+  "patchpage-data:/data",
+  "PATCHPAGE_DB_FILE=/data/patchpage-db.json",
+  "PATCHPAGE_STORAGE_DIR=/data/drafts",
+]) {
+  if (!selfHosting.includes(required)) {
+    failures.push(`self-hosting docs must document ${required}`);
+  }
+}
+if (!/non[- ]root/i.test(selfHosting)) {
+  failures.push("self-hosting docs must document the unprivileged runtime user");
+}
+if (!/semver[^\n]*immutable/i.test(selfHosting) || !/full\s+commit\s+SHA/i.test(selfHosting)) {
+  failures.push("self-hosting docs must document both immutable image tag forms");
+}
+if (!/(?:moving[^\n]*`latest`|`latest`[^\n]*(?:follows|moves))/i.test(selfHosting)) {
+  failures.push("self-hosting docs must distinguish the moving latest tag");
+}
+
+if (anonymousImageJob) {
+  if (!sameMembers(jobNeeds(anonymousImageJob), ["guard", "docker-ghcr"])) {
+    failures.push("ghcr-anonymous-smoke must wait for guard and docker-ghcr");
+  }
+
+  if (!sameEntries(jobPermissions(anonymousImageJob), new Map())) {
+    failures.push("ghcr-anonymous-smoke must have no GitHub token permissions");
+  }
+
+  for (const forbidden of [
+    "uses:",
+    "actions/checkout",
+    "docker/login-action",
+    "docker login",
+    "docker build",
+    "docker tag",
+    "docker load",
+    "docker save",
+    "github.token",
+    "GITHUB_TOKEN",
+    "GITHUB_REF_NAME",
+    ":latest",
+    "packages:",
+  ]) {
+    if (anonymousImageJob.includes(forbidden)) {
+      failures.push(`ghcr-anonymous-smoke must not contain ${forbidden}`);
+    }
+  }
+
+  const pull = anonymousImageJob.indexOf('docker pull "$image"');
+  const boot = anonymousImageJob.indexOf('docker run -d');
+  const portInspect = anonymousImageJob.indexOf("docker container inspect");
+  const healthRequest = anonymousImageJob.search(
+    /body\s*=\s*"\$\(curl\s+-fsS\s+"http:\/\/127\.0\.0\.1:\$\{host_port\}\/healthz"[^\n]*\)"/,
+  );
+  const exactHealth = anonymousImageJob.search(
+    /\[\[\s*"\$body"\s*==\s*'\{"ok":true\}'\s*\]\]/,
+  );
+  if (
+    !/image\s*=\s*"ghcr\.io\/allisonmahmood\/patchpage-server:\$\{\{\s*needs\.guard\.outputs\.version\s*\}\}"/.test(
+      anonymousImageJob,
+    ) ||
+    pull === -1 ||
+    boot <= pull ||
+    portInspect <= boot ||
+    !anonymousImageJob.slice(boot).includes('"$image"')
+  ) {
+    failures.push(
+      "ghcr-anonymous-smoke must pull and boot the published immutable version tag",
+    );
+  }
+
+  if (healthRequest <= boot || exactHealth <= healthRequest) {
+    failures.push(
+      "ghcr-anonymous-smoke must obtain and require the exact live /healthz response",
+    );
+  }
+
+  if (
+    !/docker_config\s*=\s*"\$\(mktemp -d\)"/.test(anonymousImageJob) ||
+    !/export\s+DOCKER_CONFIG\s*=\s*"\$docker_config"/.test(anonymousImageJob) ||
+    !anonymousImageJob.includes("-p 127.0.0.1::3000") ||
+    !anonymousImageJob.includes("Docker did not publish the server port")
+  ) {
+    failures.push("ghcr-anonymous-smoke must isolate anonymous Docker credentials and host port");
+  }
+}
+
 if (failures.length > 0) {
   for (const failure of failures) {
     console.error(`- ${failure}`);
@@ -758,6 +1118,6 @@ if (failures.length > 0) {
   process.exitCode = 1;
 } else {
   console.log(
-    `Verified ${actionLines.length} pinned Actions, npm@${npmVersion}, and the exact-tarball publication boundary.`,
+    `Verified ${actionLines.length} pinned Actions, npm@${npmVersion}, exact release image identity, and the anonymous GHCR gate.`,
   );
 }

@@ -10,6 +10,9 @@ All notable changes to PatchPage are documented in this file. The format is base
 
 - Bounded trusted-proxy configuration for canonical client IP attribution, with safe direct
   defaults and deployment guidance for verified reverse-proxy topologies.
+- Release automation for the intended supported
+  `ghcr.io/allisonmahmood/patchpage-server` image, with immutable version and commit tags,
+  a moving `latest` tag, a non-root runtime, and `/data` persistence.
 
 ### Changed
 

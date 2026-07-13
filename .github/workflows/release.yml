@@ -15,6 +15,7 @@ jobs:
       contents: read
     outputs:
       version: ${{ steps.version.outputs.version }}
+      revision: ${{ steps.version.outputs.revision }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
       - id: version
@@ -35,7 +36,14 @@ jobs:
             exit 1
           fi
 
+          revision="$(git rev-parse HEAD)"
+          if [[ ! "$revision" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::Resolved release revision is not a full commit SHA: ${revision}"
+            exit 1
+          fi
+
           echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "revision=$revision" >> "$GITHUB_OUTPUT"
 
   prepare-npm:
     runs-on: ubuntu-latest
@@ -449,41 +457,157 @@ jobs:
           password: ${{ github.token }}
       - name: Build, verify, and push image
         shell: bash
+        env:
+          VERSION: ${{ needs.guard.outputs.version }}
+          REVISION: ${{ needs.guard.outputs.revision }}
         run: |
           set -euo pipefail
 
           image="patchpage-server:release"
-          container="patchpage-server-release-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
           ghcr_image="ghcr.io/allisonmahmood/patchpage-server"
+          targets=(
+            "${ghcr_image}:${VERSION}"
+            "${ghcr_image}:${REVISION}"
+            "${ghcr_image}:latest"
+          )
+          immutable_targets=(
+            "${ghcr_image}:${VERSION}"
+            "${ghcr_image}:${REVISION}"
+          )
 
-          docker build -f apps/server/Dockerfile -t "$image" .
+          ensure_immutable_tag_absent() {
+            local target="$1"
+            local manifest_error="${RUNNER_TEMP}/ghcr-manifest-${target##*:}.err"
+
+            if docker manifest inspect "$target" >/dev/null 2>"$manifest_error"; then
+              echo "::error::Immutable GHCR tag already exists: ${target}"
+              exit 1
+            fi
+
+            if grep -Eiq "manifest unknown|no such manifest|not found|name unknown" "$manifest_error"; then
+              return
+            fi
+
+            echo "::error::Could not verify GHCR tag state for ${target}"
+            cat "$manifest_error" >&2
+            exit 1
+          }
+
+          docker build \
+            --build-arg "VERSION=$VERSION" \
+            --build-arg "REVISION=$REVISION" \
+            -f apps/server/Dockerfile \
+            -t "$image" .
+
+          built_image_id="$(docker image inspect --format '{{.Id}}' "$image")"
+          scripts/verify-server-image.sh "$image" "$VERSION" "$REVISION"
+
+          verified_image_id="$(docker image inspect --format '{{.Id}}' "$image")"
+          if [[ "$verified_image_id" != "$built_image_id" ]]; then
+            echo "::error::Verified image changed before tagging"
+            exit 1
+          fi
+
+          for target in "${targets[@]}"; do
+            docker tag "$image" "$target"
+          done
+
+          for target in "${targets[@]}"; do
+            target_image_id="$(docker image inspect --format '{{.Id}}' "$target")"
+            if [[ "$target_image_id" != "$built_image_id" ]]; then
+              echo "::error::${target} does not reference the verified image"
+              exit 1
+            fi
+          done
+
+          for target in "${immutable_targets[@]}"; do
+            ensure_immutable_tag_absent "$target"
+          done
+
+          pushed_digest=""
+          for target in "${targets[@]}"; do
+            if ! push_output="$(docker push "$target" 2>&1)"; then
+              printf '%s\n' "$push_output" >&2
+              exit 1
+            fi
+            printf '%s\n' "$push_output"
+
+            digest="$(
+              sed -nE 's/.*digest: (sha256:[0-9a-f]{64}).*/\1/p' <<<"$push_output" | tail -n1
+            )"
+            if [[ -z "$digest" ]]; then
+              echo "::error::Could not determine pushed digest for ${target}"
+              exit 1
+            fi
+
+            if [[ -z "$pushed_digest" ]]; then
+              pushed_digest="$digest"
+            elif [[ "$digest" != "$pushed_digest" ]]; then
+              echo "::error::${target} pushed digest ${digest} differs from ${pushed_digest}"
+              exit 1
+            fi
+          done
+
+  ghcr-anonymous-smoke:
+    needs: [guard, docker-ghcr]
+    runs-on: ubuntu-latest
+    permissions: {}
+    steps:
+      - name: Anonymously pull and boot the published server image
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          image="ghcr.io/allisonmahmood/patchpage-server:${{ needs.guard.outputs.version }}"
+          container="patchpage-server-anonymous-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          docker_config="$(mktemp -d)"
+          export DOCKER_CONFIG="$docker_config"
 
           cleanup() {
             docker rm -f "$container" >/dev/null 2>&1 || true
+            rm -rf "$docker_config"
           }
           trap cleanup EXIT
 
-          docker run -d --name "$container" -p 3000:3000 "$image"
-
-          ok=""
-          for _ in {1..60}; do
-            body="$(curl -fsS http://localhost:3000/healthz 2>/dev/null || true)"
-            if [[ "$body" == *ok* ]]; then
-              ok="true"
+          pulled=""
+          for attempt in 1 2 3 4 5; do
+            if docker pull "$image"; then
+              pulled="true"
               break
+            fi
+
+            if [[ "$attempt" != "5" ]]; then
+              sleep 15
+            fi
+          done
+
+          if [[ "$pulled" != "true" ]]; then
+            echo "::error::Published image was not anonymously pullable"
+            exit 1
+          fi
+
+          docker run -d --name "$container" -p 127.0.0.1::3000 "$image"
+          host_port="$(
+            docker container inspect \
+              --format '{{(index (index .NetworkSettings.Ports "3000/tcp") 0).HostPort}}' \
+              "$container"
+          )"
+          if [[ -z "$host_port" ]]; then
+            echo "::error::Docker did not publish the server port"
+            exit 1
+          fi
+
+          for _ in {1..60}; do
+            body="$(curl -fsS "http://127.0.0.1:${host_port}/healthz" 2>/dev/null || true)"
+            if [[ "$body" == '{"ok":true}' ]]; then
+              exit 0
             fi
             sleep 1
           done
 
-          if [[ "$ok" != "true" ]]; then
-            docker logs "$container" || true
-            exit 1
-          fi
-
-          docker tag "$image" "${ghcr_image}:${GITHUB_REF_NAME}"
-          docker tag "$image" "${ghcr_image}:latest"
-          docker push "${ghcr_image}:${GITHUB_REF_NAME}"
-          docker push "${ghcr_image}:latest"
+          docker logs "$container" || true
+          echo "::error::Published image did not return the expected /healthz response"
+          exit 1
 
   npx-smoke:
     needs: publish-npm

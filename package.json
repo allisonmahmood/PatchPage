@@ -9,6 +9,7 @@
     "dev": "turbo run dev --parallel",
     "test": "turbo run test",
     "test:release-workflow": "node scripts/verify-release-workflow.mjs",
+    "test:server-image": "bash scripts/verify-server-image.sh",
     "lint": "turbo run lint",
     "typecheck": "turbo run typecheck",
     "db:migrate": "turbo run db:migrate",

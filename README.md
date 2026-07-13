@@ -35,7 +35,7 @@ The skill source lives at [skills/patchpage/SKILL.md](skills/patchpage/SKILL.md)
 
 ## Self-hosting
 
-PatchPage is a normal Node HTTP service and runs anywhere that supports Node or containers. It uses Postgres (or a local JSON file) for metadata and filesystem or Azure Blob Storage for HTML objects. See [docs/SELF_HOSTING.md](docs/SELF_HOSTING.md) for a full walkthrough: configuration, database migration, running the server, and minting API tokens.
+Release automation publishes the supported container image as `ghcr.io/allisonmahmood/patchpage-server`. It runs as a non-root user and uses `/data` as the writable persistence mount for the default JSON metadata and filesystem storage drivers. PatchPage can also run directly on Node with Postgres or JSON metadata and filesystem or Azure Blob Storage. See [docs/SELF_HOSTING.md](docs/SELF_HOSTING.md) for image tags, container and source setup, configuration, database migration, and minting API tokens.
 
 ## Repository layout
 
