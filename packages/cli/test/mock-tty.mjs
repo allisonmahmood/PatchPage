@@ -11,17 +11,24 @@ let isRaw = false;
 let windowsSignalScheduled = false;
 
 if (timeoutSignalReportPath) {
-  const writeTimeoutSignalReport = (sigtermReceived) => {
-    writeFileSync(
-      timeoutSignalReportPath,
-      JSON.stringify({ ready: true, sigtermReceived })
-    );
+  const timeoutSignalState = {
+    ready: true,
+    sigtermReceived: false,
+    fallbackTriggered: false
+  };
+  const writeTimeoutSignalReport = () => {
+    writeFileSync(timeoutSignalReportPath, JSON.stringify(timeoutSignalState));
   };
   process.on("SIGTERM", () => {
-    writeTimeoutSignalReport(true);
+    timeoutSignalState.sigtermReceived = true;
+    writeTimeoutSignalReport();
   });
-  writeTimeoutSignalReport(false);
-  setTimeout(() => process.kill(process.pid, "SIGKILL"), 2_000);
+  writeTimeoutSignalReport();
+  setTimeout(() => {
+    timeoutSignalState.fallbackTriggered = true;
+    writeTimeoutSignalReport();
+    process.kill(process.pid, "SIGKILL");
+  }, 2_000);
   await new Promise(() => {});
 }
 

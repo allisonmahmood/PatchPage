@@ -393,7 +393,8 @@ describe("patchpage auth set terminal boundary", () => {
       ).rejects.toThrow("CLI timed out: patchpage auth set");
       expect(JSON.parse(readFileSync(timeoutSignalReportPath, "utf8"))).toEqual({
         ready: true,
-        sigtermReceived: false
+        sigtermReceived: false,
+        fallbackTriggered: false
       });
     }
   );
