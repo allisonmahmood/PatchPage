@@ -78,6 +78,7 @@ describe("PatchPage server", () => {
     expect(isProtectedApiPath("/%61pi/does-not-exist")).toBe(true);
     expect(isProtectedApiPath("http://host/api/does-not-exist?ignored=true")).toBe(true);
     expect(isProtectedApiPath("https://host/%61pi/does-not-exist#fragment")).toBe(true);
+    expect(isProtectedApiPath("http://host?x=/api/%")).toBe(false);
     expect(isProtectedApiPath("HtTp://host/%61pi/does-not-exist")).toBe(true);
     expect(isProtectedApiPath("/api%2Fdoes-not-exist")).toBe(true);
     expect(isProtectedApiPath("/api//does-not-exist")).toBe(true);
@@ -740,6 +741,65 @@ describe("PatchPage server", () => {
       }
     }
   );
+
+  it("preserves authenticated 404s for long unmatched API route shapes", async () => {
+    const config = testConfig();
+    const db = new JsonFilePatchPageDb(path.join(tempDir, "long-unmatched-api-db.json"));
+    await db.initialize("dev-token");
+    const storage = new FileSystemHtmlStorage(
+      path.join(tempDir, "long-unmatched-api-drafts")
+    );
+    const app = createApp({ config, db, storage });
+    const longSegment = "x".repeat(101);
+
+    try {
+      for (const { method, requestTarget } of [
+        { method: "POST", requestTarget: `/api/unmatched/${longSegment}` },
+        {
+          method: "PUT",
+          requestTarget: `/api/drafts/${longSegment}/disable`
+        }
+      ]) {
+        const response = await rawHttpRequest(
+          app,
+          requestTarget,
+          "",
+          { Authorization: "Bearer dev-token" },
+          { closeAfterWrite: false, method }
+        );
+        expect(response.statusCode).toBe(404);
+        expect(response.json()).toEqual({ ok: false, error: "Not found." });
+      }
+    } finally {
+      await app.close();
+      await db.close();
+    }
+  });
+
+  it("does not classify an absolute URI query as an API path or consume its bucket", async () => {
+    const config = testConfig();
+    const db = new JsonFilePatchPageDb(path.join(tempDir, "absolute-query-db.json"));
+    await db.initialize("dev-token");
+    const storage = new FileSystemHtmlStorage(path.join(tempDir, "absolute-query-drafts"));
+    const app = createApp({ config, db, storage });
+
+    try {
+      const publicQuery = await rawHttpRequest(app, "http://host?x=/api/%");
+      expect(publicQuery.statusCode).toBe(400);
+
+      for (let attempt = 1; attempt <= 60; attempt += 1) {
+        const response = await rawHttpRequest(app, "/api/does-not-exist");
+        expect(response.statusCode).toBe(401);
+      }
+
+      const limited = await rawHttpRequest(app, "/api/does-not-exist");
+      expect(limited.statusCode).toBe(429);
+      expect(limited.headers["retry-after"]).toBe("60");
+    } finally {
+      await app.close();
+      await db.close();
+    }
+  });
 
   it("limits authenticated upload attempts by stable token identity", async () => {
     let now = 1_000;
@@ -1489,7 +1549,7 @@ async function rawHttpRequest(
   requestTarget: string,
   payload = "",
   headers: Record<string, string> = {},
-  options: { closeAfterWrite?: boolean } = {}
+  options: { closeAfterWrite?: boolean; method?: string } = {}
 ): Promise<RawHttpResponse> {
   const address = app.server.address();
   const port =
@@ -1538,7 +1598,7 @@ async function rawHttpRequest(
         ([name, value]) => `${name}: ${value}`
       );
       const request = [
-        `POST ${requestTarget} HTTP/1.1`,
+        `${options.method ?? "POST"} ${requestTarget} HTTP/1.1`,
         ...headerLines,
         "",
         payload

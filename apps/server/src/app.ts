@@ -405,28 +405,51 @@ export function isProtectedApiPath(requestTarget: string): boolean {
   return classifyApiRequestTargetPolicy(requestTarget).protected;
 }
 
+function rawRequestTargetPath(requestTarget: string): string {
+  const end = requestTarget.search(/[?#]/);
+  const targetWithoutQuery = end === -1 ? requestTarget : requestTarget.slice(0, end);
+  const absolutePrefix = /^https?:\/\//i.exec(targetWithoutQuery)?.[0];
+  if (!absolutePrefix) return targetWithoutQuery;
+
+  const pathStart = targetWithoutQuery.indexOf("/", absolutePrefix.length);
+  return pathStart === -1 ? "/" : targetWithoutQuery.slice(pathStart);
+}
+
+function registeredApiParamExceedsRouterLimit(
+  method: string | undefined,
+  rawPath: string
+): boolean {
+  if (method !== "POST" && method !== "DELETE") return false;
+
+  const [leading, rawApi, rawDrafts, rawParameter] = rawPath.split("/");
+  if (
+    leading !== "" ||
+    rawApi === undefined ||
+    rawDrafts === undefined ||
+    rawParameter === undefined ||
+    decodeURI(rawApi) !== "api" ||
+    decodeURI(rawDrafts) !== "drafts"
+  ) {
+    return false;
+  }
+
+  return decodeURIComponent(rawParameter).length > FASTIFY_DEFAULT_MAX_PARAM_LENGTH;
+}
+
 function rewriteProtectedApiRoutingFailure(request: IncomingMessage): string {
   const requestTarget = request.url ?? "/";
+  const rawPath = rawRequestTargetPath(requestTarget);
   const pathname = canonicalRequestTargetPath(requestTarget);
   let errorStatus: PreRoutingApiErrorStatus | undefined;
 
   if (pathname === null) {
     if (!hasLexicalProtectedApiPrefix(requestTarget)) return requestTarget;
     errorStatus = 400;
-  } else if (isApiPolicyPath(pathname)) {
-    const originForm = requestTarget.replace(/^https?:\/\/.*?\//i, "/");
-    const end = originForm.search(/[?#]/);
-    const rawPath = end === -1 ? originForm : originForm.slice(0, end);
-    if (
-      rawPath
-        .split("/")
-        .some(
-          (segment) =>
-            decodeURIComponent(segment).length > FASTIFY_DEFAULT_MAX_PARAM_LENGTH
-        )
-    ) {
-      errorStatus = 414;
-    }
+  } else if (
+    isApiPolicyPath(pathname) &&
+    registeredApiParamExceedsRouterLimit(request.method, rawPath)
+  ) {
+    errorStatus = 414;
   }
 
   if (!errorStatus) return requestTarget;
@@ -435,9 +458,7 @@ function rewriteProtectedApiRoutingFailure(request: IncomingMessage): string {
 }
 
 function hasLexicalProtectedApiPrefix(requestTarget: string): boolean {
-  const originForm = requestTarget.replace(/^https?:\/\/.*?\//i, "/");
-  const end = originForm.search(/[?#]/);
-  const rawPath = end === -1 ? originForm : originForm.slice(0, end);
+  const rawPath = rawRequestTargetPath(requestTarget);
   const asciiDecodedPath = rawPath.replace(/%([0-7][0-9a-f])/gi, (_escape, hex: string) =>
     String.fromCharCode(Number.parseInt(hex, 16))
   );
@@ -449,9 +470,7 @@ function isApiPolicyPath(pathname: string): boolean {
 }
 
 function canonicalRequestTargetPath(requestTarget: string): string | null {
-  const originForm = requestTarget.replace(/^https?:\/\/.*?\//i, "/");
-  const end = originForm.search(/[?#]/);
-  const rawPath = end === -1 ? originForm : originForm.slice(0, end);
+  const rawPath = rawRequestTargetPath(requestTarget);
   const rawPathWithPolicySeparators = rawPath.replace(/%2f/gi, "/");
 
   try {
