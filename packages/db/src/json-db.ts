@@ -1,7 +1,18 @@
 import { randomUUID } from "node:crypto";
-import { mkdir, open, readFile, rename, stat, unlink, type FileHandle } from "node:fs/promises";
+import type { Stats } from "node:fs";
+import {
+  mkdir,
+  lstat,
+  open,
+  readFile,
+  realpath,
+  rename,
+  stat,
+  unlink,
+  type FileHandle
+} from "node:fs/promises";
 import path from "node:path";
-import { TextDecoder } from "node:util";
+import { TextDecoder, types as utilTypes } from "node:util";
 import { newInternalId, sha256 } from "@patchpage/core";
 import type {
   ApiTokenAuth,
@@ -125,6 +136,7 @@ export class JsonFilePatchPageDb implements PatchPageDb {
 
   async recordUpload(input: RecordUploadInput): Promise<RecordUploadResult> {
     return this.mutateState((state) => {
+      assertLosslessJsonPersistenceValue(input.metadata);
       const now = new Date().toISOString();
       const existingDraft = state.drafts.find((draft) => draft.id === input.draftId) || null;
 
@@ -259,7 +271,8 @@ export class JsonFilePatchPageDb implements PatchPageDb {
   private async mutateState<T>(
     mutate: (state: JsonDbState) => StateMutationResult<T>
   ): Promise<T> {
-    return serializeJsonMutation(this.filePath, async () => {
+    const mutationIdentity = await canonicalMutationIdentity(this.filePath);
+    return serializeJsonMutation(mutationIdentity, async () => {
       const state = await this.readState();
       const result = mutate(state);
       if (result.changed) await this.writeState(state);
@@ -268,6 +281,8 @@ export class JsonFilePatchPageDb implements PatchPageDb {
   }
 
   private async readState(): Promise<JsonDbState> {
+    await inspectDatabaseFilePath(this.filePath);
+
     let bytes: Buffer;
     try {
       bytes = await readFile(this.filePath);
@@ -298,28 +313,49 @@ export class JsonFilePatchPageDb implements PatchPageDb {
   }
 
   private async writeState(state: JsonDbState): Promise<void> {
+    const serialized = serializeLosslessJsonState(state);
     const directoryPath = path.dirname(this.filePath);
-    const existingMode = await readFileMode(this.filePath);
     const temporaryPath = path.join(
       directoryPath,
       `.${path.basename(this.filePath)}.${process.pid}.${randomUUID()}.tmp`
     );
+    let directory: FileHandle | null = null;
     let temporaryFile: FileHandle | null = null;
     let renamed = false;
 
-    await mkdir(directoryPath, { recursive: true });
-
     try {
+      directory = await ensureDurableDirectory(directoryPath);
+      const existingFile = await inspectDatabaseFilePath(this.filePath);
+      const existingMode = existingFile ? existingFile.mode & 0o777 : null;
+
       temporaryFile = await open(temporaryPath, "wx", existingMode ?? 0o666);
-      await temporaryFile.writeFile(`${JSON.stringify(state, null, 2)}\n`, "utf8");
+      await temporaryFile.writeFile(serialized, "utf8");
       if (existingMode !== null) await temporaryFile.chmod(existingMode);
       await temporaryFile.sync();
       await temporaryFile.close();
       temporaryFile = null;
 
-      await rename(temporaryPath, this.filePath);
+      await inspectDatabaseFilePath(this.filePath);
+      try {
+        await rename(temporaryPath, this.filePath);
+      } catch (error) {
+        // Linux reports EBUSY when rename targets a mount point, including
+        // same-filesystem bind mounts that ordinary stat identity cannot detect.
+        if (process.platform === "linux" && hasErrorCode(error, "EBUSY")) {
+          throw new Error(
+            "JSON metadata file cannot be a Linux single-file bind mount; mount a writable containing directory instead."
+          );
+        }
+        throw error;
+      }
       renamed = true;
-      await syncDirectory(directoryPath);
+      try {
+        await syncDirectoryHandle(directory);
+      } catch {
+        throw new Error(
+          "JSON metadata commit outcome is indeterminate because the containing directory could not be flushed after rename."
+        );
+      }
     } finally {
       if (temporaryFile) {
         await temporaryFile.close().catch(() => undefined);
@@ -327,17 +363,167 @@ export class JsonFilePatchPageDb implements PatchPageDb {
       if (!renamed) {
         await unlink(temporaryPath).catch(() => undefined);
       }
+      if (directory) {
+        await directory.close().catch(() => undefined);
+      }
     }
   }
 }
 
-async function serializeJsonMutation<T>(filePath: string, task: () => Promise<T>): Promise<T> {
-  const previous = mutationQueues.get(filePath);
+async function inspectDatabaseFilePath(filePath: string): Promise<Stats | null> {
+  try {
+    const fileStats = await lstat(filePath);
+    if (fileStats.isSymbolicLink()) {
+      throw new Error("JSON metadata file path must not be a symbolic link.");
+    }
+    return fileStats;
+  } catch (error) {
+    if (hasErrorCode(error, "ENOENT")) return null;
+    throw error;
+  }
+}
+
+async function canonicalMutationIdentity(filePath: string): Promise<string> {
+  let existingAncestor = path.dirname(filePath);
+  const unresolvedComponents = [path.basename(filePath)];
+
+  while (true) {
+    try {
+      const canonicalAncestor = await realpath(existingAncestor);
+      // This is a process-local coordination key, not an I/O path. Conservative
+      // case folding avoids split queues before a case-insensitive filesystem can
+      // return the final component's canonical spelling.
+      return foldMutationIdentity(path.join(canonicalAncestor, ...unresolvedComponents));
+    } catch (error) {
+      if (!hasErrorCode(error, "ENOENT")) throw error;
+
+      const parent = path.dirname(existingAncestor);
+      if (parent === existingAncestor) throw error;
+      unresolvedComponents.unshift(path.basename(existingAncestor));
+      existingAncestor = parent;
+    }
+  }
+}
+
+function foldMutationIdentity(filePath: string): string {
+  return filePath.normalize("NFKC").toUpperCase().toLowerCase().normalize("NFKC");
+}
+
+function serializeLosslessJsonState(state: JsonDbState): string {
+  try {
+    assertLosslessJsonPersistenceValue(state);
+    if (!isJsonDbState(state)) throw new Error("Invalid JSON database state.");
+
+    const serialized = JSON.stringify(state, null, 2);
+    if (typeof serialized !== "string") throw new Error("JSON serialization failed.");
+    return `${serialized}\n`;
+  } catch {
+    throw jsonPersistenceError();
+  }
+}
+
+function assertLosslessJsonPersistenceValue(value: unknown): void {
+  try {
+    assertLosslessJsonValue(value, new WeakSet<object>());
+  } catch {
+    throw jsonPersistenceError();
+  }
+}
+
+function jsonPersistenceError(): Error {
+  return new Error("JSON metadata state cannot be persisted losslessly.");
+}
+
+function assertLosslessJsonValue(value: unknown, seen: WeakSet<object>): void {
+  if (value === null || typeof value === "string" || typeof value === "boolean") return;
+
+  if (typeof value === "number") {
+    if (!Number.isFinite(value) || Object.is(value, -0)) throw new Error("Unsafe JSON number.");
+    return;
+  }
+
+  if (typeof value !== "object" || utilTypes.isProxy(value)) {
+    throw new Error("Unsafe JSON value.");
+  }
+
+  if (seen.has(value)) throw new Error("Repeated JSON object reference.");
+  seen.add(value);
+
+  assertNoJsonTransformation(value);
+
+  if (Array.isArray(value)) {
+    if (Object.getPrototypeOf(value) !== Array.prototype) {
+      throw new Error("Unsafe JSON array.");
+    }
+
+    const keys = Reflect.ownKeys(value);
+    if (keys.length !== value.length + 1) throw new Error("Sparse JSON array.");
+
+    for (const key of keys) {
+      if (key === "length") continue;
+      if (typeof key !== "string") throw new Error("Symbol-keyed JSON array.");
+
+      const index = Number(key);
+      if (
+        !Number.isInteger(index) ||
+        index < 0 ||
+        index >= value.length ||
+        String(index) !== key
+      ) {
+        throw new Error("Non-index JSON array property.");
+      }
+
+      assertJsonDataProperty(value, key, seen);
+    }
+    return;
+  }
+
+  if (Object.getPrototypeOf(value) !== Object.prototype) {
+    throw new Error("Unsafe JSON object.");
+  }
+
+  for (const key of Reflect.ownKeys(value)) {
+    if (typeof key !== "string") throw new Error("Symbol-keyed JSON object.");
+    assertJsonDataProperty(value, key, seen);
+  }
+}
+
+function assertNoJsonTransformation(value: object): void {
+  let current: object | null = value;
+  while (current) {
+    const descriptor = Object.getOwnPropertyDescriptor(current, "toJSON");
+    if (
+      descriptor &&
+      (!("value" in descriptor) || typeof descriptor.value === "function")
+    ) {
+      throw new Error("JSON transformation is unsupported.");
+    }
+    current = Object.getPrototypeOf(current) as object | null;
+  }
+}
+
+function assertJsonDataProperty(
+  object: object,
+  key: string,
+  seen: WeakSet<object>
+): void {
+  const descriptor = Object.getOwnPropertyDescriptor(object, key);
+  if (!descriptor || !descriptor.enumerable || !("value" in descriptor)) {
+    throw new Error("Unsafe JSON property.");
+  }
+  assertLosslessJsonValue(descriptor.value, seen);
+}
+
+async function serializeJsonMutation<T>(
+  mutationIdentity: string,
+  task: () => Promise<T>
+): Promise<T> {
+  const previous = mutationQueues.get(mutationIdentity);
   let release = (): void => undefined;
   const current = new Promise<void>((resolve) => {
     release = resolve;
   });
-  mutationQueues.set(filePath, current);
+  mutationQueues.set(mutationIdentity, current);
 
   if (previous) await previous;
 
@@ -345,8 +531,8 @@ async function serializeJsonMutation<T>(filePath: string, task: () => Promise<T>
     return await task();
   } finally {
     release();
-    if (mutationQueues.get(filePath) === current) {
-      mutationQueues.delete(filePath);
+    if (mutationQueues.get(mutationIdentity) === current) {
+      mutationQueues.delete(mutationIdentity);
     }
   }
 }
@@ -355,29 +541,53 @@ function hasErrorCode(error: unknown, code: string): boolean {
   return error instanceof Error && "code" in error && error.code === code;
 }
 
-async function readFileMode(filePath: string): Promise<number | null> {
+async function ensureDurableDirectory(directoryPath: string): Promise<FileHandle | null> {
   try {
-    return (await stat(filePath)).mode & 0o777;
+    return await openDirectoryHandle(directoryPath);
   } catch (error) {
-    if (hasErrorCode(error, "ENOENT")) return null;
+    if (!hasErrorCode(error, "ENOENT")) throw error;
+
+    const parentPath = path.dirname(directoryPath);
+    if (parentPath === directoryPath) throw error;
+    const parent = await ensureDurableDirectory(parentPath);
+
+    try {
+      try {
+        await mkdir(directoryPath);
+      } catch (mkdirError) {
+        if (!hasErrorCode(mkdirError, "EEXIST") || !(await stat(directoryPath)).isDirectory()) {
+          throw mkdirError;
+        }
+      }
+      await syncDirectoryHandle(parent);
+    } finally {
+      if (parent) await parent.close().catch(() => undefined);
+    }
+
+    return openDirectoryHandle(directoryPath);
+  }
+}
+
+async function openDirectoryHandle(directoryPath: string): Promise<FileHandle | null> {
+  try {
+    return await open(directoryPath, "r");
+  } catch (error) {
+    if (isUnsupportedDirectoryOperationError(error)) return null;
     throw error;
   }
 }
 
-async function syncDirectory(directoryPath: string): Promise<void> {
-  let directory: FileHandle | null = null;
+async function syncDirectoryHandle(directory: FileHandle | null): Promise<void> {
+  if (!directory) return;
 
   try {
-    directory = await open(directoryPath, "r");
     await directory.sync();
   } catch (error) {
-    if (!isUnsupportedDirectorySyncError(error)) throw error;
-  } finally {
-    if (directory) await directory.close();
+    if (!isUnsupportedDirectoryOperationError(error)) throw error;
   }
 }
 
-function isUnsupportedDirectorySyncError(error: unknown): boolean {
+function isUnsupportedDirectoryOperationError(error: unknown): boolean {
   if (!(error instanceof Error) || !("code" in error)) return false;
 
   return (

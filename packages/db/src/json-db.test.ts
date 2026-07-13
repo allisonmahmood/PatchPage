@@ -1,7 +1,20 @@
-import { chmod, mkdtemp, open, readFile, rm, stat, writeFile } from "node:fs/promises";
+import {
+  chmod,
+  lstat,
+  mkdir,
+  mkdtemp,
+  open,
+  readFile,
+  readlink,
+  readdir,
+  rm,
+  stat,
+  symlink,
+  writeFile
+} from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { JsonFilePatchPageDb } from "./json-db.js";
 
 let tempDir: string;
@@ -87,6 +100,137 @@ describe("JsonFilePatchPageDb", () => {
       const lookup = await setupDb.findDraftVersion(upload.draftId);
       expect(lookup.version?.id).toBe(upload.versionId);
       expect(lookup.version?.objectKey).toBe(upload.objectKey);
+    }
+  });
+
+  it.skipIf(process.platform === "win32")(
+    "serializes fresh-file mutations through symlinked parent paths",
+    async () => {
+      const realParent = path.join(tempDir, "real-parent");
+      const aliasedParent = path.join(tempDir, "aliased-parent");
+      await mkdir(realParent);
+      await symlink(realParent, aliasedParent, "dir");
+
+      const realFilePath = path.join(realParent, "missing-parent", "db.json");
+      const aliasedFilePath = path.join(aliasedParent, "missing-parent", "db.json");
+      const uploads = Array.from({ length: 12 }, (_, index) => {
+        const draftId = `symlink_draft_${index}`;
+        const versionId = `symlink_ver_${index}`;
+        const db = new JsonFilePatchPageDb(index % 2 === 0 ? realFilePath : aliasedFilePath);
+
+        return db.recordUpload({
+          draftId,
+          versionId,
+          accountId: "acct_test",
+          apiTokenId: "tok_test",
+          title: `Symlink draft ${index}`,
+          objectKey: `drafts/${draftId}/versions/${versionId}.html`,
+          contentHash: `sha256:symlink-${index}`,
+          fileSize: index + 1,
+          filename: `symlink-${index}.html`,
+          metadata: { padding: "x".repeat(64 * 1024) },
+          sourceIp: null,
+          userAgent: "vitest"
+        });
+      });
+
+      await Promise.all(uploads);
+
+      const db = new JsonFilePatchPageDb(realFilePath);
+      for (let index = 0; index < uploads.length; index += 1) {
+        const lookup = await db.findDraftVersion(`symlink_draft_${index}`);
+        expect(lookup.version?.id).toBe(`symlink_ver_${index}`);
+      }
+    }
+  );
+
+  it("serializes fresh-file mutations through case aliases on case-insensitive filesystems", async () => {
+    const parentPath = path.join(tempDir, "CaseParent");
+    const parentAlias = path.join(tempDir, "caseparent");
+    await mkdir(parentPath);
+
+    const aliasesShareDirectory = await stat(parentAlias).then(
+      (aliasStats) => stat(parentPath).then((parentStats) => aliasStats.ino === parentStats.ino),
+      () => false
+    );
+    if (!aliasesShareDirectory) return;
+
+    const upperFilePath = path.join(parentPath, "PatchPage.JSON");
+    const lowerFilePath = path.join(parentAlias, "patchpage.json");
+    const uploads = Array.from({ length: 12 }, (_, index) => {
+      const draftId = `case_draft_${index}`;
+      const versionId = `case_ver_${index}`;
+      const db = new JsonFilePatchPageDb(index % 2 === 0 ? upperFilePath : lowerFilePath);
+
+      return db.recordUpload({
+        draftId,
+        versionId,
+        accountId: "acct_test",
+        apiTokenId: "tok_test",
+        title: `Case draft ${index}`,
+        objectKey: `drafts/${draftId}/versions/${versionId}.html`,
+        contentHash: `sha256:case-${index}`,
+        fileSize: index + 1,
+        filename: `case-${index}.html`,
+        metadata: { padding: "x".repeat(64 * 1024) },
+        sourceIp: null,
+        userAgent: "vitest"
+      });
+    });
+
+    await Promise.all(uploads);
+
+    const db = new JsonFilePatchPageDb(upperFilePath);
+    for (let index = 0; index < uploads.length; index += 1) {
+      const lookup = await db.findDraftVersion(`case_draft_${index}`);
+      expect(lookup.version?.id).toBe(`case_ver_${index}`);
+    }
+  });
+
+  it("serializes fresh-file mutations through Unicode case aliases when the filesystem supports them", async () => {
+    const parentPath = path.join(tempDir, "unicode-case-parent");
+    await mkdir(parentPath);
+    const probePath = path.join(parentPath, "Straße.probe");
+    const probeAlias = path.join(parentPath, "STRASSE.probe");
+    await writeFile(probePath, "probe");
+    const aliasesShareFile = await stat(probeAlias).then(
+      (aliasStats) => stat(probePath).then((probeStats) => aliasStats.ino === probeStats.ino),
+      () => false
+    );
+    await rm(probePath);
+    if (!aliasesShareFile) return;
+
+    const mixedCaseFilePath = path.join(parentPath, "Straße.JSON");
+    const foldedFilePath = path.join(parentPath, "STRASSE.json");
+    const uploads = Array.from({ length: 8 }, (_, index) => {
+      const draftId = `unicode_case_draft_${index}`;
+      const versionId = `unicode_case_ver_${index}`;
+      const db = new JsonFilePatchPageDb(
+        index % 2 === 0 ? mixedCaseFilePath : foldedFilePath
+      );
+
+      return db.recordUpload({
+        draftId,
+        versionId,
+        accountId: "acct_test",
+        apiTokenId: "tok_test",
+        title: `Unicode case draft ${index}`,
+        objectKey: `drafts/${draftId}/versions/${versionId}.html`,
+        contentHash: `sha256:unicode-case-${index}`,
+        fileSize: index + 1,
+        filename: `unicode-case-${index}.html`,
+        metadata: { padding: "x".repeat(64 * 1024) },
+        sourceIp: null,
+        userAgent: "vitest"
+      });
+    });
+
+    await Promise.all(uploads);
+
+    const db = new JsonFilePatchPageDb(mixedCaseFilePath);
+    for (let index = 0; index < uploads.length; index += 1) {
+      const lookup = await db.findDraftVersion(`unicode_case_draft_${index}`);
+      expect(lookup.version?.id).toBe(`unicode_case_ver_${index}`);
     }
   });
 
@@ -271,6 +415,525 @@ describe("JsonFilePatchPageDb", () => {
     expect(await readFile(filePath)).toEqual(original);
     expect(error).toBeInstanceOf(Error);
     expect(String(error)).not.toContain("persisted-secret");
+  });
+
+  it.skipIf(process.platform === "win32")(
+    "rejects a live final-component database symlink without changing it or its target",
+    async () => {
+      const targetPath = path.join(tempDir, "target.json");
+      const filePath = path.join(tempDir, "db.json");
+      await new JsonFilePatchPageDb(targetPath).initialize("target-secret");
+      const originalTarget = await readFile(targetPath);
+      await symlink(path.basename(targetPath), filePath);
+      const originalLink = await lstat(filePath);
+      const originalLinkTarget = await readlink(filePath);
+
+      const error = await new JsonFilePatchPageDb(filePath)
+        .initialize("replacement-secret")
+        .then(
+          () => null,
+          (reason: unknown) => reason
+        );
+
+      const finalLink = await lstat(filePath);
+      expect(error).toBeInstanceOf(Error);
+      expect((error as Error).message).toBe(
+        "JSON metadata file path must not be a symbolic link."
+      );
+      expect(String(error)).not.toContain("target-secret");
+      expect(String(error)).not.toContain("replacement-secret");
+      expect(finalLink.isSymbolicLink()).toBe(true);
+      expect(finalLink.ino).toBe(originalLink.ino);
+      expect(await readlink(filePath)).toBe(originalLinkTarget);
+      expect(await readFile(targetPath)).toEqual(originalTarget);
+      expect((await readdir(tempDir)).sort()).toEqual(["db.json", "target.json"]);
+    }
+  );
+
+  it.skipIf(process.platform === "win32")(
+    "rejects a dangling final-component database symlink without replacing it",
+    async () => {
+      const targetPath = path.join(tempDir, "missing-target.json");
+      const filePath = path.join(tempDir, "db.json");
+      await symlink(path.basename(targetPath), filePath);
+      const originalLink = await lstat(filePath);
+      const originalLinkTarget = await readlink(filePath);
+
+      const error = await new JsonFilePatchPageDb(filePath)
+        .initialize("replacement-secret")
+        .then(
+          () => null,
+          (reason: unknown) => reason
+        );
+
+      const finalLink = await lstat(filePath);
+      expect(error).toBeInstanceOf(Error);
+      expect((error as Error).message).toBe(
+        "JSON metadata file path must not be a symbolic link."
+      );
+      expect(String(error)).not.toContain("replacement-secret");
+      expect(finalLink.isSymbolicLink()).toBe(true);
+      expect(finalLink.ino).toBe(originalLink.ino);
+      expect(await readlink(filePath)).toBe(originalLinkTarget);
+      await expect(lstat(targetPath)).rejects.toMatchObject({ code: "ENOENT" });
+      expect(await readdir(tempDir)).toEqual(["db.json"]);
+    }
+  );
+
+  it("rejects mutation state that cannot survive JSON persistence losslessly", async () => {
+    const filePath = path.join(tempDir, "db.json");
+    const db = new JsonFilePatchPageDb(filePath);
+    await db.initialize("dev-token");
+    const auth = await db.findApiTokenByToken("dev-token");
+    expect(auth).not.toBeNull();
+    const original = await readFile(filePath);
+
+    const cyclicValue: Record<string, unknown> = { secret: "mutation-secret" };
+    cyclicValue.self = cyclicValue;
+    const sparseValue = new Array(1);
+    let toJsonCalls = 0;
+    const transformingValue = {
+      secret: "mutation-secret",
+      toJSON() {
+        toJsonCalls += 1;
+        return { transformed: true };
+      }
+    };
+    const accessorValue = Object.defineProperty({}, "secret", {
+      enumerable: true,
+      get() {
+        throw new Error("mutation-secret");
+      }
+    });
+    const hiddenValue = Object.defineProperty({}, "secret", {
+      enumerable: false,
+      value: "mutation-secret"
+    });
+    const symbolKeyValue = { safe: true } as Record<PropertyKey, unknown>;
+    symbolKeyValue[Symbol("mutation-secret")] = true;
+    const sharedChild = { secret: "mutation-secret" };
+    const sharedReferenceValue = { first: sharedChild, second: sharedChild };
+    const nullPrototypeValue = Object.assign(Object.create(null), { safe: true });
+
+    const hazards: Array<{ name: string; value: unknown }> = [
+      { name: "NaN", value: Number.NaN },
+      { name: "positive infinity", value: Number.POSITIVE_INFINITY },
+      { name: "negative infinity", value: Number.NEGATIVE_INFINITY },
+      { name: "negative zero", value: -0 },
+      { name: "undefined", value: undefined },
+      { name: "function", value: () => "mutation-secret" },
+      { name: "symbol", value: Symbol("mutation-secret") },
+      { name: "bigint", value: 1n },
+      { name: "transforming toJSON", value: transformingValue },
+      { name: "cycle", value: cyclicValue },
+      { name: "sparse array", value: sparseValue },
+      { name: "accessor", value: accessorValue },
+      { name: "non-enumerable state", value: hiddenValue },
+      { name: "symbol-keyed state", value: symbolKeyValue },
+      { name: "shared object reference", value: sharedReferenceValue },
+      { name: "null-prototype object", value: nullPrototypeValue },
+      { name: "exotic object", value: new Date() }
+    ];
+
+    for (const hazard of hazards) {
+      const error = await db
+        .recordUpload({
+          draftId: `unsafe_${hazard.name}`,
+          versionId: `ver_${hazard.name}`,
+          accountId: auth!.accountId,
+          apiTokenId: auth!.id,
+          title: "Unsafe mutation",
+          objectKey: "drafts/unsafe/version.html",
+          contentHash: "sha256:unsafe",
+          fileSize: 1,
+          filename: "unsafe.html",
+          metadata: { secret: "mutation-secret", hazard: hazard.value },
+          sourceIp: null,
+          userAgent: "vitest"
+        })
+        .then(
+          () => null,
+          (reason: unknown) => reason
+        );
+
+      expect(error, hazard.name).toBeInstanceOf(Error);
+      expect((error as Error).message, hazard.name).toBe(
+        "JSON metadata state cannot be persisted losslessly."
+      );
+      expect(String(error), hazard.name).not.toContain("mutation-secret");
+      expect(String(error), hazard.name).not.toContain("dev-token");
+      expect(await readFile(filePath), hazard.name).toEqual(original);
+      expect(await readdir(tempDir), hazard.name).toEqual(["db.json"]);
+    }
+
+    expect(toJsonCalls).toBe(0);
+  });
+
+  it("rejects unsafe metadata accessors without invoking or disclosing them", async () => {
+    const filePath = path.join(tempDir, "db.json");
+    const db = new JsonFilePatchPageDb(filePath);
+    await db.initialize("dev-token");
+    const original = await readFile(filePath);
+    let accessorCalls = 0;
+    const metadata = Object.defineProperty({}, "repoOrg", {
+      enumerable: true,
+      get() {
+        accessorCalls += 1;
+        throw new Error("mutation-secret");
+      }
+    });
+
+    const error = await db
+      .recordUpload({
+        draftId: "unsafe_accessor",
+        versionId: "ver_unsafe_accessor",
+        accountId: "acct_bootstrap",
+        apiTokenId: "tok_bootstrap",
+        title: "Unsafe accessor",
+        objectKey: "drafts/unsafe-accessor/version.html",
+        contentHash: "sha256:unsafe-accessor",
+        fileSize: 1,
+        filename: "unsafe.html",
+        metadata,
+        sourceIp: null,
+        userAgent: "vitest"
+      })
+      .then(
+        () => null,
+        (reason: unknown) => reason
+      );
+
+    expect(error).toBeInstanceOf(Error);
+    expect((error as Error).message).toBe(
+      "JSON metadata state cannot be persisted losslessly."
+    );
+    expect(String(error)).not.toContain("mutation-secret");
+    expect(accessorCalls).toBe(0);
+    expect(await readFile(filePath)).toEqual(original);
+    expect(await readdir(tempDir)).toEqual(["db.json"]);
+  });
+
+  it("rejects unsafe token mutation state without disclosing the raw token", async () => {
+    const filePath = path.join(tempDir, "db.json");
+    const db = new JsonFilePatchPageDb(filePath);
+    await db.initialize("dev-token");
+    const original = await readFile(filePath);
+
+    const error = await db
+      .createApiToken({
+        accountId: "acct_bootstrap",
+        name: "Unsafe token",
+        token: "raw-token-secret",
+        scopes: ["upload", undefined] as unknown as string[]
+      })
+      .then(
+        () => null,
+        (reason: unknown) => reason
+      );
+
+    expect(error).toBeInstanceOf(Error);
+    expect((error as Error).message).toBe(
+      "JSON metadata state cannot be persisted losslessly."
+    );
+    expect(String(error)).not.toContain("raw-token-secret");
+    expect(await readFile(filePath)).toEqual(original);
+    expect(await readdir(tempDir)).toEqual(["db.json"]);
+  });
+
+  it("rejects unsafe state before opening a temporary commit file", async () => {
+    const filePath = path.join(tempDir, "db.json");
+    await new JsonFilePatchPageDb(filePath).initialize("dev-token");
+    const original = await readFile(filePath);
+    const actualFs = await vi.importActual<typeof import("node:fs/promises")>(
+      "node:fs/promises"
+    );
+    const temporaryOpens: string[] = [];
+    const trackedOpen = (async (...args: Parameters<typeof actualFs.open>) => {
+      if (args[1] === "wx") temporaryOpens.push(String(args[0]));
+      return Reflect.apply(actualFs.open, actualFs, args);
+    }) as typeof actualFs.open;
+
+    vi.resetModules();
+    vi.doMock("node:fs/promises", () => ({ ...actualFs, open: trackedOpen }));
+
+    let error: unknown;
+    try {
+      const { JsonFilePatchPageDb: TrackedJsonFilePatchPageDb } = await import(
+        "./json-db.js"
+      );
+      error = await new TrackedJsonFilePatchPageDb(filePath)
+        .recordUpload({
+          draftId: "unsafe_before_temp",
+          versionId: "ver_unsafe_before_temp",
+          accountId: "acct_bootstrap",
+          apiTokenId: "tok_bootstrap",
+          title: "Unsafe before temp",
+          objectKey: "drafts/unsafe-before-temp/version.html",
+          contentHash: "sha256:unsafe-before-temp",
+          fileSize: 1,
+          filename: "unsafe.html",
+          metadata: { secret: "mutation-secret", unsafe: 1n },
+          sourceIp: null,
+          userAgent: "vitest"
+        })
+        .then(
+          () => null,
+          (reason: unknown) => reason
+        );
+    } finally {
+      vi.doUnmock("node:fs/promises");
+      vi.resetModules();
+    }
+
+    expect(error).toBeInstanceOf(Error);
+    expect((error as Error).message).toBe(
+      "JSON metadata state cannot be persisted losslessly."
+    );
+    expect(String(error)).not.toContain("mutation-secret");
+    expect(temporaryOpens).toEqual([]);
+    expect(await readFile(filePath)).toEqual(original);
+  });
+
+  it.skipIf(process.platform === "win32")(
+    "flushes each new parent directory entry during fresh initialization",
+    async () => {
+      const actualFs = await vi.importActual<typeof import("node:fs/promises")>(
+        "node:fs/promises"
+      );
+      const syncedDirectories: string[] = [];
+      const trackedOpen = (async (...args: Parameters<typeof actualFs.open>) => {
+        const handle = await Reflect.apply(actualFs.open, actualFs, args);
+        if (args[1] === "r") {
+          const directoryPath = path.resolve(String(args[0]));
+          const originalSync = handle.sync.bind(handle);
+          handle.sync = async () => {
+            syncedDirectories.push(directoryPath);
+            await originalSync();
+          };
+        }
+        return handle;
+      }) as typeof actualFs.open;
+
+      vi.resetModules();
+      vi.doMock("node:fs/promises", () => ({ ...actualFs, open: trackedOpen }));
+
+      const directoryPath = path.join(tempDir, "first", "second");
+      const filePath = path.join(directoryPath, "db.json");
+      try {
+        const { JsonFilePatchPageDb: TrackedJsonFilePatchPageDb } = await import(
+          "./json-db.js"
+        );
+        await new TrackedJsonFilePatchPageDb(filePath).initialize("dev-token");
+      } finally {
+        vi.doUnmock("node:fs/promises");
+        vi.resetModules();
+      }
+
+      expect(syncedDirectories).toEqual([
+        tempDir,
+        path.join(tempDir, "first"),
+        directoryPath
+      ]);
+      const auth = await new JsonFilePatchPageDb(filePath).findApiTokenByToken(
+        "dev-token"
+      );
+      expect(auth?.id).toBe("tok_bootstrap");
+    }
+  );
+
+  it("fails before commit when the target directory cannot be opened", async () => {
+    const filePath = path.join(tempDir, "db.json");
+    const db = new JsonFilePatchPageDb(filePath);
+    await db.initialize("dev-token");
+    const original = await readFile(filePath);
+    const actualFs = await vi.importActual<typeof import("node:fs/promises")>(
+      "node:fs/promises"
+    );
+    const failingOpen = (async (...args: Parameters<typeof actualFs.open>) => {
+      if (args[1] === "r" && path.resolve(String(args[0])) === tempDir) {
+        throw Object.assign(new Error("directory open failed"), { code: "EACCES" });
+      }
+      return Reflect.apply(actualFs.open, actualFs, args);
+    }) as typeof actualFs.open;
+
+    vi.resetModules();
+    vi.doMock("node:fs/promises", () => ({ ...actualFs, open: failingOpen }));
+
+    let error: unknown;
+    try {
+      const { JsonFilePatchPageDb: FailingJsonFilePatchPageDb } = await import(
+        "./json-db.js"
+      );
+      error = await new FailingJsonFilePatchPageDb(filePath)
+        .initialize("replacement-secret")
+        .then(
+          () => null,
+          (reason: unknown) => reason
+        );
+    } finally {
+      vi.doUnmock("node:fs/promises");
+      vi.resetModules();
+    }
+
+    expect(error).toBeInstanceOf(Error);
+    expect(error).toMatchObject({ code: "EACCES" });
+    expect(String(error)).not.toContain("replacement-secret");
+    expect(await readFile(filePath)).toEqual(original);
+    expect(await readdir(tempDir)).toEqual(["db.json"]);
+    expect(await db.findApiTokenByToken("replacement-secret")).toBeNull();
+  });
+
+  it.skipIf(process.platform === "win32")(
+    "reuses the precommit target directory handle after rename",
+    async () => {
+      const filePath = path.join(tempDir, "db.json");
+      await new JsonFilePatchPageDb(filePath).initialize("dev-token");
+      const actualFs = await vi.importActual<typeof import("node:fs/promises")>(
+        "node:fs/promises"
+      );
+      let targetDirectoryOpens = 0;
+      let targetDirectorySyncs = 0;
+      const singleDirectoryOpen = (async (...args: Parameters<typeof actualFs.open>) => {
+        const isTargetDirectory =
+          args[1] === "r" && path.resolve(String(args[0])) === tempDir;
+        if (isTargetDirectory && targetDirectoryOpens > 0) {
+          throw Object.assign(new Error("target directory reopened"), {
+            code: "EACCES"
+          });
+        }
+
+        const handle = await Reflect.apply(actualFs.open, actualFs, args);
+        if (isTargetDirectory) {
+          targetDirectoryOpens += 1;
+          const originalSync = handle.sync.bind(handle);
+          handle.sync = async () => {
+            targetDirectorySyncs += 1;
+            await originalSync();
+          };
+        }
+        return handle;
+      }) as typeof actualFs.open;
+
+      vi.resetModules();
+      vi.doMock("node:fs/promises", () => ({
+        ...actualFs,
+        open: singleDirectoryOpen
+      }));
+
+      try {
+        const { JsonFilePatchPageDb: SingleOpenJsonFilePatchPageDb } = await import(
+          "./json-db.js"
+        );
+        await new SingleOpenJsonFilePatchPageDb(filePath).initialize(
+          "replacement-secret"
+        );
+      } finally {
+        vi.doUnmock("node:fs/promises");
+        vi.resetModules();
+      }
+
+      expect(targetDirectoryOpens).toBe(1);
+      expect(targetDirectorySyncs).toBe(1);
+      expect(await readdir(tempDir)).toEqual(["db.json"]);
+      const auth = await new JsonFilePatchPageDb(filePath).findApiTokenByToken(
+        "replacement-secret"
+      );
+      expect(auth?.id).toBe("tok_bootstrap");
+    }
+  );
+
+  it("reports an indeterminate outcome when directory fsync fails after rename", async () => {
+    const filePath = path.join(tempDir, "db.json");
+    await new JsonFilePatchPageDb(filePath).initialize("dev-token");
+    const original = await readFile(filePath);
+    const actualFs = await vi.importActual<typeof import("node:fs/promises")>(
+      "node:fs/promises"
+    );
+    const failingOpen = (async (...args: Parameters<typeof actualFs.open>) => {
+      const handle = await Reflect.apply(actualFs.open, actualFs, args);
+      if (args[1] === "r" && path.resolve(String(args[0])) === tempDir) {
+        handle.sync = async () => {
+          throw Object.assign(new Error("filesystem-secret"), { code: "EIO" });
+        };
+      }
+      return handle;
+    }) as typeof actualFs.open;
+
+    vi.resetModules();
+    vi.doMock("node:fs/promises", () => ({ ...actualFs, open: failingOpen }));
+
+    let error: unknown;
+    try {
+      const { JsonFilePatchPageDb: FailingJsonFilePatchPageDb } = await import(
+        "./json-db.js"
+      );
+      error = await new FailingJsonFilePatchPageDb(filePath)
+        .initialize("replacement-secret")
+        .then(
+          () => null,
+          (reason: unknown) => reason
+        );
+    } finally {
+      vi.doUnmock("node:fs/promises");
+      vi.resetModules();
+    }
+
+    expect(error).toBeInstanceOf(Error);
+    expect((error as Error).message).toContain("commit outcome is indeterminate");
+    expect(String(error)).not.toContain("filesystem-secret");
+    expect(String(error)).not.toContain("replacement-secret");
+    expect(await readFile(filePath)).not.toEqual(original);
+    expect(await readdir(tempDir)).toEqual(["db.json"]);
+    const auth = await new JsonFilePatchPageDb(filePath).findApiTokenByToken(
+      "replacement-secret"
+    );
+    expect(auth?.id).toBe("tok_bootstrap");
+  });
+
+  it("rejects Linux single-file mounts without changing the mounted file", async () => {
+    const filePath = path.join(tempDir, "db.json");
+    await new JsonFilePatchPageDb(filePath).initialize("dev-token");
+    const original = await readFile(filePath);
+    const actualFs = await vi.importActual<typeof import("node:fs/promises")>(
+      "node:fs/promises"
+    );
+    const busyRename = (async () => {
+      throw Object.assign(new Error("mount-secret"), { code: "EBUSY" });
+    }) as typeof actualFs.rename;
+    const originalPlatform = Object.getOwnPropertyDescriptor(process, "platform");
+
+    vi.resetModules();
+    vi.doMock("node:fs/promises", () => ({ ...actualFs, rename: busyRename }));
+    Object.defineProperty(process, "platform", {
+      ...originalPlatform,
+      value: "linux"
+    });
+
+    let error: unknown;
+    try {
+      const { JsonFilePatchPageDb: MountedJsonFilePatchPageDb } = await import(
+        "./json-db.js"
+      );
+      error = await new MountedJsonFilePatchPageDb(filePath)
+        .initialize("replacement-secret")
+        .then(
+          () => null,
+          (reason: unknown) => reason
+        );
+    } finally {
+      vi.doUnmock("node:fs/promises");
+      vi.resetModules();
+      if (originalPlatform) Object.defineProperty(process, "platform", originalPlatform);
+    }
+
+    expect(error).toBeInstanceOf(Error);
+    expect((error as Error).message).toBe(
+      "JSON metadata file cannot be a Linux single-file bind mount; mount a writable containing directory instead."
+    );
+    expect(String(error)).not.toContain("mount-secret");
+    expect(String(error)).not.toContain("replacement-secret");
+    expect(await readFile(filePath)).toEqual(original);
+    expect(await readdir(tempDir)).toEqual(["db.json"]);
   });
 
   it.skipIf(!supportsPosixPermissionTest)(
