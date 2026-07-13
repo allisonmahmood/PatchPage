@@ -309,11 +309,11 @@ for (const ecosystem of ["npm", "github-actions"]) {
 }
 
 const releaseConcurrency = workflow.match(
-  /^concurrency:\n  group: ([^\n]+)\n  cancel-in-progress: false$/m,
+  /^concurrency:\n  group: ([^\n]+)\n  queue: max\n  cancel-in-progress: false$/m,
 );
 if (!releaseConcurrency) {
   failures.push(
-    "release.yml must serialize all patchpage-server publishes in one package-wide concurrency group with cancel-in-progress disabled",
+    "release.yml must serialize all patchpage-server publishes in one package-wide max queue without canceling running or pending releases",
   );
 } else if (releaseConcurrency[1] !== "release-ghcr-patchpage-server") {
   failures.push(
@@ -1605,6 +1605,18 @@ async function runMutationChecks() {
           /docker-ghcr must accept only existing immutable tags with the verified image\/config ID/,
       },
       {
+        name: "reject a single pending release queue",
+        env: {
+          PATCHPAGE_RELEASE_WORKFLOW_SOURCE: replaceOnce(
+            workflow,
+            "  queue: max",
+            "  queue: single",
+          ),
+        },
+        expected:
+          /release\.yml must serialize all patchpage-server publishes in one package-wide max queue without canceling running or pending releases/,
+      },
+      {
         name: "reject missing release concurrency",
         env: {
           PATCHPAGE_RELEASE_WORKFLOW_SOURCE: replaceOnce(
@@ -1612,6 +1624,7 @@ async function runMutationChecks() {
             [
               "concurrency:",
               "  group: release-ghcr-patchpage-server",
+              "  queue: max",
               "  cancel-in-progress: false",
               "",
             ].join("\n"),
