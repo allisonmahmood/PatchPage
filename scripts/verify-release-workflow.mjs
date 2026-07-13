@@ -2,7 +2,7 @@ import { readFile } from "node:fs/promises";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
-import { parseDocument } from "yaml";
+import { isMap, isScalar, isSeq, parseDocument } from "yaml";
 
 const repoRoot = path.resolve(
   process.env.PATCHPAGE_RELEASE_WORKFLOW_REPO_ROOT ??
@@ -38,14 +38,16 @@ const readme = process.env.PATCHPAGE_RELEASE_README_SOURCE ?? readmeFile;
 const packageJson = JSON.parse(packageSource);
 const failures = [];
 let parsedWorkflow = null;
+let workflowDocument = null;
 
 try {
-  const document = parseDocument(workflow, { uniqueKeys: true });
+  const document = parseDocument(workflow, { keepSourceTokens: true, uniqueKeys: true });
   if (document.errors.length > 0) {
     for (const error of document.errors) {
       failures.push(`release.yml must be valid YAML with unique map keys: ${error.message}`);
     }
   } else {
+    workflowDocument = document;
     parsedWorkflow = document.toJS();
   }
 } catch (error) {
@@ -107,6 +109,212 @@ const reviewedActions = new Map([
 ]);
 const reviewedUploadArtifact = `actions/upload-artifact@${reviewedActions.get("actions/upload-artifact").sha}`;
 const reviewedDownloadArtifact = `actions/download-artifact@${reviewedActions.get("actions/download-artifact").sha}`;
+const expectedVersionProducerRun = [
+  "set -euo pipefail",
+  "",
+  "version=\"$(node -p \"require('./packages/cli/package.json').version\")\"",
+  "if [[ ! \"$version\" =~ ^(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)$ ]]; then",
+  "  echo \"::error::Release version must be exact stable SemVer, got ${version}\"",
+  "  exit 1",
+  "fi",
+  "",
+  "expected_ref=\"v${version}\"",
+  "",
+  "if [[ \"$expected_ref\" != \"$GITHUB_REF_NAME\" ]]; then",
+  "  echo \"::error::Tag ${GITHUB_REF_NAME} does not match packages/cli version ${expected_ref}\"",
+  "  exit 1",
+  "fi",
+  "",
+  "if ! grep -Fq \"## [${version}]\" CHANGELOG.md; then",
+  "  echo \"::error::CHANGELOG.md is missing a ## [${version}] heading\"",
+  "  exit 1",
+  "fi",
+  "",
+  "revision=\"$(git rev-parse HEAD)\"",
+  "if [[ ! \"$revision\" =~ ^[0-9a-f]{40}$ ]]; then",
+  "  echo \"::error::Resolved release revision is not a full commit SHA: ${revision}\"",
+  "  exit 1",
+  "fi",
+  "",
+  "echo \"version=$version\" >> \"$GITHUB_OUTPUT\"",
+  "echo \"revision=$revision\" >> \"$GITHUB_OUTPUT\"",
+  "",
+].join("\n");
+const expectedPackageProducerRun = [
+  "set -euo pipefail",
+  "",
+  "package_dir=\"$RUNNER_TEMP/patchpage-package\"",
+  "rm -rf \"$package_dir\"",
+  "mkdir -p \"$package_dir\"",
+  "",
+  "cd packages/cli",
+  "node \"$NPM_CLI\" pack \\",
+  "  --ignore-scripts \\",
+  "  --json \\",
+  "  --pack-destination \"$package_dir\" \\",
+  "  > \"$RUNNER_TEMP/patchpage-pack.json\"",
+  "",
+  "node - \"$RUNNER_TEMP/patchpage-pack.json\" <<'NODE'",
+  "const fs = require(\"node:fs\");",
+  "",
+  "const pack = JSON.parse(fs.readFileSync(process.argv[2], \"utf8\"))[0];",
+  "const required = [\"dist/index.js\", \"skills/patchpage/SKILL.md\", \"LICENSE\", \"README.md\"];",
+  "const files = new Set(pack.files.map((file) => file.path));",
+  "const missing = required.filter((file) => !files.has(file));",
+  "",
+  "if (missing.length > 0) {",
+  "  console.error(`Missing files from npm pack: ${missing.join(\", \")}`);",
+  "  console.error(\"Packed files:\");",
+  "  for (const file of [...files].sort()) {",
+  "    console.error(`- ${file}`);",
+  "  }",
+  "  process.exit(1);",
+  "}",
+  "NODE",
+  "",
+  "reported_tarball=\"$(",
+  "  node - \"$RUNNER_TEMP/patchpage-pack.json\" \"$package_dir\" <<'NODE'",
+  "const fs = require(\"node:fs\");",
+  "const path = require(\"node:path\");",
+  "",
+  "const pack = JSON.parse(fs.readFileSync(process.argv[2], \"utf8\"))[0];",
+  "console.log(path.resolve(process.argv[3], pack.filename));",
+  "NODE",
+  ")\"",
+  "",
+  "mapfile -t tarballs < <(find \"$package_dir\" -maxdepth 1 -type f -name 'patchpage-*.tgz' -print)",
+  "if [[ \"${#tarballs[@]}\" -ne 1 ]]; then",
+  "  echo \"::error::Expected exactly one PatchPage tarball, found ${#tarballs[@]}\"",
+  "  exit 1",
+  "fi",
+  "",
+  "tarball=\"${tarballs[0]}\"",
+  "if [[ \"$tarball\" != \"$reported_tarball\" ]]; then",
+  "  echo \"::error::npm pack reported $reported_tarball, but found $tarball\"",
+  "  exit 1",
+  "fi",
+  "",
+  "cli_version=\"$(node -p \"require('./package.json').version\")\"",
+  "unique_tarball=\"$package_dir/patchpage-${cli_version}-run-attempt-${GITHUB_RUN_ATTEMPT}.tgz\"",
+  "mv -- \"$tarball\" \"$unique_tarball\"",
+  "tarball=\"$unique_tarball\"",
+  "",
+  "echo \"TARBALL=$tarball\" >> \"$GITHUB_ENV\"",
+  "echo \"CLI_VERSION=$cli_version\" >> \"$GITHUB_ENV\"",
+  "echo \"tarball-path=$tarball\" >> \"$GITHUB_OUTPUT\"",
+  "echo \"filename=$(basename \"$tarball\")\" >> \"$GITHUB_OUTPUT\"",
+  "echo \"sha256=$(sha256sum \"$tarball\" | awk '{print $1}')\" >> \"$GITHUB_OUTPUT\"",
+  "",
+].join("\n");
+const expectedPublicationRun = [
+  "set -euo pipefail",
+  "",
+  "shopt -s nullglob",
+  "tarballs=(\"$RUNNER_TEMP/patchpage-package\"/*.tgz)",
+  "if [[ \"${#tarballs[@]}\" -ne 1 ]]; then",
+  "  echo \"::error::Expected exactly one downloaded PatchPage tarball, found ${#tarballs[@]}\"",
+  "  exit 1",
+  "fi",
+  "",
+  "tarball=\"${tarballs[0]}\"",
+  "if [[ \"$(basename \"$tarball\")\" != \"$EXPECTED_FILENAME\" ]]; then",
+  "  echo \"::error::Downloaded tarball name does not match the verified artifact\"",
+  "  exit 1",
+  "fi",
+  "",
+  "actual_sha256=\"$(sha256sum \"$tarball\" | awk '{print $1}')\"",
+  "if [[ \"$actual_sha256\" != \"$EXPECTED_SHA256\" ]]; then",
+  "  echo \"::error::Downloaded tarball digest does not match the verified artifact\"",
+  "  exit 1",
+  "fi",
+  "",
+  "IFS=$'\\t' read -r package_name package_version < <(",
+  "  tar -xOf \"$tarball\" package/package.json \\",
+  "    | node -e 'const fs = require(\"node:fs\"); const pkg = JSON.parse(fs.readFileSync(0, \"utf8\")); console.log(`${pkg.name}\\t${pkg.version}`)'",
+  ")",
+  "if [[ \"$package_name\" != \"patchpage\" ]]; then",
+  "  echo \"::error::Downloaded package is named $package_name, expected patchpage\"",
+  "  exit 1",
+  "fi",
+  "if [[ \"$package_version\" != \"$EXPECTED_VERSION\" ]]; then",
+  "  echo \"::error::Downloaded package version $package_version does not match $EXPECTED_VERSION\"",
+  "  exit 1",
+  "fi",
+  "",
+  "npm_cli=\"$RUNNER_TEMP/npm-cli/bin/npm-cli.js\"",
+  "actual_npm_version=\"$(node \"$npm_cli\" --version)\"",
+  "if [[ \"$actual_npm_version\" != \"$EXPECTED_NPM_VERSION\" ]]; then",
+  "  echo \"::error::Downloaded npm CLI reported $actual_npm_version, expected $EXPECTED_NPM_VERSION\"",
+  "  exit 1",
+  "fi",
+  "",
+  "registry_metadata=\"$RUNNER_TEMP/npm-registry-metadata.json\"",
+  "curl_error=\"$RUNNER_TEMP/npm-registry-curl.err\"",
+  "registry_url=\"https://registry.npmjs.org/${package_name}/${EXPECTED_VERSION}\"",
+  "if ! http_status=\"$(",
+  "  curl --silent --show-error \\",
+  "    --proto '=https' \\",
+  "    --tlsv1.2 \\",
+  "    --output \"$registry_metadata\" \\",
+  "    --write-out '%{http_code}' \\",
+  "    \"$registry_url\" \\",
+  "    2>\"$curl_error\"",
+  ")\"; then",
+  "  echo \"::error::Failed to query npm registry for patchpage@${EXPECTED_VERSION}\"",
+  "  cat \"$curl_error\" >&2",
+  "  exit 1",
+  "fi",
+  "",
+  "case \"$http_status\" in",
+  "  200)",
+  "    registry_integrity=\"$(",
+  "      node - \"$registry_metadata\" <<'NODE'",
+  "const { readFileSync } = require(\"node:fs\");",
+  "",
+  "const metadata = JSON.parse(readFileSync(process.argv[2], \"utf8\"));",
+  "const integrity = metadata.dist?.integrity;",
+  "if (typeof integrity === \"string\" && integrity.length > 0) {",
+  "  process.stdout.write(integrity);",
+  "}",
+  "NODE",
+  "    )\"",
+  "    if [[ -z \"$registry_integrity\" ]]; then",
+  "      echo \"::error::npm registry metadata is missing dist.integrity\"",
+  "      exit 1",
+  "    fi",
+  "",
+  "    local_integrity=\"$(",
+  "      node - \"$tarball\" <<'NODE'",
+  "const { createHash } = require(\"node:crypto\");",
+  "const { readFileSync } = require(\"node:fs\");",
+  "",
+  "const digest = createHash(\"sha512\")",
+  "  .update(readFileSync(process.argv[2]))",
+  "  .digest(\"base64\");",
+  "process.stdout.write(`sha512-${digest}`);",
+  "NODE",
+  "    )\"",
+  "    if [[ \"$registry_integrity\" != \"$local_integrity\" ]]; then",
+  "      echo \"::error::patchpage@${EXPECTED_VERSION} exists with different integrity\"",
+  "      exit 1",
+  "    fi",
+  "",
+  "    echo \"patchpage@${EXPECTED_VERSION} already published with matching integrity, skipping\"",
+  "    exit 0",
+  "    ;;",
+  "  404)",
+  "    echo \"patchpage@${EXPECTED_VERSION} is absent from npm; publishing\"",
+  "    ;;",
+  "  *)",
+  "    echo \"::error::Unexpected npm registry HTTP status: $http_status\"",
+  "    exit 1",
+  "    ;;",
+  "esac",
+  "",
+  "node \"$npm_cli\" publish \"$tarball\" --ignore-scripts --provenance \\",
+  "  --registry=https://registry.npmjs.org",
+  "",
+].join("\n");
 
 function job(name) {
   const lines = workflow.split("\n");
@@ -191,180 +399,76 @@ function uniqueStep(steps, predicate, description) {
   return matches[0];
 }
 
-function exactTrimmedLineCount(source, expectedLine) {
-  return source
-    .split("\n")
-    .filter((line) => line.trim() === expectedLine).length;
+function workflowLineNumber(offset) {
+  return workflow.slice(0, offset).split("\n").length;
 }
 
-function shellCodeBeforeComment(line) {
-  let singleQuoted = false;
-  let doubleQuoted = false;
-  let escaped = false;
-
-  for (let index = 0; index < line.length; index += 1) {
-    const character = line[index];
-    if (escaped) {
-      escaped = false;
-      continue;
-    }
-    if (character === "\\" && !singleQuoted) {
-      escaped = true;
-      continue;
-    }
-    if (character === "'" && !doubleQuoted) {
-      singleQuoted = !singleQuoted;
-      continue;
-    }
-    if (character === '"' && !singleQuoted) {
-      doubleQuoted = !doubleQuoted;
-      continue;
-    }
-    if (
-      character === "#" &&
-      !singleQuoted &&
-      !doubleQuoted &&
-      (index === 0 || /\s/.test(line[index - 1]))
-    ) {
-      return line.slice(0, index);
-    }
+function parsedActionUses(document) {
+  if (document === null) {
+    return [];
   }
 
-  return line;
-}
-
-function nextShellGroupingDepth(line, startingDepth) {
-  let depth = startingDepth;
-  let singleQuoted = false;
-  let doubleQuoted = false;
-  let escaped = false;
-
-  for (let index = 0; index < line.length; index += 1) {
-    const character = line[index];
-    if (escaped) {
-      escaped = false;
-      continue;
-    }
-    if (character === "\\" && !singleQuoted) {
-      escaped = true;
-      continue;
-    }
-    if (character === "'" && !doubleQuoted) {
-      singleQuoted = !singleQuoted;
-      continue;
-    }
-    if (character === '"' && !singleQuoted) {
-      doubleQuoted = !doubleQuoted;
-      continue;
-    }
-    if (singleQuoted) {
-      continue;
-    }
-
-    const opensCommandSubstitution =
-      character === "(" &&
-      (line[index - 1] === "$" || line[index - 1] === "<" || line[index - 1] === ">");
-    const opensSubshell =
-      character === "(" &&
-      !doubleQuoted &&
-      (index === 0 || /[\s;|&]/.test(line[index - 1]));
-
-    if (opensCommandSubstitution || opensSubshell || (character === "(" && depth > 0)) {
-      depth += 1;
-      continue;
-    }
-    if (character === ")" && depth > 0) {
-      depth -= 1;
-    }
+  const jobs = document.get("jobs", true);
+  if (!isMap(jobs)) {
+    failures.push("release.yml must define jobs as a parsed YAML map");
+    return [];
   }
 
-  return depth;
-}
+  const actions = [];
+  for (const jobPair of jobs.items) {
+    const jobName = isScalar(jobPair.key) ? jobPair.key.value : null;
+    if (!isMap(jobPair.value)) {
+      failures.push("every release.yml job must be a parsed YAML map");
+      continue;
+    }
+    const steps = jobPair.value.get("steps", true);
+    if (!isSeq(steps)) {
+      failures.push(`${String(jobName)} must define steps as a parsed YAML sequence`);
+      continue;
+    }
 
-function shellStructure(source) {
-  const lines = source.split("\n");
-  const structure = [];
-  const compoundStack = [];
-  let groupingDepth = 0;
-  let heredocTerminator = null;
-  let offset = 0;
-
-  for (const [index, line] of lines.entries()) {
-    const trimmed = line.trim();
-    if (heredocTerminator !== null) {
-      structure.push({ depth: null, index, isShell: false, line, offset });
-      if (trimmed === heredocTerminator) {
-        heredocTerminator = null;
+    for (const [stepIndex, step] of steps.items.entries()) {
+      if (!isMap(step)) {
+        failures.push(`${String(jobName)} step ${stepIndex + 1} must be a parsed YAML map`);
+        continue;
       }
-      offset += line.length + 1;
-      continue;
+      const usesPairs = step.items.filter(
+        (pair) => isScalar(pair.key) && pair.key.value === "uses",
+      );
+      if (usesPairs.length === 0) {
+        continue;
+      }
+      if (usesPairs.length !== 1) {
+        failures.push(`${String(jobName)} step ${stepIndex + 1} must define uses exactly once`);
+        continue;
+      }
+
+      const [usesPair] = usesPairs;
+      const valueRange = isScalar(usesPair.value) ? usesPair.value.range : null;
+      const valueEnd = Array.isArray(valueRange) ? valueRange[1] : null;
+      const lineEnd =
+        typeof valueEnd === "number" ? workflow.indexOf("\n", valueEnd) : -1;
+
+      actions.push({
+        comment: isScalar(usesPair.value) ? usesPair.value.comment : null,
+        coordinate: isScalar(usesPair.value) ? usesPair.value.value : null,
+        inlineSuffix:
+          typeof valueEnd === "number"
+            ? workflow
+                .slice(valueEnd, lineEnd === -1 ? workflow.length : lineEnd)
+                .replace(/\r$/, "")
+            : null,
+        jobName,
+        lineNumber: workflowLineNumber(usesPair.key.range?.[0] ?? 0),
+      });
     }
-
-    const code = shellCodeBeforeComment(line);
-    const statement = code.trim();
-    const closesCompound =
-      (/^fi(?:\s*;|\s*$)/.test(statement) && "if") ||
-      (/^done(?:\s*;|\s*$)/.test(statement) && "loop") ||
-      (/^esac(?:\s*;|\s*$)/.test(statement) && "case") ||
-      (/^}(?:\s*;|\s*$)/.test(statement) && "brace");
-    if (closesCompound && compoundStack.at(-1) === closesCompound) {
-      compoundStack.pop();
-    }
-
-    structure.push({
-      depth: compoundStack.length + groupingDepth,
-      index,
-      isShell: statement !== "",
-      line,
-      offset,
-    });
-
-    if (/^if(?:\s|$)/.test(statement)) {
-      compoundStack.push("if");
-    } else if (/^case\b[\s\S]*\bin\s*$/.test(statement)) {
-      compoundStack.push("case");
-    } else if (/^(?:for|select|while|until)(?:\s|$)/.test(statement)) {
-      compoundStack.push("loop");
-    } else if (
-      /^(?:function\s+)?[A-Za-z_][A-Za-z0-9_]*(?:\s*\(\s*\))?\s*\{\s*$/.test(
-        statement,
-      ) ||
-      /(?:^|(?:&&|\|\||[;|&])\s*)\{\s*$/.test(statement)
-    ) {
-      compoundStack.push("brace");
-    }
-
-    groupingDepth = nextShellGroupingDepth(code, groupingDepth);
-    const heredoc = code.match(/<<-?\s*(?:'([^']+)'|"([^"]+)"|([A-Za-z_][A-Za-z0-9_]*))/);
-    heredocTerminator = heredoc?.[1] ?? heredoc?.[2] ?? heredoc?.[3] ?? null;
-    offset += line.length + 1;
   }
 
-  return structure;
+  return actions;
 }
 
-function exactTopLevelGuardBlock(structure, expectedLines) {
-  const candidates = structure.filter(
-    (entry) => entry.isShell && entry.line.trim() === expectedLines[0],
-  );
-  if (candidates.length !== 1 || candidates[0].depth !== 0) {
-    return null;
-  }
+const actionUses = parsedActionUses(workflowDocument);
 
-  const start = candidates[0];
-  for (const [offset, expectedLine] of expectedLines.entries()) {
-    const entry = structure[start.index + offset];
-    if (!entry?.isShell || entry.line.trim() !== expectedLine) {
-      return null;
-    }
-  }
-
-  return {
-    endIndex: start.index + expectedLines.length - 1,
-    offset: start.offset,
-    startIndex: start.index,
-  };
-}
 function ciJob(name) {
   const lines = ciWorkflow.split("\n");
   const start = lines.findIndex((line) => line === `  ${name}:`);
@@ -434,35 +538,51 @@ function sameEntries(actual, expected) {
   );
 }
 
-const actionLines = workflow
-  .split("\n")
-  .map((line, index) => ({ line, lineNumber: index + 1 }))
-  .filter(({ line }) => /^\s+(?:-\s+)?uses:/.test(line));
-
-if (actionLines.length === 0) {
+if (parsedWorkflow !== null && actionUses.length === 0) {
   failures.push("release.yml must use at least one external Action");
 }
 
-for (const { line, lineNumber } of actionLines) {
-  const match = line.match(
-    /^\s+(?:-\s+)?uses:\s+([^\s@]+)@([0-9a-f]{40})\s+#\s+(v\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?)\s*$/,
-  );
-
-  if (!match) {
+for (const { comment, coordinate, inlineSuffix, lineNumber } of actionUses) {
+  if (typeof coordinate !== "string") {
     failures.push(
       `release.yml:${lineNumber} must pin an Action to a full commit SHA with an inline semver release comment`,
     );
     continue;
   }
 
-  const [, actionName, sha, version] = match;
-  const reviewed = reviewedActions.get(actionName);
-  if (!reviewed) {
-    failures.push(`release.yml:${lineNumber} uses unreviewed Action ${actionName}`);
+  const coordinateMatch = coordinate.match(/^([^\s@]+)@([^\s@]+)$/);
+  if (!coordinateMatch) {
+    failures.push(
+      `release.yml:${lineNumber} must pin an Action to a full commit SHA with an inline semver release comment`,
+    );
     continue;
   }
 
-  if (reviewed.sha !== sha || reviewed.version !== version) {
+  const [, actionName, reference] = coordinateMatch;
+  const reviewed = reviewedActions.get(actionName);
+  if (!reviewed) {
+    failures.push(`release.yml:${lineNumber} uses unreviewed Action ${actionName}`);
+  }
+
+  if (!/^[0-9a-f]{40}$/.test(reference)) {
+    failures.push(`release.yml:${lineNumber} must pin ${actionName} to a full commit SHA`);
+  }
+
+  if (reviewed && reviewed.sha !== reference) {
+    failures.push(
+      `release.yml:${lineNumber} must use reviewed coordinate ${actionName}@${reviewed.sha} # ${reviewed.version}`,
+    );
+  }
+
+  const commentVersion =
+    typeof comment === "string"
+      ? comment.match(/^ (v\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?)$/)?.[1]
+      : null;
+  if (commentVersion === null || inlineSuffix !== ` # ${commentVersion}`) {
+    failures.push(
+      `release.yml:${lineNumber} must pin an Action to a full commit SHA with an inline semver release comment`,
+    );
+  } else if (reviewed && reviewed.version !== commentVersion) {
     failures.push(
       `release.yml:${lineNumber} must use reviewed coordinate ${actionName}@${reviewed.sha} # ${reviewed.version}`,
     );
@@ -478,8 +598,9 @@ const expectedActionCounts = new Map([
   ["docker/login-action", 1],
 ]);
 for (const [actionName, expectedCount] of expectedActionCounts) {
-  const actualCount = actionLines.filter(({ line }) =>
-    line.includes(`uses: ${actionName}@`),
+  const actualCount = actionUses.filter(
+    ({ coordinate }) =>
+      typeof coordinate === "string" && coordinate.startsWith(`${actionName}@`),
   ).length;
   if (actualCount !== expectedCount) {
     failures.push(
@@ -544,12 +665,24 @@ const guardJob = job("guard");
 const prepareNpmJob = job("prepare-npm");
 const verifyJob = job("verify");
 const publishJob = job("publish-npm");
+const parsedGuardJob = parsedJob("guard");
 const parsedPrepareNpmJob = parsedJob("prepare-npm");
 const parsedVerifyJob = parsedJob("verify");
 const parsedPublishJob = parsedJob("publish-npm");
+const guardSteps = parsedSteps("guard", parsedGuardJob);
 const prepareNpmSteps = parsedSteps("prepare-npm", parsedPrepareNpmJob);
 const verifySteps = parsedSteps("verify", parsedVerifyJob);
 const publishSteps = parsedSteps("publish-npm", parsedPublishJob);
+const guardCheckoutStep = uniqueStep(
+  guardSteps,
+  (step) => step.uses === `actions/checkout@${reviewedActions.get("actions/checkout").sha}`,
+  "the guard checkout step",
+);
+const versionProducerStep = uniqueStep(
+  guardSteps,
+  (step) => step.id === "version",
+  "the guard version producer step",
+);
 const npmCliUploadStep = uniqueStep(
   prepareNpmSteps,
   (step) => step.name === "Upload the reviewed npm CLI",
@@ -560,35 +693,6 @@ const dockerJob = job("docker-ghcr");
 const anonymousImageJob = job("ghcr-anonymous-smoke");
 const ciDockerJob = ciJob("docker");
 
-if (guardJob) {
-  const versionCommand = guardJob.indexOf('version="$(node -p');
-  const stableVersionGuard = failClosedGuardPosition(
-    guardJob,
-    'if [[ ! "$version" =~ ^(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)$ ]]; then',
-  );
-  const expectedRef = guardJob.indexOf('expected_ref="v${version}"');
-  const versionOutput = guardJob.indexOf('echo "version=$version" >> "$GITHUB_OUTPUT"');
-  const revisionCommand = guardJob.indexOf('revision="$(git rev-parse HEAD)"');
-  const revisionValidation = guardJob.indexOf('[[ ! "$revision" =~ ^[0-9a-f]{40}$ ]]');
-  const revisionOutput = guardJob.indexOf('echo "revision=$revision" >> "$GITHUB_OUTPUT"');
-  if (
-    versionCommand === -1 ||
-    stableVersionGuard <= versionCommand ||
-    expectedRef <= stableVersionGuard ||
-    versionOutput <= expectedRef
-  ) {
-    failures.push(
-      "guard must reject prerelease or noncanonical versions before release fan-out",
-    );
-  }
-  if (
-    !guardJob.includes("revision: ${{ steps.version.outputs.revision }}") ||
-    revisionCommand === -1 ||
-    revisionValidation <= revisionCommand ||
-    revisionOutput <= revisionValidation
-  ) {
-    failures.push("guard must expose the checked-out full commit SHA as the release revision");
-  }
 const npmCliUploadIdStep = uniqueStep(
   prepareNpmSteps,
   (step) => step.id === "npm-cli-artifact",
@@ -598,6 +702,21 @@ const packageMetadataStep = uniqueStep(
   verifySteps,
   (step) => step.id === "package",
   "the package metadata producer step",
+);
+const packageMetadataNameStep = uniqueStep(
+  verifySteps,
+  (step) => step.name === "Pack exactly one release tarball and verify contents",
+  "the Pack exactly one release tarball and verify contents step",
+);
+const verifyNpmCliStep = uniqueStep(
+  verifySteps,
+  (step) => step.name === "Verify the isolated npm CLI",
+  "the Verify the isolated npm CLI step",
+);
+const smokeInstallStep = uniqueStep(
+  verifySteps,
+  (step) => step.name === "Install and run tarball on minimum supported Node",
+  "the minimum-Node tarball smoke step",
 );
 const packageUploadStep = uniqueStep(
   verifySteps,
@@ -625,6 +744,33 @@ const publicationStep = uniqueStep(
   "the Publish the verified tarball to npm step",
 );
 const publicationRun = typeof publicationStep?.run === "string" ? publicationStep.run : "";
+
+if (
+  parsedWorkflow !== null &&
+  !hasExactMapping(parsedGuardJob?.outputs, {
+    version: "${{ steps.version.outputs.version }}",
+    revision: "${{ steps.version.outputs.revision }}",
+  })
+) {
+  failures.push("guard outputs must bind exactly to the version producer");
+}
+
+if (
+  parsedWorkflow !== null &&
+  (guardCheckoutStep === null ||
+    !hasExactKeys(guardCheckoutStep, ["uses"]) ||
+    guardSteps.indexOf(guardCheckoutStep) !== 0 ||
+    versionProducerStep === null ||
+    !hasExactKeys(versionProducerStep, ["id", "shell", "run"]) ||
+    versionProducerStep.id !== "version" ||
+    versionProducerStep.shell !== "bash" ||
+    versionProducerStep.run !== expectedVersionProducerRun ||
+    guardSteps.indexOf(versionProducerStep) !== 1)
+) {
+  failures.push(
+    "guard must check out the repository before running the exact version producer",
+  );
+}
 
 if (
   parsedWorkflow !== null &&
@@ -660,9 +806,17 @@ if (
     "tarball-sha256": "${{ steps.package.outputs.sha256 }}",
     "package-artifact-id": "${{ steps.package-artifact.outputs.artifact-id }}",
   }) ||
-    packageMetadataStep?.name !== "Pack exactly one release tarball and verify contents")
+    packageMetadataStep === null ||
+    packageMetadataStep !== packageMetadataNameStep ||
+    !hasExactKeys(packageMetadataStep, ["name", "id", "shell", "run"]) ||
+    packageMetadataStep.name !== "Pack exactly one release tarball and verify contents" ||
+    packageMetadataStep.id !== "package" ||
+    packageMetadataStep.shell !== "bash" ||
+    packageMetadataStep.run !== expectedPackageProducerRun)
 ) {
-  failures.push("verify outputs must bind exactly to the package and artifact producers");
+  failures.push(
+    "verify outputs must bind to the exact package and artifact producers",
+  );
 }
 
 if (
@@ -679,6 +833,54 @@ if (
     }))
 ) {
   failures.push("verify must upload exactly the active single raw tarball input");
+}
+
+if (
+  parsedWorkflow !== null &&
+  (verifyNpmCliStep === null ||
+    packageMetadataStep === null ||
+    smokeInstallStep === null ||
+    packageUploadStep === null ||
+    verifySteps.indexOf(verifyNpmCliStep) >= verifySteps.indexOf(packageMetadataStep) ||
+    verifySteps.indexOf(packageMetadataStep) >= verifySteps.indexOf(smokeInstallStep) ||
+    verifySteps.indexOf(smokeInstallStep) >= verifySteps.indexOf(packageUploadStep))
+) {
+  failures.push(
+    "verify must validate the isolated npm CLI, produce the package, smoke-test it, then upload it",
+  );
+}
+
+const expectedVerifyWorkflowCommandReferences = [
+  {
+    line: 'echo "NPM_CLI=$NPM_CLI" >> "$GITHUB_ENV"',
+    step: verifyNpmCliStep,
+  },
+  ...expectedPackageProducerRun
+    .split("\n")
+    .filter((line) => line.includes("GITHUB_ENV") || line.includes("GITHUB_OUTPUT"))
+    .map((line) => ({ line, step: packageMetadataStep })),
+];
+const verifyWorkflowCommandReferences = verifySteps.flatMap((step) =>
+  typeof step.run === "string"
+    ? step.run
+        .split("\n")
+        .filter((line) => line.includes("GITHUB_ENV") || line.includes("GITHUB_OUTPUT"))
+        .map((line) => ({ line, step }))
+    : [],
+);
+if (
+  parsedWorkflow !== null &&
+  (verifyWorkflowCommandReferences.length !==
+    expectedVerifyWorkflowCommandReferences.length ||
+    verifyWorkflowCommandReferences.some(
+      (reference, index) =>
+        reference.step !== expectedVerifyWorkflowCommandReferences[index].step ||
+        reference.line !== expectedVerifyWorkflowCommandReferences[index].line,
+    ))
+) {
+  failures.push(
+    "verify may write GITHUB_ENV and GITHUB_OUTPUT only at the reviewed producer lines",
+  );
 }
 
 const publishDownloadSteps = publishSteps.filter(
@@ -720,20 +922,15 @@ const publicationStepIndex = publishSteps.indexOf(publicationStep);
 if (
   parsedWorkflow !== null &&
   (publicationStep === null ||
+    !hasExactKeys(publicationStep, ["name", "shell", "env", "run"]) ||
     publicationStep.shell !== "bash" ||
-    publicationRun === "" ||
+    publicationRun !== expectedPublicationRun ||
     publishSteps.indexOf(packageDownloadStep) >= publicationStepIndex ||
-    publishSteps.indexOf(npmCliDownloadStep) >= publicationStepIndex ||
-    exactTrimmedLineCount(
-      publicationRun,
-      'tarballs=("$RUNNER_TEMP/patchpage-package"/*.tgz)',
-    ) !== 1 ||
-    exactTrimmedLineCount(
-      publicationRun,
-      'npm_cli="$RUNNER_TEMP/npm-cli/bin/npm-cli.js"',
-    ) !== 1)
+    publishSteps.indexOf(npmCliDownloadStep) >= publicationStepIndex)
 ) {
-  failures.push("publish-npm must consume both isolated downloads in the publication step");
+  failures.push(
+    "the publication step must contain exactly name, shell, env, and the reviewed run after both isolated downloads",
+  );
 }
 
 if (
@@ -773,9 +970,11 @@ if (prepareNpmJob) {
     "actions/setup-node",
     "actions/upload-artifact",
   ]);
-  const prepareActions = [
-    ...prepareNpmJob.matchAll(/uses:\s+([^\s@]+)@/g),
-  ].map((match) => match[1]);
+  const prepareActions = actionUses
+    .filter(({ jobName }) => jobName === "prepare-npm")
+    .map(({ coordinate }) =>
+      typeof coordinate === "string" ? coordinate.split("@")[0] : null,
+    );
   for (const action of prepareActions) {
     if (!allowedPrepareActions.has(action)) {
       failures.push(`prepare-npm must not execute the ${action} Action`);
@@ -1123,9 +1322,12 @@ for (const forbidden of [
 }
 
 const allowedPublishActions = new Set(["actions/setup-node", "actions/download-artifact"]);
-for (const match of publishJob.matchAll(/uses:\s+([^\s@]+)@/g)) {
-  if (!allowedPublishActions.has(match[1])) {
-    failures.push(`publish-npm must not execute the ${match[1]} Action`);
+for (const { coordinate } of actionUses.filter(
+  ({ jobName }) => jobName === "publish-npm",
+)) {
+  const action = typeof coordinate === "string" ? coordinate.split("@")[0] : null;
+  if (!allowedPublishActions.has(action)) {
+    failures.push(`publish-npm must not execute the ${String(action)} Action`);
   }
 }
 
@@ -1142,126 +1344,6 @@ for (const match of publishJob.matchAll(/node\s+"\$npm_cli"\s+([A-Za-z-]+)/g)) {
 
 if (publishJob.includes('node "$npm_cli" view')) {
   failures.push("publish-npm must not infer package absence from npm view");
-}
-
-const registryRequestStart = publishJob.indexOf('if ! http_status="$(');
-const registryCaseStart = publishJob.indexOf('case "$http_status" in');
-const registryRequest = publishJob.slice(registryRequestStart, registryCaseStart);
-if (
-  registryRequestStart === -1 ||
-  registryCaseStart <= registryRequestStart ||
-  !publishJob.includes("curl --silent --show-error") ||
-  !publishJob.includes('--output "$registry_metadata"') ||
-  !publishJob.includes("--write-out '%{http_code}'") ||
-  !publishJob.includes(
-    'registry_url="https://registry.npmjs.org/${package_name}/${EXPECTED_VERSION}"',
-  ) ||
-  !registryRequest.includes("exit 1") ||
-  registryRequest.includes("|| true") ||
-  publishJob.includes("curl --fail") ||
-  publishJob.includes("curl --location")
-) {
-  failures.push(
-    "publish-npm must distinguish registry HTTP status from curl transport failure",
-  );
-}
-
-const registryCase = publishJob.match(
-  /case "\$http_status" in([\s\S]*?)\n\s+esac/,
-)?.[1];
-if (!registryCase) {
-  failures.push("publish-npm must explicitly handle registry HTTP statuses");
-} else {
-  const status200Match = registryCase.match(/\n\s+200\)([\s\S]*?)\n\s+;;/);
-  const status404Match = registryCase.match(/\n\s+404\)([\s\S]*?)\n\s+;;/);
-  const otherStatusMatch = registryCase.match(/\n\s+\*\)([\s\S]*?)\n\s+;;/);
-  const status200 = status200Match?.[1] ?? "";
-  const status404 = status404Match?.[1] ?? "";
-  const otherStatus = otherStatusMatch?.[1] ?? "";
-  const missingIntegrity = status200.indexOf('-z "$registry_integrity"');
-  const localSri = status200.indexOf('createHash("sha512")');
-  const integrityMismatch = status200.indexOf(
-    '"$registry_integrity" != "$local_integrity"',
-  );
-  const matchingIntegritySkip = status200.lastIndexOf("exit 0");
-
-  if (
-    !status200Match ||
-    !status200.includes("dist?.integrity") ||
-    !status200.includes(
-      'typeof integrity === "string" && integrity.length > 0',
-    ) ||
-    missingIntegrity === -1 ||
-    localSri <= missingIntegrity ||
-    !status200.includes('readFileSync(process.argv[2])') ||
-    !status200.includes("process.stdout.write(`sha512-${digest}`)") ||
-    integrityMismatch <= localSri ||
-    matchingIntegritySkip <= integrityMismatch ||
-    !status200.slice(missingIntegrity, localSri).includes("exit 1") ||
-    !status200.slice(integrityMismatch, matchingIntegritySkip).includes("exit 1")
-  ) {
-    failures.push(
-      "registry HTTP 200 must skip only when dist.integrity matches the local tarball SRI",
-    );
-  }
-
-  if (!status404Match || /\bexit\b/.test(status404)) {
-    failures.push("only registry HTTP 404 may fall through to publication");
-  }
-
-  if (!otherStatusMatch || !/exit\s+1/.test(otherStatus)) {
-    failures.push("unexpected registry HTTP statuses must fail publication");
-  }
-}
-
-const registryCaseEnd = publishJob.indexOf("      esac");
-const npmPublish = publishJob.indexOf('node "$npm_cli" publish');
-if (registryCaseEnd === -1 || npmPublish <= registryCaseEnd) {
-  failures.push("npm publish must occur only after the registry HTTP state machine");
-}
-
-const publicationShell = shellStructure(publicationRun);
-const packageNameGuard = exactTopLevelGuardBlock(publicationShell, [
-  'if [[ "$package_name" != "patchpage" ]]; then',
-  'echo "::error::Downloaded package is named $package_name, expected patchpage"',
-  "exit 1",
-  "fi",
-]);
-const packageVersionGuard = exactTopLevelGuardBlock(publicationShell, [
-  'if [[ "$package_version" != "$EXPECTED_VERSION" ]]; then',
-  'echo "::error::Downloaded package version $package_version does not match $EXPECTED_VERSION"',
-  "exit 1",
-  "fi",
-]);
-const publicationDigestGuard = publicationRun.indexOf(
-  'if [[ "$actual_sha256" != "$EXPECTED_SHA256" ]]; then',
-);
-const publicationMetadataRead = publicationRun.indexOf(
-  'tar -xOf "$tarball" package/package.json',
-);
-const publicationNpmCliVersionExecution = publicationRun.indexOf(
-  'node "$npm_cli" --version',
-);
-const publicationRegistryRequest = publicationRun.indexOf('if ! http_status="$(');
-const publicationNpmPublish = publicationRun.indexOf('node "$npm_cli" publish');
-
-if (
-  parsedWorkflow !== null &&
-  (publicationDigestGuard === -1 ||
-    publicationMetadataRead <= publicationDigestGuard ||
-    packageNameGuard === null ||
-    packageVersionGuard === null ||
-    packageNameGuard.offset <= publicationMetadataRead ||
-    packageVersionGuard.startIndex <= packageNameGuard.endIndex ||
-    publicationNpmCliVersionExecution <= packageVersionGuard.offset ||
-    publicationRegistryRequest <= packageVersionGuard.offset ||
-    publicationNpmPublish <= packageVersionGuard.offset ||
-    publicationNpmPublish <= publicationNpmCliVersionExecution ||
-    publicationNpmPublish <= publicationRegistryRequest)
-) {
-  failures.push(
-    "publish-npm must read package metadata, then run the exact top-level name and version fail-closed guards before npm or registry activity",
-  );
 }
 
 if ((verifyJob.match(/node "\$NPM_CLI" pack/g) ?? []).length !== 1) {
@@ -1882,6 +1964,26 @@ function replaceOnce(source, search, replacement) {
 
 async function runMutationChecks() {
   const mutationFailures = [];
+  const packageNameGuard = [
+    '          if [[ "$package_name" != "patchpage" ]]; then',
+    '            echo "::error::Downloaded package is named $package_name, expected patchpage"',
+    "            exit 1",
+    "          fi",
+  ].join("\n");
+  const basenameGuard = [
+    '          if [[ "$(basename "$tarball")" != "$EXPECTED_FILENAME" ]]; then',
+    '            echo "::error::Downloaded tarball name does not match the verified artifact"',
+    "            exit 1",
+    "          fi",
+  ].join("\n");
+  const shaGuard = [
+    '          if [[ "$actual_sha256" != "$EXPECTED_SHA256" ]]; then',
+    '            echo "::error::Downloaded tarball digest does not match the verified artifact"',
+    "            exit 1",
+    "          fi",
+  ].join("\n");
+  const publicationContractFailure =
+    /publication step must contain exactly name, shell, env, and the reviewed run/;
   let checks;
   try {
     checks = [
@@ -1920,7 +2022,7 @@ async function runMutationChecks() {
           ),
         },
         expected:
-          /guard must reject prerelease or noncanonical versions before release fan-out/,
+          /guard must check out the repository before running the exact version producer/,
       },
       {
         name: "reject image artifact selected by name instead of immutable ID",
@@ -2060,6 +2162,338 @@ async function runMutationChecks() {
         },
         expected: /CI must use deterministic string image version and quoted revision metadata/,
       },
+      {
+        name: "reject identity guard after false AND continuation",
+        env: {
+          PATCHPAGE_RELEASE_WORKFLOW_SOURCE: replaceOnce(
+            workflow,
+            packageNameGuard,
+            `          false &&\n${packageNameGuard}`,
+          ),
+        },
+        expected: publicationContractFailure,
+      },
+      {
+        name: "reject identity guard after backslash OR continuation",
+        env: {
+          PATCHPAGE_RELEASE_WORKFLOW_SOURCE: replaceOnce(
+            workflow,
+            packageNameGuard,
+            `          true \\\n            ||\n${packageNameGuard}`,
+          ),
+        },
+        expected: publicationContractFailure,
+      },
+      {
+        name: "reject identity guard after pipeline continuation",
+        env: {
+          PATCHPAGE_RELEASE_WORKFLOW_SOURCE: replaceOnce(
+            workflow,
+            packageNameGuard,
+            `          true |\n${packageNameGuard}`,
+          ),
+        },
+        expected: publicationContractFailure,
+      },
+      {
+        name: "reject identity guard rendered as multiline quoted text",
+        env: {
+          PATCHPAGE_RELEASE_WORKFLOW_SOURCE: replaceOnce(
+            workflow,
+            packageNameGuard,
+            `          : '\n${packageNameGuard}\n          '`,
+          ),
+        },
+        expected: publicationContractFailure,
+      },
+      {
+        name: "reject identity guard rendered as escaped heredoc data",
+        env: {
+          PATCHPAGE_RELEASE_WORKFLOW_SOURCE: replaceOnce(
+            workflow,
+            packageNameGuard,
+            `          cat <<\\EOF\n${packageNameGuard}\n          EOF`,
+          ),
+        },
+        expected: publicationContractFailure,
+      },
+      {
+        name: "reject identity guard rendered as multiple-heredoc data",
+        env: {
+          PATCHPAGE_RELEASE_WORKFLOW_SOURCE: replaceOnce(
+            workflow,
+            packageNameGuard,
+            [
+              "          cat <<'FIRST' <<'SECOND'",
+              "          harmless",
+              "          FIRST",
+              packageNameGuard,
+              "          SECOND",
+            ].join("\n"),
+          ),
+        },
+        expected: publicationContractFailure,
+      },
+      {
+        name: "reject identity guard nested in split-line case",
+        env: {
+          PATCHPAGE_RELEASE_WORKFLOW_SOURCE: replaceOnce(
+            workflow,
+            packageNameGuard,
+            [
+              '          case "safe"',
+              "          in",
+              "            never)",
+              packageNameGuard,
+              "              ;;",
+              "          esac",
+            ].join("\n"),
+          ),
+        },
+        expected: publicationContractFailure,
+      },
+      {
+        name: "reject basename guard nested under false",
+        env: {
+          PATCHPAGE_RELEASE_WORKFLOW_SOURCE: replaceOnce(
+            workflow,
+            basenameGuard,
+            `          if false; then\n${basenameGuard}\n          fi`,
+          ),
+        },
+        expected: publicationContractFailure,
+      },
+      {
+        name: "reject digest guard nested under false",
+        env: {
+          PATCHPAGE_RELEASE_WORKFLOW_SOURCE: replaceOnce(
+            workflow,
+            shaGuard,
+            `          if false; then\n${shaGuard}\n          fi`,
+          ),
+        },
+        expected: publicationContractFailure,
+      },
+      {
+        name: "reject package name reassignment",
+        env: {
+          PATCHPAGE_RELEASE_WORKFLOW_SOURCE: replaceOnce(
+            workflow,
+            packageNameGuard,
+            `          package_name="patchpage"\n${packageNameGuard}`,
+          ),
+        },
+        expected: publicationContractFailure,
+      },
+      {
+        name: "reject package version reassignment",
+        env: {
+          PATCHPAGE_RELEASE_WORKFLOW_SOURCE: replaceOnce(
+            workflow,
+            '          if [[ "$package_version" != "$EXPECTED_VERSION" ]]; then',
+            '          package_version="$EXPECTED_VERSION"\n          if [[ "$package_version" != "$EXPECTED_VERSION" ]]; then',
+          ),
+        },
+        expected: publicationContractFailure,
+      },
+      {
+        name: "reject expected filename reassignment",
+        env: {
+          PATCHPAGE_RELEASE_WORKFLOW_SOURCE: replaceOnce(
+            workflow,
+            basenameGuard,
+            `          EXPECTED_FILENAME="$(basename "$tarball")"\n${basenameGuard}`,
+          ),
+        },
+        expected: publicationContractFailure,
+      },
+      {
+        name: "reject expected digest reassignment",
+        env: {
+          PATCHPAGE_RELEASE_WORKFLOW_SOURCE: replaceOnce(
+            workflow,
+            shaGuard,
+            `          EXPECTED_SHA256="$actual_sha256"\n${shaGuard}`,
+          ),
+        },
+        expected: publicationContractFailure,
+      },
+      {
+        name: "reject expected package version reassignment",
+        env: {
+          PATCHPAGE_RELEASE_WORKFLOW_SOURCE: replaceOnce(
+            workflow,
+            '          if [[ "$package_version" != "$EXPECTED_VERSION" ]]; then',
+            '          EXPECTED_VERSION="$package_version"\n          if [[ "$package_version" != "$EXPECTED_VERSION" ]]; then',
+          ),
+        },
+        expected: publicationContractFailure,
+      },
+      {
+        name: "reject expected npm version reassignment",
+        env: {
+          PATCHPAGE_RELEASE_WORKFLOW_SOURCE: replaceOnce(
+            workflow,
+            '          if [[ "$actual_npm_version" != "$EXPECTED_NPM_VERSION" ]]; then',
+            '          EXPECTED_NPM_VERSION="$actual_npm_version"\n          if [[ "$actual_npm_version" != "$EXPECTED_NPM_VERSION" ]]; then',
+          ),
+        },
+        expected: publicationContractFailure,
+      },
+      {
+        name: "reject disabled publication step",
+        env: {
+          PATCHPAGE_RELEASE_WORKFLOW_SOURCE: replaceOnce(
+            workflow,
+            "      - name: Publish the verified tarball to npm\n        shell: bash",
+            "      - name: Publish the verified tarball to npm\n        if: false\n        shell: bash",
+          ),
+        },
+        expected: publicationContractFailure,
+      },
+      {
+        name: "reject continue-on-error publication step",
+        env: {
+          PATCHPAGE_RELEASE_WORKFLOW_SOURCE: replaceOnce(
+            workflow,
+            "      - name: Publish the verified tarball to npm\n        shell: bash",
+            "      - name: Publish the verified tarball to npm\n        continue-on-error: true\n        shell: bash",
+          ),
+        },
+        expected: publicationContractFailure,
+      },
+      {
+        name: "reject extra publication step keys",
+        env: {
+          PATCHPAGE_RELEASE_WORKFLOW_SOURCE: replaceOnce(
+            workflow,
+            "      - name: Publish the verified tarball to npm\n        shell: bash",
+            "      - name: Publish the verified tarball to npm\n        timeout-minutes: 1\n        shell: bash",
+          ),
+        },
+        expected: publicationContractFailure,
+      },
+      {
+        name: "reject unreviewed Action behind quoted uses key",
+        env: {
+          PATCHPAGE_RELEASE_WORKFLOW_SOURCE: replaceOnce(
+            workflow,
+            "      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1\n      - id: version",
+            '      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1\n      - "uses": attacker/action@main # v1.0.0\n      - id: version',
+          ),
+        },
+        expected: /uses unreviewed Action attacker\/action/,
+      },
+      {
+        name: "reject guard output producer rebind",
+        env: {
+          PATCHPAGE_RELEASE_WORKFLOW_SOURCE: replaceOnce(
+            workflow,
+            "      version: ${{ steps.version.outputs.version }}",
+            "      version: ${{ steps.attacker.outputs.version }}",
+          ),
+        },
+        expected: /guard outputs must bind exactly to the version producer/,
+      },
+      {
+        name: "reject guard producer ID rebind",
+        env: {
+          PATCHPAGE_RELEASE_WORKFLOW_SOURCE: replaceOnce(
+            workflow,
+            "      - id: version",
+            "      - id: attacker",
+          ),
+        },
+        expected: /guard version producer step must exist exactly once/,
+      },
+      {
+        name: "reject guard producer run changes",
+        env: {
+          PATCHPAGE_RELEASE_WORKFLOW_SOURCE: replaceOnce(
+            workflow,
+            '          echo "revision=$revision" >> "$GITHUB_OUTPUT"',
+            '          echo "revision=$revision" >> "$GITHUB_OUTPUT"\n          : changed',
+          ),
+        },
+        expected: /guard must check out the repository before running the exact version producer/,
+      },
+      {
+        name: "reject package filename output rebind",
+        env: {
+          PATCHPAGE_RELEASE_WORKFLOW_SOURCE: replaceOnce(
+            workflow,
+            "      tarball-filename: ${{ steps.package.outputs.filename }}",
+            "      tarball-filename: ${{ steps.attacker.outputs.filename }}",
+          ),
+        },
+        expected: /verify outputs must bind to the exact package and artifact producers/,
+      },
+      {
+        name: "reject package digest output rebind",
+        env: {
+          PATCHPAGE_RELEASE_WORKFLOW_SOURCE: replaceOnce(
+            workflow,
+            "      tarball-sha256: ${{ steps.package.outputs.sha256 }}",
+            "      tarball-sha256: ${{ steps.attacker.outputs.sha256 }}",
+          ),
+        },
+        expected: /verify outputs must bind to the exact package and artifact producers/,
+      },
+      {
+        name: "reject package producer run changes",
+        env: {
+          PATCHPAGE_RELEASE_WORKFLOW_SOURCE: replaceOnce(
+            workflow,
+            '          echo "sha256=$(sha256sum "$tarball" | awk \'{print $1}\')" >> "$GITHUB_OUTPUT"',
+            '          echo "sha256=$(sha256sum "$tarball" | awk \'{print $1}\')" >> "$GITHUB_OUTPUT"\n          : changed',
+          ),
+        },
+        expected: /verify outputs must bind to the exact package and artifact producers/,
+      },
+      {
+        name: "reject later GITHUB_ENV writes",
+        env: {
+          PATCHPAGE_RELEASE_WORKFLOW_SOURCE: replaceOnce(
+            workflow,
+            "      - name: Upload the exact tested tarball",
+            '      - name: Rebind package environment\n        shell: bash\n        run: echo "TARBALL=/tmp/attacker.tgz" >> "$GITHUB_ENV"\n      - name: Upload the exact tested tarball',
+          ),
+        },
+        expected: /verify may write GITHUB_ENV and GITHUB_OUTPUT only at the reviewed producer lines/,
+      },
+      {
+        name: "reject later GITHUB_OUTPUT writes",
+        env: {
+          PATCHPAGE_RELEASE_WORKFLOW_SOURCE: replaceOnce(
+            workflow,
+            "      - name: Upload the exact tested tarball",
+            '      - name: Add later output\n        id: later\n        shell: bash\n        run: echo "sha256=attacker" >> "$GITHUB_OUTPUT"\n      - name: Upload the exact tested tarball',
+          ),
+        },
+        expected: /verify may write GITHUB_ENV and GITHUB_OUTPUT only at the reviewed producer lines/,
+      },
+      {
+        name: "reject later GITHUB_ENV redirection",
+        env: {
+          PATCHPAGE_RELEASE_WORKFLOW_SOURCE: replaceOnce(
+            workflow,
+            "      - name: Upload the exact tested tarball",
+            '      - name: Redirect package environment\n        shell: bash\n        run: printf "%s\\n" "TARBALL=/tmp/attacker.tgz" > "${GITHUB_ENV}"\n      - name: Upload the exact tested tarball',
+          ),
+        },
+        expected: /verify may write GITHUB_ENV and GITHUB_OUTPUT only at the reviewed producer lines/,
+      },
+      {
+        name: "reject later GITHUB_OUTPUT redirection",
+        env: {
+          PATCHPAGE_RELEASE_WORKFLOW_SOURCE: replaceOnce(
+            workflow,
+            "      - name: Upload the exact tested tarball",
+            '      - name: Redirect later output\n        id: later\n        shell: bash\n        run: printf "%s\\n" "sha256=attacker" > "${GITHUB_OUTPUT}"\n      - name: Upload the exact tested tarball',
+          ),
+        },
+        expected: /verify may write GITHUB_ENV and GITHUB_OUTPUT only at the reviewed producer lines/,
+      },
     ];
   } catch (error) {
     mutationFailures.push(error.message);
@@ -2090,7 +2524,6 @@ async function runMutationChecks() {
 
   return mutationFailures;
 }
-
 if (failures.length > 0) {
   for (const failure of failures) {
     console.error(`- ${failure}`);
@@ -2109,7 +2542,7 @@ if (failures.length > 0) {
     process.exitCode = 1;
   } else {
   console.log(
-      `Verified ${actionLines.length} pinned Actions, npm@${npmVersion}, exact release image identity, anonymous GHCR gate, and mutation checks.`,
+      `Verified ${actionUses.length} pinned Actions, npm@${npmVersion}, exact release image identity, anonymous GHCR gate, and mutation checks.`,
   );
   }
 }
