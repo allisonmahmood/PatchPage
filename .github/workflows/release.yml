@@ -9,7 +9,7 @@ on:
 permissions: {}
 
 concurrency:
-  group: release-${{ github.ref }}
+  group: release-ghcr-patchpage-server
   cancel-in-progress: false
 
 jobs:
@@ -616,6 +616,10 @@ jobs:
             echo "::error::Expected revision is not a full lowercase commit SHA: $EXPECTED_REVISION"
             exit 1
           fi
+          if [[ ! "$EXPECTED_VERSION" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            echo "::error::Expected version is not exact stable semver: $EXPECTED_VERSION"
+            exit 1
+          fi
 
           ghcr_image="ghcr.io/allisonmahmood/patchpage-server"
           semver_target="${ghcr_image}:${EXPECTED_VERSION}"
@@ -778,11 +782,86 @@ jobs:
             fi
           done
 
-          push_verified_target "$latest_target"
           if [[ ! "$verified_manifest_digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
-            echo "::error::No verified GHCR manifest digest was produced"
+            echo "::error::Immutable GHCR tags did not establish the current release manifest digest"
             exit 1
           fi
+
+          latest_remote_digest=""
+          latest_remote_config_id=""
+          if inspect_remote_target "$latest_target" latest_remote_digest latest_remote_config_id; then
+            if ! docker pull "$latest_target"; then
+              echo "::error::Could not pull existing latest GHCR tag ${latest_target}"
+              exit 1
+            fi
+            latest_pulled_image_id="$(docker image inspect --format '{{.Id}}' "$latest_target")"
+            if [[ "$latest_pulled_image_id" != "$latest_remote_config_id" ]]; then
+              echo "::error::Latest GHCR tag raw manifest config ${latest_remote_config_id} does not match pulled image ID ${latest_pulled_image_id}"
+              exit 1
+            fi
+
+            latest_version="$(docker image inspect --format '{{ index .Config.Labels "org.opencontainers.image.version" }}' "$latest_target")"
+            if [[ ! "$latest_version" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+              echo "::error::Existing latest GHCR tag version metadata is invalid: ${latest_version}"
+              exit 1
+            fi
+
+            if ! latest_comparison="$(
+              python3 - "$latest_version" "$EXPECTED_VERSION" <<'PY'
+          import re
+          import sys
+
+          existing, expected = sys.argv[1:3]
+          pattern = re.compile(r"^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$")
+          if not pattern.match(existing) or not pattern.match(expected):
+              raise SystemExit("versions must be exact stable semver")
+
+          existing_parts = [int(part) for part in existing.split(".")]
+          expected_parts = [int(part) for part in expected.split(".")]
+
+          if existing_parts < expected_parts:
+              print("older")
+          elif existing_parts == expected_parts:
+              print("equal")
+          elif existing_parts > expected_parts:
+              print("newer")
+          else:
+              raise SystemExit("unknown comparison")
+          PY
+            )"; then
+              echo "::error::Could not compare existing latest version ${latest_version} with ${EXPECTED_VERSION}"
+              exit 1
+            fi
+
+            case "$latest_comparison" in
+              older)
+                echo "Existing latest GHCR tag version ${latest_version} is older than current release ${EXPECTED_VERSION}; updating latest"
+                push_verified_target "$latest_target"
+                ;;
+              equal)
+                if [[ "$latest_remote_config_id" != "$EXPECTED_IMAGE_ID" ]]; then
+                  echo "::error::Existing latest GHCR tag for ${EXPECTED_VERSION} has config ${latest_remote_config_id}, expected ${EXPECTED_IMAGE_ID}"
+                  exit 1
+                fi
+                if [[ "$latest_remote_digest" != "$verified_manifest_digest" ]]; then
+                  echo "::error::Existing latest GHCR tag for ${EXPECTED_VERSION} has manifest digest ${latest_remote_digest}, expected current release digest ${verified_manifest_digest}"
+                  exit 1
+                fi
+                echo "Latest GHCR tag already points at current release ${EXPECTED_VERSION} with verified digest ${latest_remote_digest}"
+                ;;
+              newer)
+                echo "Existing latest GHCR tag version ${latest_version} is newer than current release ${EXPECTED_VERSION}; leaving latest untouched"
+                ;;
+              *)
+                echo "::error::Unknown latest semver comparison result: ${latest_comparison}"
+                exit 1
+                ;;
+            esac
+          else
+            echo "Latest GHCR tag is absent; publishing current release ${EXPECTED_VERSION}"
+            push_verified_target "$latest_target"
+          fi
+
           echo "manifest-digest=$verified_manifest_digest" >> "$GITHUB_OUTPUT"
 
   ghcr-anonymous-smoke:

@@ -308,13 +308,16 @@ for (const ecosystem of ["npm", "github-actions"]) {
   }
 }
 
-if (
-  !/concurrency:\n  group: release-\$\{\{\s*github\.ref\s*\}\}\n  cancel-in-progress: false/m.test(
-    workflow,
-  )
-) {
+const releaseConcurrency = workflow.match(
+  /^concurrency:\n  group: ([^\n]+)\n  cancel-in-progress: false$/m,
+);
+if (!releaseConcurrency) {
   failures.push(
-    "release.yml must serialize each exact release ref with cancel-in-progress disabled",
+    "release.yml must serialize all patchpage-server publishes in one package-wide concurrency group with cancel-in-progress disabled",
+  );
+} else if (releaseConcurrency[1] !== "release-ghcr-patchpage-server") {
+  failures.push(
+    "release.yml concurrency group must be the constant package-wide release-ghcr-patchpage-server group, not a ref/version-scoped group",
   );
 }
 
@@ -1141,6 +1144,117 @@ if (dockerJob) {
       "docker-ghcr must fail closed on remote digest drift and output one verified digest",
     );
   }
+
+  const immutableDigestEstablished = dockerJob.indexOf(
+    "Immutable GHCR tags did not establish the current release manifest digest",
+  );
+  const latestInspect = dockerJob.indexOf(
+    'if inspect_remote_target "$latest_target" latest_remote_digest latest_remote_config_id; then',
+  );
+  const latestPull = dockerJob.indexOf('if ! docker pull "$latest_target"; then');
+  const latestImageId = dockerJob.indexOf(
+    'latest_pulled_image_id="$(docker image inspect --format',
+  );
+  const latestImageIdGuard = dockerJob.indexOf(
+    'if [[ "$latest_pulled_image_id" != "$latest_remote_config_id" ]]; then',
+  );
+  const latestVersionRead = dockerJob.indexOf(
+    'latest_version="$(docker image inspect --format',
+  );
+  const latestVersionGuard = dockerJob.indexOf(
+    'if [[ ! "$latest_version" =~ ^(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)$ ]]; then',
+  );
+  const latestComparison = dockerJob.indexOf('if ! latest_comparison="$(');
+  const latestCaseStart = dockerJob.indexOf('case "$latest_comparison" in');
+  const manifestDigestOutput = dockerJob.indexOf(
+    'echo "manifest-digest=$verified_manifest_digest" >> "$GITHUB_OUTPUT"',
+  );
+
+  if (
+    immutableDigestEstablished === -1 ||
+    latestInspect <= immutableDigestEstablished ||
+    latestPull <= latestInspect ||
+    latestImageId <= latestPull ||
+    latestImageIdGuard <= latestImageId ||
+    latestVersionRead <= latestImageIdGuard ||
+    latestVersionGuard <= latestVersionRead ||
+    latestComparison <= latestVersionGuard ||
+    latestCaseStart <= latestComparison ||
+    manifestDigestOutput <= latestCaseStart
+  ) {
+    failures.push(
+      "docker-ghcr must establish the immutable release digest before inspecting and gating latest, then output the immutable digest afterward",
+    );
+  }
+
+  const latestGate =
+    latestInspect === -1 || manifestDigestOutput === -1
+      ? ""
+      : dockerJob.slice(latestInspect, manifestDigestOutput);
+  const latestCase = latestGate.match(
+    /case "\$latest_comparison" in([\s\S]*?)\n\s+esac/,
+  )?.[1];
+  const latestOlder = latestCase?.match(/\n\s+older\)([\s\S]*?)\n\s+;;/)?.[1] ?? "";
+  const latestEqual = latestCase?.match(/\n\s+equal\)([\s\S]*?)\n\s+;;/)?.[1] ?? "";
+  const latestNewer = latestCase?.match(/\n\s+newer\)([\s\S]*?)\n\s+;;/)?.[1] ?? "";
+  const latestUnknown = latestCase?.match(/\n\s+\*\)([\s\S]*?)\n\s+;;/)?.[1] ?? "";
+  const latestAbsent = latestGate.match(
+    /\n\s+else\n\s+echo "Latest GHCR tag is absent; publishing current release \$\{EXPECTED_VERSION\}"\n\s+push_verified_target "\$latest_target"\n\s+fi\s*$/,
+  )?.[0] ?? "";
+
+  if (
+    !latestGate.includes("raw manifest config") ||
+    !latestGate.includes("org.opencontainers.image.version") ||
+    !latestGate.includes("Existing latest GHCR tag version metadata is invalid") ||
+    !latestGate.includes('python3 - "$latest_version" "$EXPECTED_VERSION"') ||
+    !latestGate.includes("existing_parts = [int(part) for part in existing.split(\".\")]") ||
+    !latestGate.includes("expected_parts = [int(part) for part in expected.split(\".\")]") ||
+    !latestGate.includes("Could not compare existing latest version") ||
+    !latestGate.includes("Latest GHCR tag is absent; publishing current release")
+  ) {
+    failures.push(
+      "docker-ghcr must fail closed while reading latest config, version label, and numeric semver comparison state",
+    );
+  }
+
+  if (!latestAbsent) {
+    failures.push("absent latest must be published from the verified current release image");
+  }
+
+  if (
+    !latestOlder.includes('push_verified_target "$latest_target"') ||
+    !latestOlder.includes("older than current release")
+  ) {
+    failures.push("older latest must be updated from the verified current release image");
+  }
+
+  if (
+    !latestEqual.includes('if [[ "$latest_remote_config_id" != "$EXPECTED_IMAGE_ID" ]]; then') ||
+    !latestEqual.includes(
+      'if [[ "$latest_remote_digest" != "$verified_manifest_digest" ]]; then',
+    ) ||
+    latestEqual.includes('push_verified_target "$latest_target"')
+  ) {
+    failures.push(
+      "equal latest must already match the current release config and immutable digest without mutation",
+    );
+  }
+
+  if (
+    !latestNewer.includes("newer than current release") ||
+    !latestNewer.includes("leaving latest untouched") ||
+    latestNewer.includes('push_verified_target "$latest_target"') ||
+    latestNewer.includes("$EXPECTED_IMAGE_ID") ||
+    latestNewer.includes("$verified_manifest_digest")
+  ) {
+    failures.push(
+      "newer latest must be left untouched without requiring it to match the older release digest",
+    );
+  }
+
+  if (!latestUnknown.includes("exit 1")) {
+    failures.push("unknown latest semver comparison results must fail closed");
+  }
 }
 
 if (ciDockerJob) {
@@ -1423,14 +1537,14 @@ async function runMutationChecks() {
             workflow,
             [
               "concurrency:",
-              "  group: release-${{ github.ref }}",
+              "  group: release-ghcr-patchpage-server",
               "  cancel-in-progress: false",
               "",
             ].join("\n"),
             "",
           ),
         },
-        expected: /release\.yml must serialize each exact release ref/,
+        expected: /release\.yml must serialize all patchpage-server publishes/,
       },
       {
         name: "reject removed GHCR digest output",
@@ -1442,6 +1556,24 @@ async function runMutationChecks() {
           ),
         },
         expected: /docker-ghcr must expose the verified GHCR manifest digest/,
+      },
+      {
+        name: "reject older release overwriting newer latest",
+        env: {
+          PATCHPAGE_RELEASE_WORKFLOW_SOURCE: replaceOnce(
+            workflow,
+            [
+              "              newer)",
+              '                echo "Existing latest GHCR tag version ${latest_version} is newer than current release ${EXPECTED_VERSION}; leaving latest untouched"',
+            ].join("\n"),
+            [
+              "              newer)",
+              '                push_verified_target "$latest_target"',
+              '                echo "Existing latest GHCR tag version ${latest_version} is newer than current release ${EXPECTED_VERSION}; leaving latest untouched"',
+            ].join("\n"),
+          ),
+        },
+        expected: /newer latest must be left untouched/,
       },
       {
         name: "reject unquoted CI revision",
