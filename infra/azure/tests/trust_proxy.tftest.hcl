@@ -29,7 +29,7 @@ run "wires_trusted_proxy_hop_count" {
   assert {
     condition = anytrue([
       for setting in azurerm_container_app.server.template[0].container[0].env :
-      setting.name == "PATCHPAGE_TRUST_PROXY" && coalesce(setting.value, "") == "2"
+      setting.name == "PATCHPAGE_TRUST_PROXY" ? try(setting.value == "2", false) : false
     ])
     error_message = "Configured trusted-proxy values must be wired into the Container App environment."
   }
@@ -47,9 +47,11 @@ run "wires_trusted_proxy_networks" {
   assert {
     condition = anytrue([
       for setting in azurerm_container_app.server.template[0].container[0].env :
-      setting.name == "PATCHPAGE_TRUST_PROXY" &&
-      coalesce(setting.value, "") ==
-      "192.0.2.10, 10.0.0.0/8, 2001:db8::1, 2001:db8:1234::/48"
+      setting.name == "PATCHPAGE_TRUST_PROXY" ? try(
+        setting.value ==
+        "192.0.2.10, 10.0.0.0/8, 2001:db8::1, 2001:db8:1234::/48",
+        false
+      ) : false
     ])
     error_message = "Configured trusted-proxy networks must be wired into the Container App environment."
   }
