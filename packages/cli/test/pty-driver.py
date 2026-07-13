@@ -6,6 +6,7 @@ import json
 import os
 import pty
 import select
+import signal
 import subprocess
 import sys
 import termios
@@ -31,6 +32,7 @@ process = subprocess.Popen(
 output = bytearray()
 prompt = b"PatchPage API token:"
 deadline = time.monotonic() + (3 if interaction == "none" else 5)
+raw_during_interaction = None
 
 
 def read_pty():
@@ -53,12 +55,17 @@ while (
         output.extend(read_pty())
 
 if prompt in output:
+    current_terminal = termios.tcgetattr(slave_fd)
+    raw_during_interaction = not current_terminal[3] & (termios.ICANON | termios.ECHO)
     if interaction == "line":
         os.write(master_fd, payload + b"\r")
     elif interaction == "eof":
         os.write(master_fd, b"\x04")
     elif interaction == "interrupt":
         os.write(master_fd, b"\x03")
+    elif interaction.startswith("signal:"):
+        signal_name = interaction.removeprefix("signal:")
+        os.kill(process.pid, getattr(signal, signal_name))
     else:
         raise ValueError(f"Unknown interaction: {interaction}")
     deadline = time.monotonic() + 5
@@ -87,6 +94,7 @@ print(
         {
             "output": output.decode("utf-8", errors="replace"),
             "status": process.returncode,
+            "rawDuringInteraction": raw_during_interaction,
             "terminalRestored": terminal_restored,
         }
     )

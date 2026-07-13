@@ -276,8 +276,48 @@ async function promptForApiToken(): Promise<string> {
   const onClose = () => abort(new CliError("API token input ended before a token was entered."));
   let readline: ReturnType<typeof createInterface> | undefined;
   let promptStarted = false;
+  let cleanedUp = false;
+  const signalHandlers = new Map<NodeJS.Signals, () => void>();
+  const cleanup = () => {
+    if (cleanedUp) return;
+    cleanedUp = true;
+
+    try {
+      input.removeListener("end", onEnd);
+      input.removeListener("error", onError);
+      readline?.removeListener("SIGINT", onInterrupt);
+      readline?.removeListener("close", onClose);
+      readline?.removeListener("error", onError);
+      try {
+        readline?.close();
+      } finally {
+        try {
+          hiddenOutput.destroy();
+        } finally {
+          if (Boolean(input.isRaw) !== wasRaw) input.setRawMode(wasRaw);
+        }
+      }
+      if (promptStarted) output.write("\n");
+    } finally {
+      for (const [signal, handler] of signalHandlers) {
+        process.removeListener(signal, handler);
+      }
+    }
+  };
+  const onExternalSignal = (signal: NodeJS.Signals) => {
+    try {
+      cleanup();
+    } finally {
+      process.kill(process.pid, signal);
+    }
+  };
 
   try {
+    for (const signal of ["SIGINT", "SIGTERM", "SIGHUP"] as const) {
+      const handler = () => onExternalSignal(signal);
+      signalHandlers.set(signal, handler);
+      process.on(signal, handler);
+    }
     readline = createInterface({
       input,
       output: hiddenOutput,
@@ -288,6 +328,7 @@ async function promptForApiToken(): Promise<string> {
     input.prependOnceListener("error", onError);
     readline.once("SIGINT", onInterrupt);
     readline.once("close", onClose);
+    readline.once("error", onError);
     promptStarted = true;
     output.write("PatchPage API token: ");
 
@@ -299,17 +340,7 @@ async function promptForApiToken(): Promise<string> {
       throw new CliError("Could not read the API token.");
     }
   } finally {
-    input.removeListener("end", onEnd);
-    input.removeListener("error", onError);
-    readline?.removeListener("SIGINT", onInterrupt);
-    readline?.removeListener("close", onClose);
-    try {
-      readline?.close();
-      hiddenOutput.destroy();
-    } finally {
-      if (Boolean(input.isRaw) !== wasRaw) input.setRawMode(wasRaw);
-    }
-    if (promptStarted) output.write("\n");
+    cleanup();
   }
 }
 
