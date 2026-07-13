@@ -57,6 +57,48 @@ run "wires_trusted_proxy_networks" {
   }
 }
 
+run "wires_partial_trusted_proxy_networks" {
+  command = plan
+
+  variables {
+    subscription_id = "00000000-0000-0000-0000-000000000000"
+    public_base_url = "https://drafts.self-hoster.dev"
+    trust_proxy     = "0.0.0.0/1, 192.0.2.0/24, ::1, ::/96, 2001:db8::/32"
+  }
+
+  assert {
+    condition = anytrue([
+      for setting in azurerm_container_app.server.template[0].container[0].env :
+      setting.name == "PATCHPAGE_TRUST_PROXY" ? try(
+        setting.value == "0.0.0.0/1, 192.0.2.0/24, ::1, ::/96, 2001:db8::/32",
+        false
+      ) : false
+    ])
+    error_message = "Partial trusted-proxy network sets must remain valid."
+  }
+}
+
+run "wires_native_ipv6_partial_networks" {
+  command = plan
+
+  variables {
+    subscription_id = "00000000-0000-0000-0000-000000000000"
+    public_base_url = "https://drafts.self-hoster.dev"
+    trust_proxy     = "8000::/1, 0:0:0:0:0:0:c000:200/120"
+  }
+
+  assert {
+    condition = anytrue([
+      for setting in azurerm_container_app.server.template[0].container[0].env :
+      setting.name == "PATCHPAGE_TRUST_PROXY" ? try(
+        setting.value == "8000::/1, 0:0:0:0:0:0:c000:200/120",
+        false
+      ) : false
+    ])
+    error_message = "Native partial IPv6 networks must remain valid."
+  }
+}
+
 run "rejects_boolean_trust" {
   command = plan
 
@@ -321,6 +363,102 @@ run "rejects_ipv6_blanket_cidr" {
   expect_failures = [var.trust_proxy]
 }
 
+run "rejects_ipv4_full_family_union" {
+  command = plan
+
+  variables {
+    subscription_id = "00000000-0000-0000-0000-000000000000"
+    public_base_url = "https://drafts.self-hoster.dev"
+    trust_proxy     = "0.0.0.0/1,128.0.0.0/1"
+  }
+
+  expect_failures = [var.trust_proxy]
+}
+
+run "rejects_reordered_ipv4_full_family_union" {
+  command = plan
+
+  variables {
+    subscription_id = "00000000-0000-0000-0000-000000000000"
+    public_base_url = "https://drafts.self-hoster.dev"
+    trust_proxy     = "128.0.0.0/1,0.0.0.0/1"
+  }
+
+  expect_failures = [var.trust_proxy]
+}
+
+run "rejects_alternate_ipv4_full_family_union" {
+  command = plan
+
+  variables {
+    subscription_id = "00000000-0000-0000-0000-000000000000"
+    public_base_url = "https://drafts.self-hoster.dev"
+    trust_proxy     = "0.0.0.0/2,64.0.0.0/2,128.0.0.0/1"
+  }
+
+  expect_failures = [var.trust_proxy]
+}
+
+run "rejects_overlapping_ipv4_full_family_union" {
+  command = plan
+
+  variables {
+    subscription_id = "00000000-0000-0000-0000-000000000000"
+    public_base_url = "https://drafts.self-hoster.dev"
+    trust_proxy     = "0.0.0.0/2,64.0.0.0/2,128.0.0.0/2,192.0.0.0/2,192.0.2.0/24"
+  }
+
+  expect_failures = [var.trust_proxy]
+}
+
+run "rejects_ipv6_full_family_union" {
+  command = plan
+
+  variables {
+    subscription_id = "00000000-0000-0000-0000-000000000000"
+    public_base_url = "https://drafts.self-hoster.dev"
+    trust_proxy     = "::/1,8000::/1"
+  }
+
+  expect_failures = [var.trust_proxy]
+}
+
+run "rejects_alternate_ipv6_full_family_union" {
+  command = plan
+
+  variables {
+    subscription_id = "00000000-0000-0000-0000-000000000000"
+    public_base_url = "https://drafts.self-hoster.dev"
+    trust_proxy     = "8000::/1,::/2,4000::/2"
+  }
+
+  expect_failures = [var.trust_proxy]
+}
+
+run "rejects_nested_ipv6_full_family_union" {
+  command = plan
+
+  variables {
+    subscription_id = "00000000-0000-0000-0000-000000000000"
+    public_base_url = "https://drafts.self-hoster.dev"
+    trust_proxy     = "::/1,8000::/2,c000::/2"
+  }
+
+  expect_failures = [var.trust_proxy]
+}
+
+run "rejects_overlapping_ipv6_full_family_union" {
+  command = plan
+
+  variables {
+    subscription_id = "00000000-0000-0000-0000-000000000000"
+    public_base_url = "https://drafts.self-hoster.dev"
+    trust_proxy     = "::/2,4000::/2,8000::/2,c000::/2,2001:db8::/32"
+  }
+
+  expect_failures = [var.trust_proxy]
+}
+
 run "rejects_ipv4_mapped_ipv6_blanket_cidr" {
   command = plan
 
@@ -328,6 +466,114 @@ run "rejects_ipv4_mapped_ipv6_blanket_cidr" {
     subscription_id = "00000000-0000-0000-0000-000000000000"
     public_base_url = "https://drafts.self-hoster.dev"
     trust_proxy     = "::ffff:0:0/96"
+  }
+
+  expect_failures = [var.trust_proxy]
+}
+
+run "rejects_deprecated_transitional_ipv6_blanket_cidr" {
+  command = plan
+
+  variables {
+    subscription_id = "00000000-0000-0000-0000-000000000000"
+    public_base_url = "https://drafts.self-hoster.dev"
+    trust_proxy     = "::0.0.0.0/96"
+  }
+
+  expect_failures = [var.trust_proxy]
+}
+
+run "wires_compressed_native_ipv6_compatible_cidr" {
+  command = plan
+
+  variables {
+    subscription_id = "00000000-0000-0000-0000-000000000000"
+    public_base_url = "https://drafts.self-hoster.dev"
+    trust_proxy     = "::/96"
+  }
+
+  assert {
+    condition = anytrue([
+      for setting in azurerm_container_app.server.template[0].container[0].env :
+      setting.name == "PATCHPAGE_TRUST_PROXY" ? try(setting.value == "::/96", false) : false
+    ])
+    error_message = "Native ::/96 IPv6 networks must remain valid."
+  }
+}
+
+run "wires_expanded_native_ipv6_compatible_cidr" {
+  command = plan
+
+  variables {
+    subscription_id = "00000000-0000-0000-0000-000000000000"
+    public_base_url = "https://drafts.self-hoster.dev"
+    trust_proxy     = "0:0:0:0:0:0:0:0/96"
+  }
+
+  assert {
+    condition = anytrue([
+      for setting in azurerm_container_app.server.template[0].container[0].env :
+      setting.name == "PATCHPAGE_TRUST_PROXY" ? try(
+        setting.value == "0:0:0:0:0:0:0:0/96",
+        false
+      ) : false
+    ])
+    error_message = "Expanded native ::/96 IPv6 networks must remain valid."
+  }
+}
+
+run "rejects_specific_deprecated_transitional_ipv6_cidr" {
+  command = plan
+
+  variables {
+    subscription_id = "00000000-0000-0000-0000-000000000000"
+    public_base_url = "https://drafts.self-hoster.dev"
+    trust_proxy     = "::192.0.2.0/120"
+  }
+
+  expect_failures = [var.trust_proxy]
+}
+
+run "rejects_deprecated_transitional_ipv6_literal" {
+  command = plan
+
+  variables {
+    subscription_id = "00000000-0000-0000-0000-000000000000"
+    public_base_url = "https://drafts.self-hoster.dev"
+    trust_proxy     = "::192.0.2.10"
+  }
+
+  expect_failures = [var.trust_proxy]
+}
+
+run "wires_hex_native_ipv6_compatible_cidr" {
+  command = plan
+
+  variables {
+    subscription_id = "00000000-0000-0000-0000-000000000000"
+    public_base_url = "https://drafts.self-hoster.dev"
+    trust_proxy     = "0:0:0:0:0:0:c000:200/120"
+  }
+
+  assert {
+    condition = anytrue([
+      for setting in azurerm_container_app.server.template[0].container[0].env :
+      setting.name == "PATCHPAGE_TRUST_PROXY" ? try(
+        setting.value == "0:0:0:0:0:0:c000:200/120",
+        false
+      ) : false
+    ])
+    error_message = "Hex IPv4-compatible native IPv6 CIDRs must remain valid."
+  }
+}
+
+run "rejects_ipv4_mapped_ipv6_literal" {
+  command = plan
+
+  variables {
+    subscription_id = "00000000-0000-0000-0000-000000000000"
+    public_base_url = "https://drafts.self-hoster.dev"
+    trust_proxy     = "::ffff:192.0.2.10"
   }
 
   expect_failures = [var.trust_proxy]
@@ -352,18 +598,6 @@ run "rejects_noncanonical_ipv4_mapped_ipv6_blanket_supernet" {
     subscription_id = "00000000-0000-0000-0000-000000000000"
     public_base_url = "https://drafts.self-hoster.dev"
     trust_proxy     = "::ffff:0:0/95"
-  }
-
-  expect_failures = [var.trust_proxy]
-}
-
-run "rejects_ipv6_supernet_covering_all_mapped_ipv4_peers" {
-  command = plan
-
-  variables {
-    subscription_id = "00000000-0000-0000-0000-000000000000"
-    public_base_url = "https://drafts.self-hoster.dev"
-    trust_proxy     = "::/1"
   }
 
   expect_failures = [var.trust_proxy]
@@ -412,6 +646,18 @@ run "rejects_expanded_ipv4_mapped_ipv6_cidr" {
     subscription_id = "00000000-0000-0000-0000-000000000000"
     public_base_url = "https://drafts.self-hoster.dev"
     trust_proxy     = "0:0:0:0:0:ffff:a00:0/104"
+  }
+
+  expect_failures = [var.trust_proxy]
+}
+
+run "rejects_ipv6_supernet_covering_all_mapped_ipv4_peers" {
+  command = plan
+
+  variables {
+    subscription_id = "00000000-0000-0000-0000-000000000000"
+    public_base_url = "https://drafts.self-hoster.dev"
+    trust_proxy     = "::/1"
   }
 
   expect_failures = [var.trust_proxy]

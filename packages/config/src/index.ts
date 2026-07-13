@@ -1,8 +1,19 @@
-import { BlockList, isIP } from "node:net";
+import { isIP } from "node:net";
 
 const MAX_TRUST_PROXY_HOPS = 32;
-const IPV4_MAPPED_IPV6_NETWORK = new BlockList();
-IPV4_MAPPED_IPV6_NETWORK.addSubnet("::ffff:0:0", 96, "ipv6");
+const IPV4_BITS = 32;
+const IPV6_BITS = 128;
+const IPV4_MAX = (1n << 32n) - 1n;
+const IPV6_MAX = (1n << 128n) - 1n;
+const IPV4_MAPPED_IPV6_START = 0xffffn << 32n;
+const IPV4_MAPPED_IPV6_END = IPV4_MAPPED_IPV6_START + IPV4_MAX;
+const DEPRECATED_TRANSITIONAL_IPV6_PATTERN = /^::(?:[0-9]{1,3}\.){3}[0-9]{1,3}$/;
+
+interface TrustedProxyRange {
+  family: 4 | 6;
+  start: bigint;
+  end: bigint;
+}
 
 export interface ServerConfig {
   port: number;
@@ -67,40 +78,145 @@ function trustProxyValue(value: string | undefined): false | number | string[] {
   }
 
   const entries = trimmed.split(",").map((entry) => entry.trim());
-  if (entries.every(isIpOrCidr)) return entries;
+  const ranges: TrustedProxyRange[] = [];
+  for (const entry of entries) {
+    const range = trustedProxyRange(entry);
+    if (!range) {
+      throw new Error(`Invalid PATCHPAGE_TRUST_PROXY value: ${value}`);
+    }
+    ranges.push(range);
+  }
 
-  throw new Error(`Invalid PATCHPAGE_TRUST_PROXY value: ${value}`);
+  if (coversFullAddressFamily(ranges, 4) || coversFullAddressFamily(ranges, 6)) {
+    throw new Error(`Invalid PATCHPAGE_TRUST_PROXY value: ${value}`);
+  }
+
+  return entries;
 }
 
-function isIpOrCidr(value: string): boolean {
-  if (!value.includes("%") && isIP(value)) return true;
+function trustedProxyRange(value: string): TrustedProxyRange | null {
+  if (value.includes("%")) return null;
 
   const [address, prefix, extra] = value.split("/");
-  if (
-    !address ||
-    address.includes("%") ||
-    !prefix ||
-    extra !== undefined ||
-    !/^[1-9]\d*$/.test(prefix)
-  ) {
-    return false;
-  }
+  if (!address || extra !== undefined) return null;
 
   const family = isIP(address);
-  const prefixLength = Number(prefix);
-  const maxPrefix = family === 4 ? 32 : family === 6 ? 128 : 0;
-  if (prefixLength > maxPrefix) return false;
-  return family !== 6 || !overlapsIpv4MappedIpv6(address, prefixLength);
+  if (family !== 4 && family !== 6) return null;
+
+  const bitWidth = family === 4 ? IPV4_BITS : IPV6_BITS;
+  const prefixLength = prefix === undefined ? bitWidth : parsePrefixLength(prefix, bitWidth);
+  if (prefixLength === null) return null;
+  if (family === 6 && DEPRECATED_TRANSITIONAL_IPV6_PATTERN.test(address)) return null;
+
+  const range = cidrRange(address, family, prefixLength);
+  if (family === 6 && overlapsIpv4MappedIpv6Alias(range)) return null;
+  return range;
 }
 
-function overlapsIpv4MappedIpv6(address: string, prefixLength: number): boolean {
-  if (prefixLength > 96) {
-    return IPV4_MAPPED_IPV6_NETWORK.check(address, "ipv6");
+function parsePrefixLength(prefix: string, bitWidth: number): number | null {
+  if (!/^[1-9]\d*$/.test(prefix)) return null;
+  const prefixLength = Number(prefix);
+  return prefixLength <= bitWidth ? prefixLength : null;
+}
+
+function cidrRange(address: string, family: 4 | 6, prefixLength: number): TrustedProxyRange {
+  const bitWidth = family === 4 ? IPV4_BITS : IPV6_BITS;
+  const value = family === 4 ? ipv4ToBigInt(address) : ipv6ToBigInt(address);
+  const size = 1n << BigInt(bitWidth - prefixLength);
+  const start = (value / size) * size;
+
+  return {
+    family,
+    start,
+    end: start + size - 1n
+  };
+}
+
+function overlapsIpv4MappedIpv6Alias(range: TrustedProxyRange): boolean {
+  return rangesOverlap(
+    range.start,
+    range.end,
+    IPV4_MAPPED_IPV6_START,
+    IPV4_MAPPED_IPV6_END
+  );
+}
+
+function rangesOverlap(start: bigint, end: bigint, otherStart: bigint, otherEnd: bigint): boolean {
+  return start <= otherEnd && end >= otherStart;
+}
+
+function coversFullAddressFamily(ranges: TrustedProxyRange[], family: 4 | 6): boolean {
+  const familyRanges = ranges.filter((range) => range.family === family);
+  if (familyRanges.length === 0) return false;
+
+  familyRanges.sort((a, b) => (a.start < b.start ? -1 : a.start > b.start ? 1 : 0));
+
+  const max = family === 4 ? IPV4_MAX : IPV6_MAX;
+  let nextUncovered = 0n;
+  for (const range of familyRanges) {
+    if (range.end < nextUncovered) continue;
+    if (range.start > nextUncovered) return false;
+    if (range.end === max) return true;
+    nextUncovered = range.end + 1n;
   }
 
-  const candidate = new BlockList();
-  candidate.addSubnet(address, prefixLength, "ipv6");
-  return candidate.check("::ffff:0:0", "ipv6");
+  return false;
+}
+
+function ipv4ToBigInt(address: string): bigint {
+  let value = 0n;
+  for (const octet of address.split(".")) {
+    value = (value << 8n) + BigInt(Number(octet));
+  }
+  return value;
+}
+
+function ipv6ToBigInt(address: string): bigint {
+  const halves = address.toLowerCase().split("::");
+  if (halves.length > 2) throw new Error(`Invalid IPv6 address: ${address}`);
+
+  const head = halves[0] ?? "";
+  const tail = halves[1] ?? "";
+  const headSegments = countIpv6Segments(head);
+  const tailSegments = countIpv6Segments(tail);
+  const zeroSegments = halves.length === 2 ? IPV6_BITS / 16 - headSegments - tailSegments : 0;
+  const segments: number[] = [];
+
+  appendIpv6Segments(segments, head);
+  for (let index = 0; index < zeroSegments; index += 1) {
+    segments.push(0);
+  }
+  appendIpv6Segments(segments, tail);
+
+  let value = 0n;
+  for (const segment of segments) {
+    value = (value << 16n) + BigInt(segment);
+  }
+  return value;
+}
+
+function countIpv6Segments(section: string): number {
+  if (!section) return 0;
+
+  let count = 0;
+  for (const segment of section.split(":")) {
+    count += segment.includes(".") ? 2 : 1;
+  }
+  return count;
+}
+
+function appendIpv6Segments(segments: number[], section: string): void {
+  if (!section) return;
+
+  for (const segment of section.split(":")) {
+    if (segment.includes(".")) {
+      const ipv4 = ipv4ToBigInt(segment);
+      segments.push(Number((ipv4 >> 16n) & 0xffffn));
+      segments.push(Number(ipv4 & 0xffffn));
+    } else {
+      segments.push(Number.parseInt(segment, 16));
+    }
+  }
 }
 
 function intValue(value: string | undefined, fallback: number): number {

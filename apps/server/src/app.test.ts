@@ -163,11 +163,15 @@ describe("PatchPage server", () => {
 
   it.each([
     "::ffff:0:0/96",
+    "::0.0.0.0/96",
+    "::192.0.2.10",
+    "::192.0.2.0/120",
+    "::/1",
+    "0.0.0.0/1,128.0.0.0/1",
     "::ffff:10.0.0.0/104",
     "0:0:0:0:0:ffff:a00:0/104",
     "::fffe:0:0/95",
-    "::ffff:0:0/95",
-    "::/1"
+    "::ffff:0:0/95"
   ])(
     "rejects effective blanket trust %s before a direct peer can spoof attribution",
     async (trustProxy) => {
