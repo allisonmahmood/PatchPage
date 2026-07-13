@@ -46,6 +46,52 @@ variable "public_base_url" {
   }
 }
 
+variable "trust_proxy" {
+  description = "Optional trusted-proxy hop count or comma-separated IP/CIDR set. Null keeps forwarding headers untrusted."
+  type        = string
+  default     = null
+
+  validation {
+    condition = var.trust_proxy == null ? true : (
+      can(regex("^[1-9][0-9]*$", trimspace(var.trust_proxy))) ? (
+        tonumber(trimspace(var.trust_proxy)) <= 32
+        ) : alltrue([
+          for entry in split(",", var.trust_proxy) : (
+            trimspace(entry) != "" &&
+            (
+              length(split("/", trimspace(entry))) == 1 ? (
+                can(regex("^[0-9]{1,3}(\\.[0-9]{1,3}){3}$", trimspace(entry))) ?
+                try(cidrhost("${trimspace(entry)}/32", 0), "") == trimspace(entry) :
+                !strcontains(trimspace(entry), "%") &&
+                strcontains(trimspace(entry), ":") &&
+                can(cidrhost("${trimspace(entry)}/128", 0))
+                ) : length(split("/", trimspace(entry))) == 2 ? (
+                  can(regex(
+                    "^[1-9][0-9]*$",
+                    split("/", trimspace(entry))[1]
+                    )) && (
+                    can(regex(
+                      "^[0-9]{1,3}(\\.[0-9]{1,3}){3}$",
+                      split("/", trimspace(entry))[0]
+                      )) ?
+                    try(
+                      cidrhost("${split("/", trimspace(entry))[0]}/32", 0),
+                      ""
+                    ) == split("/", trimspace(entry))[0] &&
+                    can(cidrhost(trimspace(entry), 0)) :
+                    !strcontains(split("/", trimspace(entry))[0], "%") &&
+                    strcontains(split("/", trimspace(entry))[0], ":") &&
+                    can(cidrhost(trimspace(entry), 0))
+                  )
+              ) : false
+            )
+          )
+        ])
+    )
+    error_message = "trust_proxy must be null, a decimal hop count from 1 to 32, or comma-separated literal IP/CIDR entries; blank, boolean, wildcard, malformed, empty, and /0 values are not allowed."
+  }
+}
+
 variable "server_image" {
   description = "Fully qualified PatchPage server image reference. Use the quickstart placeholder until ACR has a real image."
   type        = string

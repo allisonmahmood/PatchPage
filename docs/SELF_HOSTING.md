@@ -28,6 +28,8 @@ PatchPage reads configuration from process environment variables. It does **not*
 # HTTP
 PORT=3000
 PATCHPAGE_PUBLIC_BASE_URL=https://post.example.com
+# Leave unset for a direct deployment. Configure only after verifying the proxy path.
+# PATCHPAGE_TRUST_PROXY=1
 
 # Auth
 # The bootstrap token becomes a usable admin+upload API token on startup/migration.
@@ -59,6 +61,7 @@ AZURE_STORAGE_CONNECTION_STRING=
 Notes on values:
 
 - `PATCHPAGE_PUBLIC_BASE_URL` is used to build the public draft URLs returned by uploads and rendered in the viewer. Set it to the externally reachable origin (scheme + host, no trailing slash). The Azure Terraform example requires a deployer-owned HTTPS origin; the application itself retains its `http://localhost:3000` default for local development.
+- `PATCHPAGE_TRUST_PROXY` controls whether Fastify derives `request.ip` from `X-Forwarded-For`. Leave it undefined unless every route to the server has a verified trust boundary. See [Client IP attribution behind proxies](#client-ip-attribution-behind-proxies).
 - `PATCHPAGE_MAX_HTML_BYTES` caps the size of a single HTML document (default 524288 = 512 KiB).
 - `PATCHPAGE_ALLOW_ANONYMOUS_UPLOADS` is parsed but not currently enforced — the upload endpoint always requires a token with the `upload` scope regardless of this setting. Keep it `false`.
 - The `json` metadata driver and `filesystem` storage driver write under `.local/` by default and need no external services — good for a quick self-host or local testing. For a durable multi-instance deployment, use `postgres` and a shared object store (`azure-blob`).
@@ -156,6 +159,61 @@ Alternatively, CI can set `PATCHPAGE_API_URL` and `PATCHPAGE_API_TOKEN` directly
 ## Deployment notes
 
 PatchPage serves plain HTTP and does not terminate TLS itself. Put it behind a reverse proxy or platform ingress (nginx, Caddy, a cloud load balancer, Azure Container Apps ingress, etc.) that terminates TLS and forwards to `$PORT`, and set `PATCHPAGE_PUBLIC_BASE_URL` to the public HTTPS origin. Provide `DATABASE_URL` and any storage credentials through your platform's secret management rather than committing them.
+
+### Client IP attribution behind proxies
+
+Fastify's `request.ip` is PatchPage's single attributed client address. Uploads persist that value in the `source_ip` fields of `draft_versions` and `upload_events`; code that needs the attributed client address must consume the same value rather than reparsing forwarding headers.
+
+When `PATCHPAGE_TRUST_PROXY` is absent, Fastify ignores `X-Forwarded-For` and `request.ip` is the direct socket peer. This is the safe setting for a direct deployment. A defined blank or whitespace-only value is an error, not another spelling of "off".
+
+The setting accepts exactly one of these forms:
+
+- A decimal hop count from `1` through `32`, kept as a number for Fastify. Starting at PatchPage, Fastify considers the socket peer first, then the rightmost `X-Forwarded-For` entry, and continues right-to-left. Count `1` trusts the socket peer and selects the rightmost forwarded address. Count `2` also trusts that nearest forwarded hop and selects the next address to its left.
+- One or more comma-separated literal IPv4/IPv6 addresses or CIDR networks. Fastify walks from the socket outward while each address belongs to the configured set; the first address outside the set becomes `request.ip`.
+
+Values such as `0`, negative or fractional counts, `true`, `false`, `all`, `*`, empty list entries, malformed addresses, and blanket `/0` networks are rejected. Network entries are syntax-only until you replace them with the proxy addresses actually observed in your environment; for example:
+
+```env
+# Documentation addresses only; replace both entries with observed proxy egress ranges.
+PATCHPAGE_TRUST_PROXY=192.0.2.10,2001:db8:1234::/48
+```
+
+For one nginx proxy, make nginx replace any client-supplied value and use count `1` only if nginx is the sole route to PatchPage:
+
+```nginx
+location / {
+    proxy_set_header X-Forwarded-For $remote_addr;
+    proxy_pass http://patchpage:3000;
+}
+```
+
+```env
+PATCHPAGE_TRUST_PROXY=1
+```
+
+nginx also provides `$proxy_add_x_forwarded_for`, which appends its peer address to an existing header. If you use it in a multi-proxy topology, validate the upstream before preserving its header and configure PatchPage for the whole observed chain. See nginx's [`proxy_set_header` and `$proxy_add_x_forwarded_for` documentation](https://nginx.org/en/docs/http/ngx_http_proxy_module.html).
+
+For a single Caddy proxy, its normal reverse proxy behavior sets the forwarded headers and disregards client-supplied forwarded values. With no other path to PatchPage, count `1` is appropriate:
+
+```caddyfile
+post.example.com {
+    reverse_proxy patchpage:3000
+}
+```
+
+```env
+PATCHPAGE_TRUST_PROXY=1
+```
+
+If another proxy or CDN precedes Caddy, configure Caddy's own trusted-proxy boundary first and then configure PatchPage for the chain Caddy actually sends. See Caddy's [`reverse_proxy` forwarding-header behavior](https://caddyserver.com/docs/caddyfile/directives/reverse_proxy#defaults).
+
+For an invariant two-proxy path such as `client -> CDN/load balancer -> nginx/Caddy -> PatchPage`, count `2` selects the address two positions away from the application:
+
+```env
+PATCHPAGE_TRUST_PROXY=2
+```
+
+Hop counts are safe only when every reachable route has that exact proxy depth and each proxy overwrites or predictably appends forwarding data. A shorter bypass path can turn an attacker-supplied header entry into `request.ip`. Prefer a verified address/CIDR set when path length varies, but do not trust broad private networks shared with untrusted workloads. In either mode, prevent clients from reaching PatchPage around the trusted proxy and test every public hostname with a deliberately spoofed `X-Forwarded-For` value before relying on the attribution for audit.
 
 The [`infra/azure`](../infra/azure) Terraform directory is an Azure-specific worked example for the platform resources: Container Apps and external ingress, a container registry, PostgreSQL, Blob Storage with a private container, managed identity, and server configuration. It intentionally does not provision the deployer's DNS records, Container App custom hostname, Azure managed certificate, or certificate binding. Its [README](../infra/azure/README.md) separates those resources from the complete manual custom-domain and certificate flow.
 

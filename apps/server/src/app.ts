@@ -42,7 +42,8 @@ declare module "fastify" {
 export function createApp(options: CreateAppOptions): FastifyInstance {
   const app = Fastify({
     logger: false,
-    bodyLimit: Math.max(options.config.maxHtmlBytes * 3, 2 * 1024 * 1024)
+    bodyLimit: Math.max(options.config.maxHtmlBytes * 3, 2 * 1024 * 1024),
+    trustProxy: options.config.trustProxy
   });
 
   app.addHook("onSend", async (_request, reply) => {

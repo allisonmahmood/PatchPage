@@ -6,5 +6,9 @@ environment_name = "prod"
 # public DNS hostname you own. Do not include a port, path, or trailing slash.
 public_base_url = "https://patchpage.your-domain.invalid"
 
+# Safe default: forwarding headers remain untrusted. Set only after completing
+# the trusted-proxy HITL verification in README.md.
+trust_proxy = null
+
 # Fill after the first ACR build:
 # server_image = "acrpatchpageabc123.azurecr.io/patchpage-server:git-sha"

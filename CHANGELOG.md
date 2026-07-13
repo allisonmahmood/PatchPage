@@ -6,6 +6,11 @@ All notable changes to PatchPage are documented in this file. The format is base
 
 ## [Unreleased]
 
+### Added
+
+- Bounded trusted-proxy configuration for canonical client IP attribution, with safe direct
+  defaults and deployment guidance for verified reverse-proxy topologies.
+
 ### Changed
 
 - The `patchpage` CLI and server now require Node.js 22 or newer. Node 20 reached

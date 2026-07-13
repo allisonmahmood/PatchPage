@@ -1,6 +1,11 @@
+import { isIP } from "node:net";
+
+const MAX_TRUST_PROXY_HOPS = 32;
+
 export interface ServerConfig {
   port: number;
   publicBaseUrl: string;
+  trustProxy: false | number | string[];
   bootstrapApiToken: string | null;
   allowAnonymousUploads: boolean;
   maxHtmlBytes: number;
@@ -22,6 +27,7 @@ export function getServerConfig(env: NodeJS.ProcessEnv = process.env): ServerCon
   return {
     port: intValue(env.PORT, 3000),
     publicBaseUrl: stringValue(env.PATCHPAGE_PUBLIC_BASE_URL) ?? "http://localhost:3000",
+    trustProxy: trustProxyValue(env.PATCHPAGE_TRUST_PROXY),
     bootstrapApiToken: stringValue(env.PATCHPAGE_BOOTSTRAP_API_TOKEN),
     allowAnonymousUploads: boolValue(env.PATCHPAGE_ALLOW_ANONYMOUS_UPLOADS, false),
     maxHtmlBytes: intValue(env.PATCHPAGE_MAX_HTML_BYTES, 512 * 1024),
@@ -48,6 +54,39 @@ export function requireConfigValue(name: string, value: string | null | undefine
 function stringValue(value: string | undefined): string | null {
   const trimmed = value?.trim();
   return trimmed ? trimmed : null;
+}
+
+function trustProxyValue(value: string | undefined): false | number | string[] {
+  if (value === undefined) return false;
+
+  const trimmed = value.trim();
+  if (/^[1-9]\d*$/.test(trimmed) && Number(trimmed) <= MAX_TRUST_PROXY_HOPS) {
+    return Number(trimmed);
+  }
+
+  const entries = trimmed.split(",").map((entry) => entry.trim());
+  if (entries.every(isIpOrCidr)) return entries;
+
+  throw new Error(`Invalid PATCHPAGE_TRUST_PROXY value: ${value}`);
+}
+
+function isIpOrCidr(value: string): boolean {
+  if (!value.includes("%") && isIP(value)) return true;
+
+  const [address, prefix, extra] = value.split("/");
+  if (
+    !address ||
+    address.includes("%") ||
+    !prefix ||
+    extra !== undefined ||
+    !/^[1-9]\d*$/.test(prefix)
+  ) {
+    return false;
+  }
+
+  const family = isIP(address);
+  const maxPrefix = family === 4 ? 32 : family === 6 ? 128 : 0;
+  return Number(prefix) <= maxPrefix;
 }
 
 function intValue(value: string | undefined, fallback: number): number {
