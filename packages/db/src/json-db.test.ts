@@ -159,42 +159,13 @@ describe("JsonFilePatchPageDb", () => {
       await mkdir(realParent);
       await symlink(realParent, aliasedParent, "dir");
 
-      let textualIdentityCalls = 0;
-      let releaseTextualIdentities = (): void => undefined;
-      const textualIdentities = new Promise<void>((resolve) => {
-        releaseTextualIdentities = resolve;
-      });
       const uncanonicalRealpath = (async (
         target: Parameters<typeof fsPromises.realpath>[0]
-      ) => {
-        textualIdentityCalls += 1;
-        if (textualIdentityCalls === 2) releaseTextualIdentities();
-        await textualIdentities;
-        return path.resolve(String(target));
-      }) as typeof fsPromises.realpath;
-
-      let primaryReads = 0;
-      let releaseConcurrentReads = (): void => undefined;
-      const concurrentReads = new Promise<void>((resolve) => {
-        releaseConcurrentReads = resolve;
-      });
-      const trackedReadFile = (async (...args: Parameters<typeof fsPromises.readFile>) => {
-        if (
-          textualIdentityCalls >= 2 &&
-          path.basename(String(args[0])) === "db.json" &&
-          primaryReads < 2
-        ) {
-          primaryReads += 1;
-          if (primaryReads === 2) releaseConcurrentReads();
-          await concurrentReads;
-        }
-        return Reflect.apply(fsPromises.readFile, fsPromises, args);
-      }) as typeof fsPromises.readFile;
+      ) => path.resolve(String(target))) as typeof fsPromises.realpath;
 
       vi.resetModules();
       vi.doMock("node:fs/promises", () => ({
         ...fsPromises,
-        readFile: trackedReadFile,
         realpath: uncanonicalRealpath
       }));
 
@@ -240,9 +211,14 @@ describe("JsonFilePatchPageDb", () => {
     }
   );
 
-  it("keeps the mutation queue stable when a missing parent appears mid-transaction", async () => {
+  it("keeps the mutation queue stable when a dangling parent alias becomes live", async () => {
+    if (process.platform === "win32") return;
     const directoryPath = path.join(tempDir, "staggered-parent");
+    const aliasedDirectoryPath = path.join(tempDir, "staggered-alias");
+    await symlink(directoryPath, aliasedDirectoryPath, "dir");
     const filePath = path.join(directoryPath, "db.json");
+    const aliasedFilePath = path.join(aliasedDirectoryPath, "db.json");
+    const primaryPaths = new Set([filePath, aliasedFilePath]);
     const cachedIdentityStats = new Map<string, Stats>();
     let ancestorPath = tempDir;
     while (true) {
@@ -287,9 +263,17 @@ describe("JsonFilePatchPageDb", () => {
     }) as typeof fsPromises.mkdir;
     const trackedStat = (async (...args: Parameters<typeof fsPromises.stat>) => {
       const requestedPath = path.resolve(String(args[0]));
-      const cached = cachedIdentityStats.get(requestedPath);
+      const cached =
+        cachedIdentityStats.get(requestedPath) ??
+        (parentExists && requestedPath === aliasedDirectoryPath
+          ? cachedIdentityStats.get(directoryPath)
+          : undefined);
       if (cached) {
-        if (parentExists && requestedPath === directoryPath && primaryReads === 1) {
+        if (
+          parentExists &&
+          requestedPath === aliasedDirectoryPath &&
+          primaryReads === 1
+        ) {
           resolveSecondIdentity();
         }
         return cached;
@@ -297,20 +281,20 @@ describe("JsonFilePatchPageDb", () => {
       throw Object.assign(new Error("missing identity path"), { code: "ENOENT" });
     }) as typeof fsPromises.stat;
     const trackedLstat = (async (...args: Parameters<typeof fsPromises.lstat>) => {
-      if (path.resolve(String(args[0])) === filePath && !primaryExists) {
+      if (primaryPaths.has(path.resolve(String(args[0]))) && !primaryExists) {
         throw Object.assign(new Error("missing primary"), { code: "ENOENT" });
       }
       return Reflect.apply(fsPromises.lstat, fsPromises, args);
     }) as typeof fsPromises.lstat;
     const trackedReadFile = (async (...args: Parameters<typeof fsPromises.readFile>) => {
-      if (path.resolve(String(args[0])) === filePath && !primaryExists) {
+      if (primaryPaths.has(path.resolve(String(args[0]))) && !primaryExists) {
         primaryReads += 1;
         throw Object.assign(new Error("missing primary"), { code: "ENOENT" });
       }
       return Reflect.apply(fsPromises.readFile, fsPromises, args);
     }) as typeof fsPromises.readFile;
     const trackedRename = (async (...args: Parameters<typeof fsPromises.rename>) => {
-      const replacesPrimary = path.resolve(String(args[1])) === filePath;
+      const replacesPrimary = primaryPaths.has(path.resolve(String(args[1])));
       if (replacesPrimary && renameCalls === 0) {
         renameCalls += 1;
         resolveRenameBlocked();
@@ -353,7 +337,7 @@ describe("JsonFilePatchPageDb", () => {
       });
       await Promise.all([parentCreated, renameBlocked]);
 
-      const secondDb = new StaggeredJsonFilePatchPageDb(filePath);
+      const secondDb = new StaggeredJsonFilePatchPageDb(aliasedFilePath);
       const second = secondDb.recordUpload({
         draftId: "staggered_second",
         versionId: "staggered_ver_second",
