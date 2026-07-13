@@ -855,7 +855,31 @@ jobs:
                 echo "Latest GHCR tag already points at current release ${EXPECTED_VERSION} with verified digest ${latest_remote_digest}"
                 ;;
               newer)
-                echo "Existing latest GHCR tag version ${latest_version} is newer than current release ${EXPECTED_VERSION}; leaving latest untouched"
+                newer_target="${ghcr_image}:${latest_version}"
+                newer_remote_digest=""
+                newer_remote_config_id=""
+                if ! inspect_remote_target "$newer_target" newer_remote_digest newer_remote_config_id; then
+                  echo "::error::Existing latest GHCR tag claims newer version ${latest_version}, but immutable tag ${newer_target} is missing"
+                  exit 1
+                fi
+                if ! docker pull "$newer_target"; then
+                  echo "::error::Could not pull immutable tag for newer latest version: ${newer_target}"
+                  exit 1
+                fi
+                newer_pulled_image_id="$(docker image inspect --format '{{.Id}}' "$newer_target")"
+                if [[ "$newer_pulled_image_id" != "$newer_remote_config_id" ]]; then
+                  echo "::error::Newer immutable GHCR tag ${newer_target} raw manifest config ${newer_remote_config_id} does not match pulled image ID ${newer_pulled_image_id}"
+                  exit 1
+                fi
+                if [[ "$newer_remote_digest" != "$latest_remote_digest" ]]; then
+                  echo "::error::Existing latest GHCR tag for newer version ${latest_version} has manifest digest ${latest_remote_digest}, but immutable tag ${newer_target} has ${newer_remote_digest}"
+                  exit 1
+                fi
+                if [[ "$newer_remote_config_id" != "$latest_remote_config_id" ]]; then
+                  echo "::error::Existing latest GHCR tag for newer version ${latest_version} has config ${latest_remote_config_id}, but immutable tag ${newer_target} has ${newer_remote_config_id}"
+                  exit 1
+                fi
+                echo "Existing latest GHCR tag version ${latest_version} is newer than current release ${EXPECTED_VERSION} and matches immutable tag ${newer_target} at ${latest_remote_digest}; leaving latest untouched"
                 ;;
               *)
                 echo "::error::Unknown latest semver comparison result: ${latest_comparison}"

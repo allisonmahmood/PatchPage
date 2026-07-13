@@ -1257,15 +1257,42 @@ if (dockerJob) {
     );
   }
 
+  const newerTarget = latestNewer.indexOf(
+    'newer_target="${ghcr_image}:${latest_version}"',
+  );
+  const newerInspect = latestNewer.indexOf(
+    'if ! inspect_remote_target "$newer_target" newer_remote_digest newer_remote_config_id; then',
+  );
+  const newerPull = latestNewer.indexOf('if ! docker pull "$newer_target"; then');
+  const newerPulledImageId = latestNewer.indexOf(
+    'newer_pulled_image_id="$(docker image inspect --format',
+  );
+  const newerPulledImageIdGuard = latestNewer.indexOf(
+    'if [[ "$newer_pulled_image_id" != "$newer_remote_config_id" ]]; then',
+  );
+  const newerDigestGuard = latestNewer.indexOf(
+    'if [[ "$newer_remote_digest" != "$latest_remote_digest" ]]; then',
+  );
+  const newerConfigGuard = latestNewer.indexOf(
+    'if [[ "$newer_remote_config_id" != "$latest_remote_config_id" ]]; then',
+  );
+  const newerSkip = latestNewer.indexOf("leaving latest untouched");
   if (
+    newerTarget === -1 ||
+    newerInspect <= newerTarget ||
+    newerPull <= newerInspect ||
+    newerPulledImageId <= newerPull ||
+    newerPulledImageIdGuard <= newerPulledImageId ||
+    newerDigestGuard <= newerPulledImageIdGuard ||
+    newerConfigGuard <= newerDigestGuard ||
+    newerSkip <= newerConfigGuard ||
     !latestNewer.includes("newer than current release") ||
-    !latestNewer.includes("leaving latest untouched") ||
     latestNewer.includes('push_verified_target "$latest_target"') ||
     latestNewer.includes("$EXPECTED_IMAGE_ID") ||
     latestNewer.includes("$verified_manifest_digest")
   ) {
     failures.push(
-      "newer latest must be left untouched without requiring it to match the older release digest",
+      "newer latest must match its immutable semver tag by digest and pulled config before being left untouched",
     );
   }
 
@@ -1352,6 +1379,13 @@ if (!/stable semver[^\n]*prerelease/i.test(selfHosting)) {
 }
 if (!/(?:moving[^\n]*`latest`|`latest`[^\n]*(?:follows|moves))/i.test(selfHosting)) {
   failures.push("self-hosting docs must distinguish the moving latest tag");
+}
+if (
+  !/newer `latest`[^\n]*manifest digest[^\n]*config[^\n]*immutable tag/i.test(selfHosting)
+) {
+  failures.push(
+    "self-hosting docs must explain how a newer latest tag is authenticated before it is retained",
+  );
 }
 for (const required of [
   "GHCR Public visibility",
@@ -1598,22 +1632,31 @@ async function runMutationChecks() {
         expected: /docker-ghcr must expose the verified GHCR manifest digest/,
       },
       {
-        name: "reject older release overwriting newer latest",
+        name: "reject trusting an unattested newer latest version label",
         env: {
           PATCHPAGE_RELEASE_WORKFLOW_SOURCE: replaceOnce(
             workflow,
+            '                if [[ "$newer_remote_digest" != "$latest_remote_digest" ]]; then',
+            "                if false; then",
+          ),
+        },
+        expected:
+          /newer latest must match its immutable semver tag by digest and pulled config before being left untouched/,
+      },
+      {
+        name: "reject older release overwriting authenticated newer latest",
+        env: {
+          PATCHPAGE_RELEASE_WORKFLOW_SOURCE: replaceOnce(
+            workflow,
+            '                echo "Existing latest GHCR tag version ${latest_version} is newer than current release ${EXPECTED_VERSION} and matches immutable tag ${newer_target} at ${latest_remote_digest}; leaving latest untouched"',
             [
-              "              newer)",
-              '                echo "Existing latest GHCR tag version ${latest_version} is newer than current release ${EXPECTED_VERSION}; leaving latest untouched"',
-            ].join("\n"),
-            [
-              "              newer)",
               '                push_verified_target "$latest_target"',
-              '                echo "Existing latest GHCR tag version ${latest_version} is newer than current release ${EXPECTED_VERSION}; leaving latest untouched"',
+              '                echo "Existing latest GHCR tag version ${latest_version} is newer than current release ${EXPECTED_VERSION} and matches immutable tag ${newer_target} at ${latest_remote_digest}; leaving latest untouched"',
             ].join("\n"),
           ),
         },
-        expected: /newer latest must be left untouched/,
+        expected:
+          /newer latest must match its immutable semver tag by digest and pulled config before being left untouched/,
       },
       {
         name: "reject unquoted CI revision",

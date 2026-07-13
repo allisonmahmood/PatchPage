@@ -18,7 +18,7 @@ Release automation is configured to publish the supported image as `ghcr.io/alli
 
 - A stable semver tag without a `v` prefix, such as `1.2.3`, is immutable and is the recommended deployment tag. Prerelease versions such as `1.2.3-rc.1` are rejected by the release guard before npm or GHCR publication can begin.
 - The full commit SHA is also an immutable tag for source-exact pinning.
-- The moving `latest` tag follows the newest release; use it only when automatic movement is intended.
+- The moving `latest` tag follows the newest release; use it only when automatic movement is intended. During a delayed release, a newer `latest` is left untouched only when its manifest digest and config match the immutable tag named by its stable version label; missing or mismatched state fails closed.
 
 First-package gate: the workflow does not change package visibility and does not fabricate the GHCR Public visibility transition. After the first authenticated push creates the package, a maintainer must set GHCR Public visibility in GitHub. Release acceptance for issue #17 stays open until the separate anonymous GHCR smoke job pulls the semver tag without credentials and verifies `/healthz`; until that gate passes, these docs describe the intended supported image, not proof that a public package is already live.
 
