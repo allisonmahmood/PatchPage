@@ -45,7 +45,11 @@ function hasUnsupportedYamlIndirection(node) {
   if (node === null || typeof node !== "object") {
     return false;
   }
-  if (isAlias(node) || typeof node.anchor === "string") {
+  if (
+    isAlias(node) ||
+    typeof node.anchor === "string" ||
+    typeof node.tag === "string"
+  ) {
     return true;
   }
   if (isMap(node)) {
@@ -64,6 +68,26 @@ function hasUnsupportedYamlIndirection(node) {
   return false;
 }
 
+function isPlainResolvedValue(value) {
+  if (
+    value === null ||
+    typeof value === "string" ||
+    typeof value === "boolean"
+  ) {
+    return true;
+  }
+  if (typeof value === "number") {
+    return Number.isFinite(value);
+  }
+  if (Array.isArray(value)) {
+    return value.every(isPlainResolvedValue);
+  }
+  if (isMapping(value)) {
+    return Object.values(value).every(isPlainResolvedValue);
+  }
+  return false;
+}
+
 try {
   const document = parseDocument(workflow, { keepSourceTokens: true, uniqueKeys: true });
   if (document.errors.length > 0) {
@@ -72,11 +96,18 @@ try {
     }
   } else if (hasUnsupportedYamlIndirection(document.contents)) {
     failures.push(
-      "release.yml must not use YAML anchors, aliases, merge keys, or non-scalar mapping keys",
+      "release.yml must not use YAML anchors, aliases, merge keys, or non-scalar mapping keys; explicit tags are forbidden",
     );
   } else {
-    workflowDocument = document;
-    parsedWorkflow = document.toJS();
+    const resolvedWorkflow = document.toJS();
+    if (!isPlainResolvedValue(resolvedWorkflow)) {
+      failures.push(
+        "release.yml must resolve only to plain scalar, array, and object values",
+      );
+    } else {
+      workflowDocument = document;
+      parsedWorkflow = resolvedWorkflow;
+    }
   }
 } catch (error) {
   failures.push(
@@ -448,7 +479,11 @@ function job(name) {
 }
 
 function isMapping(value) {
-  return value !== null && typeof value === "object" && !Array.isArray(value);
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    return false;
+  }
+  const prototype = Object.getPrototypeOf(value);
+  return prototype === Object.prototype || prototype === null;
 }
 
 function hasExactMapping(value, expected) {
@@ -3399,6 +3434,72 @@ async function runMutationChecks() {
         },
         expected:
           /release\.yml root must contain exactly the reviewed trigger, permissions, concurrency, and jobs/,
+      },
+      {
+        name: "reject ordered-map permissions",
+        env: {
+          PATCHPAGE_RELEASE_WORKFLOW_SOURCE: replaceOnce(
+            workflow,
+            "  ghcr-anonymous-smoke:\n    name: Anonymous GHCR public-visibility gate (manual visibility required)\n    needs: [guard, docker-ghcr]\n    runs-on: ubuntu-latest\n    permissions: {}",
+            '  ghcr-anonymous-smoke:\n    name: Anonymous GHCR public-visibility gate (manual visibility required)\n    needs: [guard, docker-ghcr]\n    runs-on: ubuntu-latest\n    permissions: !!omap [ { "id-token": write } ]',
+          ),
+        },
+        expected: /explicit tags are forbidden/,
+      },
+      {
+        name: "reject pairs root permissions",
+        env: {
+          PATCHPAGE_RELEASE_WORKFLOW_SOURCE: replaceOnce(
+            workflow,
+            "permissions: {}\n\nconcurrency:",
+            "permissions: !!pairs [ { id-token: write } ]\n\nconcurrency:",
+          ),
+        },
+        expected: /explicit tags are forbidden/,
+      },
+      {
+        name: "reject set permissions",
+        env: {
+          PATCHPAGE_RELEASE_WORKFLOW_SOURCE: replaceOnce(
+            workflow,
+            "  npx-smoke:\n    needs: publish-npm\n    runs-on: ubuntu-latest\n    permissions: {}",
+            "  npx-smoke:\n    needs: publish-npm\n    runs-on: ubuntu-latest\n    permissions: !!set { id-token: null }",
+          ),
+        },
+        expected: /explicit tags are forbidden/,
+      },
+      {
+        name: "reject custom tag on root map",
+        env: {
+          PATCHPAGE_RELEASE_WORKFLOW_SOURCE: replaceOnce(
+            workflow,
+            "name: Release",
+            "--- !attacker\nname: Release",
+          ),
+        },
+        expected: /explicit tags are forbidden/,
+      },
+      {
+        name: "reject custom tag on job map",
+        env: {
+          PATCHPAGE_RELEASE_WORKFLOW_SOURCE: replaceOnce(
+            workflow,
+            "  github-release:\n",
+            "  github-release: !attacker\n",
+          ),
+        },
+        expected: /explicit tags are forbidden/,
+      },
+      {
+        name: "reject custom tag on step map",
+        env: {
+          PATCHPAGE_RELEASE_WORKFLOW_SOURCE: replaceOnce(
+            workflow,
+            "  github-release:\n    needs: publish-npm\n    runs-on: ubuntu-latest\n    permissions:\n      contents: write\n    steps:\n      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1",
+            "  github-release:\n    needs: publish-npm\n    runs-on: ubuntu-latest\n    permissions:\n      contents: write\n    steps:\n      - !attacker\n        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1",
+          ),
+        },
+        expected: /explicit tags are forbidden/,
       },
     ];
   } catch (error) {
