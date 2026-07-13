@@ -171,6 +171,28 @@ jobs:
             exit 1
           fi
 
+  azure-infra:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.9.8
+      - name: Verify Azure guide command contracts
+        run: |
+          sh -n infra/azure/tests/guide_commands_test.sh
+          sh infra/azure/tests/guide_commands_test.sh
+      - name: Verify Azure Terraform
+        working-directory: infra/azure
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          terraform fmt -check -recursive
+          terraform init -backend=false -input=false -lockfile=readonly -no-color
+          terraform validate -no-color
+          terraform test -no-color
+
   dependency-review:
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest

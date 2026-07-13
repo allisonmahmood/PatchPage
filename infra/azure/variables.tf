@@ -81,59 +81,59 @@ variable "trust_proxy" {
                   try(cidrhost("${trimspace(entry)}/128", 0), "")
                 ))
                 ) : length(split("/", trimspace(entry))) == 2 ? (
+                can(regex(
+                  "^[1-9][0-9]*$",
+                  split("/", trimspace(entry))[1]
+                  )) && (
                   can(regex(
-                    "^[1-9][0-9]*$",
-                    split("/", trimspace(entry))[1]
-                    )) && (
+                    "^[0-9]{1,3}(\\.[0-9]{1,3}){3}$",
+                    split("/", trimspace(entry))[0]
+                  )) ?
+                  try(
+                    cidrhost("${split("/", trimspace(entry))[0]}/32", 0),
+                    ""
+                  ) == split("/", trimspace(entry))[0] &&
+                  can(cidrhost(trimspace(entry), 0)) :
+                  !strcontains(split("/", trimspace(entry))[0], "%") &&
+                  strcontains(split("/", trimspace(entry))[0], ":") &&
+                  (
+                    !strcontains(split("/", trimspace(entry))[0], ".") ||
                     can(regex(
-                      "^[0-9]{1,3}(\\.[0-9]{1,3}){3}$",
+                      ":(?:0|[1-9][0-9]{0,2})(?:\\.(?:0|[1-9][0-9]{0,2})){3}$",
                       split("/", trimspace(entry))[0]
-                      )) ?
+                    ))
+                  ) &&
+                  can(cidrhost(trimspace(entry), 0)) &&
+                  !can(regex(
+                    "^[0-9]{1,3}(\\.[0-9]{1,3}){3}$",
+                    try(cidrhost(
+                      "${split("/", trimspace(entry))[0]}/128",
+                      0
+                    ), "")
+                  )) &&
+                  !can(regex(
+                    "^::(?:[0-9]{1,3}\\.){3}[0-9]{1,3}$",
+                    split("/", trimspace(entry))[0]
+                  )) &&
+                  !can(regex(
+                    "^::ffff:",
+                    lower(try(cidrhost(trimspace(entry), 0), ""))
+                  )) &&
+                  !(
                     try(
-                      cidrhost("${split("/", trimspace(entry))[0]}/32", 0),
-                      ""
-                    ) == split("/", trimspace(entry))[0] &&
-                    can(cidrhost(trimspace(entry), 0)) :
-                    !strcontains(split("/", trimspace(entry))[0], "%") &&
-                    strcontains(split("/", trimspace(entry))[0], ":") &&
-                    (
-                      !strcontains(split("/", trimspace(entry))[0], ".") ||
-                      can(regex(
-                        ":(?:0|[1-9][0-9]{0,2})(?:\\.(?:0|[1-9][0-9]{0,2})){3}$",
-                        split("/", trimspace(entry))[0]
-                      ))
-                    ) &&
-                    can(cidrhost(trimspace(entry), 0)) &&
-                    !can(regex(
-                      "^[0-9]{1,3}(\\.[0-9]{1,3}){3}$",
-                      try(cidrhost(
-                        "${split("/", trimspace(entry))[0]}/128",
-                        0
-                      ), "")
-                    )) &&
-                    !can(regex(
-                      "^::(?:[0-9]{1,3}\\.){3}[0-9]{1,3}$",
-                      split("/", trimspace(entry))[0]
-                    )) &&
-                    !can(regex(
-                      "^::ffff:",
-                      lower(try(cidrhost(trimspace(entry), 0), ""))
-                    )) &&
-                    !(
-                      try(
-                        tonumber(split("/", trimspace(entry))[1]),
-                        129
-                      ) <= 96 &&
-                      try(cidrhost(trimspace(entry), 0), "") == try(cidrhost(
-                        "::ffff:0:0/${split("/", trimspace(entry))[1]}",
-                        0
-                      ), "not-an-ipv6-network")
-                    )
+                      tonumber(split("/", trimspace(entry))[1]),
+                      129
+                    ) <= 96 &&
+                    try(cidrhost(trimspace(entry), 0), "") == try(cidrhost(
+                      "::ffff:0:0/${split("/", trimspace(entry))[1]}",
+                      0
+                    ), "not-an-ipv6-network")
                   )
+                )
               ) : false
             )
           )
-        ])
+      ])
     )
     error_message = "trust_proxy must be null, a decimal hop count from 1 to 32, or comma-separated literal IP/CIDR entries; blank, boolean, wildcard, malformed, empty, /0, deprecated transitional or IPv4-mapped IPv6 aliases, and noncanonical dotted-tail values are not allowed."
   }
@@ -155,7 +155,7 @@ variable "trust_proxy" {
                   33
                 )
               }
-              if (
+              if(
                 length(split("/", entry)) <= 2 &&
                 can(regex(
                   "^[0-9]{1,3}(\\.[0-9]{1,3}){3}(?:/[1-9][0-9]*)?$",
@@ -184,7 +184,7 @@ variable "trust_proxy" {
             tonumber(split(":", range_keys[0])[0]) != 0 ? true : (
               max([
                 for key in range_keys : tonumber(split(":", key)[1])
-              ]...) != 4294967295 ? true : !alltrue([
+                ]...) != 4294967295 ? true : !alltrue([
                 for index, key in range_keys : index == 0 ? true : (
                   tonumber(split(":", key)[0]) <= max([
                     for previous_key in slice(range_keys, 0, index) :
@@ -221,7 +221,7 @@ variable "trust_proxy" {
                   ""
                 )
               }
-              if (
+              if(
                 length(split("/", entry)) <= 2 &&
                 strcontains(split("/", entry)[0], ":") &&
                 !strcontains(split("/", entry)[0], "%") &&
@@ -276,7 +276,7 @@ variable "trust_proxy" {
             tonumber(split(":", range_keys[0])[0]) != 0 ? true : (
               max([
                 for key in range_keys : tonumber(split(":", key)[1])
-              ]...) != pow(2, 128) - 1 ? true : !alltrue([
+                ]...) != pow(2, 128) - 1 ? true : !alltrue([
                 for index, key in range_keys : index == 0 ? true : (
                   tonumber(split(":", key)[0]) <= max([
                     for previous_key in slice(range_keys, 0, index) :

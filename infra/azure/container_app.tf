@@ -15,7 +15,7 @@ locals {
     AZURE_STORAGE_ACCOUNT             = azurerm_storage_account.drafts.name
     AZURE_STORAGE_CONTAINER           = azurerm_storage_container.drafts.name
     AZURE_CLIENT_ID                   = azurerm_user_assigned_identity.app.client_id
-  }, var.trust_proxy == null ? {} : {
+    }, var.trust_proxy == null ? {} : {
     PATCHPAGE_TRUST_PROXY = var.trust_proxy
   })
 }
@@ -32,6 +32,75 @@ resource "azurerm_container_app" "server" {
   # replacing the CLI-managed binding with Terraform's original ingress shape.
   lifecycle {
     ignore_changes = [ingress]
+
+    postcondition {
+      condition     = length(self.ingress) == 1
+      error_message = "Container App must retain exactly one ingress configuration."
+    }
+
+    postcondition {
+      condition     = try(self.ingress[0].external_enabled == true, false)
+      error_message = "Container App ingress must remain external."
+    }
+
+    postcondition {
+      condition     = try(self.ingress[0].allow_insecure_connections == false, false)
+      error_message = "Container App ingress must keep insecure HTTP disabled."
+    }
+
+    postcondition {
+      condition     = try(self.ingress[0].target_port == 3000, false)
+      error_message = "Container App ingress must target server port 3000."
+    }
+
+    postcondition {
+      condition     = try(lower(self.ingress[0].transport) == "auto", false)
+      error_message = "Container App ingress transport must remain auto."
+    }
+
+    postcondition {
+      condition = try(
+        self.ingress[0].client_certificate_mode == null ? true : (
+          trimspace(self.ingress[0].client_certificate_mode) == "" ||
+          lower(trimspace(self.ingress[0].client_certificate_mode)) == "ignore"
+        ),
+        false
+      )
+      error_message = "Container App ingress must keep client certificates ignored."
+    }
+
+    postcondition {
+      condition = try(
+        self.ingress[0].exposed_port == null ||
+        self.ingress[0].exposed_port == 0,
+        false
+      )
+      error_message = "Container App ingress must not expose a separate port."
+    }
+
+    postcondition {
+      condition     = try(length(self.ingress[0].cors) == 0, false)
+      error_message = "Container App ingress must not enable a CORS policy."
+    }
+
+    postcondition {
+      condition     = try(length(self.ingress[0].ip_security_restriction) == 0, false)
+      error_message = "Container App ingress must not add IP security restrictions."
+    }
+
+    postcondition {
+      condition = try(
+        length(self.ingress[0].traffic_weight) == 1 &&
+        one(self.ingress[0].traffic_weight).latest_revision == true &&
+        one(self.ingress[0].traffic_weight).percentage == 100 &&
+        (
+          one(self.ingress[0].traffic_weight).label == null ? true :
+          trimspace(one(self.ingress[0].traffic_weight).label) == ""
+        ),
+        false
+      )
+      error_message = "Container App ingress must route 100 percent of traffic through one unlabeled latest-revision rule."
+    }
   }
 
   identity {
@@ -49,6 +118,7 @@ resource "azurerm_container_app" "server" {
     allow_insecure_connections = false
     target_port                = 3000
     transport                  = "auto"
+    client_certificate_mode    = "ignore"
 
     traffic_weight {
       latest_revision = true
