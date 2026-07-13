@@ -344,11 +344,34 @@ if ! printf '%s\n' "$LIVE_INGRESS" |
     .allowInsecure == false and
     .targetPort == 3000 and
     (.transport | type == "string" and ascii_downcase == "auto") and
+    (.clientCertificateMode |
+      type == "string" and ascii_downcase == "ignore") and
+    .corsPolicy == null and
+    (.exposedPort == null or .exposedPort == 0) and
+    (
+      .additionalPortMappings == null or
+      (.additionalPortMappings | type == "array" and length == 0)
+    ) and
+    (
+      .stickySessions == null or
+      (
+        .stickySessions |
+        type == "object" and
+        (.affinity | type == "string" and ascii_downcase == "none")
+      )
+    ) and
+    (
+      .ipSecurityRestrictions == null or
+      (.ipSecurityRestrictions | type == "array" and length == 0)
+    ) and
     (.traffic | type == "array" and length == 1) and
+    .traffic[0].label == null and
     .traffic[0].latestRevision == true and
+    (.traffic[0].revisionName | type == "string" and length > 0) and
     .traffic[0].weight == 100
   ' >/dev/null; then
-  printf 'Live ingress drifted from the required external HTTPS-only port 3000 auto-transport, latest-revision 100%% route.\n' >&2
+  printf '%s\n' \
+    'Live ingress drifted from the required HTTPS-only port, certificate, CORS, IP restriction, exposed-port, sticky-session, and latest-revision routing policy.' >&2
   exit 1
 fi
 ```
@@ -535,20 +558,31 @@ while test -n "$CAA_TREE_NAME"; do
       exit 1
     fi
 
-    CNAME_TARGETS="$(
+    if ! CNAME_TARGETS="$(
       printf '%s\n' "$CNAME_RESPONSE" |
         awk -v expected="$CAA_QUERY_NAME" '
-          $1 !~ /^;/ && toupper($4) == "CNAME" {
+          $1 ~ /^;/ || NF == 0 { next }
+          {
             owner = tolower($1)
             sub(/\.$/, "", owner)
-            if (owner == expected) {
-              target = tolower($5)
-              sub(/\.$/, "", target)
-              print target
+            if (NF != 5 ||
+                owner != expected ||
+                $2 !~ /^[0-9]+$/ ||
+                toupper($3) != "IN" ||
+                toupper($4) != "CNAME") {
+              exit 1
             }
+            target = tolower($5)
+            sub(/\.$/, "", target)
+            if (target == "") exit 1
+            print target
           }
         '
-    )"
+    )"; then
+      printf 'CNAME lookup for %s returned malformed or unexpected answer data.\n' \
+        "$CAA_QUERY_NAME" >&2
+      exit 1
+    fi
     CNAME_TARGET_COUNT="$(
       printf '%s\n' "$CNAME_TARGETS" |
         awk 'NF { count++ } END { print count + 0 }'
@@ -602,21 +636,6 @@ while test -n "$CAA_TREE_NAME"; do
     exit 1
   fi
 
-  CAA_UNEXPECTED_RECORD_OWNERS="$(
-    printf '%s\n' "$CAA_RESPONSE" |
-      awk -v expected="$CAA_QUERY_NAME" '
-        $1 !~ /^;/ && toupper($4) == "CAA" {
-          owner = tolower($1)
-          sub(/\.$/, "", owner)
-          if (owner != expected) print owner
-        }
-      '
-  )"
-  if test -n "$CAA_UNEXPECTED_RECORD_OWNERS"; then
-    printf 'CAA lookup for %s returned records for an unexpected owner.\n' \
-      "$CAA_QUERY_NAME" >&2
-    exit 1
-  fi
 
   if ! CAA_RECORDS="$(
     printf '%s\n' "$CAA_RESPONSE" |
@@ -641,26 +660,27 @@ while test -n "$CAA_TREE_NAME"; do
           return !escaped
         }
 
-        $1 !~ /^;/ && toupper($4) == "CAA" {
+        $1 ~ /^;/ || NF == 0 { next }
+        {
           owner = tolower($1)
           sub(/\.$/, "", owner)
-          if (owner == expected) {
-            if ($2 !~ /^[0-9]+$/ ||
-                toupper($3) != "IN" ||
-                NF < 7 ||
-                $5 !~ /^[0-9]+$/ ||
-                ($5 + 0) > 255 ||
-                $6 !~ /^[A-Za-z0-9]+$/ ||
-                length($6) > 15) {
-              exit 1
-            }
-            value = ""
-            for (i = 7; i <= NF; i++) {
-              value = value (i == 7 ? "" : " ") $i
-            }
-            if (!valid_value(value)) exit 1
-            print $5, $6, value
+          if (owner != expected ||
+              $2 !~ /^[0-9]+$/ ||
+              toupper($3) != "IN" ||
+              toupper($4) != "CAA" ||
+              NF < 7 ||
+              $5 !~ /^[0-9]+$/ ||
+              ($5 + 0) > 255 ||
+              $6 !~ /^[A-Za-z0-9]+$/ ||
+              length($6) > 15) {
+            exit 1
           }
+          value = ""
+          for (i = 7; i <= NF; i++) {
+            value = value (i == 7 ? "" : " ") $i
+          }
+          if (!valid_value(value)) exit 1
+          print $5, $6, value
         }
       '
   )"; then
@@ -852,6 +872,7 @@ if ! SMOKE_TMP_DIR="$(mktemp -d)"; then
   exit 1
 fi
 trap 'rm -rf "$SMOKE_TMP_DIR"' EXIT HUP INT TERM
+SMOKE_MARKER="PATCHPAGE_AZURE_SMOKE_${SMOKE_TMP_DIR##*/}"
 
 smoke_fail() {
   printf '%s\n' "$1" >&2
@@ -919,6 +940,19 @@ fi
 if test -z "$BOOTSTRAP_API_TOKEN"; then
   smoke_fail 'Terraform returned an empty bootstrap API token.'
 fi
+if ! UPLOAD_PAYLOAD="$(
+  jq -cn --arg marker "$SMOKE_MARKER" \
+    '{
+      html: (
+        "<!doctype html><html><head><title>Azure smoke test</title></head><body><h1>" +
+        $marker +
+        "</h1></body></html>"
+      ),
+      filename: "azure-smoke.html"
+    }'
+)"; then
+  smoke_fail 'Could not safely encode the unique smoke upload payload.'
+fi
 
 if ! UPLOAD_STATUS="$(
   curl --proto '=https' --tlsv1.2 \
@@ -928,7 +962,7 @@ if ! UPLOAD_STATUS="$(
     --request POST \
     --header "Authorization: Bearer $BOOTSTRAP_API_TOKEN" \
     --header "Content-Type: application/json" \
-    --data '{"html":"<!doctype html><html><head><title>Azure smoke test</title></head><body><h1>PATCHPAGE_AZURE_SMOKE_OK</h1></body></html>","filename":"azure-smoke.html"}' \
+    --data "$UPLOAD_PAYLOAD" \
     "$PUBLIC_BASE_URL/api/uploads"
 )"; then
   smoke_fail 'The authenticated upload request failed.'
@@ -961,12 +995,13 @@ fi
 if test "$DRAFT_STATUS" != "200"; then
   smoke_fail "Expected uploaded draft status 200, received $DRAFT_STATUS."
 fi
-if ! grep -Fq -- 'PATCHPAGE_AZURE_SMOKE_OK' "$SMOKE_TMP_DIR/draft.html"; then
-  smoke_fail 'The fetched draft did not contain the uploaded smoke marker.'
+if ! grep -Fq -- "$SMOKE_MARKER" "$SMOKE_TMP_DIR/draft.html"; then
+  smoke_fail 'The fetched draft did not contain this run’s exact smoke marker.'
 fi
 
 printf '%s\n' "$DRAFT_URL"
 unset BOOTSTRAP_API_TOKEN
+unset SMOKE_MARKER UPLOAD_PAYLOAD
 rm -rf "$SMOKE_TMP_DIR"
 ```
 

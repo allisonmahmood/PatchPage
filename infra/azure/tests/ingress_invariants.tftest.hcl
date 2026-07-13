@@ -36,11 +36,33 @@ run "configures_every_ignored_ingress_invariant" {
   }
 
   assert {
+    condition     = lower(azurerm_container_app.server.ingress[0].client_certificate_mode) == "ignore"
+    error_message = "Expected client certificates to remain ignored."
+  }
+
+  assert {
+    condition     = try(azurerm_container_app.server.ingress[0].exposed_port, null) == null
+    error_message = "Expected no separately exposed ingress port."
+  }
+
+  assert {
+    condition     = length(azurerm_container_app.server.ingress[0].cors) == 0
+    error_message = "Expected no ingress CORS policy."
+  }
+
+  assert {
+    condition     = length(azurerm_container_app.server.ingress[0].ip_security_restriction) == 0
+    error_message = "Expected no ingress IP security restrictions."
+  }
+
+  assert {
     condition = (
       length(azurerm_container_app.server.ingress[0].traffic_weight) == 1 &&
       one(azurerm_container_app.server.ingress[0].traffic_weight).latest_revision == true &&
-      one(azurerm_container_app.server.ingress[0].traffic_weight).percentage == 100
+      one(azurerm_container_app.server.ingress[0].traffic_weight).percentage == 100 &&
+      try(one(azurerm_container_app.server.ingress[0].traffic_weight).label, null) == null &&
+      try(one(azurerm_container_app.server.ingress[0].traffic_weight).revision_suffix, null) == null
     )
-    error_message = "Expected one 100 percent latest-revision route."
+    error_message = "Expected one unlabeled 100 percent latest-revision route."
   }
 }

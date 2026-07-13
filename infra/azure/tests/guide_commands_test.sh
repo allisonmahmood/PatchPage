@@ -455,6 +455,12 @@ run_ingress_verification_block() {
       target_port="3000"
       transport='"Auto"'
       traffic='[{"latestRevision":true,"weight":100,"revisionName":"app-test--abc"}]'
+      client_certificate_mode='"Ignore"'
+      cors_policy="null"
+      exposed_port="null"
+      ip_security_restrictions="null"
+      additional_port_mappings="null"
+      sticky_sessions="null"
       case "$scenario" in
         malformed_json)
           printf '%s\n' '{not-json'
@@ -465,16 +471,36 @@ run_ingress_verification_block() {
         target_port_drift) target_port="8080" ;;
         transport_drift) transport='"http2"' ;;
         missing_transport) transport="null" ;;
+        client_certificate_drift) client_certificate_mode='"Accept"' ;;
+        missing_client_certificate) client_certificate_mode="null" ;;
+        cors_drift) cors_policy='{"allowedOrigins":["https://other.example"]}' ;;
+        exposed_port_drift) exposed_port="8443" ;;
+        additional_port_drift)
+          additional_port_mappings='[{"external":true,"targetPort":9000,"exposedPort":9000}]'
+          ;;
+        sticky_session_drift) sticky_sessions='{"affinity":"sticky"}' ;;
+        ip_restriction_drift)
+          ip_security_restrictions='[{"action":"Allow","ipAddressRange":"192.0.2.0/24","name":"unexpected"}]'
+          ;;
         empty_traffic) traffic='[]' ;;
         multiple_traffic)
           traffic='[{"latestRevision":true,"weight":50},{"latestRevision":false,"weight":50}]'
           ;;
         revision_drift) traffic='[{"latestRevision":false,"weight":100}]' ;;
+        missing_revision_name)
+          traffic='[{"label":null,"latestRevision":true,"revisionName":null,"weight":100}]'
+          ;;
+        label_drift)
+          traffic='[{"label":"canary","latestRevision":true,"revisionName":"app-test--abc","weight":100}]'
+          ;;
         weight_drift) traffic='[{"latestRevision":true,"weight":90}]' ;;
       esac
       printf \
-        '{"external":%s,"allowInsecure":%s,"targetPort":%s,"transport":%s,"traffic":%s}\n' \
-        "$external" "$allow_insecure" "$target_port" "$transport" "$traffic"
+        '{"external":%s,"allowInsecure":%s,"targetPort":%s,"transport":%s,"clientCertificateMode":%s,"corsPolicy":%s,"exposedPort":%s,"additionalPortMappings":%s,"stickySessions":%s,"ipSecurityRestrictions":%s,"traffic":%s}\n' \
+        "$external" "$allow_insecure" "$target_port" "$transport" \
+        "$client_certificate_mode" "$cors_policy" "$exposed_port" \
+        "$additional_port_mappings" "$sticky_sessions" \
+        "$ip_security_restrictions" "$traffic"
     }
 
     eval "$INGRESS_VERIFICATION_BLOCK"
@@ -497,9 +523,18 @@ test_ingress_verification() {
     target_port_drift \
     transport_drift \
     missing_transport \
+    client_certificate_drift \
+    missing_client_certificate \
+    cors_drift \
+    exposed_port_drift \
+    additional_port_drift \
+    sticky_session_drift \
+    ip_restriction_drift \
     empty_traffic \
     multiple_traffic \
     revision_drift \
+    missing_revision_name \
+    label_drift \
     weight_drift; do
     if run_ingress_verification_block "$scenario"; then
       fail "documented ingress verification accepted $scenario"
@@ -730,6 +765,26 @@ run_caa_block() {
           printf '%s\n' \
             'ALIAS.EXAMPLE.NET. 300 IN CNAME DRAFTS.TEAM.EXAMPLE.COM.'
           ;;
+        CNAME:cname_invalid_ttl:drafts.team.example.com)
+          printf '%s\n' \
+            'drafts.team.example.com. invalid IN CNAME alias.example.net.'
+          ;;
+        CNAME:cname_invalid_class:drafts.team.example.com)
+          printf '%s\n' \
+            'drafts.team.example.com. 300 CH CNAME alias.example.net.'
+          ;;
+        CNAME:cname_wrong_type:drafts.team.example.com)
+          printf '%s\n' \
+            'drafts.team.example.com. 300 IN A 192.0.2.10'
+          ;;
+        CNAME:cname_misaligned:drafts.team.example.com)
+          printf '%s\n' \
+            'drafts.team.example.com. IN CNAME alias.example.net.'
+          ;;
+        CNAME:cname_unexpected_owner:drafts.team.example.com)
+          printf '%s\n' \
+            'other.team.example.com. 300 IN CNAME alias.example.net.'
+          ;;
         CAA:inherit_noerror:example.com)
           printf '%s\n' 'example.com. 300 IN CAA 0 IsSuE "DiGiCeRt.CoM"'
           ;;
@@ -774,6 +829,26 @@ run_caa_block() {
             'team.example.com. 300 IN CAA 0 issue "digicert.com"' \
             'team.example.com. 300 IN CAA 0 iodef mailto:security@example.com'
           ;;
+        CAA:caa_invalid_ttl:team.example.com)
+          printf '%s\n' \
+            'team.example.com. invalid IN CAA 0 issue "digicert.com"'
+          ;;
+        CAA:caa_invalid_class:team.example.com)
+          printf '%s\n' \
+            'team.example.com. 300 CH CAA 0 issue "digicert.com"'
+          ;;
+        CAA:caa_wrong_type:team.example.com)
+          printf '%s\n' \
+            'team.example.com. 300 IN TXT "ignored"'
+          ;;
+        CAA:caa_misaligned:team.example.com)
+          printf '%s\n' \
+            'team.example.com. IN CAA 0 issue "digicert.com"'
+          ;;
+        CAA:caa_unexpected_owner:team.example.com)
+          printf '%s\n' \
+            'other.example.com. 300 IN CAA 0 issue "digicert.com"'
+          ;;
       esac
     }
 
@@ -809,7 +884,14 @@ CAA team.example.com"
     fail "CAA lookup did not follow the normalized CNAME before original-parent walking"
   fi
 
-  for scenario in cname_ambiguity cname_loop; do
+  for scenario in \
+    cname_ambiguity \
+    cname_loop \
+    cname_wrong_type \
+    cname_invalid_ttl \
+    cname_invalid_class \
+    cname_misaligned \
+    cname_unexpected_owner; do
     if run_caa_block "$scenario"; then
       fail "CAA lookup accepted $scenario"
     fi
@@ -830,7 +912,12 @@ CNAME alias.example.net"
     unknown_critical \
     malformed_flags \
     malformed_fields \
-    malformed_value; do
+    malformed_value \
+    caa_invalid_ttl \
+    caa_invalid_class \
+    caa_wrong_type \
+    caa_misaligned \
+    caa_unexpected_owner; do
     if run_caa_block "$scenario"; then
       fail "CAA lookup accepted the $scenario policy"
     fi
@@ -961,6 +1048,10 @@ run_deployed_smoke_block() {
       output_file=""
       header_file=""
       url=""
+      request=""
+      authorization=""
+      content_type=""
+      data=""
       while test "$#" -gt 0; do
         case "$1" in
           --output)
@@ -973,7 +1064,25 @@ run_deployed_smoke_block() {
             test "$#" -gt 0 || return 1
             header_file="$1"
             ;;
-          --write-out|--request|--header|--data|--proto)
+          --request)
+            shift
+            test "$#" -gt 0 || return 1
+            request="$1"
+            ;;
+          --header)
+            shift
+            test "$#" -gt 0 || return 1
+            case "$1" in
+              "Authorization: "*) authorization="$1" ;;
+              "Content-Type: "*) content_type="$1" ;;
+            esac
+            ;;
+          --data)
+            shift
+            test "$#" -gt 0 || return 1
+            data="$1"
+            ;;
+          --write-out|--proto)
             shift
             test "$#" -gt 0 || return 1
             ;;
@@ -1033,6 +1142,21 @@ run_deployed_smoke_block() {
         https://drafts.self-hoster.dev/api/uploads | https://Drafts.Self-Hoster.Dev/api/uploads)
           test "$scenario" != "upload_command_failure" || return 1
           test -n "$output_file" || return 1
+          test "$request" = "POST" || return 1
+          test "$authorization" = "Authorization: Bearer test-token" || return 1
+          test "$content_type" = "Content-Type: application/json" || return 1
+          printf '%s\n' "$data" |
+            jq -e --arg marker "$SMOKE_MARKER" '
+              type == "object" and
+              (keys == ["filename", "html"]) and
+              .filename == "azure-smoke.html" and
+              .html == (
+                "<!doctype html><html><head><title>Azure smoke test</title></head><body><h1>" +
+                $marker +
+                "</h1></body></html>"
+              )
+            ' >/dev/null ||
+            return 1
           case "$scenario" in
             upload_invalid_json)
               printf '%s' '{not-json' > "$output_file"
@@ -1067,13 +1191,21 @@ run_deployed_smoke_block() {
         https://drafts.self-hoster.dev/d/abc123def456 | https://Drafts.Self-Hoster.Dev/d/abc123def456)
           test "$scenario" != "fetch_command_failure" || return 1
           test -n "$output_file" || return 1
-          if test "$scenario" = "fetch_body_mismatch"; then
-            printf '%s' '<html><body>wrong draft</body></html>' > "$output_file"
-          else
-            printf '%s' \
-              '<html><iframe srcdoc="&lt;h1&gt;PATCHPAGE_AZURE_SMOKE_OK&lt;/h1&gt;"></iframe></html>' \
-              > "$output_file"
-          fi
+          case "$scenario" in
+            fetch_body_mismatch)
+              printf '%s' '<html><body>wrong draft</body></html>' > "$output_file"
+              ;;
+            fetch_stale_marker)
+              printf '%s' \
+                '<html><iframe srcdoc="&lt;h1&gt;PATCHPAGE_AZURE_SMOKE_STALE&lt;/h1&gt;"></iframe></html>' \
+                > "$output_file"
+              ;;
+            *)
+              printf \
+                '<html><iframe srcdoc="&lt;h1&gt;%s&lt;/h1&gt;"></iframe></html>' \
+                "$SMOKE_MARKER" > "$output_file"
+              ;;
+          esac
           if test "$scenario" = "fetch_status_mismatch"; then
             printf '%s' "404"
           else
@@ -1125,7 +1257,8 @@ test_deployed_smoke() {
     upload_url_mismatch \
     fetch_command_failure \
     fetch_status_mismatch \
-    fetch_body_mismatch; do
+    fetch_body_mismatch \
+    fetch_stale_marker; do
     failure_output="$TMP_DIR/deployed-smoke-$scenario.out"
     if run_deployed_smoke_block "$scenario" "$failure_output"; then
       fail "deployed smoke accepted $scenario"

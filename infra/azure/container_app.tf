@@ -59,13 +59,39 @@ resource "azurerm_container_app" "server" {
     }
 
     postcondition {
+      condition     = try(lower(self.ingress[0].client_certificate_mode) == "ignore", false)
+      error_message = "Container App ingress must keep client certificates ignored."
+    }
+
+    postcondition {
+      condition = try(
+        self.ingress[0].exposed_port == null ||
+        self.ingress[0].exposed_port == 0,
+        false
+      )
+      error_message = "Container App ingress must not expose a separate port."
+    }
+
+    postcondition {
+      condition     = try(length(self.ingress[0].cors) == 0, false)
+      error_message = "Container App ingress must not enable a CORS policy."
+    }
+
+    postcondition {
+      condition     = try(length(self.ingress[0].ip_security_restriction) == 0, false)
+      error_message = "Container App ingress must not add IP security restrictions."
+    }
+
+    postcondition {
       condition = try(
         length(self.ingress[0].traffic_weight) == 1 &&
         one(self.ingress[0].traffic_weight).latest_revision == true &&
-        one(self.ingress[0].traffic_weight).percentage == 100,
+        one(self.ingress[0].traffic_weight).percentage == 100 &&
+        one(self.ingress[0].traffic_weight).label == null &&
+        one(self.ingress[0].traffic_weight).revision_suffix == null,
         false
       )
-      error_message = "Container App ingress must route 100 percent of traffic to the latest revision."
+      error_message = "Container App ingress must route 100 percent of traffic through one unlabeled latest-revision rule."
     }
   }
 
@@ -84,6 +110,7 @@ resource "azurerm_container_app" "server" {
     allow_insecure_connections = false
     target_port                = 3000
     transport                  = "auto"
+    client_certificate_mode    = "ignore"
 
     traffic_weight {
       latest_revision = true
