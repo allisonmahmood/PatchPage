@@ -15,6 +15,11 @@ if [[ -z "$image" || -z "$expected_version" || -z "$expected_revision" ]]; then
   exit 2
 fi
 
+if [[ ! "$expected_revision" =~ ^[0-9a-f]{40}$ ]]; then
+  echo "Expected revision must be a quoted 40-character lowercase hex string, got: $expected_revision" >&2
+  exit 2
+fi
+
 if ! command -v docker >/dev/null 2>&1; then
   echo "server image contract requires Docker, but the docker command is unavailable" >&2
   exit 127

@@ -1,6 +1,6 @@
 # Self-Hosting PatchPage
 
-PatchPage is a normal Node HTTP service and runs anywhere that supports Node or containers. Azure Container Apps is the maintainer's deployment target, not a requirement — this guide covers the supported container image and running your own instance from source. The [Azure Terraform](../infra/azure) directory is a worked example you can adapt.
+PatchPage is a normal Node HTTP service and runs anywhere that supports Node or containers. Azure Container Apps is the maintainer's deployment target, not a requirement — this guide covers the container image contract that release automation will publish and running your own instance from source. The [Azure Terraform](../infra/azure) directory is a worked example you can adapt.
 
 Once your server is running, point the CLI at it and you have a private PatchPage: upload access is token-gated, but the draft URLs it returns are public and unlisted (anyone with the link can view them).
 
@@ -12,13 +12,15 @@ Once your server is running, point the CLI at it and you have a private PatchPag
 - A PostgreSQL database, if you use the `postgres` metadata driver. The default `json` driver needs no database and is fine for small or single-user instances.
 - Git is optional; the CLI records repo/branch metadata with each upload when the file is inside a git repo.
 
-## Supported container image
+## Supported container image contract
 
-Release automation publishes the supported image as `ghcr.io/allisonmahmood/patchpage-server`. Its tags are published from one verified image:
+Release automation is configured to publish the supported image as `ghcr.io/allisonmahmood/patchpage-server`. Its tags are published from one verified image:
 
 - A semver tag without a `v` prefix, such as `1.2.3`, is immutable and is the recommended deployment tag.
 - The full commit SHA is also an immutable tag for source-exact pinning.
 - The moving `latest` tag follows the newest release; use it only when automatic movement is intended.
+
+First-package gate: the workflow does not change package visibility and does not fabricate the GHCR Public visibility transition. After the first authenticated push creates the package, a maintainer must set GHCR Public visibility in GitHub. Release acceptance for issue #17 stays open until the separate anonymous GHCR smoke job pulls the semver tag without credentials and verifies `/healthz`; until that gate passes, these docs describe the intended supported image, not proof that a public package is already live.
 
 The image runs as the non-root `node` user (UID/GID 1000). Its supported writable persistence mount is `/data`. With the default `json` metadata and `filesystem` storage drivers, the image sets:
 

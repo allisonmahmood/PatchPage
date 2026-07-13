@@ -35,7 +35,9 @@ The skill source lives at [skills/patchpage/SKILL.md](skills/patchpage/SKILL.md)
 
 ## Self-hosting
 
-Release automation publishes the supported container image as `ghcr.io/allisonmahmood/patchpage-server`. It runs as a non-root user and uses `/data` as the writable persistence mount for the default JSON metadata and filesystem storage drivers. PatchPage can also run directly on Node with Postgres or JSON metadata and filesystem or Azure Blob Storage. See [docs/SELF_HOSTING.md](docs/SELF_HOSTING.md) for image tags, container and source setup, configuration, database migration, and minting API tokens.
+Release automation is configured to publish the supported container image as `ghcr.io/allisonmahmood/patchpage-server`. The first GHCR package still requires a maintainer to set Public visibility in GitHub; availability is accepted only after the anonymous GHCR smoke job pulls the semver tag without credentials. This is not a claim that the first package is already public.
+
+The image runs as a non-root user and uses `/data` as the writable persistence mount for the default JSON metadata and filesystem storage drivers. PatchPage can also run directly on Node with Postgres or JSON metadata and filesystem or Azure Blob Storage. See [docs/SELF_HOSTING.md](docs/SELF_HOSTING.md) for image tags, container and source setup, configuration, database migration, and minting API tokens.
 
 ## Repository layout
 
