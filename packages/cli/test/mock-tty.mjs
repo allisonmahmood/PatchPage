@@ -2,12 +2,28 @@ import { writeFileSync } from "node:fs";
 
 const reportPath = process.env.PATCHPAGE_TEST_TTY_REPORT;
 const inputError = process.env.PATCHPAGE_TEST_TTY_INPUT_ERROR;
+const timeoutSignalReportPath = process.env.PATCHPAGE_TEST_TTY_TIMEOUT_SIGNAL_REPORT;
 const simulatedWindowsSignal = process.env.PATCHPAGE_TEST_WINDOWS_SIGNAL;
 const input = process.stdin;
 const output = process.stderr;
 const rawModeChanges = [];
 let isRaw = false;
 let windowsSignalScheduled = false;
+
+if (timeoutSignalReportPath) {
+  const writeTimeoutSignalReport = (sigtermReceived) => {
+    writeFileSync(
+      timeoutSignalReportPath,
+      JSON.stringify({ ready: true, sigtermReceived })
+    );
+  };
+  process.on("SIGTERM", () => {
+    writeTimeoutSignalReport(true);
+  });
+  writeTimeoutSignalReport(false);
+  setTimeout(() => process.kill(process.pid, "SIGKILL"), 2_000);
+  await new Promise(() => {});
+}
 
 if (simulatedWindowsSignal) {
   const kill = process.kill.bind(process);

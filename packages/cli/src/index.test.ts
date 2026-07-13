@@ -179,7 +179,30 @@ describe("patchpage auth set", () => {
   }
 
   it.runIf(supportsPythonPty)(
-    "runs a preinstalled signal listener once before restoring the terminal and controlling SIGTERM termination",
+    "restores the terminal before a preloaded SIGTERM listener exits",
+    () => {
+      const stateDir = makeStateDir();
+      const signalReportPath = path.join(stateDir, "signal-listener.json");
+      const result = runCliInPty(["auth", "set"], "signal:SIGTERM", "", stateDir, {
+        NODE_OPTIONS: `--import=${signalListenerPreloadUrl}`,
+        PATCHPAGE_TEST_SIGNAL_ACTION: "exit",
+        PATCHPAGE_TEST_SIGNAL_REPORT: signalReportPath
+      });
+
+      expect(result.rawDuringInteraction).toBe(true);
+      expect(JSON.parse(readFileSync(signalReportPath, "utf8"))).toEqual({
+        signal: "SIGTERM",
+        count: 1,
+        raw: false
+      });
+      expect(result.status).toBe(72);
+      expect(result.terminalRestored).toBe(true);
+      expect(existsSync(path.join(result.stateDir, "credentials.json"))).toBe(false);
+    }
+  );
+
+  it.runIf(supportsPythonPty)(
+    "restores the terminal before delivering SIGTERM once to a preloaded listener and controlling termination",
     () => {
       const stateDir = makeStateDir();
       const signalReportPath = path.join(stateDir, "signal-listener.json");
@@ -353,6 +376,27 @@ describe("patchpage auth set terminal boundary", () => {
     expectTerminalRestored(result.terminal);
     expect(existsSync(path.join(result.stateDir, "credentials.json"))).toBe(false);
   });
+
+  it.runIf(process.platform !== "win32")(
+    "hard-kills a SIGTERM-ignoring mock-TTY child when the async runner times out",
+    async () => {
+      const stateDir = makeStateDir();
+      const timeoutSignalReportPath = path.join(stateDir, "timeout-signal.json");
+
+      await expect(
+        runCliWithMockTtyAsync(
+          ["auth", "set"],
+          { PATCHPAGE_TEST_TTY_TIMEOUT_SIGNAL_REPORT: timeoutSignalReportPath },
+          stateDir,
+          1_000
+        )
+      ).rejects.toThrow("CLI timed out: patchpage auth set");
+      expect(JSON.parse(readFileSync(timeoutSignalReportPath, "utf8"))).toEqual({
+        ready: true,
+        sigtermReceived: false
+      });
+    }
+  );
 
   for (const [signalName, exitCode] of [
     ["SIGHUP", 129],
@@ -531,6 +575,8 @@ function cliEnv(overrides: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv {
   delete env.PATCHPAGE_TEST_ARGV_RECORD;
   delete env.PATCHPAGE_TEST_TTY_INPUT_ERROR;
   delete env.PATCHPAGE_TEST_TTY_REPORT;
+  delete env.PATCHPAGE_TEST_TTY_TIMEOUT_SIGNAL_REPORT;
+  delete env.PATCHPAGE_TEST_SIGNAL_ACTION;
   delete env.PATCHPAGE_TEST_SIGNAL_REPORT;
   delete env.PATCHPAGE_TEST_WINDOWS_SIGNAL;
   return { ...env, ...overrides };
@@ -584,7 +630,8 @@ function runCliWithMockTty(args: string[], input: string, stateDir = makeStateDi
 function runCliWithMockTtyAsync(
   args: string[],
   envOverrides: NodeJS.ProcessEnv,
-  stateDir = makeStateDir()
+  stateDir = makeStateDir(),
+  timeoutMs = 10_000
 ) {
   const harnessDir = makeStateDir();
   const argvOutputPath = path.join(harnessDir, "argv.json");
@@ -623,8 +670,8 @@ function runCliWithMockTtyAsync(
     let timedOut = false;
     const timeout = setTimeout(() => {
       timedOut = true;
-      child.kill();
-    }, 10_000);
+      child.kill("SIGKILL");
+    }, timeoutMs);
     child.once("error", (error) => {
       clearTimeout(timeout);
       reject(error);

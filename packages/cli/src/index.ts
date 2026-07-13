@@ -305,18 +305,21 @@ async function promptForApiToken(): Promise<string> {
     }
   };
   const onExternalSignal = (signal: NodeJS.Signals) => {
+    const requiresControlledExit =
+      process.listenerCount(signal) > 1 ||
+      (process.platform === "win32" && (signal === "SIGHUP" || signal === "SIGBREAK"));
+    if (requiresControlledExit) {
+      const signalNumber =
+        os.constants.signals[signal] ?? (signal === "SIGBREAK" ? 21 : 1);
+      queueMicrotask(() => process.exit(128 + signalNumber));
+    }
+
     try {
       cleanup();
     } finally {
-      const requiresControlledExit =
-        process.listenerCount(signal) > 0 ||
-        (process.platform === "win32" && (signal === "SIGHUP" || signal === "SIGBREAK"));
-      if (requiresControlledExit) {
-        const signalNumber =
-          os.constants.signals[signal] ?? (signal === "SIGBREAK" ? 21 : 1);
-        process.exit(128 + signalNumber);
+      if (!requiresControlledExit) {
+        process.kill(process.pid, signal);
       }
-      process.kill(process.pid, signal);
     }
   };
 
@@ -324,7 +327,7 @@ async function promptForApiToken(): Promise<string> {
     for (const signal of ["SIGINT", "SIGTERM", "SIGHUP", "SIGBREAK"] as const) {
       const handler = () => onExternalSignal(signal);
       signalHandlers.set(signal, handler);
-      process.on(signal, handler);
+      process.prependListener(signal, handler);
     }
     readline = createInterface({
       input,
