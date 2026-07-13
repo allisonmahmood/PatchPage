@@ -2,6 +2,7 @@ import { readFile } from "node:fs/promises";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
+import { parseDocument } from "yaml";
 
 const repoRoot = path.resolve(
   process.env.PATCHPAGE_RELEASE_WORKFLOW_REPO_ROOT ??
@@ -36,6 +37,23 @@ const selfHosting =
 const readme = process.env.PATCHPAGE_RELEASE_README_SOURCE ?? readmeFile;
 const packageJson = JSON.parse(packageSource);
 const failures = [];
+let parsedWorkflow = null;
+
+try {
+  const document = parseDocument(workflow, { uniqueKeys: true });
+  if (document.errors.length > 0) {
+    for (const error of document.errors) {
+      failures.push(`release.yml must be valid YAML with unique map keys: ${error.message}`);
+    }
+  } else {
+    parsedWorkflow = document.toJS();
+  }
+} catch (error) {
+  failures.push(
+    `release.yml must be valid YAML with unique map keys: ${error instanceof Error ? error.message : String(error)}`,
+  );
+}
+
 const reviewedNodeVersion = "24.18.0";
 const exactVersionPattern = /^\d+\.\d+\.\d+$/;
 const reviewedNpm = Object.freeze({
@@ -87,6 +105,8 @@ const reviewedActions = new Map([
     },
   ],
 ]);
+const reviewedUploadArtifact = `actions/upload-artifact@${reviewedActions.get("actions/upload-artifact").sha}`;
+const reviewedDownloadArtifact = `actions/download-artifact@${reviewedActions.get("actions/download-artifact").sha}`;
 
 function job(name) {
   const lines = workflow.split("\n");
@@ -103,48 +123,247 @@ function job(name) {
   return lines.slice(start, end === -1 ? undefined : end).join("\n");
 }
 
-function stepContaining(jobSource, marker) {
-  const lines = jobSource.split("\n");
-  const markerIndex = lines.findIndex((line) => line.trim() === marker);
+function isMapping(value) {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
 
-  if (markerIndex === -1) {
-    return "";
+function hasExactMapping(value, expected) {
+  if (!isMapping(value)) {
+    return false;
   }
 
-  let start = markerIndex;
-  while (start >= 0 && !/^      - /.test(lines[start])) {
-    start -= 1;
-  }
-
-  const end = lines.findIndex(
-    (line, index) => index > markerIndex && /^      - /.test(line),
+  const expectedEntries = Object.entries(expected);
+  return (
+    Object.keys(value).length === expectedEntries.length &&
+    expectedEntries.every(([key, expectedValue]) => value[key] === expectedValue)
   );
-  return lines.slice(start, end === -1 ? undefined : end).join("\n");
 }
 
-function exactLineCount(source, line) {
-  return source.split("\n").filter((candidate) => candidate === line).length;
+function hasExactKeys(value, expectedKeys) {
+  if (!isMapping(value)) {
+    return false;
+  }
+  const actualKeys = Object.keys(value).sort();
+  return (
+    actualKeys.length === expectedKeys.length &&
+    expectedKeys
+      .slice()
+      .sort()
+      .every((key, index) => key === actualKeys[index])
+  );
 }
 
-function failClosedGuardPosition(source, guardLine) {
+function parsedJob(name) {
+  if (parsedWorkflow === null) {
+    return null;
+  }
+
+  const jobs = isMapping(parsedWorkflow) ? parsedWorkflow.jobs : null;
+  const selectedJob = isMapping(jobs) ? jobs[name] : null;
+  if (!isMapping(selectedJob)) {
+    failures.push(`release.yml must define ${name} as a parsed job map`);
+    return null;
+  }
+
+  return selectedJob;
+}
+
+function parsedSteps(jobName, selectedJob) {
+  if (selectedJob === null) {
+    return [];
+  }
+  if (!Array.isArray(selectedJob.steps) || !selectedJob.steps.every(isMapping)) {
+    failures.push(`${jobName} must define steps as parsed YAML maps`);
+    return [];
+  }
+  return selectedJob.steps;
+}
+
+function uniqueStep(steps, predicate, description) {
+  if (parsedWorkflow === null) {
+    return null;
+  }
+  const matches = steps.filter(predicate);
+  if (matches.length !== 1) {
+    failures.push(`${description} must exist exactly once`);
+    return null;
+  }
+  return matches[0];
+}
+
+function exactTrimmedLineCount(source, expectedLine) {
+  return source
+    .split("\n")
+    .filter((line) => line.trim() === expectedLine).length;
+}
+
+function shellCodeBeforeComment(line) {
+  let singleQuoted = false;
+  let doubleQuoted = false;
+  let escaped = false;
+
+  for (let index = 0; index < line.length; index += 1) {
+    const character = line[index];
+    if (escaped) {
+      escaped = false;
+      continue;
+    }
+    if (character === "\\" && !singleQuoted) {
+      escaped = true;
+      continue;
+    }
+    if (character === "'" && !doubleQuoted) {
+      singleQuoted = !singleQuoted;
+      continue;
+    }
+    if (character === '"' && !singleQuoted) {
+      doubleQuoted = !doubleQuoted;
+      continue;
+    }
+    if (
+      character === "#" &&
+      !singleQuoted &&
+      !doubleQuoted &&
+      (index === 0 || /\s/.test(line[index - 1]))
+    ) {
+      return line.slice(0, index);
+    }
+  }
+
+  return line;
+}
+
+function nextShellGroupingDepth(line, startingDepth) {
+  let depth = startingDepth;
+  let singleQuoted = false;
+  let doubleQuoted = false;
+  let escaped = false;
+
+  for (let index = 0; index < line.length; index += 1) {
+    const character = line[index];
+    if (escaped) {
+      escaped = false;
+      continue;
+    }
+    if (character === "\\" && !singleQuoted) {
+      escaped = true;
+      continue;
+    }
+    if (character === "'" && !doubleQuoted) {
+      singleQuoted = !singleQuoted;
+      continue;
+    }
+    if (character === '"' && !singleQuoted) {
+      doubleQuoted = !doubleQuoted;
+      continue;
+    }
+    if (singleQuoted) {
+      continue;
+    }
+
+    const opensCommandSubstitution =
+      character === "(" &&
+      (line[index - 1] === "$" || line[index - 1] === "<" || line[index - 1] === ">");
+    const opensSubshell =
+      character === "(" &&
+      !doubleQuoted &&
+      (index === 0 || /[\s;|&]/.test(line[index - 1]));
+
+    if (opensCommandSubstitution || opensSubshell || (character === "(" && depth > 0)) {
+      depth += 1;
+      continue;
+    }
+    if (character === ")" && depth > 0) {
+      depth -= 1;
+    }
+  }
+
+  return depth;
+}
+
+function shellStructure(source) {
   const lines = source.split("\n");
-  const start = lines.findIndex((line) => line.trim() === guardLine);
+  const structure = [];
+  const compoundStack = [];
+  let groupingDepth = 0;
+  let heredocTerminator = null;
+  let offset = 0;
 
-  if (start === -1) {
-    return -1;
+  for (const [index, line] of lines.entries()) {
+    const trimmed = line.trim();
+    if (heredocTerminator !== null) {
+      structure.push({ depth: null, index, isShell: false, line, offset });
+      if (trimmed === heredocTerminator) {
+        heredocTerminator = null;
+      }
+      offset += line.length + 1;
+      continue;
+    }
+
+    const code = shellCodeBeforeComment(line);
+    const statement = code.trim();
+    const closesCompound =
+      (/^fi(?:\s*;|\s*$)/.test(statement) && "if") ||
+      (/^done(?:\s*;|\s*$)/.test(statement) && "loop") ||
+      (/^esac(?:\s*;|\s*$)/.test(statement) && "case") ||
+      (/^}(?:\s*;|\s*$)/.test(statement) && "brace");
+    if (closesCompound && compoundStack.at(-1) === closesCompound) {
+      compoundStack.pop();
+    }
+
+    structure.push({
+      depth: compoundStack.length + groupingDepth,
+      index,
+      isShell: statement !== "",
+      line,
+      offset,
+    });
+
+    if (/^if(?:\s|$)/.test(statement)) {
+      compoundStack.push("if");
+    } else if (/^case\b[\s\S]*\bin\s*$/.test(statement)) {
+      compoundStack.push("case");
+    } else if (/^(?:for|select|while|until)(?:\s|$)/.test(statement)) {
+      compoundStack.push("loop");
+    } else if (
+      /^(?:function\s+)?[A-Za-z_][A-Za-z0-9_]*(?:\s*\(\s*\))?\s*\{\s*$/.test(
+        statement,
+      ) ||
+      /(?:^|(?:&&|\|\||[;|&])\s*)\{\s*$/.test(statement)
+    ) {
+      compoundStack.push("brace");
+    }
+
+    groupingDepth = nextShellGroupingDepth(code, groupingDepth);
+    const heredoc = code.match(/<<-?\s*(?:'([^']+)'|"([^"]+)"|([A-Za-z_][A-Za-z0-9_]*))/);
+    heredocTerminator = heredoc?.[1] ?? heredoc?.[2] ?? heredoc?.[3] ?? null;
+    offset += line.length + 1;
   }
 
-  const end = lines.findIndex(
-    (line, index) => index > start && line.trim() === "fi",
+  return structure;
+}
+
+function exactTopLevelGuardBlock(structure, expectedLines) {
+  const candidates = structure.filter(
+    (entry) => entry.isShell && entry.line.trim() === expectedLines[0],
   );
-  if (
-    end === -1 ||
-    !lines.slice(start + 1, end).some((line) => line.trim() === "exit 1")
-  ) {
-    return -1;
+  if (candidates.length !== 1 || candidates[0].depth !== 0) {
+    return null;
   }
 
-  return lines.slice(0, start).join("\n").length + (start === 0 ? 0 : 1);
+  const start = candidates[0];
+  for (const [offset, expectedLine] of expectedLines.entries()) {
+    const entry = structure[start.index + offset];
+    if (!entry?.isShell || entry.line.trim() !== expectedLine) {
+      return null;
+    }
+  }
+
+  return {
+    endIndex: start.index + expectedLines.length - 1,
+    offset: start.offset,
+    startIndex: start.index,
+  };
 }
 function ciJob(name) {
   const lines = ciWorkflow.split("\n");
@@ -325,10 +544,16 @@ const guardJob = job("guard");
 const prepareNpmJob = job("prepare-npm");
 const verifyJob = job("verify");
 const publishJob = job("publish-npm");
-const packageUploadStep = stepContaining(verifyJob, "id: package-artifact");
-const packageDownloadStep = stepContaining(
-  publishJob,
-  "- name: Download the exact tested tarball",
+const parsedPrepareNpmJob = parsedJob("prepare-npm");
+const parsedVerifyJob = parsedJob("verify");
+const parsedPublishJob = parsedJob("publish-npm");
+const prepareNpmSteps = parsedSteps("prepare-npm", parsedPrepareNpmJob);
+const verifySteps = parsedSteps("verify", parsedVerifyJob);
+const publishSteps = parsedSteps("publish-npm", parsedPublishJob);
+const npmCliUploadStep = uniqueStep(
+  prepareNpmSteps,
+  (step) => step.name === "Upload the reviewed npm CLI",
+  "the Upload the reviewed npm CLI step",
 );
 const serverImageJob = job("verify-server-image");
 const dockerJob = job("docker-ghcr");
@@ -364,6 +589,163 @@ if (guardJob) {
   ) {
     failures.push("guard must expose the checked-out full commit SHA as the release revision");
   }
+const npmCliUploadIdStep = uniqueStep(
+  prepareNpmSteps,
+  (step) => step.id === "npm-cli-artifact",
+  "the npm-cli-artifact producer step",
+);
+const packageMetadataStep = uniqueStep(
+  verifySteps,
+  (step) => step.id === "package",
+  "the package metadata producer step",
+);
+const packageUploadStep = uniqueStep(
+  verifySteps,
+  (step) => step.name === "Upload the exact tested tarball",
+  "the Upload the exact tested tarball step",
+);
+const packageUploadIdStep = uniqueStep(
+  verifySteps,
+  (step) => step.id === "package-artifact",
+  "the package-artifact producer step",
+);
+const packageDownloadStep = uniqueStep(
+  publishSteps,
+  (step) => step.name === "Download the exact tested tarball",
+  "the Download the exact tested tarball step",
+);
+const npmCliDownloadStep = uniqueStep(
+  publishSteps,
+  (step) => step.name === "Download the pinned publishing CLI",
+  "the Download the pinned publishing CLI step",
+);
+const publicationStep = uniqueStep(
+  publishSteps,
+  (step) => step.name === "Publish the verified tarball to npm",
+  "the Publish the verified tarball to npm step",
+);
+const publicationRun = typeof publicationStep?.run === "string" ? publicationStep.run : "";
+
+if (
+  parsedWorkflow !== null &&
+  !hasExactMapping(parsedPrepareNpmJob?.outputs, {
+    "npm-version": "${{ steps.npm-cli.outputs.version }}",
+    "npm-cli-artifact-id": "${{ steps.npm-cli-artifact.outputs.artifact-id }}",
+  })
+) {
+  failures.push("prepare-npm outputs must bind the exact reviewed npm CLI producers");
+}
+
+if (
+  parsedWorkflow !== null &&
+  (npmCliUploadStep === null ||
+    npmCliUploadStep !== npmCliUploadIdStep ||
+    !hasExactKeys(npmCliUploadStep, ["name", "id", "uses", "with"]) ||
+    npmCliUploadStep.uses !== reviewedUploadArtifact ||
+    !hasExactMapping(npmCliUploadStep.with, {
+      name: "npm-publishing-cli-${{ github.run_attempt }}",
+      path: "${{ runner.temp }}/npm-cli",
+      "if-no-files-found": "error",
+      "retention-days": 1,
+      "include-hidden-files": true,
+    }))
+) {
+  failures.push("prepare-npm must produce the exact isolated npm CLI artifact");
+}
+
+if (
+  parsedWorkflow !== null &&
+  (!hasExactMapping(parsedVerifyJob?.outputs, {
+    "tarball-filename": "${{ steps.package.outputs.filename }}",
+    "tarball-sha256": "${{ steps.package.outputs.sha256 }}",
+    "package-artifact-id": "${{ steps.package-artifact.outputs.artifact-id }}",
+  }) ||
+    packageMetadataStep?.name !== "Pack exactly one release tarball and verify contents")
+) {
+  failures.push("verify outputs must bind exactly to the package and artifact producers");
+}
+
+if (
+  parsedWorkflow !== null &&
+  (packageUploadStep === null ||
+    packageUploadStep !== packageUploadIdStep ||
+    !hasExactKeys(packageUploadStep, ["name", "id", "uses", "with"]) ||
+    packageUploadStep.uses !== reviewedUploadArtifact ||
+    !hasExactMapping(packageUploadStep.with, {
+      path: "${{ steps.package.outputs.tarball-path }}",
+      "if-no-files-found": "error",
+      "retention-days": 1,
+      archive: false,
+    }))
+) {
+  failures.push("verify must upload exactly the active single raw tarball input");
+}
+
+const publishDownloadSteps = publishSteps.filter(
+  (step) =>
+    typeof step.uses === "string" && step.uses.startsWith("actions/download-artifact@"),
+);
+if (parsedWorkflow !== null && publishDownloadSteps.length !== 2) {
+  failures.push("publish-npm must contain exactly two download-artifact steps");
+}
+
+if (
+  parsedWorkflow !== null &&
+  (packageDownloadStep === null ||
+    !hasExactKeys(packageDownloadStep, ["name", "uses", "with"]) ||
+    packageDownloadStep.uses !== reviewedDownloadArtifact ||
+    !hasExactMapping(packageDownloadStep.with, {
+      "artifact-ids": "${{ needs.verify.outputs.package-artifact-id }}",
+      path: "${{ runner.temp }}/patchpage-package",
+      "skip-decompress": true,
+    }))
+) {
+  failures.push("publish-npm must download the exact raw package artifact by ID");
+}
+
+if (
+  parsedWorkflow !== null &&
+  (npmCliDownloadStep === null ||
+    !hasExactKeys(npmCliDownloadStep, ["name", "uses", "with"]) ||
+    npmCliDownloadStep.uses !== reviewedDownloadArtifact ||
+    !hasExactMapping(npmCliDownloadStep.with, {
+      "artifact-ids": "${{ needs.prepare-npm.outputs.npm-cli-artifact-id }}",
+      path: "${{ runner.temp }}/npm-cli",
+    }))
+) {
+  failures.push("publish-npm must normally decompress the exact isolated npm CLI artifact");
+}
+
+const publicationStepIndex = publishSteps.indexOf(publicationStep);
+if (
+  parsedWorkflow !== null &&
+  (publicationStep === null ||
+    publicationStep.shell !== "bash" ||
+    publicationRun === "" ||
+    publishSteps.indexOf(packageDownloadStep) >= publicationStepIndex ||
+    publishSteps.indexOf(npmCliDownloadStep) >= publicationStepIndex ||
+    exactTrimmedLineCount(
+      publicationRun,
+      'tarballs=("$RUNNER_TEMP/patchpage-package"/*.tgz)',
+    ) !== 1 ||
+    exactTrimmedLineCount(
+      publicationRun,
+      'npm_cli="$RUNNER_TEMP/npm-cli/bin/npm-cli.js"',
+    ) !== 1)
+) {
+  failures.push("publish-npm must consume both isolated downloads in the publication step");
+}
+
+if (
+  parsedWorkflow !== null &&
+  !hasExactMapping(publicationStep?.env, {
+    EXPECTED_FILENAME: "${{ needs.verify.outputs.tarball-filename }}",
+    EXPECTED_NPM_VERSION: "${{ needs.prepare-npm.outputs.npm-version }}",
+    EXPECTED_SHA256: "${{ needs.verify.outputs.tarball-sha256 }}",
+    EXPECTED_VERSION: "${{ needs.guard.outputs.version }}",
+  })
+) {
+  failures.push("the publication step must bind the exact verified filename, digest, versions");
 }
 
 if (prepareNpmJob) {
@@ -603,32 +985,8 @@ const packageMetadataRead = publishJob.indexOf(
 );
 const publishTarCommands = publishJob.match(/^\s+tar\s+/gm) ?? [];
 const publishUnzipCommands = publishJob.match(/^\s+unzip(?:\s|$)/gm) ?? [];
-const packageArtifactIdDownloads = exactLineCount(
-  publishJob,
-  "          artifact-ids: ${{ needs.verify.outputs.package-artifact-id }}",
-);
 
 if (
-  !packageUploadStep.includes("uses: actions/upload-artifact@") ||
-  exactLineCount(
-    packageUploadStep,
-    "          path: ${{ steps.package.outputs.tarball-path }}",
-  ) !== 1 ||
-  exactLineCount(packageUploadStep, "          archive: false") !== 1 ||
-  packageUploadStep.includes("\n          name:") ||
-  packageUploadStep.includes("compression-level:") ||
-  packageUploadStep.includes("*.tgz") ||
-  !packageDownloadStep.includes("uses: actions/download-artifact@") ||
-  exactLineCount(
-    packageDownloadStep,
-    "          artifact-ids: ${{ needs.verify.outputs.package-artifact-id }}",
-  ) !== 1 ||
-  exactLineCount(
-    packageDownloadStep,
-    "          path: ${{ runner.temp }}/patchpage-package",
-  ) !== 1 ||
-  exactLineCount(packageDownloadStep, "          skip-decompress: true") !== 1 ||
-  packageArtifactIdDownloads !== 1 ||
   originalTarballDiscovery === -1 ||
   originalTarballCountGuard <= originalTarballDiscovery ||
   originalTarballAssignment <= originalTarballCountGuard ||
@@ -862,27 +1220,47 @@ if (registryCaseEnd === -1 || npmPublish <= registryCaseEnd) {
   failures.push("npm publish must occur only after the registry HTTP state machine");
 }
 
-const packageNameGuard = failClosedGuardPosition(
-  publishJob,
+const publicationShell = shellStructure(publicationRun);
+const packageNameGuard = exactTopLevelGuardBlock(publicationShell, [
   'if [[ "$package_name" != "patchpage" ]]; then',
-);
-const packageVersionGuard = failClosedGuardPosition(
-  publishJob,
+  'echo "::error::Downloaded package is named $package_name, expected patchpage"',
+  "exit 1",
+  "fi",
+]);
+const packageVersionGuard = exactTopLevelGuardBlock(publicationShell, [
   'if [[ "$package_version" != "$EXPECTED_VERSION" ]]; then',
+  'echo "::error::Downloaded package version $package_version does not match $EXPECTED_VERSION"',
+  "exit 1",
+  "fi",
+]);
+const publicationDigestGuard = publicationRun.indexOf(
+  'if [[ "$actual_sha256" != "$EXPECTED_SHA256" ]]; then',
 );
-const npmCliVersionExecution = publishJob.indexOf('node "$npm_cli" --version');
+const publicationMetadataRead = publicationRun.indexOf(
+  'tar -xOf "$tarball" package/package.json',
+);
+const publicationNpmCliVersionExecution = publicationRun.indexOf(
+  'node "$npm_cli" --version',
+);
+const publicationRegistryRequest = publicationRun.indexOf('if ! http_status="$(');
+const publicationNpmPublish = publicationRun.indexOf('node "$npm_cli" publish');
 
 if (
-  packageMetadataRead === -1 ||
-  packageNameGuard <= packageMetadataRead ||
-  packageVersionGuard <= packageNameGuard ||
-  npmCliVersionExecution <= packageVersionGuard ||
-  registryRequestStart <= packageVersionGuard ||
-  npmPublish <= npmCliVersionExecution ||
-  npmPublish <= registryRequestStart
+  parsedWorkflow !== null &&
+  (publicationDigestGuard === -1 ||
+    publicationMetadataRead <= publicationDigestGuard ||
+    packageNameGuard === null ||
+    packageVersionGuard === null ||
+    packageNameGuard.offset <= publicationMetadataRead ||
+    packageVersionGuard.startIndex <= packageNameGuard.endIndex ||
+    publicationNpmCliVersionExecution <= packageVersionGuard.offset ||
+    publicationRegistryRequest <= packageVersionGuard.offset ||
+    publicationNpmPublish <= packageVersionGuard.offset ||
+    publicationNpmPublish <= publicationNpmCliVersionExecution ||
+    publicationNpmPublish <= publicationRegistryRequest)
 ) {
   failures.push(
-    "publish-npm must read package metadata, fail closed on exact patchpage name and expected version, then perform registry or npm CLI activity before publishing",
+    "publish-npm must read package metadata, then run the exact top-level name and version fail-closed guards before npm or registry activity",
   );
 }
 
