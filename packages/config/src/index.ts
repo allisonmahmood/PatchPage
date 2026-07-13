@@ -1,6 +1,7 @@
 import { isIP } from "node:net";
 
 const MAX_TRUST_PROXY_HOPS = 32;
+const MAX_RATE_LIMIT_PER_MINUTE = 10_000;
 const IPV4_BITS = 32;
 const IPV6_BITS = 128;
 const IPV4_MAX = (1n << 32n) - 1n;
@@ -22,6 +23,9 @@ export interface ServerConfig {
   bootstrapApiToken: string | null;
   allowAnonymousUploads: boolean;
   maxHtmlBytes: number;
+  protectedApiRateLimitPerMinute: number;
+  authenticatedUploadRateLimitPerMinute: number;
+  anonymousCreateRateLimitPerMinute: number;
   dbDriver: "postgres" | "json";
   databaseUrl: string | null;
   jsonDbFile: string;
@@ -44,6 +48,21 @@ export function getServerConfig(env: NodeJS.ProcessEnv = process.env): ServerCon
     bootstrapApiToken: stringValue(env.PATCHPAGE_BOOTSTRAP_API_TOKEN),
     allowAnonymousUploads: boolValue(env.PATCHPAGE_ALLOW_ANONYMOUS_UPLOADS, false),
     maxHtmlBytes: intValue(env.PATCHPAGE_MAX_HTML_BYTES, 512 * 1024),
+    protectedApiRateLimitPerMinute: rateLimitPerMinuteValue(
+      "PATCHPAGE_PROTECTED_API_RATE_LIMIT_PER_MINUTE",
+      env.PATCHPAGE_PROTECTED_API_RATE_LIMIT_PER_MINUTE,
+      60
+    ),
+    authenticatedUploadRateLimitPerMinute: rateLimitPerMinuteValue(
+      "PATCHPAGE_AUTHENTICATED_UPLOAD_RATE_LIMIT_PER_MINUTE",
+      env.PATCHPAGE_AUTHENTICATED_UPLOAD_RATE_LIMIT_PER_MINUTE,
+      20
+    ),
+    anonymousCreateRateLimitPerMinute: rateLimitPerMinuteValue(
+      "PATCHPAGE_ANONYMOUS_CREATE_RATE_LIMIT_PER_MINUTE",
+      env.PATCHPAGE_ANONYMOUS_CREATE_RATE_LIMIT_PER_MINUTE,
+      5
+    ),
     dbDriver,
     databaseUrl,
     jsonDbFile: stringValue(env.PATCHPAGE_DB_FILE) ?? ".local/patchpage-db.json",
@@ -225,6 +244,28 @@ function intValue(value: string | undefined, fallback: number): number {
   const parsed = Number(trimmed);
   if (!Number.isInteger(parsed) || parsed < 0) {
     throw new Error(`Expected a positive integer, received: ${value}`);
+  }
+  return parsed;
+}
+
+function rateLimitPerMinuteValue(
+  name: string,
+  value: string | undefined,
+  fallback: number
+): number {
+  const trimmed = stringValue(value);
+  if (!trimmed) return fallback;
+  if (!/^[1-9]\d*$/.test(trimmed)) {
+    throw new Error(
+      `${name} must be a decimal integer from 1 through ${MAX_RATE_LIMIT_PER_MINUTE}, received: ${value}`
+    );
+  }
+
+  const parsed = Number(trimmed);
+  if (parsed > MAX_RATE_LIMIT_PER_MINUTE) {
+    throw new Error(
+      `${name} must be a decimal integer from 1 through ${MAX_RATE_LIMIT_PER_MINUTE}, received: ${value}`
+    );
   }
   return parsed;
 }

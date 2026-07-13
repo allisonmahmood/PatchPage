@@ -73,6 +73,11 @@ PATCHPAGE_ALLOW_ANONYMOUS_UPLOADS=false
 # Upload limits
 PATCHPAGE_MAX_HTML_BYTES=524288
 
+# Abuse protection
+PATCHPAGE_PROTECTED_API_RATE_LIMIT_PER_MINUTE=60
+PATCHPAGE_AUTHENTICATED_UPLOAD_RATE_LIMIT_PER_MINUTE=20
+PATCHPAGE_ANONYMOUS_CREATE_RATE_LIMIT_PER_MINUTE=5
+
 # Metadata store: "postgres" or "json"
 # Defaults to "postgres" if DATABASE_URL is set, otherwise "json".
 PATCHPAGE_DB_DRIVER=postgres
@@ -101,8 +106,21 @@ Notes on values:
 - `PATCHPAGE_PUBLIC_BASE_URL` is used to build the public draft URLs returned by uploads and rendered in the viewer. Set it to the externally reachable origin (scheme + host, no trailing slash). The Azure Terraform example requires a deployer-owned HTTPS origin; the application itself retains its `http://localhost:3000` default for local development.
 - `PATCHPAGE_TRUST_PROXY` controls whether Fastify derives `request.ip` from `X-Forwarded-For`. Leave it undefined unless every route to the server has a verified trust boundary. See [Client IP attribution behind proxies](#client-ip-attribution-behind-proxies).
 - `PATCHPAGE_MAX_HTML_BYTES` caps the size of a single HTML document (default 524288 = 512 KiB).
+- `PATCHPAGE_PROTECTED_API_RATE_LIMIT_PER_MINUTE`, `PATCHPAGE_AUTHENTICATED_UPLOAD_RATE_LIMIT_PER_MINUTE`, and `PATCHPAGE_ANONYMOUS_CREATE_RATE_LIMIT_PER_MINUTE` are decimal integers from `1` through `10000`. Defaults are `60`, `20`, and `5`.
 - `PATCHPAGE_ALLOW_ANONYMOUS_UPLOADS` is parsed but not currently enforced — the upload endpoint always requires a token with the `upload` scope regardless of this setting. Keep it `false`.
 - When running from source, the `json` metadata driver and `filesystem` storage driver write under `.local/` by default. The supported image overrides those path defaults to `/data` as shown above. Both modes need no external services and suit a quick or single-instance self-host. For a durable multi-instance deployment, use `postgres` and a shared object store (`azure-blob`).
+
+### Abuse protection and rate limits
+
+PatchPage applies deterministic fixed-window in-memory limits inside each server process:
+
+- Protected `/api` requests are limited to `PATCHPAGE_PROTECTED_API_RATE_LIMIT_PER_MINUTE` attempts per minute per canonical Fastify `request.ip`. That IP follows `PATCHPAGE_TRUST_PROXY`, so configure the proxy boundary before relying on IP-based buckets.
+- Authenticated upload requests are limited to `PATCHPAGE_AUTHENTICATED_UPLOAD_RATE_LIMIT_PER_MINUTE` attempts per minute per API token database identity. Rotating the raw bearer secret for the same token record does not create a fresh upload bucket.
+- A real anonymous-create limiter is configured at `PATCHPAGE_ANONYMOUS_CREATE_RATE_LIMIT_PER_MINUTE` attempts per minute per canonical `request.ip` for future anonymous upload support. Anonymous uploads are still disabled today; `POST /api/uploads` requires a token with the `upload` scope.
+
+When a bucket is exceeded, PatchPage returns HTTP `429` with JSON `{ "ok": false, "code": "rate_limited", ... }` and an integer `Retry-After` header. Public `GET /healthz` and draft viewer routes under `/d/...` do not consume protected API or upload buckets.
+
+These counters are process-local and memory-only. They reset on restart and are not shared across Node processes, containers, or replicas. For multi-instance deployments, treat them as a local safety net and add an ingress, load balancer, CDN, or shared external rate limiter if you need a global limit.
 
 ### JSON metadata durability
 
