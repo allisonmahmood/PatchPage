@@ -68,14 +68,14 @@ patchpage upload ./plan.html
 # Version: 1
 ```
 
-By default, uploading a file the CLI has seen before updates that same draft (a new version). Use `--new` to force a brand-new draft, or `--draft <draft-id>` to target a specific existing draft.
+By default, uploading a file the CLI has seen before updates that same draft (a new version). If that cached draft is unavailable, the upload fails; pass `--new` to create a brand-new draft with a server-generated ID. `--draft <draft-id>` is update-only: it can add a version to an existing active draft owned by your account, but it never creates a draft at a caller-chosen ID. Unknown, unavailable, or unowned targets fail with the same generic update error. `--draft` and `--new` cannot be combined.
 
 ## Flags
 
 - `--api-url <url>` — override the API base URL for this command (available on `auth set`, `whoami`, and `upload`).
 - `--token-stdin` — on `auth set`, read exactly one non-empty token from redirected stdin. This is the explicit automation path and is rejected when stdin is a terminal.
-- `--new` — on `upload`, always create a new draft instead of updating the one previously uploaded from this path.
-- `--draft <draft-id>` — on `upload`, add a new version to a specific draft.
+- `--new` — on `upload`, always create a new draft with a server-generated ID instead of updating the one previously uploaded from this path. It cannot be combined with `--draft`.
+- `--draft <draft-id>` — on `upload`, update a specific existing draft. This is update-only and never creates a new draft. It cannot be combined with `--new`.
 
 ## Environment variables
 

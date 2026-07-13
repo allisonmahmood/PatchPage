@@ -1,6 +1,7 @@
 import pg from "pg";
 import { newInternalId, sha256 } from "@patchpage/core";
 import { POSTGRES_SCHEMA_SQL } from "./migrations.js";
+import { UploadTargetError } from "./types.js";
 import type {
   ApiTokenAuth,
   CreateApiTokenInput,
@@ -9,7 +10,8 @@ import type {
   DraftVersionRecord,
   PatchPageDb,
   RecordUploadInput,
-  RecordUploadResult
+  RecordUploadResult,
+  UploadTargetInput
 } from "./types.js";
 
 const { Pool } = pg;
@@ -71,49 +73,86 @@ export class PostgresPatchPageDb implements PatchPageDb {
     return { id, name };
   }
 
+  async assertUploadTarget(input: UploadTargetInput): Promise<void> {
+    const result =
+      input.intent === "update"
+        ? await this.pool.query(
+            `
+              SELECT 1
+              FROM drafts
+              WHERE id = $1
+                AND account_id = $2
+                AND deleted_at IS NULL
+                AND disabled_at IS NULL
+            `,
+            [input.draftId, input.accountId]
+          )
+        : await this.pool.query("SELECT 1 FROM drafts WHERE id = $1", [input.draftId]);
+
+    if (input.intent === "update" ? !result.rowCount : Boolean(result.rowCount)) {
+      throw new UploadTargetError(
+        input.intent === "update" ? "draft_unavailable" : "draft_conflict"
+      );
+    }
+  }
+
   async recordUpload(input: RecordUploadInput): Promise<RecordUploadResult> {
     const client = await this.pool.connect();
     try {
       await client.query("BEGIN");
 
-      const existingResult = await client.query(
-        `
-          SELECT *
-          FROM drafts
-          WHERE id = $1 AND deleted_at IS NULL
-          LIMIT 1
-        `,
-        [input.draftId]
-      );
-      const existingDraft = existingResult.rows[0] || null;
-
-      if (existingDraft && existingDraft.account_id !== input.accountId) {
-        const error = new Error("Draft not found.");
-        (error as Error & { statusCode?: number }).statusCode = 404;
-        throw error;
-      }
-
-      const versionResult = await client.query(
-        `
-          SELECT COALESCE(MAX(version_number), 0) + 1 AS next_version
-          FROM draft_versions
-          WHERE draft_id = $1
-        `,
-        [input.draftId]
-      );
-      const versionNumber = Number(versionResult.rows[0].next_version);
-      const title = input.title || existingDraft?.title || input.filename || "Untitled Draft";
       const repoOrg = cleanText(input.metadata.repoOrg);
       const repoName = cleanText(input.metadata.repoName);
+      let title: string;
+      let versionNumber: number;
 
-      if (!existingDraft) {
-        await client.query(
+      if (input.intent === "update") {
+        const existingResult = await client.query(
           `
-            INSERT INTO drafts (id, account_id, title, visibility, current_version_id, repo_org, repo_name)
+            SELECT *
+            FROM drafts
+            WHERE id = $1
+              AND account_id = $2
+              AND deleted_at IS NULL
+              AND disabled_at IS NULL
+            FOR UPDATE
+          `,
+          [input.draftId, input.accountId]
+        );
+        const existingDraft = existingResult.rows[0] || null;
+        if (!existingDraft) {
+          throw new UploadTargetError("draft_unavailable");
+        }
+
+        // Allocate after acquiring the draft row lock. A concurrent update for
+        // the same draft waits above, then this query sees the committed version.
+        const versionResult = await client.query(
+          `
+            SELECT COALESCE(MAX(version_number), 0) + 1 AS next_version
+            FROM draft_versions
+            WHERE draft_id = $1
+          `,
+          [input.draftId]
+        );
+        versionNumber = Number(versionResult.rows[0].next_version);
+        title = input.title || existingDraft.title || input.filename || "Untitled Draft";
+      } else {
+        title = input.title || input.filename || "Untitled Draft";
+        versionNumber = 1;
+        const createdDraft = await client.query(
+          `
+            INSERT INTO drafts (
+              id, account_id, title, visibility, current_version_id, repo_org, repo_name
+            )
             VALUES ($1, $2, $3, 'unlisted', $4, $5, $6)
+            ON CONFLICT (id) DO NOTHING
+            RETURNING id
           `,
           [input.draftId, input.accountId, title, input.versionId, repoOrg, repoName]
         );
+        if (!createdDraft.rowCount) {
+          throw new UploadTargetError("draft_conflict");
+        }
       }
 
       await client.query(
@@ -168,7 +207,7 @@ export class PostgresPatchPageDb implements PatchPageDb {
           input.draftId,
           input.versionId,
           input.apiTokenId,
-          existingDraft ? "draft.updated" : "draft.created",
+          input.intent === "update" ? "draft.updated" : "draft.created",
           input.sourceIp,
           input.userAgent,
           JSON.stringify(input.metadata)

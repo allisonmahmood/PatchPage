@@ -1,10 +1,12 @@
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdtemp, readdir, readFile, rm } from "node:fs/promises";
+import { setTimeout as delay } from "node:timers/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { getServerConfig } from "@patchpage/config";
 import type { ServerConfig } from "@patchpage/config";
 import { JsonFilePatchPageDb } from "@patchpage/db";
+import type { RecordUploadInput, RecordUploadResult } from "@patchpage/db";
 import { FileSystemHtmlStorage } from "@patchpage/storage";
 import { createApp } from "./app.js";
 
@@ -40,7 +42,13 @@ describe("PatchPage server", () => {
     });
 
     expect(upload.statusCode).toBe(201);
-    const body = upload.json() as { draftId: string; publicUrl: string };
+    const body = upload.json() as {
+      draftId: string;
+      publicUrl: string;
+      versionNumber: number;
+    };
+    expect(body.draftId).toMatch(/^[a-z0-9]{12}$/);
+    expect(body.versionNumber).toBe(1);
     expect(body.publicUrl).toBe(`${publicBaseUrl}/d/${body.draftId}`);
 
     await app.close();
@@ -184,6 +192,435 @@ describe("PatchPage server", () => {
       ).rejects.toThrow(/Invalid PATCHPAGE_TRUST_PROXY/);
     }
   );
+  it("rejects an unknown client-supplied draft ID without creating a public draft", async () => {
+    const config = testConfig();
+    const db = new JsonFilePatchPageDb(path.join(tempDir, "unknown-update-db.json"));
+    await db.initialize("dev-token");
+    const storage = new FileSystemHtmlStorage(path.join(tempDir, "unknown-update-drafts"));
+    const app = createApp({ config, db, storage });
+    const draftId = "abcdefghijkl";
+
+    const upload = await app.inject({
+      method: "POST",
+      url: "/api/uploads",
+      headers: { authorization: "Bearer dev-token" },
+      payload: {
+        draftId,
+        html: "<!doctype html><html><head><title>Must not exist</title></head><body></body></html>"
+      }
+    });
+
+    expect(upload.statusCode).toBe(404);
+    expect(upload.json()).toEqual({ ok: false, error: "Draft not found." });
+    const viewer = await app.inject({ method: "GET", url: `/d/${draftId}` });
+    expect(viewer.statusCode).toBe(404);
+    expect(await listFiles(storage.rootDir)).toEqual([]);
+
+    await app.close();
+    await db.close();
+  });
+
+  it("returns the same response for unavailable update targets", async () => {
+    const config = testConfig();
+    const db = new JsonFilePatchPageDb(path.join(tempDir, "unavailable-update-db.json"));
+    await db.initialize("dev-token");
+    const auth = await db.findApiTokenByToken("dev-token");
+    if (!auth) throw new Error("Expected bootstrap authentication.");
+    const storage = new FileSystemHtmlStorage(path.join(tempDir, "unavailable-update-drafts"));
+    const app = createApp({ config, db, storage });
+    const unknownDraftId = "aaaaaaaaaaaa";
+    const foreignDraftId = "bbbbbbbbbbbb";
+    const deletedDraftId = "cccccccccccc";
+    const disabledDraftId = "dddddddddddd";
+
+    for (const [draftId, accountId] of [
+      [foreignDraftId, "acct_another"],
+      [deletedDraftId, auth.accountId],
+      [disabledDraftId, auth.accountId]
+    ]) {
+      await db.recordUpload({
+        intent: "create",
+        draftId,
+        versionId: `ver_${draftId}`,
+        accountId,
+        apiTokenId: auth.id,
+        title: "Existing target",
+        objectKey: `drafts/${draftId}/versions/seed.html`,
+        contentHash: "sha256:seed",
+        fileSize: 1,
+        filename: "seed.html",
+        metadata: {},
+        sourceIp: null,
+        userAgent: "vitest"
+      });
+    }
+    await db.deleteDraft(deletedDraftId, auth.accountId);
+    await db.disableDraft(disabledDraftId, auth.accountId, "policy");
+
+    const responses = await Promise.all(
+      [unknownDraftId, foreignDraftId, deletedDraftId, disabledDraftId].map((draftId) =>
+        app.inject({
+          method: "POST",
+          url: "/api/uploads",
+          headers: { authorization: "Bearer dev-token" },
+          payload: {
+            draftId,
+            html: "<!doctype html><html><head><title>Update</title></head><body></body></html>"
+          }
+        })
+      )
+    );
+
+    for (const response of responses) {
+      expect(response.statusCode).toBe(404);
+      expect(response.json()).toEqual({ ok: false, error: "Draft not found." });
+    }
+
+    await app.close();
+    await db.close();
+  });
+
+  it("updates an existing owned draft and preserves its previous version", async () => {
+    const config = testConfig();
+    const db = new JsonFilePatchPageDb(path.join(tempDir, "owned-update-db.json"));
+    await db.initialize("dev-token");
+    const storage = new FileSystemHtmlStorage(path.join(tempDir, "owned-update-drafts"));
+    const app = createApp({ config, db, storage });
+    const headers = { authorization: "Bearer dev-token" };
+
+    const created = await app.inject({
+      method: "POST",
+      url: "/api/uploads",
+      headers,
+      payload: {
+        html: "<!doctype html><html><head><title>Original</title></head><body>original-marker</body></html>"
+      }
+    });
+    const createBody = created.json() as { draftId: string; versionNumber: number };
+
+    const updated = await app.inject({
+      method: "POST",
+      url: "/api/uploads",
+      headers,
+      payload: {
+        draftId: createBody.draftId,
+        html: "<!doctype html><html><head><title>Updated</title></head><body>updated-marker</body></html>"
+      }
+    });
+
+    expect(created.statusCode).toBe(201);
+    expect(createBody.versionNumber).toBe(1);
+    expect(updated.statusCode).toBe(200);
+    expect(updated.json()).toMatchObject({
+      draftId: createBody.draftId,
+      versionNumber: 2,
+      title: "Updated"
+    });
+
+    const currentViewer = await app.inject({
+      method: "GET",
+      url: `/d/${createBody.draftId}`
+    });
+    const originalViewer = await app.inject({
+      method: "GET",
+      url: `/d/${createBody.draftId}/v/1`
+    });
+    expect(currentViewer.statusCode).toBe(200);
+    expect(currentViewer.body).toContain("updated-marker");
+    expect(currentViewer.body).not.toContain("original-marker");
+    expect(originalViewer.statusCode).toBe(200);
+    expect(originalViewer.body).toContain("original-marker");
+
+    await app.close();
+    await db.close();
+  });
+
+  it("does not hold metadata locks while object storage is slow", async () => {
+    const config = testConfig();
+    const db = new JsonFilePatchPageDb(path.join(tempDir, "slow-storage-db.json"));
+    await db.initialize("dev-token");
+    const auth = await db.findApiTokenByToken("dev-token");
+    if (!auth) throw new Error("Expected bootstrap authentication.");
+    const storage = new ControlledHtmlStorage(path.join(tempDir, "slow-storage-drafts"));
+    const app = createApp({ config, db, storage });
+    const created = await app.inject({
+      method: "POST",
+      url: "/api/uploads",
+      headers: { authorization: "Bearer dev-token" },
+      payload: {
+        html: "<!doctype html><html><head><title>Slow target</title></head><body></body></html>"
+      }
+    });
+    const createdBody = created.json();
+    const unrelatedDraftId = "eeeeeeeeeeee";
+    await db.recordUpload({
+      intent: "create",
+      draftId: unrelatedDraftId,
+      versionId: "ver_unrelated",
+      accountId: auth.accountId,
+      apiTokenId: auth.id,
+      title: "Unrelated",
+      objectKey: `drafts/${unrelatedDraftId}/versions/ver_unrelated.html`,
+      contentHash: "sha256:unrelated",
+      fileSize: 1,
+      filename: "unrelated.html",
+      metadata: {},
+      sourceIp: null,
+      userAgent: "vitest"
+    });
+
+    const writeStarted = Promise.withResolvers<void>();
+    const allowWrite = Promise.withResolvers<void>();
+    storage.afterPut = async () => {
+      writeStarted.resolve();
+      await allowWrite.promise;
+    };
+
+    try {
+      const update = app.inject({
+        method: "POST",
+        url: "/api/uploads",
+        headers: { authorization: "Bearer dev-token" },
+        payload: {
+          draftId: createdBody.draftId,
+          html: "<!doctype html><html><head><title>Slow update</title></head><body></body></html>"
+        }
+      });
+      await writeStarted.promise;
+
+      const disable = db.disableDraft(
+        unrelatedDraftId,
+        auth.accountId,
+        "unrelated policy action"
+      );
+      expect(await Promise.race([disable.then(() => true), delay(100, false)])).toBe(true);
+      await expect(disable).resolves.toBe(true);
+
+      allowWrite.resolve();
+      await expect(update).resolves.toMatchObject({ statusCode: 200 });
+    } finally {
+      allowWrite.resolve();
+      await app.close();
+      await db.close();
+    }
+  });
+
+  it("removes only the new object when final eligibility recheck rejects", async () => {
+    const config = testConfig();
+    const db = new JsonFilePatchPageDb(path.join(tempDir, "race-cleanup-db.json"));
+    await db.initialize("dev-token");
+    const auth = await db.findApiTokenByToken("dev-token");
+    if (!auth) throw new Error("Expected bootstrap authentication.");
+    const storage = new ControlledHtmlStorage(path.join(tempDir, "race-cleanup-drafts"));
+    const app = createApp({ config, db, storage });
+    const created = await app.inject({
+      method: "POST",
+      url: "/api/uploads",
+      headers: { authorization: "Bearer dev-token" },
+      payload: {
+        html: "<!doctype html><html><head><title>Original</title></head><body>original</body></html>"
+      }
+    });
+    const createdBody = created.json();
+    const originalKey =
+      `drafts/${createdBody.draftId}/versions/${createdBody.versionId}.html`;
+    storage.afterPut = async () => {
+      await db.disableDraft(createdBody.draftId, auth.accountId, "policy race");
+    };
+
+    const update = await app.inject({
+      method: "POST",
+      url: "/api/uploads",
+      headers: { authorization: "Bearer dev-token" },
+      payload: {
+        draftId: createdBody.draftId,
+        html: "<!doctype html><html><head><title>Rejected</title></head><body>rejected</body></html>"
+      }
+    });
+
+    expect(update.statusCode).toBe(404);
+    expect(update.json()).toEqual({ ok: false, error: "Draft not found." });
+    expect(await listFiles(storage.rootDir)).toEqual([originalKey]);
+    await expect(storage.getHtmlObject(originalKey)).resolves.toContain("original");
+
+    await app.close();
+    await db.close();
+  });
+
+  it("does not mutate metadata when object storage fails", async () => {
+    const config = testConfig();
+    const db = new JsonFilePatchPageDb(path.join(tempDir, "storage-failure-db.json"));
+    await db.initialize("dev-token");
+    const storage = new ControlledHtmlStorage(path.join(tempDir, "storage-failure-drafts"));
+    const app = createApp({ config, db, storage });
+    const created = await app.inject({
+      method: "POST",
+      url: "/api/uploads",
+      headers: { authorization: "Bearer dev-token" },
+      payload: {
+        html: "<!doctype html><html><head><title>Original</title></head><body>original</body></html>"
+      }
+    });
+    const createdBody = created.json();
+    storage.putError = new Error("Object storage unavailable.");
+
+    const update = await app.inject({
+      method: "POST",
+      url: "/api/uploads",
+      headers: { authorization: "Bearer dev-token" },
+      payload: {
+        draftId: createdBody.draftId,
+        html: "<!doctype html><html><head><title>Failed</title></head><body>failed</body></html>"
+      }
+    });
+
+    expect(update.statusCode).toBe(500);
+    const current = await db.findDraftVersion(createdBody.draftId);
+    expect(current.version?.id).toBe(createdBody.versionId);
+    expect(await listFiles(storage.rootDir)).toEqual([
+      `drafts/${createdBody.draftId}/versions/${createdBody.versionId}.html`
+    ]);
+
+    await app.close();
+    await db.close();
+  });
+
+  it("surfaces cleanup failure instead of masking an orphan as a safe rejection", async () => {
+    const config = testConfig();
+    const db = new JsonFilePatchPageDb(path.join(tempDir, "cleanup-failure-db.json"));
+    await db.initialize("dev-token");
+    const auth = await db.findApiTokenByToken("dev-token");
+    if (!auth) throw new Error("Expected bootstrap authentication.");
+    const storage = new ControlledHtmlStorage(path.join(tempDir, "cleanup-failure-drafts"));
+    const app = createApp({ config, db, storage });
+    const created = await app.inject({
+      method: "POST",
+      url: "/api/uploads",
+      headers: { authorization: "Bearer dev-token" },
+      payload: {
+        html: "<!doctype html><html><head><title>Original</title></head><body></body></html>"
+      }
+    });
+    const createdBody = created.json();
+    storage.afterPut = async () => {
+      await db.disableDraft(createdBody.draftId, auth.accountId, "policy race");
+    };
+    storage.deleteError = new Error("Cleanup unavailable.");
+
+    const update = await app.inject({
+      method: "POST",
+      url: "/api/uploads",
+      headers: { authorization: "Bearer dev-token" },
+      payload: {
+        draftId: createdBody.draftId,
+        html: "<!doctype html><html><head><title>Rejected</title></head><body></body></html>"
+      }
+    });
+
+    expect(update.statusCode).toBe(500);
+    expect(update.json()).toEqual({ ok: false, error: "Internal server error." });
+    expect(await listFiles(storage.rootDir)).toHaveLength(2);
+
+    await app.close();
+    await db.close();
+  });
+
+  it("keeps the new object when metadata commit outcome is indeterminate", async () => {
+    const config = testConfig();
+    const db = new CommitIndeterminateJsonDb(path.join(tempDir, "indeterminate-db.json"));
+    await db.initialize("dev-token");
+    const storage = new ControlledHtmlStorage(path.join(tempDir, "indeterminate-drafts"));
+    const app = createApp({ config, db, storage });
+    const created = await app.inject({
+      method: "POST",
+      url: "/api/uploads",
+      headers: { authorization: "Bearer dev-token" },
+      payload: {
+        html: "<!doctype html><html><head><title>Original</title></head><body></body></html>"
+      }
+    });
+    const createdBody = created.json();
+    db.throwAfterRecord = true;
+
+    const update = await app.inject({
+      method: "POST",
+      url: "/api/uploads",
+      headers: { authorization: "Bearer dev-token" },
+      payload: {
+        draftId: createdBody.draftId,
+        html: "<!doctype html><html><head><title>Committed</title></head><body>committed</body></html>"
+      }
+    });
+
+    expect(update.statusCode).toBe(500);
+    const current = await db.findDraftVersion(createdBody.draftId);
+    expect(current.version?.versionNumber).toBe(2);
+    if (!current.version) throw new Error("Expected committed version.");
+    expect(await listFiles(storage.rootDir)).toHaveLength(2);
+    await expect(storage.getHtmlObject(current.version.objectKey)).resolves.toContain(
+      "committed"
+    );
+
+    await app.close();
+    await db.close();
+  });
+
+  it("accepts the released CLI null draft marker as server-generated create intent", async () => {
+    const config = testConfig();
+    const db = new JsonFilePatchPageDb(path.join(tempDir, "legacy-null-db.json"));
+    await db.initialize("dev-token");
+    const storage = new FileSystemHtmlStorage(path.join(tempDir, "legacy-null-drafts"));
+    const app = createApp({ config, db, storage });
+
+    const upload = await app.inject({
+      method: "POST",
+      url: "/api/uploads",
+      headers: { authorization: "Bearer dev-token" },
+      payload: {
+        html: "<!doctype html><html><head><title>Released CLI</title></head><body></body></html>",
+        filename: "released-cli.html",
+        draftId: null,
+        metadata: {
+          cliVersion: "0.1.0",
+          fileSha256: "legacy-client-hash"
+        }
+      }
+    });
+
+    expect(upload.statusCode).toBe(201);
+    const response = upload.json();
+    expect(response.draftId).toMatch(/^[a-z0-9]{12}$/);
+    expect(response.versionNumber).toBe(1);
+
+    await app.close();
+    await db.close();
+  });
+
+  it("rejects invalid non-null draft IDs instead of treating them as creates", async () => {
+    const config = testConfig();
+    const db = new JsonFilePatchPageDb(path.join(tempDir, "explicit-intent-db.json"));
+    await db.initialize("dev-token");
+    const storage = new FileSystemHtmlStorage(path.join(tempDir, "explicit-intent-drafts"));
+    const app = createApp({ config, db, storage });
+
+    for (const draftId of ["", 123]) {
+      const upload = await app.inject({
+        method: "POST",
+        url: "/api/uploads",
+        headers: { authorization: "Bearer dev-token" },
+        payload: {
+          draftId,
+          html: "<!doctype html><html><head><title>Invalid target</title></head><body></body></html>"
+        }
+      });
+
+      expect(upload.statusCode).toBe(400);
+      expect(upload.json()).toEqual({ ok: false, error: "Invalid draft ID." });
+    }
+
+    await app.close();
+    await db.close();
+  });
 });
 
 interface SourceIpAttribution {
@@ -255,4 +692,54 @@ function testConfig(): ServerConfig {
     azureStorageContainer: null,
     azureStorageConnectionString: null
   };
+}
+
+class ControlledHtmlStorage extends FileSystemHtmlStorage {
+  afterPut: (() => Promise<void>) | null = null;
+  putError: Error | null = null;
+  deleteError: Error | null = null;
+
+  override async putHtmlObject(key: string, html: string): Promise<void> {
+    if (this.putError) throw this.putError;
+    await super.putHtmlObject(key, html);
+    if (this.afterPut) await this.afterPut();
+  }
+
+  override async deleteHtmlObject(key: string): Promise<void> {
+    if (this.deleteError) throw this.deleteError;
+    await super.deleteHtmlObject(key);
+  }
+}
+
+class CommitIndeterminateJsonDb extends JsonFilePatchPageDb {
+  throwAfterRecord = false;
+
+  override async recordUpload(input: RecordUploadInput): Promise<RecordUploadResult> {
+    const result = await super.recordUpload(input);
+    if (this.throwAfterRecord) {
+      throw new Error("JSON metadata commit outcome is indeterminate.");
+    }
+    return result;
+  }
+}
+
+async function listFiles(rootDir: string, currentDir = rootDir): Promise<string[]> {
+  let entries;
+  try {
+    entries = await readdir(currentDir, { withFileTypes: true });
+  } catch (error) {
+    if (error instanceof Error && "code" in error && error.code === "ENOENT") return [];
+    throw error;
+  }
+
+  const files: string[] = [];
+  for (const entry of entries) {
+    const entryPath = path.join(currentDir, entry.name);
+    if (entry.isDirectory()) {
+      files.push(...(await listFiles(rootDir, entryPath)));
+    } else if (entry.isFile()) {
+      files.push(path.relative(rootDir, entryPath));
+    }
+  }
+  return files.sort();
 }

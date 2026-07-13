@@ -44,6 +44,7 @@ describe("JsonFilePatchPageDb", () => {
     expect(auth?.accountId).toBe("acct_bootstrap");
 
     const upload = await db.recordUpload({
+      intent: "create",
       draftId: "abcdefghijkl",
       versionId: "ver_one",
       accountId: auth!.accountId,
@@ -84,6 +85,7 @@ describe("JsonFilePatchPageDb", () => {
         versionId,
         objectKey: `drafts/${draftId}/versions/${versionId}.html`,
         promise: db.recordUpload({
+          intent: "create",
           draftId,
           versionId,
           accountId: auth!.accountId,
@@ -175,6 +177,7 @@ describe("JsonFilePatchPageDb", () => {
             index % 2 === 0 ? realFilePath : aliasedFilePath
           );
           return db.recordUpload({
+            intent: "create",
             draftId,
             versionId,
             accountId: "acct_test",
@@ -241,6 +244,7 @@ describe("JsonFilePatchPageDb", () => {
         );
         const firstDb = new StaggeredJsonFilePatchPageDb(filePath);
         const first = firstDb.recordUpload({
+          intent: "create",
           draftId: "staggered_first",
           versionId: "staggered_ver_first",
           accountId: "acct_test",
@@ -258,6 +262,7 @@ describe("JsonFilePatchPageDb", () => {
 
         const secondError = await new StaggeredJsonFilePatchPageDb(aliasedFilePath)
           .recordUpload({
+            intent: "create",
             draftId: "staggered_second",
             versionId: "staggered_ver_second",
             accountId: "acct_test",
@@ -316,6 +321,7 @@ describe("JsonFilePatchPageDb", () => {
       const db = new JsonFilePatchPageDb(index % 2 === 0 ? upperFilePath : lowerFilePath);
 
       return db.recordUpload({
+        intent: "create",
         draftId,
         versionId,
         accountId: "acct_test",
@@ -363,6 +369,7 @@ describe("JsonFilePatchPageDb", () => {
       );
 
       return db.recordUpload({
+        intent: "create",
         draftId,
         versionId,
         accountId: "acct_test",
@@ -452,6 +459,7 @@ describe("JsonFilePatchPageDb", () => {
 
     for (const draftId of ["draft_to_disable", "draft_to_delete"]) {
       await setupDb.recordUpload({
+        intent: "create",
         draftId,
         versionId: `ver_${draftId}`,
         accountId: auth!.accountId,
@@ -764,6 +772,7 @@ describe("JsonFilePatchPageDb", () => {
     for (const hazard of hazards) {
       const error = await db
         .recordUpload({
+          intent: "create",
           draftId: `unsafe_${hazard.name}`,
           versionId: `ver_${hazard.name}`,
           accountId: auth!.accountId,
@@ -812,6 +821,7 @@ describe("JsonFilePatchPageDb", () => {
 
     const error = await db
       .recordUpload({
+        intent: "create",
         draftId: "unsafe_accessor",
         versionId: "ver_unsafe_accessor",
         accountId: "acct_bootstrap",
@@ -889,6 +899,7 @@ describe("JsonFilePatchPageDb", () => {
       );
       error = await new TrackedJsonFilePatchPageDb(filePath)
         .recordUpload({
+          intent: "create",
           draftId: "unsafe_before_temp",
           versionId: "ver_unsafe_before_temp",
           accountId: "acct_bootstrap",
@@ -1298,6 +1309,7 @@ describe("JsonFilePatchPageDb", () => {
     expect(auth).not.toBeNull();
 
     await writerDb.recordUpload({
+      intent: "create",
       draftId: "stable_draft",
       versionId: "ver_stable",
       accountId: auth!.accountId,
@@ -1333,6 +1345,7 @@ describe("JsonFilePatchPageDb", () => {
 
     try {
       await writerDb.recordUpload({
+        intent: "create",
         draftId: "large_draft",
         versionId: "ver_large",
         accountId: auth!.accountId,

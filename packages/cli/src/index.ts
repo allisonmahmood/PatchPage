@@ -135,11 +135,15 @@ program
 program
   .command("upload")
   .argument("<file>", "HTML file path")
-  .option("--draft <draft-id>", "Update a specific draft")
+  .option("--draft <draft-id>", "Update an existing draft only; never creates a draft")
   .option("--new", "Always create a new draft")
   .option("--api-url <url>", "Override the configured PatchPage API base URL")
   .description("Upload or update an HTML draft.")
   .action(async (file: string, options: { draft?: string; new?: boolean; apiUrl?: string }) => {
+    if (options.draft !== undefined && options.new) {
+      throw new CliError("--draft and --new cannot be used together.");
+    }
+
     const resolvedFile = path.resolve(file);
     const html = readHtmlFile(resolvedFile);
     const validation = validateHtml(html);
@@ -151,7 +155,8 @@ program
     const { apiUrl, apiToken } = readAuth(options.apiUrl);
     const drafts = readDrafts();
     const knownDraft = drafts.files?.[resolvedFile];
-    const draftId = options.new ? null : options.draft || knownDraft?.draftId || null;
+    const draftId = options.new ? null : (options.draft ?? knownDraft?.draftId ?? null);
+    const isUpdateAttempt = draftId !== null;
 
     const response = await fetch(`${apiUrl}/api/uploads`, {
       method: "POST",
@@ -163,7 +168,7 @@ program
       body: JSON.stringify({
         html,
         filename: path.basename(resolvedFile),
-        draftId,
+        ...(draftId !== null ? { draftId } : {}),
         metadata: {
           ...collectGitMetadata(path.dirname(resolvedFile)),
           cliVersion: VERSION,
@@ -174,6 +179,16 @@ program
 
     const body = await readResponseJson(response);
     if (!response.ok) {
+      if (response.status === 404 && isUpdateAttempt) {
+        if (options.draft === undefined) {
+          throw new CliError(
+            "Cached draft is unavailable for update. Use --new to create a new draft."
+          );
+        }
+        throw new CliError(
+          "Draft is unavailable for update. --draft never creates a new draft."
+        );
+      }
       const details = body.errors?.length ? `\n- ${body.errors.join("\n- ")}` : "";
       const hint = response.status === 401 || response.status === 403 ? defaultHostHint(apiUrl) : "";
       throw new CliError(`${body.error || "Upload failed."}${details}${hint}`);

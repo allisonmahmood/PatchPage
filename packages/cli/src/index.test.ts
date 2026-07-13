@@ -486,6 +486,209 @@ describe("CLI auth guidance", () => {
   });
 });
 
+describe("patchpage upload", () => {
+  it("documents --draft as update-only in command help", () => {
+    const result = runCli(["upload", "--help"]);
+
+    expect(result.status).toBe(0);
+    expect(result.stdout).toContain(
+      "--draft <draft-id>  Update an existing draft only; never creates a draft"
+    );
+  });
+
+  it("rejects combining the update-only and create-only options", () => {
+    const result = runCli([
+      "upload",
+      "does-not-exist.html",
+      "--draft",
+      "abcdefghijkl",
+      "--new"
+    ]);
+    const emptyTargetResult = runCli([
+      "upload",
+      "does-not-exist.html",
+      "--draft",
+      "",
+      "--new"
+    ]);
+
+    expect(result.status).toBe(1);
+    expect(result.stdout).toBe("");
+    expect(result.stderr).toBe("--draft and --new cannot be used together.\n");
+    expect(emptyTargetResult.status).toBe(1);
+    expect(emptyTargetResult.stdout).toBe("");
+    expect(emptyTargetResult.stderr).toBe("--draft and --new cannot be used together.\n");
+  });
+
+  it("omits the draft ID field when creating a draft", async () => {
+    const token = "pp_create_request_secret";
+    const fixtureDir = makeStateDir();
+    const htmlPath = path.join(fixtureDir, "create.html");
+    writeFileSync(
+      htmlPath,
+      "<!doctype html><html><head><title>Create</title></head><body></body></html>"
+    );
+    let requestBody: Record<string, unknown> | undefined;
+    const server = createServer(async (request, response) => {
+      let body = "";
+      for await (const chunk of request) body += chunk;
+      requestBody = JSON.parse(body) as Record<string, unknown>;
+      response.statusCode = 201;
+      response.setHeader("Content-Type", "application/json");
+      response.end(
+        JSON.stringify({
+          ok: true,
+          draftId: "abcdefghijkl",
+          publicUrl: "http://example.test/d/abcdefghijkl",
+          versionNumber: 1,
+          warnings: []
+        })
+      );
+    });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+
+    try {
+      const address = server.address();
+      if (!address || typeof address === "string") throw new Error("Expected a TCP test server");
+      const result = await runCliAsync(
+        ["upload", htmlPath, "--new", "--api-url", `http://127.0.0.1:${address.port}`],
+        { PATCHPAGE_API_TOKEN: token }
+      );
+
+      expect(result.status).toBe(0);
+      expect(requestBody).toBeDefined();
+      expect(requestBody).not.toHaveProperty("draftId");
+      expect(result.stdout).toContain("Uploaded draft");
+      expect(result.argv.join("\0")).not.toContain(token);
+      expect(`${result.stdout}${result.stderr}`).not.toContain(token);
+    } finally {
+      await new Promise<void>((resolve, reject) =>
+        server.close((error) => (error ? reject(error) : resolve()))
+      );
+    }
+  });
+
+  it("reports an unavailable --draft target safely without retrying as create", async () => {
+    const token = "pp_update_request_secret";
+    const draftId = "abcdefghijkl";
+    const fixtureDir = makeStateDir();
+    const htmlPath = path.join(fixtureDir, "update.html");
+    writeFileSync(
+      htmlPath,
+      "<!doctype html><html><head><title>Update</title></head><body></body></html>"
+    );
+    let requestCount = 0;
+    let authorization: string | undefined;
+    let requestBody: Record<string, unknown> | undefined;
+    const server = createServer(async (request, response) => {
+      requestCount += 1;
+      authorization = request.headers.authorization;
+      let body = "";
+      for await (const chunk of request) body += chunk;
+      requestBody = JSON.parse(body) as Record<string, unknown>;
+      response.statusCode = 404;
+      response.setHeader("Content-Type", "application/json");
+      response.end(JSON.stringify({ ok: false, error: "Draft not found." }));
+    });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+
+    try {
+      const address = server.address();
+      if (!address || typeof address === "string") throw new Error("Expected a TCP test server");
+      const result = await runCliAsync(
+        [
+          "upload",
+          htmlPath,
+          "--draft",
+          draftId,
+          "--api-url",
+          `http://127.0.0.1:${address.port}`
+        ],
+        { PATCHPAGE_API_TOKEN: token }
+      );
+
+      expect(result.status).toBe(1);
+      expect(result.stdout).toBe("");
+      expect(result.stderr).toBe(
+        "Draft is unavailable for update. --draft never creates a new draft.\n"
+      );
+      expect(requestCount).toBe(1);
+      expect(authorization).toBe(`Bearer ${token}`);
+      expect(requestBody).toHaveProperty("draftId", draftId);
+      expect(existsSync(path.join(result.stateDir, "drafts.json"))).toBe(false);
+      expect(result.argv.join("\0")).not.toContain(token);
+      expect(`${result.stdout}${result.stderr}`).not.toContain(token);
+    } finally {
+      await new Promise<void>((resolve, reject) =>
+        server.close((error) => (error ? reject(error) : resolve()))
+      );
+    }
+  });
+
+  it("reports an unavailable cached draft safely without retrying as create", async () => {
+    const token = "pp_cached_update_secret";
+    const draftId = "abcdefghijkl";
+    const stateDir = makeStateDir();
+    const htmlPath = path.join(stateDir, "cached-update.html");
+    writeFileSync(
+      htmlPath,
+      "<!doctype html><html><head><title>Cached update</title></head><body></body></html>"
+    );
+    writeFileSync(
+      path.join(stateDir, "drafts.json"),
+      `${JSON.stringify(
+        {
+          files: {
+            [htmlPath]: {
+              draftId,
+              publicUrl: `http://example.test/d/${draftId}`,
+              latestVersionNumber: 1,
+              updatedAt: "2026-07-13T00:00:00.000Z"
+            }
+          }
+        },
+        null,
+        2
+      )}\n`
+    );
+    let requestCount = 0;
+    let requestBody: Record<string, unknown> | undefined;
+    const server = createServer(async (request, response) => {
+      requestCount += 1;
+      let body = "";
+      for await (const chunk of request) body += chunk;
+      requestBody = JSON.parse(body) as Record<string, unknown>;
+      response.statusCode = 404;
+      response.setHeader("Content-Type", "application/json");
+      response.end(JSON.stringify({ ok: false, error: "Draft not found." }));
+    });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+
+    try {
+      const address = server.address();
+      if (!address || typeof address === "string") throw new Error("Expected a TCP test server");
+      const result = await runCliAsync(
+        ["upload", htmlPath, "--api-url", `http://127.0.0.1:${address.port}`],
+        { PATCHPAGE_API_TOKEN: token },
+        stateDir
+      );
+
+      expect(result.status).toBe(1);
+      expect(result.stdout).toBe("");
+      expect(result.stderr).toBe(
+        "Cached draft is unavailable for update. Use --new to create a new draft.\n"
+      );
+      expect(requestCount).toBe(1);
+      expect(requestBody).toHaveProperty("draftId", draftId);
+      expect(`${result.stdout}${result.stderr}`).not.toContain(token);
+    } finally {
+      await new Promise<void>((resolve, reject) =>
+        server.close((error) => (error ? reject(error) : resolve()))
+      );
+    }
+  });
+});
+
 describe("PTY test driver", () => {
   it.runIf(supportsPythonPty)("hard-kills a child after the interaction deadline", () => {
     const stateDir = makeStateDir();
@@ -522,9 +725,11 @@ function runCli(args: string[], input?: string, stateDir = makeStateDir()) {
   return { ...result, argv: readArgv(argvOutputPath), stateDir };
 }
 
-function runCliAsync(args: string[], envOverrides: NodeJS.ProcessEnv = {}) {
-  const stateDir = makeStateDir();
-
+function runCliAsync(
+  args: string[],
+  envOverrides: NodeJS.ProcessEnv = {},
+  stateDir = makeStateDir()
+) {
   return new Promise<{
     argv: string[];
     status: number | null;

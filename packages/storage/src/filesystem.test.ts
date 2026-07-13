@@ -25,6 +25,17 @@ describe("FileSystemHtmlStorage", () => {
     );
   });
 
+  it("deletes HTML objects idempotently", async () => {
+    const storage = new FileSystemHtmlStorage(tempDir);
+    const key = "drafts/abc/versions/one.html";
+
+    await storage.putHtmlObject(key, "<h1>hi</h1>");
+    await storage.deleteHtmlObject(key);
+    await storage.deleteHtmlObject(key);
+
+    await expect(storage.getHtmlObject(key)).rejects.toThrow();
+  });
+
   it("blocks path traversal", async () => {
     const storage = new FileSystemHtmlStorage(tempDir);
 

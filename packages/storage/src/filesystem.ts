@@ -1,4 +1,4 @@
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 import type { HtmlStorage } from "./types.js";
 
@@ -17,6 +17,10 @@ export class FileSystemHtmlStorage implements HtmlStorage {
 
   async getHtmlObject(key: string): Promise<string> {
     return readFile(this.resolveKey(key), "utf8");
+  }
+
+  async deleteHtmlObject(key: string): Promise<void> {
+    await rm(this.resolveKey(key), { force: true });
   }
 
   private resolveKey(key: string): string {

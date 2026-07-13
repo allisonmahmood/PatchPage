@@ -1,7 +1,13 @@
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import Fastify from "fastify";
 import type { ServerConfig } from "@patchpage/config";
-import type { ApiTokenAuth, PatchPageDb } from "@patchpage/db";
+import { isUploadTargetError } from "@patchpage/db";
+import type {
+  ApiTokenAuth,
+  PatchPageDb,
+  RecordUploadInput,
+  RecordUploadResult
+} from "@patchpage/db";
 import type { HtmlStorage } from "@patchpage/storage";
 import {
   contentHash,
@@ -99,8 +105,9 @@ export function createApp(options: CreateAppOptions): FastifyInstance {
     if (typeof body.html !== "string") {
       return reply.status(400).send({ ok: false, error: "Missing HTML document." });
     }
+    const html = body.html;
 
-    const validation = validateHtml(body.html, { maxBytes: options.config.maxHtmlBytes });
+    const validation = validateHtml(html, { maxBytes: options.config.maxHtmlBytes });
     if (!validation.ok) {
       return reply.status(422).send({
         ok: false,
@@ -109,8 +116,12 @@ export function createApp(options: CreateAppOptions): FastifyInstance {
       });
     }
 
-    const requestedDraftId = typeof body.draftId === "string" ? body.draftId : null;
-    if (requestedDraftId && !isDraftId(requestedDraftId)) {
+    const requestedDraftId =
+      body.draftId === undefined || body.draftId === null ? null : body.draftId;
+    if (
+      requestedDraftId !== null &&
+      (typeof requestedDraftId !== "string" || !isDraftId(requestedDraftId))
+    ) {
       return reply.status(400).send({ ok: false, error: "Invalid draft ID." });
     }
 
@@ -121,22 +132,38 @@ export function createApp(options: CreateAppOptions): FastifyInstance {
     const metadata = normalizeMetadata(body.metadata);
     const title = validation.title || filename || "Untitled Draft";
 
-    await options.storage.putHtmlObject(objectKey, body.html);
-
-    const upload = await options.db.recordUpload({
+    const uploadInput: RecordUploadInput = {
+      intent: requestedDraftId ? "update" : "create",
       draftId,
       versionId,
       accountId: auth.accountId,
       apiTokenId: auth.id,
       title,
       objectKey,
-      contentHash: contentHash(body.html),
-      fileSize: Buffer.byteLength(body.html, "utf8"),
+      contentHash: contentHash(html),
+      fileSize: Buffer.byteLength(html, "utf8"),
       filename,
       metadata,
       sourceIp: request.ip || null,
       userAgent: request.headers["user-agent"] || null
-    });
+    };
+
+    await options.db.assertUploadTarget(uploadInput);
+    await options.storage.putHtmlObject(objectKey, html);
+
+    let upload: RecordUploadResult;
+    try {
+      upload = await options.db.recordUpload(uploadInput);
+    } catch (error) {
+      if (!isUploadTargetError(error)) throw error;
+      try {
+        await options.storage.deleteHtmlObject(objectKey);
+      } catch (cleanupError) {
+        app.log.error(cleanupError);
+        throw new Error("Upload cleanup failed.");
+      }
+      throw error;
+    }
 
     const publicUrl = getDraftPublicUrl({
       draftId,
