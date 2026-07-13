@@ -1,6 +1,8 @@
-import { isIP } from "node:net";
+import { BlockList, isIP } from "node:net";
 
 const MAX_TRUST_PROXY_HOPS = 32;
+const IPV4_MAPPED_IPV6_NETWORK = new BlockList();
+IPV4_MAPPED_IPV6_NETWORK.addSubnet("::ffff:0:0", 96, "ipv6");
 
 export interface ServerConfig {
   port: number;
@@ -85,8 +87,20 @@ function isIpOrCidr(value: string): boolean {
   }
 
   const family = isIP(address);
+  const prefixLength = Number(prefix);
   const maxPrefix = family === 4 ? 32 : family === 6 ? 128 : 0;
-  return Number(prefix) <= maxPrefix;
+  if (prefixLength > maxPrefix) return false;
+  return family !== 6 || !overlapsIpv4MappedIpv6(address, prefixLength);
+}
+
+function overlapsIpv4MappedIpv6(address: string, prefixLength: number): boolean {
+  if (prefixLength > 96) {
+    return IPV4_MAPPED_IPV6_NETWORK.check(address, "ipv6");
+  }
+
+  const candidate = new BlockList();
+  candidate.addSubnet(address, prefixLength, "ipv6");
+  return candidate.check("::ffff:0:0", "ipv6");
 }
 
 function intValue(value: string | undefined, fallback: number): number {

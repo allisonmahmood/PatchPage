@@ -59,6 +59,14 @@ describe("getServerConfig", () => {
     "10.0.0.0/33",
     "2001:db8::/129",
     "0.0.0.0/0",
+    "::ffff:0:0/96",
+    "::ffff:10.0.0.0/104",
+    "0:0:0:0:0:ffff:a00:0/104",
+    "::fffe:0:0/95",
+    "::ffff:0:0/95",
+    "::/1",
+    "2001:db8::192.168.001.001",
+    "2001:db8::192.168.001.001/120",
     "::/0"
   ])("rejects an unsafe or malformed trusted-proxy value %j", (value) => {
     expect(() => getServerConfig({ PATCHPAGE_TRUST_PROXY: value })).toThrow(

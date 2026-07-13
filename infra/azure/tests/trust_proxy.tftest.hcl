@@ -318,3 +318,99 @@ run "rejects_ipv6_blanket_cidr" {
 
   expect_failures = [var.trust_proxy]
 }
+
+run "rejects_ipv4_mapped_ipv6_blanket_cidr" {
+  command = plan
+
+  variables {
+    subscription_id = "00000000-0000-0000-0000-000000000000"
+    public_base_url = "https://drafts.self-hoster.dev"
+    trust_proxy     = "::ffff:0:0/96"
+  }
+
+  expect_failures = [var.trust_proxy]
+}
+
+run "rejects_ipv4_mapped_ipv6_blanket_supernet" {
+  command = plan
+
+  variables {
+    subscription_id = "00000000-0000-0000-0000-000000000000"
+    public_base_url = "https://drafts.self-hoster.dev"
+    trust_proxy     = "::fffe:0:0/95"
+  }
+
+  expect_failures = [var.trust_proxy]
+}
+
+run "rejects_noncanonical_ipv4_mapped_ipv6_blanket_supernet" {
+  command = plan
+
+  variables {
+    subscription_id = "00000000-0000-0000-0000-000000000000"
+    public_base_url = "https://drafts.self-hoster.dev"
+    trust_proxy     = "::ffff:0:0/95"
+  }
+
+  expect_failures = [var.trust_proxy]
+}
+
+run "rejects_ipv6_supernet_covering_all_mapped_ipv4_peers" {
+  command = plan
+
+  variables {
+    subscription_id = "00000000-0000-0000-0000-000000000000"
+    public_base_url = "https://drafts.self-hoster.dev"
+    trust_proxy     = "::/1"
+  }
+
+  expect_failures = [var.trust_proxy]
+}
+
+run "rejects_specific_ipv4_mapped_ipv6_cidr" {
+  command = plan
+
+  variables {
+    subscription_id = "00000000-0000-0000-0000-000000000000"
+    public_base_url = "https://drafts.self-hoster.dev"
+    trust_proxy     = "::ffff:10.0.0.0/104"
+  }
+
+  expect_failures = [var.trust_proxy]
+}
+
+run "rejects_noncanonical_dotted_ipv4_tail_in_ipv6_literal" {
+  command = plan
+
+  variables {
+    subscription_id = "00000000-0000-0000-0000-000000000000"
+    public_base_url = "https://drafts.self-hoster.dev"
+    trust_proxy     = "2001:db8::192.168.001.001"
+  }
+
+  expect_failures = [var.trust_proxy]
+}
+
+run "rejects_noncanonical_dotted_ipv4_tail_in_ipv6_cidr" {
+  command = plan
+
+  variables {
+    subscription_id = "00000000-0000-0000-0000-000000000000"
+    public_base_url = "https://drafts.self-hoster.dev"
+    trust_proxy     = "2001:db8::192.168.001.001/120"
+  }
+
+  expect_failures = [var.trust_proxy]
+}
+
+run "rejects_expanded_ipv4_mapped_ipv6_cidr" {
+  command = plan
+
+  variables {
+    subscription_id = "00000000-0000-0000-0000-000000000000"
+    public_base_url = "https://drafts.self-hoster.dev"
+    trust_proxy     = "0:0:0:0:0:ffff:a00:0/104"
+  }
+
+  expect_failures = [var.trust_proxy]
+}

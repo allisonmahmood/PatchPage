@@ -64,6 +64,13 @@ variable "trust_proxy" {
                 try(cidrhost("${trimspace(entry)}/32", 0), "") == trimspace(entry) :
                 !strcontains(trimspace(entry), "%") &&
                 strcontains(trimspace(entry), ":") &&
+                (
+                  !strcontains(trimspace(entry), ".") ||
+                  can(regex(
+                    ":(?:0|[1-9][0-9]{0,2})(?:\\.(?:0|[1-9][0-9]{0,2})){3}$",
+                    trimspace(entry)
+                  ))
+                ) &&
                 can(cidrhost("${trimspace(entry)}/128", 0))
                 ) : length(split("/", trimspace(entry))) == 2 ? (
                   can(regex(
@@ -81,14 +88,42 @@ variable "trust_proxy" {
                     can(cidrhost(trimspace(entry), 0)) :
                     !strcontains(split("/", trimspace(entry))[0], "%") &&
                     strcontains(split("/", trimspace(entry))[0], ":") &&
-                    can(cidrhost(trimspace(entry), 0))
+                    (
+                      !strcontains(split("/", trimspace(entry))[0], ".") ||
+                      can(regex(
+                        ":(?:0|[1-9][0-9]{0,2})(?:\\.(?:0|[1-9][0-9]{0,2})){3}$",
+                        split("/", trimspace(entry))[0]
+                      ))
+                    ) &&
+                    can(cidrhost(trimspace(entry), 0)) &&
+                    !can(regex(
+                      "^[0-9]{1,3}(\\.[0-9]{1,3}){3}$",
+                      try(cidrhost(
+                        "${split("/", trimspace(entry))[0]}/128",
+                        0
+                      ), "")
+                    )) &&
+                    !can(regex(
+                      "^::ffff:",
+                      lower(try(cidrhost(trimspace(entry), 0), ""))
+                    )) &&
+                    !(
+                      try(
+                        tonumber(split("/", trimspace(entry))[1]),
+                        129
+                      ) <= 96 &&
+                      try(cidrhost(trimspace(entry), 0), "") == try(cidrhost(
+                        "::ffff:0:0/${split("/", trimspace(entry))[1]}",
+                        0
+                      ), "not-an-ipv6-network")
+                    )
                   )
               ) : false
             )
           )
         ])
     )
-    error_message = "trust_proxy must be null, a decimal hop count from 1 to 32, or comma-separated literal IP/CIDR entries; blank, boolean, wildcard, malformed, empty, and /0 values are not allowed."
+    error_message = "trust_proxy must be null, a decimal hop count from 1 to 32, or comma-separated literal IP/CIDR entries; blank, boolean, wildcard, malformed, empty, /0, IPv4-mapped IPv6 CIDR, and noncanonical dotted-tail values are not allowed."
   }
 }
 

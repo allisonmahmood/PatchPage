@@ -171,7 +171,7 @@ The setting accepts exactly one of these forms:
 - A decimal hop count from `1` through `32`, kept as a number for Fastify. Starting at PatchPage, Fastify considers the socket peer first, then the rightmost `X-Forwarded-For` entry, and continues right-to-left. Count `1` trusts the socket peer and selects the rightmost forwarded address. Count `2` also trusts that nearest forwarded hop and selects the next address to its left.
 - One or more comma-separated literal IPv4/IPv6 addresses or CIDR networks. Fastify walks from the socket outward while each address belongs to the configured set; the first address outside the set becomes `request.ip`.
 
-Values such as `0`, negative or fractional counts, `true`, `false`, `all`, `*`, empty list entries, malformed addresses, and blanket `/0` networks are rejected. Network entries are syntax-only until you replace them with the proxy addresses actually observed in your environment; for example:
+Values such as `0`, negative or fractional counts, `true`, `false`, `all`, `*`, empty list entries, malformed addresses, blanket `/0` networks, and IPv4-mapped IPv6 CIDRs are rejected. IPv6 entries with dotted IPv4 tails must use canonical decimal octets; ambiguous forms with leading zeroes are rejected so Terraform and the Node.js runtime interpret the same trust boundary. Network entries are syntax-only until you replace them with the proxy addresses actually observed in your environment; for example:
 
 ```env
 # Documentation addresses only; replace both entries with observed proxy egress ranges.

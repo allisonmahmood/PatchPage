@@ -160,6 +160,26 @@ describe("PatchPage server", () => {
       eventSourceIp: "192.0.2.10"
     });
   });
+
+  it.each([
+    "::ffff:0:0/96",
+    "::ffff:10.0.0.0/104",
+    "0:0:0:0:0:ffff:a00:0/104",
+    "::fffe:0:0/95",
+    "::ffff:0:0/95",
+    "::/1"
+  ])(
+    "rejects effective blanket trust %s before a direct peer can spoof attribution",
+    async (trustProxy) => {
+      await expect(
+        uploadSourceIp({
+          trustProxy,
+          remoteAddress: "192.0.2.10",
+          forwardedFor: "203.0.113.9"
+        })
+      ).rejects.toThrow(/Invalid PATCHPAGE_TRUST_PROXY/);
+    }
+  );
 });
 
 interface SourceIpAttribution {
