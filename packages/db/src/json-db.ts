@@ -5,7 +5,6 @@ import {
   lstat,
   open,
   readFile,
-  realpath,
   rename,
   stat,
   unlink,
@@ -282,6 +281,7 @@ export class JsonFilePatchPageDb implements PatchPageDb {
   }
 
   private async readState(): Promise<JsonDbState> {
+    await assertNoSymlinkAncestors(this.filePath);
     await inspectDatabaseFilePath(this.filePath);
 
     let bytes: Buffer;
@@ -314,6 +314,7 @@ export class JsonFilePatchPageDb implements PatchPageDb {
   }
 
   private async writeState(state: JsonDbState): Promise<void> {
+    await assertNoSymlinkAncestors(this.filePath);
     const serialized = serializeLosslessJsonState(state);
     const directoryPath = path.dirname(this.filePath);
     const temporaryPath = path.join(
@@ -392,44 +393,49 @@ async function inspectDatabaseFilePath(filePath: string): Promise<Stats | null> 
   }
 }
 
-async function canonicalMutationIdentities(filePath: string): Promise<string[]> {
+async function assertNoSymlinkAncestors(filePath: string): Promise<void> {
   let ancestorPath = path.dirname(filePath);
-  const unresolvedComponents = [path.basename(filePath)];
-  const identities: string[] = [];
-  let resolvedFilePath: string | null = null;
-  let rootIdentity: string | null = null;
 
   while (true) {
-    if (!resolvedFilePath) {
-      try {
-        const resolvedAncestor = await realpath(ancestorPath);
-        resolvedFilePath = path.join(resolvedAncestor, ...unresolvedComponents);
-      } catch (error) {
-        if (!hasErrorCode(error, "ENOENT")) throw error;
-      }
-    }
-
     try {
-      const ancestorStats = await stat(ancestorPath, { bigint: true });
-      // Every existing ancestor contributes a key. The higher keys remain stable
-      // when missing directories appear, while device/inode identity collapses
-      // symlink, case-insensitive, and bind-mount aliases.
-      const unresolvedSuffix = foldMutationIdentity(path.join(...unresolvedComponents));
-      identities.push(`${ancestorStats.dev}:${ancestorStats.ino}:${unresolvedSuffix}`);
-      if (path.dirname(ancestorPath) === ancestorPath) {
-        rootIdentity = `${ancestorStats.dev}:${ancestorStats.ino}`;
+      const ancestorStats = await lstat(ancestorPath);
+      const isDarwinCompatibilityPath =
+        process.platform === "darwin" &&
+        (ancestorPath === "/etc" || ancestorPath === "/tmp" || ancestorPath === "/var");
+      // Darwin exposes these fixed platform roots as compatibility symlinks;
+      // user-configurable symbolic-link parents remain unsupported.
+      if (ancestorStats.isSymbolicLink() && !isDarwinCompatibilityPath) {
+        throw new Error("JSON metadata file path must not have symbolic-link parent directories.");
       }
     } catch (error) {
       if (!hasErrorCode(error, "ENOENT")) throw error;
     }
 
     const parent = path.dirname(ancestorPath);
-    if (parent === ancestorPath) {
-      if (resolvedFilePath && rootIdentity) {
-        identities.push(`resolved:${rootIdentity}:${foldMutationIdentity(resolvedFilePath)}`);
-      }
-      return identities;
+    if (parent === ancestorPath) return;
+    ancestorPath = parent;
+  }
+}
+
+async function canonicalMutationIdentities(filePath: string): Promise<string[]> {
+  let ancestorPath = path.dirname(filePath);
+  const unresolvedComponents = [path.basename(filePath)];
+  const identities: string[] = [];
+
+  while (true) {
+    try {
+      const ancestorStats = await stat(ancestorPath, { bigint: true });
+      // Every existing ancestor contributes a key. The higher keys remain stable
+      // when missing directories appear, while device/inode identity collapses
+      // case-insensitive and bind-mount aliases.
+      const unresolvedSuffix = foldMutationIdentity(path.join(...unresolvedComponents));
+      identities.push(`${ancestorStats.dev}:${ancestorStats.ino}:${unresolvedSuffix}`);
+    } catch (error) {
+      if (!hasErrorCode(error, "ENOENT")) throw error;
     }
+
+    const parent = path.dirname(ancestorPath);
+    if (parent === ancestorPath) return identities;
     unresolvedComponents.unshift(path.basename(ancestorPath));
     ancestorPath = parent;
   }

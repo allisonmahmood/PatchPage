@@ -1,5 +1,4 @@
 import { execFile as execFileCallback } from "node:child_process";
-import type { Stats } from "node:fs";
 import * as fsPromises from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -111,68 +110,61 @@ describe("JsonFilePatchPageDb", () => {
   });
 
   it.skipIf(process.platform === "win32")(
-    "serializes fresh-file mutations through symlinked parent paths",
+    "rejects a live symbolic-link parent without changing the link or target",
     async () => {
       const realParent = path.join(tempDir, "real-parent");
       const aliasedParent = path.join(tempDir, "aliased-parent");
+      const realFilePath = path.join(realParent, "db.json");
+      const aliasedFilePath = path.join(aliasedParent, "db.json");
       await mkdir(realParent);
+      await new JsonFilePatchPageDb(realFilePath).initialize("original-secret");
+      const original = await readFile(realFilePath);
       await symlink(realParent, aliasedParent, "dir");
 
-      const realFilePath = path.join(realParent, "missing-parent", "db.json");
-      const aliasedFilePath = path.join(aliasedParent, "missing-parent", "db.json");
-      const uploads = Array.from({ length: 12 }, (_, index) => {
-        const draftId = `symlink_draft_${index}`;
-        const versionId = `symlink_ver_${index}`;
-        const db = new JsonFilePatchPageDb(index % 2 === 0 ? realFilePath : aliasedFilePath);
+      const error = await new JsonFilePatchPageDb(aliasedFilePath)
+        .initialize("replacement-secret")
+        .then(
+          () => null,
+          (reason: unknown) => reason
+        );
 
-        return db.recordUpload({
-          draftId,
-          versionId,
-          accountId: "acct_test",
-          apiTokenId: "tok_test",
-          title: `Symlink draft ${index}`,
-          objectKey: `drafts/${draftId}/versions/${versionId}.html`,
-          contentHash: `sha256:symlink-${index}`,
-          fileSize: index + 1,
-          filename: `symlink-${index}.html`,
-          metadata: { padding: "x".repeat(64 * 1024) },
-          sourceIp: null,
-          userAgent: "vitest"
-        });
-      });
-
-      await Promise.all(uploads);
-
-      const db = new JsonFilePatchPageDb(realFilePath);
-      for (let index = 0; index < uploads.length; index += 1) {
-        const lookup = await db.findDraftVersion(`symlink_draft_${index}`);
-        expect(lookup.version?.id).toBe(`symlink_ver_${index}`);
-      }
+      expect(error).toBeInstanceOf(Error);
+      expect((error as Error).message).toBe(
+        "JSON metadata file path must not have symbolic-link parent directories."
+      );
+      expect(String(error)).not.toContain("original-secret");
+      expect(String(error)).not.toContain("replacement-secret");
+      expect((await lstat(aliasedParent)).isSymbolicLink()).toBe(true);
+      expect(await readlink(aliasedParent)).toBe(realParent);
+      expect(await readFile(realFilePath)).toEqual(original);
     }
   );
 
   it.skipIf(process.platform === "win32")(
-    "serializes aliases that share a directory identity without a shared realpath",
+    "serializes modeled containing-directory bind aliases by shared identity",
     async () => {
       const realParent = path.join(tempDir, "identity-parent");
       const aliasedParent = path.join(tempDir, "identity-alias");
       await mkdir(realParent);
       await symlink(realParent, aliasedParent, "dir");
 
-      const uncanonicalRealpath = (async (
-        target: Parameters<typeof fsPromises.realpath>[0]
-      ) => path.resolve(String(target))) as typeof fsPromises.realpath;
+      const trackedLstat = (async (...args: Parameters<typeof fsPromises.lstat>) => {
+        if (path.resolve(String(args[0])) === aliasedParent) {
+          return fsPromises.stat(realParent);
+        }
+        return Reflect.apply(fsPromises.lstat, fsPromises, args);
+      }) as typeof fsPromises.lstat;
 
       vi.resetModules();
       vi.doMock("node:fs/promises", () => ({
         ...fsPromises,
-        realpath: uncanonicalRealpath
+        lstat: trackedLstat
       }));
 
       const realFilePath = path.join(realParent, "db.json");
       const aliasedFilePath = path.join(aliasedParent, "db.json");
       try {
-        // A static import cannot observe the per-test mocked filesystem boundary.
+        // The lstat mock models a bind mount, which is not a symbolic-link parent.
         const { JsonFilePatchPageDb: IdentityJsonFilePatchPageDb } = await import(
           "./json-db.js"
         );
@@ -211,167 +203,99 @@ describe("JsonFilePatchPageDb", () => {
     }
   );
 
-  it("keeps the mutation queue stable when a dangling parent alias becomes live", async () => {
-    if (process.platform === "win32") return;
-    const directoryPath = path.join(tempDir, "staggered-parent");
-    const aliasedDirectoryPath = path.join(tempDir, "staggered-alias");
-    await symlink(directoryPath, aliasedDirectoryPath, "dir");
-    const filePath = path.join(directoryPath, "db.json");
-    const aliasedFilePath = path.join(aliasedDirectoryPath, "db.json");
-    const primaryPaths = new Set([filePath, aliasedFilePath]);
-    const cachedIdentityStats = new Map<string, Stats>();
-    let ancestorPath = tempDir;
-    while (true) {
-      cachedIdentityStats.set(
-        path.resolve(ancestorPath),
-        await fsPromises.stat(ancestorPath)
-      );
-      const parentPath = path.dirname(ancestorPath);
-      if (parentPath === ancestorPath) break;
-      ancestorPath = parentPath;
-    }
+  it.skipIf(process.platform === "win32")(
+    "rejects a dangling parent alias already running before its target is created",
+    async () => {
+      const directoryPath = path.join(tempDir, "staggered-parent");
+      const aliasedDirectoryPath = path.join(tempDir, "staggered-alias");
+      await symlink(directoryPath, aliasedDirectoryPath, "dir");
+      const filePath = path.join(directoryPath, "db.json");
+      const aliasedFilePath = path.join(aliasedDirectoryPath, "db.json");
 
-    let parentExists = false;
-    let resolveParentCreated = (): void => undefined;
-    const parentCreated = new Promise<void>((resolve) => {
-      resolveParentCreated = resolve;
-    });
-    let resolveSecondIdentity = (): void => undefined;
-    const secondIdentityObserved = new Promise<void>((resolve) => {
-      resolveSecondIdentity = resolve;
-    });
-    let resolveRenameBlocked = (): void => undefined;
-    const renameBlocked = new Promise<void>((resolve) => {
-      resolveRenameBlocked = resolve;
-    });
-    let releaseRename = (): void => undefined;
-    const renameRelease = new Promise<void>((resolve) => {
-      releaseRename = resolve;
-    });
-    let primaryExists = false;
-    let primaryReads = 0;
-    let renameCalls = 0;
-
-    const trackedMkdir = (async (...args: Parameters<typeof fsPromises.mkdir>) => {
-      const result = await Reflect.apply(fsPromises.mkdir, fsPromises, args);
-      if (path.resolve(String(args[0])) === directoryPath) {
-        cachedIdentityStats.set(directoryPath, await fsPromises.stat(directoryPath));
-        parentExists = true;
-        resolveParentCreated();
-      }
-      return result;
-    }) as typeof fsPromises.mkdir;
-    const trackedStat = (async (...args: Parameters<typeof fsPromises.stat>) => {
-      const requestedPath = path.resolve(String(args[0]));
-      const cached =
-        cachedIdentityStats.get(requestedPath) ??
-        (parentExists && requestedPath === aliasedDirectoryPath
-          ? cachedIdentityStats.get(directoryPath)
-          : undefined);
-      if (cached) {
-        if (
-          parentExists &&
-          requestedPath === aliasedDirectoryPath &&
-          primaryReads === 1
-        ) {
-          resolveSecondIdentity();
+      let resolveMkdirStarted = (): void => undefined;
+      const mkdirStarted = new Promise<void>((resolve) => {
+        resolveMkdirStarted = resolve;
+      });
+      let releaseMkdir = (): void => undefined;
+      const mkdirRelease = new Promise<void>((resolve) => {
+        releaseMkdir = resolve;
+      });
+      const trackedMkdir = (async (...args: Parameters<typeof fsPromises.mkdir>) => {
+        if (path.resolve(String(args[0])) === directoryPath) {
+          resolveMkdirStarted();
+          await mkdirRelease;
         }
-        return cached;
-      }
-      throw Object.assign(new Error("missing identity path"), { code: "ENOENT" });
-    }) as typeof fsPromises.stat;
-    const trackedLstat = (async (...args: Parameters<typeof fsPromises.lstat>) => {
-      if (primaryPaths.has(path.resolve(String(args[0]))) && !primaryExists) {
-        throw Object.assign(new Error("missing primary"), { code: "ENOENT" });
-      }
-      return Reflect.apply(fsPromises.lstat, fsPromises, args);
-    }) as typeof fsPromises.lstat;
-    const trackedReadFile = (async (...args: Parameters<typeof fsPromises.readFile>) => {
-      if (primaryPaths.has(path.resolve(String(args[0]))) && !primaryExists) {
-        primaryReads += 1;
-        throw Object.assign(new Error("missing primary"), { code: "ENOENT" });
-      }
-      return Reflect.apply(fsPromises.readFile, fsPromises, args);
-    }) as typeof fsPromises.readFile;
-    const trackedRename = (async (...args: Parameters<typeof fsPromises.rename>) => {
-      const replacesPrimary = primaryPaths.has(path.resolve(String(args[1])));
-      if (replacesPrimary && renameCalls === 0) {
-        renameCalls += 1;
-        resolveRenameBlocked();
-        await renameRelease;
-      }
-      const result = await Reflect.apply(fsPromises.rename, fsPromises, args);
-      if (replacesPrimary) primaryExists = true;
-      return result;
-    }) as typeof fsPromises.rename;
+        return Reflect.apply(fsPromises.mkdir, fsPromises, args);
+      }) as typeof fsPromises.mkdir;
 
-    vi.resetModules();
-    vi.doMock("node:fs/promises", () => ({
-      ...fsPromises,
-      lstat: trackedLstat,
-      mkdir: trackedMkdir,
-      readFile: trackedReadFile,
-      rename: trackedRename,
-      stat: trackedStat
-    }));
-
-    try {
-      // A static import cannot observe the per-test mocked filesystem boundary.
-      const { JsonFilePatchPageDb: StaggeredJsonFilePatchPageDb } = await import(
-        "./json-db.js"
-      );
-      const firstDb = new StaggeredJsonFilePatchPageDb(filePath);
-      const first = firstDb.recordUpload({
-        draftId: "staggered_first",
-        versionId: "staggered_ver_first",
-        accountId: "acct_test",
-        apiTokenId: "tok_test",
-        title: "Staggered first",
-        objectKey: "drafts/staggered-first/version.html",
-        contentHash: "sha256:staggered-first",
-        fileSize: 1,
-        filename: "first.html",
-        metadata: {},
-        sourceIp: null,
-        userAgent: "vitest"
-      });
-      await Promise.all([parentCreated, renameBlocked]);
-
-      const secondDb = new StaggeredJsonFilePatchPageDb(aliasedFilePath);
-      const second = secondDb.recordUpload({
-        draftId: "staggered_second",
-        versionId: "staggered_ver_second",
-        accountId: "acct_test",
-        apiTokenId: "tok_test",
-        title: "Staggered second",
-        objectKey: "drafts/staggered-second/version.html",
-        contentHash: "sha256:staggered-second",
-        fileSize: 1,
-        filename: "second.html",
-        metadata: {},
-        sourceIp: null,
-        userAgent: "vitest"
-      });
-      await secondIdentityObserved;
-      for (let turn = 0; turn < 64 && primaryReads < 2; turn += 1) {
-        await Promise.resolve();
-      }
-
-      releaseRename();
-      await Promise.all([first, second]);
-
-      expect((await firstDb.findDraftVersion("staggered_first")).version?.id).toBe(
-        "staggered_ver_first"
-      );
-      expect((await firstDb.findDraftVersion("staggered_second")).version?.id).toBe(
-        "staggered_ver_second"
-      );
-    } finally {
-      releaseRename();
-      vi.doUnmock("node:fs/promises");
       vi.resetModules();
+      vi.doMock("node:fs/promises", () => ({
+        ...fsPromises,
+        mkdir: trackedMkdir
+      }));
+
+      try {
+        // A static import cannot observe the per-test mocked filesystem boundary.
+        const { JsonFilePatchPageDb: StaggeredJsonFilePatchPageDb } = await import(
+          "./json-db.js"
+        );
+        const firstDb = new StaggeredJsonFilePatchPageDb(filePath);
+        const first = firstDb.recordUpload({
+          draftId: "staggered_first",
+          versionId: "staggered_ver_first",
+          accountId: "acct_test",
+          apiTokenId: "tok_test",
+          title: "Staggered first",
+          objectKey: "drafts/staggered-first/version.html",
+          contentHash: "sha256:staggered-first",
+          fileSize: 1,
+          filename: "first.html",
+          metadata: {},
+          sourceIp: null,
+          userAgent: "vitest"
+        });
+        await mkdirStarted;
+
+        const secondError = await new StaggeredJsonFilePatchPageDb(aliasedFilePath)
+          .recordUpload({
+            draftId: "staggered_second",
+            versionId: "staggered_ver_second",
+            accountId: "acct_test",
+            apiTokenId: "tok_test",
+            title: "Staggered second",
+            objectKey: "drafts/staggered-second/version.html",
+            contentHash: "sha256:staggered-second",
+            fileSize: 1,
+            filename: "second.html",
+            metadata: {},
+            sourceIp: null,
+            userAgent: "vitest"
+          })
+          .then(
+            () => null,
+            (reason: unknown) => reason
+          );
+
+        expect(secondError).toBeInstanceOf(Error);
+        expect((secondError as Error).message).toBe(
+          "JSON metadata file path must not have symbolic-link parent directories."
+        );
+        expect(String(secondError)).not.toContain("staggered_second");
+
+        releaseMkdir();
+        await first;
+        expect((await firstDb.findDraftVersion("staggered_first")).version?.id).toBe(
+          "staggered_ver_first"
+        );
+        expect((await firstDb.findDraftVersion("staggered_second")).version).toBeNull();
+        expect((await lstat(aliasedDirectoryPath)).isSymbolicLink()).toBe(true);
+      } finally {
+        releaseMkdir();
+        vi.doUnmock("node:fs/promises");
+        vi.resetModules();
+      }
     }
-  });
+  );
 
   it("serializes fresh-file mutations through case aliases on case-insensitive filesystems", async () => {
     const parentPath = path.join(tempDir, "CaseParent");
@@ -1278,10 +1202,21 @@ describe("JsonFilePatchPageDb", () => {
     const busyRename = (async () => {
       throw Object.assign(new Error("mount-secret"), { code: "EBUSY" });
     }) as typeof actualFs.rename;
+    const followedRootLstat = (async (...args: Parameters<typeof actualFs.lstat>) => {
+      const requestedPath = path.resolve(String(args[0]));
+      if (requestedPath === "/etc" || requestedPath === "/tmp" || requestedPath === "/var") {
+        return actualFs.stat(requestedPath);
+      }
+      return Reflect.apply(actualFs.lstat, actualFs, args);
+    }) as typeof actualFs.lstat;
     const originalPlatform = Object.getOwnPropertyDescriptor(process, "platform");
 
     vi.resetModules();
-    vi.doMock("node:fs/promises", () => ({ ...actualFs, rename: busyRename }));
+    vi.doMock("node:fs/promises", () => ({
+      ...actualFs,
+      lstat: followedRootLstat,
+      rename: busyRename
+    }));
     Object.defineProperty(process, "platform", {
       ...originalPlatform,
       value: "linux"
