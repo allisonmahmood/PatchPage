@@ -54,13 +54,21 @@ Behavior:
 Set credentials with:
 
 ```bash
-npx patchpage auth set <api-token>
+npx patchpage auth set
 ```
+
+The default flow requires a terminal and reads the token from a non-echoing prompt.
 
 For a self-hosted server:
 
 ```bash
-npx patchpage auth set <api-token> --api-url https://patchpage.example.com
+npx patchpage auth set --api-url https://patchpage.example.com
+```
+
+Automation must select redirected input explicitly and keep the token in a secret variable:
+
+```bash
+printf '%s' "$TOKEN" | npx patchpage auth set --token-stdin --api-url https://patchpage.example.com
 ```
 
 ## HTML Safety Rules
@@ -105,5 +113,7 @@ Blocked or unsafe:
 - Upload tokens gate publishing and ownership. They do not make draft viewers private.
 - Do not publish sensitive or confidential material unless public-link visibility is acceptable.
 - Do not tell the user an API token makes drafts private.
+- Never put an API token in a positional argument. Use the hidden prompt for a person or
+  explicit `--token-stdin` for automation.
 - Do not assume PatchPage is a social scheduler. It hosts static HTML drafts.
 - Do not paste giant HTML inline into chat when a link or local file is the useful deliverable.

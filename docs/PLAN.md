@@ -254,8 +254,9 @@ https://post.patchyhq.com
 Commands:
 
 ```sh
-npx patchpage auth set <api-token>
-npx patchpage auth set <api-token> --api-url https://post.example.com
+npx patchpage auth set
+npx patchpage auth set --api-url https://post.example.com
+printf '%s' "$TOKEN" | npx patchpage auth set --token-stdin --api-url https://post.example.com
 npx patchpage whoami
 npx patchpage validate ./plan.html
 npx patchpage upload ./plan.html
@@ -266,7 +267,7 @@ npx patchpage upload ./plan.html --draft <draft-id>
 Config precedence:
 
 1. Explicit CLI flags.
-2. Environment variables such as `PATCHPAGE_API_URL` and `PATCHPAGE_API_TOKEN`.
+2. For ordinary authenticated commands, environment variables such as `PATCHPAGE_API_URL` and `PATCHPAGE_API_TOKEN`.
 3. Local CLI config under `~/.patchpage`.
 4. Default `https://post.patchyhq.com`.
 

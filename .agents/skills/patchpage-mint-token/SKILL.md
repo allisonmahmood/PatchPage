@@ -67,13 +67,17 @@ revocation painless.
 On the machine that will upload:
 
 ```bash
-npx patchpage auth set "$NEW_TOKEN" --api-url "$API"
+printf '%s' "$NEW_TOKEN" | npx patchpage auth set --token-stdin --api-url "$API"
 npx patchpage whoami
 ```
 
+The explicit stdin path keeps `$NEW_TOKEN` out of process arguments; automation must not
+use redirected stdin without `--token-stdin`.
+
 `whoami` calls `GET /api/me` and prints the account, token name, and scopes. Credentials
-land in `~/.patchpage/credentials.json` with owner-only permissions. Omit `--api-url` only
-when targeting the CLI's built-in default host.
+land in `~/.patchpage/credentials.json`; every save creates or repairs that file to
+owner-only permissions on Unix. Omit `--api-url` only when targeting the CLI's built-in
+default host.
 
 ## Revoking tokens
 
@@ -87,6 +91,8 @@ read the store on every request, so the change takes effect immediately.
   echoed commands, and pasted API responses all leak them.
 - The mint response is the only time the token value is visible. Capture `.token`, or mint
   a fresh one.
+- Never pass a token positionally to `patchpage auth set`; use the hidden prompt for a
+  person or explicit `--token-stdin` for automation.
 - Tokens gate uploading and draft ownership only. Draft view URLs stay public and unlisted
   no matter which token uploaded them.
 - Do not hand the bootstrap token to CLI clients; mint per-client `upload` tokens instead.

@@ -9,8 +9,8 @@ Upload access is token-gated, but draft URLs are public and unlisted: anyone wit
 The CLI is published to npm as [`patchpage`](https://www.npmjs.com/package/patchpage) and can be run with `npx`.
 
 ```sh
-# Save a token (and, for a self-hosted instance, its base URL)
-npx patchpage auth set <api-token> --api-url https://post.example.com
+# Save a token through the non-echoing prompt (and store the self-hosted base URL)
+npx patchpage auth set --api-url https://post.example.com
 
 # Validate a file locally without uploading
 npx patchpage validate ./plan.html
@@ -19,7 +19,7 @@ npx patchpage validate ./plan.html
 npx patchpage upload ./plan.html
 ```
 
-Because the default host is the maintainer's private instance, the token you pass to `auth set` must come from a PatchPage server you control — that means your own self-hosted deployment. See [docs/SELF_HOSTING.md](docs/SELF_HOSTING.md) for deploying a server and minting tokens.
+Because the default host is the maintainer's private instance, the token you enter at the hidden `auth set` prompt must come from a PatchPage server you control — that means your own self-hosted deployment. See [docs/SELF_HOSTING.md](docs/SELF_HOSTING.md) for deploying a server and minting tokens.
 
 Full command and flag reference: [packages/cli/README.md](packages/cli/README.md).
 
@@ -64,7 +64,8 @@ In another shell:
 
 ```sh
 pnpm --filter patchpage build
-PATCHPAGE_STATE_DIR=.local/cli node packages/cli/dist/index.js auth set dev-token --api-url http://localhost:3000
+# Enter the local bootstrap token at the hidden prompt.
+PATCHPAGE_STATE_DIR=.local/cli node packages/cli/dist/index.js auth set --api-url http://localhost:3000
 PATCHPAGE_STATE_DIR=.local/cli node packages/cli/dist/index.js upload examples/plan.html
 ```
 

@@ -10,7 +10,7 @@ Run without installing:
 
 ```sh
 npx patchpage validate ./plan.html
-npx patchpage auth set <api-token> --api-url https://patchpage.example.com
+npx patchpage auth set --api-url https://patchpage.example.com
 npx patchpage upload ./plan.html
 ```
 
@@ -23,12 +23,18 @@ patchpage upload ./plan.html
 
 ## Commands
 
-### `patchpage auth set <api-token> [--api-url <url>]`
+### `patchpage auth set [--token-stdin] [--api-url <url>]`
 
-Save an API token to local state. Pass `--api-url` to also store the base URL of a self-hosted instance, so later commands don't need the flag.
+Save an API token to local state. By default, `auth set` requires a terminal and reads the token from a non-echoing prompt. Pass `--api-url` to also store the base URL of a self-hosted instance, so later commands don't need the flag.
 
 ```sh
-patchpage auth set pp_your_token_here --api-url https://post.example.com
+patchpage auth set --api-url https://post.example.com
+```
+
+Automation must select redirected input explicitly; a non-TTY invocation without `--token-stdin` fails:
+
+```sh
+printf '%s' "$TOKEN" | patchpage auth set --token-stdin --api-url https://post.example.com
 ```
 
 ### `patchpage whoami [--api-url <url>]`
@@ -67,13 +73,14 @@ By default, uploading a file the CLI has seen before updates that same draft (a 
 ## Flags
 
 - `--api-url <url>` — override the API base URL for this command (available on `auth set`, `whoami`, and `upload`).
+- `--token-stdin` — on `auth set`, read exactly one non-empty token from redirected stdin. This is the explicit automation path and is rejected when stdin is a terminal.
 - `--new` — on `upload`, always create a new draft instead of updating the one previously uploaded from this path.
 - `--draft <draft-id>` — on `upload`, add a new version to a specific draft.
 
 ## Environment variables
 
 - `PATCHPAGE_API_URL` — API base URL. Overrides the stored config; overridden by `--api-url`. Default: `https://post.patchyhq.com`.
-- `PATCHPAGE_API_TOKEN` — API token. Overrides the stored credentials, useful in CI.
+- `PATCHPAGE_API_TOKEN` — API token for ordinary authenticated commands such as `whoami` and `upload`. It overrides stored credentials and is useful in CI; `auth set` does not read it.
 - `PATCHPAGE_STATE_DIR` — directory for the CLI's config, credentials, and draft cache. Default: `~/.patchpage`.
 
 ## State
@@ -81,7 +88,7 @@ By default, uploading a file the CLI has seen before updates that same draft (a 
 The CLI stores state under `~/.patchpage` (or `PATCHPAGE_STATE_DIR`):
 
 - `config.json` — the saved API base URL.
-- `credentials.json` — the saved API token (written with `0600` permissions).
+- `credentials.json` — the saved API token. On Unix, every save creates or repairs this file to owner-only (`0600`) permissions.
 - `drafts.json` — a per-path cache mapping uploaded files to their draft IDs, so re-uploading updates the same draft.
 
 ## Agent skill
