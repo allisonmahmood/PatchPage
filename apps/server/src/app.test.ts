@@ -1,15 +1,46 @@
 import { mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
+import { createConnection } from "node:net";
 import os from "node:os";
 import path from "node:path";
+import type { AddressInfo } from "node:net";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { getServerConfig } from "@patchpage/config";
 import type { ServerConfig } from "@patchpage/config";
 import { JsonFilePatchPageDb } from "@patchpage/db";
 import type { RecordUploadInput, RecordUploadResult } from "@patchpage/db";
 import { FileSystemHtmlStorage } from "@patchpage/storage";
-import { classifyAuthorizationHeader, createApp } from "./app.js";
+import { classifyAuthorizationHeader, createApp, isProtectedApiPath } from "./app.js";
 
 let tempDir: string;
+
+const uploadLikeApiTargets: ApiTargetCase[] = [
+  {
+    label: "trailing slash",
+    url: "/api/uploads/"
+  },
+  {
+    label: "duplicate slash",
+    url: "/api//uploads"
+  },
+  {
+    label: "encoded slash",
+    url: "/api%2Fuploads"
+  },
+  {
+    label: "escaped API prefix",
+    url: "/%61pi/uploads/"
+  },
+  {
+    label: "absolute escaped API prefix",
+    url: "http://host/%61pi/uploads/",
+    rawHttp: true
+  },
+  {
+    label: "unsupported method on exact upload route",
+    url: "/api/uploads",
+    method: "PUT"
+  }
+];
 
 beforeEach(async () => {
   tempDir = await mkdtemp(path.join(os.tmpdir(), "patchpage-server-"));
@@ -29,6 +60,18 @@ describe("PatchPage server", () => {
       kind: "bearer",
       token: "dev-token"
     });
+  });
+
+  it("classifies router-equivalent protected API request targets", () => {
+    expect(isProtectedApiPath("/api?ignored=true")).toBe(true);
+    expect(isProtectedApiPath("/api#fragment")).toBe(true);
+    expect(isProtectedApiPath("/%61pi/does-not-exist")).toBe(true);
+    expect(isProtectedApiPath("http://host/api/does-not-exist?ignored=true")).toBe(true);
+    expect(isProtectedApiPath("https://host/%61pi/does-not-exist#fragment")).toBe(true);
+    expect(isProtectedApiPath("/api%2Fdoes-not-exist")).toBe(true);
+    expect(isProtectedApiPath("/api//does-not-exist")).toBe(true);
+    expect(isProtectedApiPath("/apix")).toBe(false);
+    expect(isProtectedApiPath("/%")).toBe(true);
   });
 
   it("returns uploaded draft URLs on the configured public origin", async () => {
@@ -200,6 +243,145 @@ describe("PatchPage server", () => {
     }
   });
 
+  it.each(uploadLikeApiTargets)(
+    "rejects insufficient upload scope before parsing upload-like target: $label",
+    async (target) => {
+      const { app, db } = await createScopedTokenApp(`insufficient-${target.label}`);
+
+      try {
+        const response = await oversizedJsonApiRequest(app, {
+          target,
+          token: "read-token"
+        });
+
+        expect(response.statusCode).toBe(403);
+        expect(response.json()).toEqual({
+          ok: false,
+          error: "API token does not have the required scope."
+        });
+      } finally {
+        await app.close();
+        await db.close();
+      }
+    }
+  );
+
+  it.each(uploadLikeApiTargets)(
+    "returns API 404 before parsing authorized upload-like unmatched target: $label",
+    async (target) => {
+      const { app, db } = await createScopedTokenApp(`authorized-${target.label}`);
+
+      try {
+        const response = await oversizedJsonApiRequest(app, {
+          target,
+          token: "upload-token"
+        });
+
+        expect(response.statusCode).toBe(404);
+        expect(response.json()).toEqual({
+          ok: false,
+          error: "Not found."
+        });
+      } finally {
+        await app.close();
+        await db.close();
+      }
+    }
+  );
+
+  it("allows admin scope to satisfy upload-like policy before unmatched API 404", async () => {
+    const { app, db } = await createScopedTokenApp("authorized-admin-upload-like");
+
+    try {
+      const response = await oversizedJsonApiRequest(app, {
+        target: uploadLikeApiTargets[0],
+        token: "admin-only-token"
+      });
+
+      expect(response.statusCode).toBe(404);
+      expect(response.json()).toEqual({
+        ok: false,
+        error: "Not found."
+      });
+    } finally {
+      await app.close();
+      await db.close();
+    }
+  });
+
+  it("returns API 404 before parsing arbitrary authenticated unmatched API targets", async () => {
+    const { app, db } = await createScopedTokenApp("authorized-arbitrary-unmatched-api");
+
+    try {
+      const response = await oversizedJsonApiRequest(app, {
+        target: {
+          label: "arbitrary unmatched API",
+          url: "/api/does-not-exist"
+        },
+        token: "read-token"
+      });
+
+      expect(response.statusCode).toBe(404);
+      expect(response.json()).toEqual({
+        ok: false,
+        error: "Not found."
+      });
+    } finally {
+      await app.close();
+      await db.close();
+    }
+  });
+
+  it("limits authorized upload-like unmatched targets by stable token identity", async () => {
+    let now = 1_000;
+    const { app, db } = await createScopedTokenApp("upload-like-unmatched-limit", () => now);
+    const target: ApiTargetCase = {
+      label: "encoded slash upload-like target",
+      url: "/api%2Fuploads"
+    };
+
+    try {
+      for (let attempt = 0; attempt < 20; attempt += 1) {
+        const response = await app.inject({
+          method: "POST",
+          url: target.url,
+          headers: { authorization: "Bearer upload-token" }
+        });
+        expect(response.statusCode).toBe(404);
+        expect(response.json()).toEqual({
+          ok: false,
+          error: "Not found."
+        });
+      }
+
+      const limited = await app.inject({
+        method: "POST",
+        url: target.url,
+        headers: { authorization: "Bearer upload-token" }
+      });
+      expect(limited.statusCode).toBe(429);
+      expect(limited.headers["retry-after"]).toBe("60");
+      expect(Number.isInteger(Number(limited.headers["retry-after"]))).toBe(true);
+      expect(limited.json()).toEqual({
+        ok: false,
+        error: "Rate limit exceeded.",
+        code: "rate_limited",
+        retryAfterSeconds: 60
+      });
+
+      now = 61_000;
+      const reset = await app.inject({
+        method: "POST",
+        url: target.url,
+        headers: { authorization: "Bearer upload-token" }
+      });
+      expect(reset.statusCode).toBe(404);
+    } finally {
+      await app.close();
+      await db.close();
+    }
+  });
+
   it("limits protected API attempts by canonical request IP", async () => {
     let now = 1_000;
     const config = getServerConfig({ PATCHPAGE_TRUST_PROXY: "1" });
@@ -359,6 +541,106 @@ describe("PatchPage server", () => {
       await db.close();
     }
   });
+
+  it.each([
+    {
+      label: "origin-form escaped API prefix",
+      url: "/%61pi/does-not-exist",
+      rawHttp: false
+    },
+    {
+      label: "absolute-form API target",
+      url: "http://host/api/does-not-exist",
+      rawHttp: true
+    }
+  ])(
+    "protects router-equivalent unmatched API target before parsing and counts it once per IP: $label",
+    async ({ rawHttp, url }) => {
+      let now = 1_000;
+      const config = testConfig();
+      const db = new JsonFilePatchPageDb(path.join(tempDir, `${url.replaceAll(/[^a-z0-9]/gi, "-")}-db.json`));
+      await db.initialize("dev-token");
+      const storage = new FileSystemHtmlStorage(
+        path.join(tempDir, `${url.replaceAll(/[^a-z0-9]/gi, "-")}-drafts`)
+      );
+      const app = createApp({ config, db, storage, clock: () => now });
+
+      try {
+        const attackerJson = `{"html":"${"x".repeat(2 * 1024 * 1024)}`;
+        const oversized = rawHttp
+          ? await rawHttpRequest(
+              app,
+              url,
+              "{\"html\":\"",
+              {
+                "Content-Type": "application/json",
+                "Content-Length": String(2 * 1024 * 1024 + 1)
+              },
+              { closeAfterWrite: false }
+            )
+          : await app.inject({
+              method: "POST",
+              url,
+              remoteAddress: "203.0.113.9",
+              headers: { "content-type": "application/json" },
+              payload: attackerJson
+            });
+        expect(oversized.statusCode).toBe(401);
+        expect(oversized.json()).toEqual({
+          ok: false,
+          error: "Missing or invalid API token."
+        });
+
+        for (let attempt = 1; attempt < 60; attempt += 1) {
+          const response = rawHttp
+            ? await rawHttpRequest(app, url)
+            : await app.inject({
+                method: "POST",
+                url,
+                remoteAddress: "203.0.113.9"
+              });
+          expect(response.statusCode).toBe(401);
+        }
+
+        const limited = rawHttp
+          ? await rawHttpRequest(app, url)
+          : await app.inject({
+              method: "POST",
+              url,
+              remoteAddress: "203.0.113.9"
+            });
+        expect(limited.statusCode).toBe(429);
+        expect(limited.headers["retry-after"]).toBe("60");
+        expect(Number.isInteger(Number(limited.headers["retry-after"]))).toBe(true);
+        expect(limited.json()).toEqual({
+          ok: false,
+          error: "Rate limit exceeded.",
+          code: "rate_limited",
+          retryAfterSeconds: 60
+        });
+
+        const health = await app.inject({
+          method: "GET",
+          url: "/healthz",
+          remoteAddress: "203.0.113.9"
+        });
+        expect(health.statusCode).toBe(200);
+
+        now = 61_000;
+        const reset = rawHttp
+          ? await rawHttpRequest(app, url)
+          : await app.inject({
+              method: "POST",
+              url,
+              remoteAddress: "203.0.113.9"
+            });
+        expect(reset.statusCode).toBe(401);
+      } finally {
+        await app.close();
+        await db.close();
+      }
+    }
+  );
 
   it("limits authenticated upload attempts by stable token identity", async () => {
     let now = 1_000;
@@ -1042,6 +1324,200 @@ async function markJsonTokenRevoked(filePath: string, name: string): Promise<voi
   token!.revokedAt = "2026-01-01T00:00:00.000Z";
   await writeFile(filePath, JSON.stringify(state, null, 2));
 }
+
+async function createScopedTokenApp(label: string, clock?: () => number): Promise<ScopedTokenApp> {
+  const safeLabel = label.replaceAll(/[^a-z0-9]/gi, "-");
+  const config = testConfig();
+  const db = new JsonFilePatchPageDb(path.join(tempDir, `${safeLabel}-db.json`));
+  await db.initialize("admin-token");
+  const adminAuth = await db.findApiTokenByToken("admin-token");
+  expect(adminAuth).not.toBeNull();
+  await db.createApiToken({
+    accountId: adminAuth!.accountId,
+    name: "Read token",
+    token: "read-token",
+    scopes: ["read"]
+  });
+  await db.createApiToken({
+    accountId: adminAuth!.accountId,
+    name: "Upload token",
+    token: "upload-token",
+    scopes: ["upload"]
+  });
+  await db.createApiToken({
+    accountId: adminAuth!.accountId,
+    name: "Admin only token",
+    token: "admin-only-token",
+    scopes: ["admin"]
+  });
+  const storage = new FileSystemHtmlStorage(path.join(tempDir, `${safeLabel}-drafts`));
+  const app = createApp({ config, db, storage, clock });
+  return { app, db };
+}
+
+async function oversizedJsonApiRequest(
+  app: ReturnType<typeof createApp>,
+  options: { target: ApiTargetCase; token: string }
+) {
+  const authorization = `Bearer ${options.token}`;
+  if (options.target.rawHttp) {
+    return rawHttpRequest(
+      app,
+      options.target.url,
+      "{\"html\":\"",
+      {
+        Authorization: authorization,
+        "Content-Type": "application/json",
+        "Content-Length": String(2 * 1024 * 1024 + 1)
+      },
+      { closeAfterWrite: false }
+    );
+  }
+
+  return app.inject({
+    method: options.target.method || "POST",
+    url: options.target.url,
+    headers: {
+      authorization,
+      "content-type": "application/json"
+    },
+    payload: `{"html":"${"x".repeat(2 * 1024 * 1024)}`
+  });
+}
+
+async function rawHttpRequest(
+  app: ReturnType<typeof createApp>,
+  requestTarget: string,
+  payload = "",
+  headers: Record<string, string> = {},
+  options: { closeAfterWrite?: boolean } = {}
+): Promise<RawHttpResponse> {
+  const address = app.server.address();
+  const port =
+    address && typeof address !== "string"
+      ? address.port
+      : await listenOnLoopback(app);
+
+  const raw = await new Promise<string>((resolve, reject) => {
+    const socket = createConnection({ host: "127.0.0.1", port });
+    let settled = false;
+    let response = "";
+    const resolveOnce = () => {
+      if (settled) return;
+      settled = true;
+      resolve(response);
+    };
+    const rejectOnce = (error: Error) => {
+      if (settled) return;
+      settled = true;
+      reject(error);
+    };
+    socket.setEncoding("utf8");
+    socket.setTimeout(2_000, () => {
+      socket.destroy();
+      rejectOnce(new Error("Timed out waiting for raw HTTP response."));
+    });
+    socket.on("data", (chunk) => {
+      response += chunk;
+    });
+    socket.on("end", resolveOnce);
+    socket.on("error", (error) => {
+      if (response) {
+        resolveOnce();
+        return;
+      }
+      rejectOnce(error);
+    });
+    socket.on("connect", () => {
+      const requestHeaders = {
+        Host: "host",
+        Connection: "close",
+        "Content-Length": String(Buffer.byteLength(payload)),
+        ...headers
+      };
+      const headerLines = Object.entries(requestHeaders).map(
+        ([name, value]) => `${name}: ${value}`
+      );
+      const request = [
+        `POST ${requestTarget} HTTP/1.1`,
+        ...headerLines,
+        "",
+        payload
+      ].join("\r\n");
+      if (options.closeAfterWrite === false) {
+        socket.write(request);
+        return;
+      }
+      socket.end(request);
+    });
+  });
+
+  return parseRawHttpResponse(raw);
+}
+
+async function listenOnLoopback(app: ReturnType<typeof createApp>): Promise<number> {
+  await app.listen({ host: "127.0.0.1", port: 0 });
+  const address = app.server.address();
+  if (!address || typeof address === "string") {
+    throw new Error("Expected Fastify test server to listen on a TCP address.");
+  }
+  return (address as AddressInfo).port;
+}
+
+function parseRawHttpResponse(raw: string): RawHttpResponse {
+  const [head = "", encodedBody = ""] = raw.split("\r\n\r\n", 2);
+  const [statusLine = "", ...headerLines] = head.split("\r\n");
+  const statusCode = Number(statusLine.split(" ")[1]);
+  const headers: Record<string, string> = {};
+  for (const line of headerLines) {
+    const index = line.indexOf(":");
+    if (index === -1) continue;
+    headers[line.slice(0, index).toLowerCase()] = line.slice(index + 1).trim();
+  }
+  const body =
+    headers["transfer-encoding"]?.toLowerCase() === "chunked"
+      ? decodeChunkedBody(encodedBody)
+      : encodedBody;
+
+  return {
+    statusCode,
+    headers,
+    json: () => JSON.parse(body)
+  };
+}
+
+function decodeChunkedBody(encodedBody: string): string {
+  let cursor = 0;
+  let decoded = "";
+  while (cursor < encodedBody.length) {
+    const lineEnd = encodedBody.indexOf("\r\n", cursor);
+    if (lineEnd === -1) break;
+    const size = Number.parseInt(encodedBody.slice(cursor, lineEnd), 16);
+    if (!size) break;
+    const chunkStart = lineEnd + 2;
+    decoded += encodedBody.slice(chunkStart, chunkStart + size);
+    cursor = chunkStart + size + 2;
+  }
+  return decoded;
+}
+
+type RawHttpResponse = {
+  statusCode: number;
+  headers: Record<string, string>;
+  json: () => unknown;
+};
+
+type ApiTargetCase = {
+  label: string;
+  url: string;
+  method?: string;
+  rawHttp?: boolean;
+};
+
+type ScopedTokenApp = {
+  app: ReturnType<typeof createApp>;
+  db: JsonFilePatchPageDb;
+};
 
 function testConfig(): ServerConfig {
   return {
