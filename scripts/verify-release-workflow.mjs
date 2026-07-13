@@ -273,6 +273,9 @@ if (prepareNpmJob) {
       "npm-cli-artifact-id: ${{ steps.npm-cli-artifact.outputs.artifact-id }}",
     ) ||
     !prepareNpmJob.includes("npm-version: ${{ steps.npm-cli.outputs.version }}") ||
+    !prepareNpmJob.includes(
+      "name: npm-publishing-cli-${{ github.run_attempt }}",
+    ) ||
     !prepareNpmJob.includes("uses: actions/upload-artifact@")
   ) {
     failures.push("prepare-npm must expose its immutable npm CLI artifact ID and version");
@@ -548,6 +551,14 @@ if (!/node "\$NPM_CLI" install --ignore-scripts "\$TARBALL"/.test(verifyJob)) {
 
 if (!verifyJob.includes("path: ${{ runner.temp }}/patchpage-package/*.tgz")) {
   failures.push("verify must upload only the tested PatchPage tarball as the package artifact");
+}
+
+if (
+  !verifyJob.includes(
+    "name: patchpage-package-${{ github.run_attempt }}",
+  )
+) {
+  failures.push("verify must isolate package artifacts by workflow run attempt");
 }
 
 if (!/publish\s+"\$tarball"[^\n]*--ignore-scripts[^\n]*--provenance/.test(publishJob)) {

@@ -103,7 +103,7 @@ jobs:
         id: npm-cli-artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: npm-publishing-cli
+          name: npm-publishing-cli-${{ github.run_attempt }}
           path: ${{ runner.temp }}/npm-cli
           if-no-files-found: error
           retention-days: 1
@@ -253,7 +253,7 @@ jobs:
         id: package-artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: patchpage-package
+          name: patchpage-package-${{ github.run_attempt }}
           path: ${{ runner.temp }}/patchpage-package/*.tgz
           if-no-files-found: error
           retention-days: 1
