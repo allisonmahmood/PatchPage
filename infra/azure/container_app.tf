@@ -15,7 +15,7 @@ locals {
     AZURE_STORAGE_ACCOUNT             = azurerm_storage_account.drafts.name
     AZURE_STORAGE_CONTAINER           = azurerm_storage_container.drafts.name
     AZURE_CLIENT_ID                   = azurerm_user_assigned_identity.app.client_id
-  }, var.trust_proxy == null ? {} : {
+    }, var.trust_proxy == null ? {} : {
     PATCHPAGE_TRUST_PROXY = var.trust_proxy
   })
 }
