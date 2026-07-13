@@ -30,11 +30,11 @@ const supportsPythonPty =
   process.platform !== "win32" &&
   spawnSync("python3", ["-c", "import pty, signal, termios"], { stdio: "ignore" }).status === 0;
 const externalSignals = ["SIGINT", "SIGTERM", "SIGHUP"] as const;
-const promptSignals = [...externalSignals, "SIGBREAK"] as const;
+type PromptSignal = (typeof externalSignals)[number] | "SIGBREAK";
 interface TerminalReport {
   finalRaw: boolean;
   rawModeChanges: boolean[];
-  signalHandlerCounts: Record<(typeof promptSignals)[number], number>;
+  signalHandlerCounts: Record<PromptSignal, number>;
 }
 const stateDirs: string[] = [];
 
