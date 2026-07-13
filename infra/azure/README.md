@@ -28,7 +28,7 @@ az account show --query '{subscription:id,tenant:tenantId,user:user.name}' --out
 
 ## State bootstrap
 
-Create remote Terraform state once. Set `STATE_STORAGE_ACCOUNT` to a globally unique name containing 3-24 lowercase letters and digits before running the block. Do not commit the generated backend config.
+Create remote Terraform state once. Set `STATE_STORAGE_ACCOUNT` to a globally unique name containing 3-24 lowercase letters and digits before running the block. Do not commit the generated backend config. The bootstrap deliberately uses storage-account-key authorization because an Azure account with management-plane access does not automatically have Blob data-plane OAuth access. Azure CLI retrieves the key without writing it to the backend config; do not enable shell tracing or CLI debug output for this block.
 
 <!-- guide-test:state-bootstrap -->
 
@@ -74,7 +74,7 @@ az storage account create \
 if ! az storage container create \
   --name "$STATE_CONTAINER" \
   --account-name "$STATE_STORAGE_ACCOUNT" \
-  --auth-mode login; then
+  --auth-mode key; then
   printf 'Could not create Terraform state container %s.\n' "$STATE_CONTAINER" >&2
   exit 1
 fi
@@ -82,7 +82,7 @@ if ! STATE_CONTAINER_EXISTS="$(
   az storage container exists \
     --name "$STATE_CONTAINER" \
     --account-name "$STATE_STORAGE_ACCOUNT" \
-    --auth-mode login \
+    --auth-mode key \
     --query exists \
     --output tsv
 )"; then
@@ -289,10 +289,38 @@ if test "$ACTUAL_A_RECORDS" != "$CONTAINER_APP_STATIC_IP"; then
   exit 1
 fi
 
-if ! ACTUAL_AAAA_RECORDS="$(dig +short AAAA "$CUSTOM_DOMAIN")"; then
+if ! AAAA_RESPONSE="$(
+  dig +noall +comments +answer AAAA "$CUSTOM_DOMAIN"
+)"; then
   printf 'The apex AAAA lookup failed.\n' >&2
   exit 1
 fi
+
+AAAA_STATUS="$(
+  printf '%s\n' "$AAAA_RESPONSE" |
+    awk '
+      /^;; ->>HEADER<<-/ {
+        for (i = 1; i <= NF; i++) {
+          if ($i == "status:") {
+            status = $(i + 1)
+            sub(/,$/, "", status)
+            print status
+            exit
+          }
+        }
+      }
+    '
+)"
+if test "$AAAA_STATUS" != "NOERROR"; then
+  printf 'The apex AAAA lookup returned DNS status %s.\n' \
+    "${AAAA_STATUS:-unknown}" >&2
+  exit 1
+fi
+
+ACTUAL_AAAA_RECORDS="$(
+  printf '%s\n' "$AAAA_RESPONSE" |
+    awk '$1 !~ /^;/ && toupper($4) == "AAAA" { print }'
+)"
 if test -n "$ACTUAL_AAAA_RECORDS"; then
   printf 'The apex must not publish an AAAA record; received:\n%s\n' \
     "$ACTUAL_AAAA_RECORDS" >&2
@@ -308,7 +336,7 @@ fi
 VALIDATION_METHOD="HTTP"
 ```
 
-Certificate authorities apply the first CAA RRset found while walking from the custom hostname toward the DNS root. The check continues to a parent only when the current label returns `NOERROR` without a CAA answer; any other DNS status is a hard failure. That effective policy, wherever it is inherited from, must allow DigiCert with an `issue "digicert.com"` record:
+Certificate authorities apply the first CAA RRset found while walking from the custom hostname toward the DNS root. The check continues to a parent only when the current label returns `NOERROR` without a CAA answer; any other DNS status is a hard failure. That effective policy, wherever it is inherited from, must allow DigiCert with an unparameterized `issue "digicert.com"` record. Parameterized DigiCert records fail this check because the guide cannot prove that Azure satisfies issuer-specific constraints:
 
 <!-- guide-test:caa-policy -->
 
@@ -370,9 +398,17 @@ if test -n "$CAA_RECORDS"; then
     awk '
       {
         tag = tolower($2)
-        value = tolower($3)
-        gsub(/^"|"$/, "", value)
-        sub(/;.*/, "", value)
+        value = ""
+        for (i = 3; i <= NF; i++) {
+          value = value (i == 3 ? "" : " ") $i
+        }
+        if (length(value) >= 2 && substr(value, 1, 1) == "\"" &&
+            substr(value, length(value), 1) == "\"") {
+          value = substr(value, 2, length(value) - 2)
+        }
+        sub(/^[[:space:]]+/, "", value)
+        sub(/[[:space:]]+$/, "", value)
+        value = tolower(value)
         if (tag == "issue" && value == "digicert.com") found = 1
       }
       END { exit found ? 0 : 1 }

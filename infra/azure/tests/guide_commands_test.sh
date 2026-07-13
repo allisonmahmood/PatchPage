@@ -61,6 +61,10 @@ run_state_bootstrap_block() {
           return 0
           ;;
         "storage container")
+          case " $* " in
+            *" --auth-mode key "*) ;;
+            *) return 1 ;;
+          esac
           case "$3" in
             create)
               test "$scenario" != "create_failure"
@@ -102,6 +106,14 @@ test_state_bootstrap() {
       success)
         test "$status" -eq 0 || fail "state bootstrap failed after container verification"
         test -f "$backend" || fail "state bootstrap did not create backend config after verification"
+        grep -Fqx \
+          'storage container create --name tfstate --account-name patchpagestate --auth-mode key' \
+          "$log" ||
+          fail "state container creation did not use key authorization"
+        grep -Fqx \
+          'storage container exists --name tfstate --account-name patchpagestate --auth-mode key --query exists --output tsv' \
+          "$log" ||
+          fail "state container verification did not use key authorization"
         ;;
       *)
         test "$status" -ne 0 || fail "state bootstrap succeeded after $scenario"
@@ -210,7 +222,7 @@ test_hostname_mutation_guard() {
 
 run_apex_block() {
   a_records="$1"
-  aaaa_records="$2"
+  aaaa_scenario="$2"
 
   (
     DNS_ZONE="drafts.self-hoster.dev"
@@ -219,11 +231,43 @@ run_apex_block() {
     DOMAIN_VERIFICATION_ID="verification-id"
 
     dig() {
-      case "$2" in
-        A) printf '%s\n' "$a_records" ;;
-        AAAA) printf '%s\n' "$aaaa_records" ;;
-        TXT) printf '%s\n' '"verification-id"' ;;
-        *) return 1 ;;
+      case "$1" in
+        +short)
+          case "$2" in
+            A) printf '%s\n' "$a_records" ;;
+            AAAA)
+              case "$aaaa_scenario" in
+                command_error) return 1 ;;
+                noerror_answer) printf '%s\n' '2001:db8::10' ;;
+                *) printf '%s' "" ;;
+              esac
+              ;;
+            TXT) printf '%s\n' '"verification-id"' ;;
+            *) return 1 ;;
+          esac
+          ;;
+        +noall)
+          test "$1 $2 $3 $4" = "+noall +comments +answer AAAA" || return 1
+          case "$aaaa_scenario" in
+            command_error) return 1 ;;
+            missing_status)
+              printf '%s\n' ';; ->>HEADER<<- opcode: QUERY, id: 12345'
+              return 0
+              ;;
+            noerror_empty|noerror_answer) status="NOERROR" ;;
+            servfail) status="SERVFAIL" ;;
+            refused) status="REFUSED" ;;
+            unknown_status) status="UNKNOWN" ;;
+            *) return 1 ;;
+          esac
+          printf '%s\n' ";; ->>HEADER<<- opcode: QUERY, status: $status, id: 12345"
+          if test "$aaaa_scenario" = "noerror_answer"; then
+            printf '%s\n' 'drafts.self-hoster.dev. 300 IN AAAA 2001:db8::10'
+          fi
+          ;;
+        *)
+          return 1
+          ;;
       esac
     }
 
@@ -232,16 +276,23 @@ run_apex_block() {
 }
 
 test_apex_dns() {
-  run_apex_block "203.0.113.10" "" || fail "exact apex A record was rejected"
+  run_apex_block "203.0.113.10" noerror_empty ||
+    fail "exact apex A record with a NOERROR-empty AAAA response was rejected"
 
   if run_apex_block "203.0.113.10
-198.51.100.20" ""; then
+198.51.100.20" noerror_empty; then
     fail "apex DNS accepted an additional A record"
   fi
 
-  if run_apex_block "203.0.113.10" "2001:db8::10"; then
+  if run_apex_block "203.0.113.10" noerror_answer; then
     fail "apex DNS accepted an AAAA record"
   fi
+
+  for scenario in servfail refused missing_status unknown_status command_error; do
+    if run_apex_block "203.0.113.10" "$scenario"; then
+      fail "apex DNS accepted the AAAA $scenario response"
+    fi
+  done
 }
 
 run_caa_block() {
@@ -275,13 +326,25 @@ run_caa_block() {
           printf '%s\n' ";; ->>HEADER<<- opcode: QUERY, status: $status, id: 12345"
           case "$scenario:$name" in
             inherit_noerror:example.com)
-              printf '%s\n' 'example.com. 300 IN CAA 0 issue "digicert.com"'
+              printf '%s\n' 'example.com. 300 IN CAA 0 IsSuE "DiGiCeRt.CoM"'
               ;;
             deny_nearer:team.example.com)
               printf '%s\n' 'team.example.com. 300 IN CAA 0 issue "letsencrypt.org"'
               ;;
             deny_nearer:example.com)
               printf '%s\n' 'example.com. 300 IN CAA 0 issue "digicert.com"'
+              ;;
+            unrelated:team.example.com)
+              printf '%s\n' 'team.example.com. 300 IN CAA 0 iodef "mailto:security@example.com"'
+              ;;
+            denying:team.example.com)
+              printf '%s\n' 'team.example.com. 300 IN CAA 0 issue ";"'
+              ;;
+            constrained_digicert:team.example.com)
+              printf '%s\n' 'team.example.com. 300 IN CAA 0 issue "digicert.com; accounturi=https://example.com/account/123"'
+              ;;
+            constrained_digicert_spaced:team.example.com)
+              printf '%s\n' 'team.example.com. 300 IN CAA 0 issue "digicert.com ; accounturi=https://example.com/account/123"'
               ;;
           esac
           ;;
@@ -308,6 +371,12 @@ example.com"
   if run_caa_block deny_nearer; then
     fail "CAA lookup skipped a nearer policy that denies DigiCert"
   fi
+
+  for scenario in unrelated denying constrained_digicert constrained_digicert_spaced; do
+    if run_caa_block "$scenario"; then
+      fail "CAA lookup accepted the $scenario policy"
+    fi
+  done
 
   for scenario in servfail refused; do
     if run_caa_block "$scenario"; then
