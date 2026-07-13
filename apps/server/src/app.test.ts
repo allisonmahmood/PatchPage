@@ -1,4 +1,4 @@
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -85,12 +85,160 @@ describe("PatchPage server", () => {
     await app.close();
     await db.close();
   });
+
+  it("persists the direct socket address when proxy trust is not configured", async () => {
+    const sourceIp = await uploadSourceIp({
+      remoteAddress: "192.0.2.10"
+    });
+
+    expect(sourceIp).toEqual({
+      versionSourceIp: "192.0.2.10",
+      eventSourceIp: "192.0.2.10"
+    });
+  });
+
+  it("persists the client address attributed through a trusted multi-hop proxy chain", async () => {
+    const sourceIp = await uploadSourceIp({
+      trustProxy: "2",
+      remoteAddress: "10.0.0.5",
+      forwardedFor: "203.0.113.9, 198.51.100.7"
+    });
+
+    expect(sourceIp).toEqual({
+      versionSourceIp: "203.0.113.9",
+      eventSourceIp: "203.0.113.9"
+    });
+  });
+
+  it("ignores a spoofed forwarding header on a direct request by default", async () => {
+    const sourceIp = await uploadSourceIp({
+      remoteAddress: "192.0.2.10",
+      forwardedFor: "203.0.113.9, 198.51.100.7"
+    });
+
+    expect(sourceIp).toEqual({
+      versionSourceIp: "192.0.2.10",
+      eventSourceIp: "192.0.2.10"
+    });
+  });
+
+  it("attributes the rightmost forwarded address through one trusted proxy hop", async () => {
+    const sourceIp = await uploadSourceIp({
+      trustProxy: "1",
+      remoteAddress: "10.0.0.5",
+      forwardedFor: "203.0.113.9, 198.51.100.7"
+    });
+
+    expect(sourceIp).toEqual({
+      versionSourceIp: "198.51.100.7",
+      eventSourceIp: "198.51.100.7"
+    });
+  });
+
+  it("attributes the first untrusted address beyond configured proxy networks", async () => {
+    const sourceIp = await uploadSourceIp({
+      trustProxy: "10.0.0.0/8, 198.51.100.0/24",
+      remoteAddress: "10.0.0.5",
+      forwardedFor: "203.0.113.9, 198.51.100.7"
+    });
+
+    expect(sourceIp).toEqual({
+      versionSourceIp: "203.0.113.9",
+      eventSourceIp: "203.0.113.9"
+    });
+  });
+
+  it("ignores a spoofed forwarding chain from outside configured proxy networks", async () => {
+    const sourceIp = await uploadSourceIp({
+      trustProxy: "10.0.0.0/8",
+      remoteAddress: "192.0.2.10",
+      forwardedFor: "203.0.113.9, 10.0.0.5"
+    });
+
+    expect(sourceIp).toEqual({
+      versionSourceIp: "192.0.2.10",
+      eventSourceIp: "192.0.2.10"
+    });
+  });
+
+  it.each([
+    "::ffff:0:0/96",
+    "::ffff:10.0.0.0/104",
+    "0:0:0:0:0:ffff:a00:0/104",
+    "::fffe:0:0/95",
+    "::ffff:0:0/95",
+    "::/1"
+  ])(
+    "rejects effective blanket trust %s before a direct peer can spoof attribution",
+    async (trustProxy) => {
+      await expect(
+        uploadSourceIp({
+          trustProxy,
+          remoteAddress: "192.0.2.10",
+          forwardedFor: "203.0.113.9"
+        })
+      ).rejects.toThrow(/Invalid PATCHPAGE_TRUST_PROXY/);
+    }
+  );
 });
+
+interface SourceIpAttribution {
+  versionSourceIp: string | null | undefined;
+  eventSourceIp: string | null | undefined;
+}
+
+async function uploadSourceIp(options: {
+  trustProxy?: string;
+  remoteAddress: string;
+  forwardedFor?: string;
+}): Promise<SourceIpAttribution> {
+  const apiToken = "trusted-proxy-token";
+  const config = getServerConfig(
+    options.trustProxy === undefined ? {} : { PATCHPAGE_TRUST_PROXY: options.trustProxy }
+  );
+  const dbFile = path.join(tempDir, "trusted-proxy-db.json");
+  const db = new JsonFilePatchPageDb(dbFile);
+  await db.initialize(apiToken);
+  const storage = new FileSystemHtmlStorage(path.join(tempDir, "trusted-proxy-drafts"));
+  const app = createApp({ config, db, storage });
+
+  try {
+    const upload = await app.inject({
+      method: "POST",
+      url: "/api/uploads",
+      remoteAddress: options.remoteAddress,
+      headers: {
+        authorization: `Bearer ${apiToken}`,
+        ...(options.forwardedFor === undefined ? {} : { "x-forwarded-for": options.forwardedFor })
+      },
+      payload: {
+        html: "<!doctype html><html><head><title>Trusted Proxy</title></head><body></body></html>"
+      }
+    });
+
+    expect(upload.statusCode).toBe(201);
+    const { draftId, versionId } = upload.json() as { draftId: string; versionId: string };
+    const lookup = await db.findDraftVersion(draftId);
+    const state = JSON.parse(await readFile(dbFile, "utf8")) as {
+      uploadEvents: Array<{ draftVersionId: string; sourceIp: string | null }>;
+    };
+    const event = state.uploadEvents.find((row) => row.draftVersionId === versionId);
+
+    return {
+      versionSourceIp: lookup.version?.sourceIp,
+      eventSourceIp: event?.sourceIp
+    };
+  } finally {
+    await app.close();
+    await db.close();
+  }
+}
 
 function testConfig(): ServerConfig {
   return {
     port: 3000,
     publicBaseUrl: "http://localhost:3000",
+    trustProxy: false,
     bootstrapApiToken: "dev-token",
     allowAnonymousUploads: false,
     maxHtmlBytes: 512 * 1024,

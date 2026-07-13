@@ -4,7 +4,7 @@ locals {
     PATCHPAGE_BOOTSTRAP_API_TOKEN = { secret = "bootstrap-token", value = local.bootstrap_api_token }
   }
 
-  app_plain_env = {
+  app_plain_env = merge({
     NODE_ENV                          = "production"
     PORT                              = "3000"
     PATCHPAGE_PUBLIC_BASE_URL         = var.public_base_url
@@ -15,7 +15,9 @@ locals {
     AZURE_STORAGE_ACCOUNT             = azurerm_storage_account.drafts.name
     AZURE_STORAGE_CONTAINER           = azurerm_storage_container.drafts.name
     AZURE_CLIENT_ID                   = azurerm_user_assigned_identity.app.client_id
-  }
+  }, var.trust_proxy == null ? {} : {
+    PATCHPAGE_TRUST_PROXY = var.trust_proxy
+  })
 }
 
 resource "azurerm_container_app" "server" {

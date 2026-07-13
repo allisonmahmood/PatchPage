@@ -8,7 +8,7 @@ Terraform creates:
 - external platform ingress with insecure HTTP disabled;
 - the Azure Container Registry and the app's managed identity and role assignments;
 - the Blob Storage account and private container, plus the PostgreSQL server/database; and
-- generated application secrets and the Container App environment variables, including `PATCHPAGE_PUBLIC_BASE_URL`.
+- generated application secrets and the Container App environment variables, including `PATCHPAGE_PUBLIC_BASE_URL` and, when configured, `PATCHPAGE_TRUST_PROXY`.
 
 Terraform does **not** create or manage the remote-state resources, container image build, DNS zone or records, Container App custom hostname, managed certificate, or certificate binding. Those steps are deliberately manual and provider-neutral below. Terraform creates the initial Container App ingress and then ignores later changes to the whole ingress block so an apply cannot overwrite the CLI-managed hostname and certificate binding. Any intentional ingress change therefore remains HITL: update the lifecycle rule and restore the manual binding as one coordinated operation.
 
@@ -114,8 +114,9 @@ cp terraform.tfvars.example terraform.tfvars
 
 - Set `subscription_id` to the target subscription ID and export the same value as `SUBSCRIPTION_ID` in the shell.
 - Replace the deliberately invalid `public_base_url` with the deployer's real origin. It must be HTTPS with a public DNS hostname and no credentials, port, path, query, fragment, or trailing slash.
+- Keep `trust_proxy = null` for the initial deployment. This omits `PATCHPAGE_TRUST_PROXY` so forwarded client-address headers remain untrusted. Enable it only after completing [the client-IP HITL verification](#4-verify-and-enable-client-ip-attribution).
 
-Terraform rejects the maintainer's domains, localhost/private-style names, reserved example names, and common placeholder values. The first targeted apply still requires a valid deployer-owned origin even though it only creates the registry.
+Terraform rejects the maintainer's domains, localhost/private-style names, reserved example names, and common placeholder values. It also rejects unsafe or malformed trusted-proxy values. The first targeted apply still requires a valid deployer-owned origin even though it only creates the registry.
 
 ```sh
 SUBSCRIPTION_ID="${SUBSCRIPTION_ID:?Set SUBSCRIPTION_ID to the subscription_id in terraform.tfvars}"
@@ -584,6 +585,46 @@ unset BOOTSTRAP_API_TOKEN
 
 These DNS, certificate, HTTPS, and upload checks require the deployer's real Azure subscription and DNS zone. They are intentionally human-in-the-loop and are not performed by Terraform validation or repository tests.
 
+### 4. Verify and enable client IP attribution
+
+Terraform cannot determine Azure Container Apps' forwarding chain or prove which peer addresses reach this application. The `trust_proxy` default is therefore `null`: the Container App receives no `PATCHPAGE_TRUST_PROXY` variable, Fastify ignores `X-Forwarded-For`, and persisted upload `source_ip` values identify the direct socket peer. Do not replace this default with a guessed Azure hop count or network.
+
+Complete this verification in the real deployment:
+
+1. Inventory every reachable path to the Container App: the generated `*.azurecontainerapps.io` hostname, the custom hostname, and any CDN, WAF, gateway, or additional reverse proxy. A fixed hop count is valid only if every path that remains reachable has the same depth.
+2. With `trust_proxy = null`, send controlled authenticated uploads from an independently known public client address through each path. The resulting `draft_versions.source_ip` shows the socket peer seen by PatchPage. PatchPage deliberately does not persist the raw `X-Forwarded-For` chain, so inspect that header at the application boundary with an approved temporary diagnostic revision or equivalent ingress observability. Remove temporary header logging after the observation and do not log API tokens.
+3. Record the socket peer, the right-to-left forwarded chain, whether each proxy overwrites or appends incoming forwarding headers, and whether the observed path is invariant. Repeat enough requests and revisions to detect changing peer addresses.
+4. Choose either a decimal count from `1` through `32` for a proven fixed-depth path, or comma-separated literal IP/CIDR entries for stable, verified proxy source networks. Do not use broad address ranges merely because they include the observed peer.
+5. Set the observed value in `terraform.tfvars`, review the environment change, and apply it:
+
+   ```hcl
+   # Example form only; use the value established by the observation above.
+   trust_proxy = "2"
+   ```
+
+   ```sh
+   terraform plan
+   terraform apply
+   ```
+
+6. From the same known client, perform a new authenticated upload through every reachable path while supplying a canary header such as `X-Forwarded-For: 198.51.100.123`. Query the matching upload and confirm that both persisted fields equal the independently known client address and never the spoof canary:
+
+   ```sql
+   SELECT
+     draft_versions.source_ip AS version_source_ip,
+     upload_events.source_ip AS event_source_ip
+   FROM draft_versions
+   JOIN upload_events
+     ON upload_events.draft_version_id = draft_versions.id
+   WHERE draft_versions.draft_id = 'replace-with-the-canary-draft-id'
+   ORDER BY upload_events.created_at DESC
+   LIMIT 1;
+   ```
+
+7. If any path attributes the spoof value, a proxy peer, or a different header position, restore `trust_proxy = null` and correct the topology or trust rule before using the address for audit.
+
+This verification remains an operator responsibility after deploy. Repeat it whenever Azure ingress behavior, DNS paths, custom domains, CDN/WAF layers, proxy source ranges, or Container App networking changes. Repository and Terraform tests validate parsing and environment wiring only; they do not establish the hosted trust boundary.
+
 ## Security notes
 
 - Do not commit `terraform.tfvars`, `backend.hcl`, `.terraform/`, or generated deployment notes.
@@ -591,3 +632,4 @@ These DNS, certificate, HTTPS, and upload checks require the deployer's real Azu
 - The Blob container is private; public draft viewing goes through the PatchPage server.
 - The server uses managed identity for Blob access in production.
 - Uploads require API tokens. Anonymous uploads remain disabled.
+- Keep `trust_proxy = null` until the live forwarding chain has passed the HITL verification above; an incorrect trust rule permits spoofed audit attribution.
