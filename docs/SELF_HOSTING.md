@@ -16,11 +16,18 @@ Once your server is running, point the CLI at it and you have a self-hosted Patc
 
 Release automation is configured to publish the supported image as `ghcr.io/allisonmahmood/patchpage-server`. Its tags are published from one verified image:
 
-- A stable semver tag without a `v` prefix, such as `1.2.3`, is immutable and is the recommended deployment tag. Prerelease versions such as `1.2.3-rc.1` are rejected by the release guard before npm or GHCR publication can begin.
-- The full commit SHA is also an immutable tag for source-exact pinning.
-- The moving `latest` tag follows the newest release; use it only when automatic movement is intended. During a delayed release, a newer `latest` is left untouched only when its manifest digest and config match the immutable tag named by its stable version label; missing or mismatched state fails closed.
+Reconciliation support begins with `v0.1.1`. The existing `v0.1.0` source tag predates the supported non-root `/data`, label, and license image contract, so scheduled reconciliation deliberately ignores it and never broadens or retags that legacy release.
 
-First-package gate: the workflow does not change package visibility and does not fabricate the GHCR Public visibility transition. After the first authenticated push creates the package, a maintainer must set GHCR Public visibility in GitHub. Release acceptance for issue #17 stays open until the separate anonymous GHCR smoke job pulls the semver tag without credentials and verifies `/healthz`; until that gate passes, these docs describe the intended supported image, not proof that a public package is already live.
+
+- A stable semver tag without a `v` prefix, such as `1.2.3`, is intended not to move and is the recommended human-readable deployment tag. Prerelease versions such as `1.2.3-rc.1` are rejected by the release guard before npm or GHCR publication can begin.
+- The full commit SHA tag is also intended not to move and identifies the source commit.
+- The moving `latest` tag follows the newest release; use it only when automatic movement is intended. During a delayed release, a newer `latest` is left untouched only when its manifest digest and config match the paired release tags named by its stable version and revision labels; missing or mismatched state fails closed.
+
+First-package gate: the workflow does not change package visibility or fabricate the GHCR Public visibility transition, and scheduled reconciliation likewise leaves visibility untouched. After the first authenticated push creates the package, a maintainer must set GHCR Public visibility in GitHub. Release acceptance for issue #17 stays open until the separate anonymous GHCR smoke jobs use fresh Docker configurations without credentials: the release smoke must prove the semver tag and exact digest match the publisher-bound manifest and config before booting that digest, while each reconciliation smoke must prove the semver and full-commit tags plus the digest match the bound manifest and config for every complete supported release, then verify exact `/healthz`. Repaired rows consume the newest exact immutable publisher-result artifact for their version/revision; already-complete rows consume the manifest and config digests captured by the inspect snapshot. Until those gates pass, these docs describe the intended supported image, not proof that a public package is already live.
+
+GHCR publication uses OCI manifest digests as canonical identity. OCI Distribution manifest `PUT` does not provide an ordinary tag-level `If-Match`/`If-None-Match` compare-and-swap contract, so tag pointers are not immutable and this project does not claim they are. For an immutable deployment pin, use the publisher-verified manifest digest (`ghcr.io/allisonmahmood/patchpage-server@sha256:...`). The publisher reads authoritative registry state before and after every tag write, repairs only missing release-tag mates, and fails on post-write divergence, but an external repository writer can still race after the final read or transiently between reads. Repository-writer exclusivity remains a live human gate for releases, and issue #17 stays open until that operating constraint and the anonymous smoke gate are satisfied.
+
+Release and GHCR reconciliation workflows use the shared `release-ghcr-patchpage-server` concurrency group with GitHub Actions `queue: max`. GitHub caps that maximum at 100 pending runs; the workflow relies on the documented `max` keyword rather than numeric queue syntax. Scheduled/manual reconciliation inspects every supported release, repairs a bounded batch of missing or incomplete pairs, and reconciles `latest` whenever at least one supported release is complete. Credentialless acceptance then runs for every complete supported pair, including zero-repair runs: already-complete rows use their digest-bound inspect snapshot, repaired rows use the newest exact immutable publisher-result artifact, and unrelated or stale artifacts from earlier attempts are ignored.
 
 The image runs as the non-root `node` user (UID/GID 1000). Its supported writable persistence mount is `/data`. With the default `json` metadata and `filesystem` storage drivers, the image sets:
 
@@ -29,7 +36,7 @@ PATCHPAGE_DB_FILE=/data/patchpage-db.json
 PATCHPAGE_STORAGE_DIR=/data/drafts
 ```
 
-After a release has published the image, start an instance with a named volume and an immutable release version:
+After a release has published the image, start an instance with a named volume and a stable release version:
 
 ```sh
 docker volume create patchpage-data

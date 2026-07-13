@@ -1,8 +1,10 @@
 import { createHash } from "node:crypto";
-import { readFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
+import { tmpdir } from "node:os";
+import { gunzipSync } from "node:zlib";
 import { isAlias, isMap, isScalar, isSeq, parseDocument } from "yaml";
 
 const repoRoot = path.resolve(
@@ -13,6 +15,7 @@ const repoRoot = path.resolve(
 const workflowPath = path.join(repoRoot, ".github/workflows/release.yml");
 const [
   workflowFile,
+  reconcileWorkflowFile,
   ciWorkflowFile,
   packageSource,
   lockfile,
@@ -20,9 +23,12 @@ const [
   selfHostingFile,
   readmeFile,
   serverImageVerifier,
+  dockerSaveValidator,
+  ghcrOciReleaseTool,
 ] =
   await Promise.all([
     readFile(workflowPath, "utf8"),
+    readFile(path.join(repoRoot, ".github/workflows/reconcile-ghcr.yml"), "utf8"),
     readFile(path.join(repoRoot, ".github/workflows/ci.yml"), "utf8"),
     readFile(path.join(repoRoot, "package.json"), "utf8"),
     readFile(path.join(repoRoot, "pnpm-lock.yaml"), "utf8"),
@@ -30,9 +36,21 @@ const [
     readFile(path.join(repoRoot, "docs/SELF_HOSTING.md"), "utf8"),
     readFile(path.join(repoRoot, "README.md"), "utf8"),
     readFile(path.join(repoRoot, "scripts/verify-server-image.sh"), "utf8"),
+    readFile(path.join(repoRoot, "scripts/validate-docker-save-artifact.mjs")),
+    readFile(path.join(repoRoot, "scripts/ghcr-oci-release.mjs")),
   ]);
 const workflow = process.env.PATCHPAGE_RELEASE_WORKFLOW_SOURCE ?? workflowFile;
+const reconcileWorkflow =
+  process.env.PATCHPAGE_RECONCILE_WORKFLOW_SOURCE ?? reconcileWorkflowFile;
 const ciWorkflow = process.env.PATCHPAGE_RELEASE_CI_WORKFLOW_SOURCE ?? ciWorkflowFile;
+const dockerSaveValidatorSource = process.env.PATCHPAGE_DOCKER_SAVE_VALIDATOR_SOURCE;
+const ghcrOciReleaseToolSource = process.env.PATCHPAGE_GHCR_OCI_RELEASE_SOURCE;
+const effectiveDockerSaveValidator = dockerSaveValidatorSource
+  ? Buffer.from(dockerSaveValidatorSource)
+  : dockerSaveValidator;
+const effectiveGhcrOciReleaseTool = ghcrOciReleaseToolSource
+  ? Buffer.from(ghcrOciReleaseToolSource)
+  : ghcrOciReleaseTool;
 const selfHosting =
   process.env.PATCHPAGE_RELEASE_SELF_HOSTING_SOURCE ?? selfHostingFile;
 const readme = process.env.PATCHPAGE_RELEASE_README_SOURCE ?? readmeFile;
@@ -40,6 +58,8 @@ const packageJson = JSON.parse(packageSource);
 const failures = [];
 let parsedWorkflow = null;
 let workflowDocument = null;
+let parsedReconcileWorkflow = null;
+let reconcileWorkflowDocument = null;
 
 function hasUnsupportedYamlIndirection(node) {
   if (node === null || typeof node !== "object") {
@@ -112,6 +132,38 @@ try {
 } catch (error) {
   failures.push(
     `release.yml must be valid YAML with unique map keys: ${error instanceof Error ? error.message : String(error)}`,
+  );
+}
+
+try {
+  const document = parseDocument(reconcileWorkflow, {
+    keepSourceTokens: true,
+    uniqueKeys: true,
+  });
+  if (document.errors.length > 0) {
+    for (const error of document.errors) {
+      failures.push(
+        `reconcile-ghcr.yml must be valid YAML with unique map keys: ${error.message}`,
+      );
+    }
+  } else if (hasUnsupportedYamlIndirection(document.contents)) {
+    failures.push(
+      "reconcile-ghcr.yml must not use YAML anchors, aliases, merge keys, or non-scalar mapping keys; explicit tags are forbidden",
+    );
+  } else {
+    const resolvedWorkflow = document.toJS();
+    if (!isPlainResolvedValue(resolvedWorkflow)) {
+      failures.push(
+        "reconcile-ghcr.yml must resolve only to plain scalar, array, and object values",
+      );
+    } else {
+      reconcileWorkflowDocument = document;
+      parsedReconcileWorkflow = resolvedWorkflow;
+    }
+  }
+} catch (error) {
+  failures.push(
+    `reconcile-ghcr.yml must be valid YAML with unique map keys: ${error instanceof Error ? error.message : String(error)}`,
   );
 }
 
@@ -464,11 +516,15 @@ const expectedPublicationRun = [
 ].join("\n");
 
 function job(name) {
-  const lines = workflow.split("\n");
+  return jobFrom(workflow, name, "release.yml");
+}
+
+function jobFrom(source, name, label) {
+  const lines = source.split("\n");
   const start = lines.findIndex((line) => line === `  ${name}:`);
 
   if (start === -1) {
-    failures.push(`release.yml must define the ${name} job`);
+    failures.push(`${label} must define the ${name} job`);
     return "";
   }
 
@@ -562,18 +618,18 @@ function uniqueStep(steps, predicate, description) {
   return matches[0];
 }
 
-function workflowLineNumber(offset) {
-  return workflow.slice(0, offset).split("\n").length;
+function workflowLineNumber(source, offset) {
+  return source.slice(0, offset).split("\n").length;
 }
 
-function parsedActionUses(document) {
+function parsedActionUses(document, source, label) {
   if (document === null) {
     return [];
   }
 
   const jobs = document.get("jobs", true);
   if (!isMap(jobs)) {
-    failures.push("release.yml must define jobs as a parsed YAML map");
+    failures.push(`${label} must define jobs as a parsed YAML map`);
     return [];
   }
 
@@ -581,7 +637,7 @@ function parsedActionUses(document) {
   for (const jobPair of jobs.items) {
     const jobName = isScalar(jobPair.key) ? jobPair.key.value : null;
     if (!isMap(jobPair.value)) {
-      failures.push("every release.yml job must be a parsed YAML map");
+      failures.push(`every ${label} job must be a parsed YAML map`);
       continue;
     }
     const steps = jobPair.value.get("steps", true);
@@ -610,19 +666,20 @@ function parsedActionUses(document) {
       const valueRange = isScalar(usesPair.value) ? usesPair.value.range : null;
       const valueEnd = Array.isArray(valueRange) ? valueRange[1] : null;
       const lineEnd =
-        typeof valueEnd === "number" ? workflow.indexOf("\n", valueEnd) : -1;
+        typeof valueEnd === "number" ? source.indexOf("\n", valueEnd) : -1;
 
       actions.push({
         comment: isScalar(usesPair.value) ? usesPair.value.comment : null,
         coordinate: isScalar(usesPair.value) ? usesPair.value.value : null,
         inlineSuffix:
           typeof valueEnd === "number"
-            ? workflow
-                .slice(valueEnd, lineEnd === -1 ? workflow.length : lineEnd)
+            ? source
+                .slice(valueEnd, lineEnd === -1 ? source.length : lineEnd)
                 .replace(/\r$/, "")
             : null,
         jobName,
-        lineNumber: workflowLineNumber(usesPair.key.range?.[0] ?? 0),
+        label,
+        lineNumber: workflowLineNumber(source, usesPair.key.range?.[0] ?? 0),
       });
     }
   }
@@ -630,7 +687,12 @@ function parsedActionUses(document) {
   return actions;
 }
 
-const actionUses = parsedActionUses(workflowDocument);
+const actionUses = parsedActionUses(workflowDocument, workflow, "release.yml");
+const reconcileActionUses = parsedActionUses(
+  reconcileWorkflowDocument,
+  reconcileWorkflow,
+  "reconcile-ghcr.yml",
+);
 
 function ciJob(name) {
   const lines = ciWorkflow.split("\n");
@@ -701,14 +763,43 @@ function sameEntries(actual, expected) {
   );
 }
 
+function sha256Hex(buffer) {
+  return createHash("sha256").update(buffer).digest("hex");
+}
+
+function embeddedGzipPayload(source, marker) {
+  const heredocStart = source.indexOf(`<<'${marker}'`);
+  if (heredocStart === -1) return null;
+  const payloadStart = source.indexOf("\n", heredocStart);
+  const payloadEnd = source.indexOf(`\n          ${marker}`, payloadStart);
+  if (payloadStart === -1 || payloadEnd === -1) return null;
+  return source.slice(payloadStart + 1, payloadEnd).replace(/\s+/g, "");
+}
+
+function decodedEmbeddedSource(source, marker) {
+  const payload = embeddedGzipPayload(source, marker);
+  if (!payload) return null;
+  try {
+    return gunzipSync(Buffer.from(payload, "base64"));
+  } catch {
+    return null;
+  }
+}
+
 if (parsedWorkflow !== null && actionUses.length === 0) {
   failures.push("release.yml must use at least one external Action");
 }
+if (parsedReconcileWorkflow !== null && reconcileActionUses.length === 0) {
+  failures.push("reconcile-ghcr.yml must use at least one external Action");
+}
 
-for (const { comment, coordinate, inlineSuffix, lineNumber } of actionUses) {
+for (const { comment, coordinate, inlineSuffix, label, lineNumber } of [
+  ...actionUses,
+  ...reconcileActionUses,
+]) {
   if (typeof coordinate !== "string") {
     failures.push(
-      `release.yml:${lineNumber} must pin an Action to a full commit SHA with an inline semver release comment`,
+      `${label}:${lineNumber} must pin an Action to a full commit SHA with an inline semver release comment`,
     );
     continue;
   }
@@ -716,7 +807,7 @@ for (const { comment, coordinate, inlineSuffix, lineNumber } of actionUses) {
   const coordinateMatch = coordinate.match(/^([^\s@]+)@([^\s@]+)$/);
   if (!coordinateMatch) {
     failures.push(
-      `release.yml:${lineNumber} must pin an Action to a full commit SHA with an inline semver release comment`,
+      `${label}:${lineNumber} must pin an Action to a full commit SHA with an inline semver release comment`,
     );
     continue;
   }
@@ -724,16 +815,16 @@ for (const { comment, coordinate, inlineSuffix, lineNumber } of actionUses) {
   const [, actionName, reference] = coordinateMatch;
   const reviewed = reviewedActions.get(actionName);
   if (!reviewed) {
-    failures.push(`release.yml:${lineNumber} uses unreviewed Action ${actionName}`);
+    failures.push(`${label}:${lineNumber} uses unreviewed Action ${actionName}`);
   }
 
   if (!/^[0-9a-f]{40}$/.test(reference)) {
-    failures.push(`release.yml:${lineNumber} must pin ${actionName} to a full commit SHA`);
+    failures.push(`${label}:${lineNumber} must pin ${actionName} to a full commit SHA`);
   }
 
   if (reviewed && reviewed.sha !== reference) {
     failures.push(
-      `release.yml:${lineNumber} must use reviewed coordinate ${actionName}@${reviewed.sha} # ${reviewed.version}`,
+      `${label}:${lineNumber} must use reviewed coordinate ${actionName}@${reviewed.sha} # ${reviewed.version}`,
     );
   }
 
@@ -743,11 +834,11 @@ for (const { comment, coordinate, inlineSuffix, lineNumber } of actionUses) {
       : null;
   if (commentVersion === null || inlineSuffix !== ` # ${commentVersion}`) {
     failures.push(
-      `release.yml:${lineNumber} must pin an Action to a full commit SHA with an inline semver release comment`,
+      `${label}:${lineNumber} must pin an Action to a full commit SHA with an inline semver release comment`,
     );
   } else if (reviewed && reviewed.version !== commentVersion) {
     failures.push(
-      `release.yml:${lineNumber} must use reviewed coordinate ${actionName}@${reviewed.sha} # ${reviewed.version}`,
+      `${label}:${lineNumber} must use reviewed coordinate ${actionName}@${reviewed.sha} # ${reviewed.version}`,
     );
   }
 }
@@ -758,7 +849,7 @@ const expectedActionCounts = new Map([
   ["pnpm/action-setup", 1],
   ["actions/upload-artifact", 3],
   ["actions/download-artifact", 4],
-  ["docker/login-action", 1],
+  ["docker/login-action", 0],
 ]);
 for (const [actionName, expectedCount] of expectedActionCounts) {
   const actualCount = actionUses.filter(
@@ -768,6 +859,26 @@ for (const [actionName, expectedCount] of expectedActionCounts) {
   if (actualCount !== expectedCount) {
     failures.push(
       `release.yml must retain all ${expectedCount} reviewed ${actionName} Action uses`,
+    );
+  }
+}
+
+const expectedReconcileActionCounts = new Map([
+  ["actions/checkout", 2],
+  ["actions/setup-node", 1],
+  ["pnpm/action-setup", 0],
+  ["actions/upload-artifact", 3],
+  ["actions/download-artifact", 3],
+  ["docker/login-action", 0],
+]);
+for (const [actionName, expectedCount] of expectedReconcileActionCounts) {
+  const actualCount = reconcileActionUses.filter(
+    ({ coordinate }) =>
+      typeof coordinate === "string" && coordinate.startsWith(`${actionName}@`),
+  ).length;
+  if (actualCount !== expectedCount) {
+    failures.push(
+      `reconcile-ghcr.yml must retain all ${expectedCount} reviewed ${actionName} Action uses`,
     );
   }
 }
@@ -816,7 +927,7 @@ const releaseConcurrency = workflow.match(
 );
 if (!releaseConcurrency) {
   failures.push(
-    "release.yml must serialize all patchpage-server publishes in one package-wide max queue without canceling running or pending releases",
+    "release.yml must serialize all patchpage-server publishes in one package-wide max queue without canceling running or pending releases; GitHub caps max at 100 pending runs",
   );
 } else if (releaseConcurrency[1] !== "release-ghcr-patchpage-server") {
   failures.push(
@@ -914,14 +1025,14 @@ const reviewedReleaseJobContracts = new Map([
   [
     "docker-ghcr",
     {
-      digest: "ceacc2c26a95c02cd0877c0efdf1aca66f3935d46be0c90bb6b409f3206f7039",
+      digest: "d4e7b62918f5d9150011f384b1514a24a5a637cb617dc69ece3d769b7155ed20",
       permissions: { packages: "write" },
     },
   ],
   [
     "ghcr-anonymous-smoke",
     {
-      digest: "1c844bf4b888f79c1201bb41f8b59a7616ef42bfb40f69b491b537411edb5dc1",
+      digest: "24b6be0ef3359d0a1a46e6a76f4d0fd61e6db93924594f7962d1ea91bda99d63",
       permissions: {},
     },
   ],
@@ -952,6 +1063,120 @@ if (parsedWorkflow !== null) {
     ) {
       failures.push(
         `${jobName} must match the exact reviewed job map, permissions, and ordered steps`,
+      );
+    }
+  }
+}
+
+const reviewedReconcileRoot = {
+  name: "Reconcile GHCR",
+  on: {
+    workflow_dispatch: {
+      inputs: {
+        target: {
+          description: "Optional exact stable release tag, for example v1.2.3",
+          required: false,
+          type: "string",
+        },
+        "batch-size": {
+          description: "Maximum missing or incomplete stable releases to replay",
+          required: false,
+          default: "3",
+          type: "string",
+        },
+      },
+    },
+    schedule: [{ cron: "17 */6 * * *" }],
+  },
+  permissions: {},
+  concurrency: {
+    group: "release-ghcr-patchpage-server",
+    queue: "max",
+    "cancel-in-progress": false,
+  },
+  jobs: null,
+};
+if (
+  parsedReconcileWorkflow !== null &&
+  JSON.stringify({ ...parsedReconcileWorkflow, jobs: null }) !==
+    JSON.stringify(reviewedReconcileRoot)
+) {
+  failures.push(
+    "reconcile-ghcr.yml root must contain exactly the reviewed triggers, permissions, concurrency, and jobs",
+  );
+}
+
+const expectedReconcileJobs = [
+  "inspect",
+  "rebuild",
+  "publish-ghcr",
+  "reconcile-latest",
+  "bind-publish-results",
+  "ghcr-anonymous-acceptance",
+];
+const reviewedReconcileJobContracts = new Map([
+  [
+    "inspect",
+    {
+      digest: "831898fb0c8a5b70132ce818898c247cabc9f5199fc387ab47b4e9a88ed5ce41",
+      permissions: { contents: "read", packages: "read" },
+    },
+  ],
+  [
+    "rebuild",
+    {
+      digest: "ec539fabecbc0eabdd0807d2be89941492d8e4fa49fa61ddcb7492ee3a7cd891",
+      permissions: { contents: "read" },
+    },
+  ],
+  [
+    "publish-ghcr",
+    {
+      digest: "23a606d3857b15b976ce5c7741fda0cd714836fe8b392ab5a318a0bca4699e91",
+      permissions: { actions: "read", packages: "write" },
+    },
+  ],
+  [
+    "reconcile-latest",
+    {
+      digest: "c8adfe1de7a9dda6fc626bd6d64b771ef1237ba57415e87cb229825f49667c18",
+      permissions: { packages: "write" },
+    },
+  ],
+  [
+    "bind-publish-results",
+    {
+      digest: "6b3dfd61bb2338e0ee62030893e92eb3631d95ace341e7d0997966194f89b956",
+      permissions: { actions: "read" },
+    },
+  ],
+  [
+    "ghcr-anonymous-acceptance",
+    {
+      digest: "94c89f3c826ae9744e7d122069254b988dcf56f4aa3d63f2397ad0871ec9db8f",
+      permissions: {},
+    },
+  ],
+]);
+if (
+  parsedReconcileWorkflow !== null &&
+  !hasExactKeys(parsedReconcileWorkflow.jobs, expectedReconcileJobs)
+) {
+  failures.push("reconcile-ghcr.yml must contain exactly the reviewed reconciliation jobs");
+}
+if (parsedReconcileWorkflow !== null) {
+  for (const [jobName, contract] of reviewedReconcileJobContracts) {
+    const selectedJob = parsedReconcileWorkflow.jobs[jobName];
+    const digest = isMapping(selectedJob)
+      ? createHash("sha256").update(JSON.stringify(selectedJob)).digest("hex")
+      : null;
+    if (
+      !isMapping(selectedJob) ||
+      !hasExactMapping(selectedJob.permissions, contract.permissions) ||
+      digest !== contract.digest
+    ) {
+      failures.push(
+        `reconcile-ghcr ${jobName} must match the exact reviewed job map, permissions, and ordered steps`,
       );
     }
   }
@@ -1943,21 +2168,31 @@ if (dockerJob) {
   if (
     !dockerJob.includes(
       "manifest-digest: ${{ steps.publish-image.outputs.manifest-digest }}",
+    ) ||
+    !dockerJob.includes(
+      "config-digest: ${{ steps.publish-image.outputs.config-digest }}",
     )
   ) {
-    failures.push("docker-ghcr must expose the verified GHCR manifest digest");
+    failures.push("docker-ghcr must expose the verified GHCR manifest and config digests");
   }
 
   for (const forbidden of [
     "uses: actions/checkout@",
     "uses: pnpm/action-setup@",
+    "uses: docker/login-action@",
+    "docker login",
     "docker run",
     "docker save",
+    "docker push",
+    "docker buildx",
+    "docker tag",
     "scripts/verify-server-image.sh",
     "pnpm ",
     "npm ",
     "GITHUB_WORKSPACE",
     "contents:",
+    "If-Match",
+    "If-None-Match",
   ]) {
     if (dockerJob.includes(forbidden)) {
       failures.push(`docker-ghcr publisher must not contain ${forbidden}`);
@@ -1976,252 +2211,731 @@ if (dockerJob) {
     failures.push("docker-ghcr must download the exact raw image artifact ID");
   }
 
+  const validatorSource = decodedEmbeddedSource(
+    dockerJob,
+    "PATCHPAGE_VALIDATE_DOCKER_SAVE_ARTIFACT",
+  );
+  const ociSource = decodedEmbeddedSource(dockerJob, "PATCHPAGE_GHCR_OCI_RELEASE");
+  const validatorSha = sha256Hex(effectiveDockerSaveValidator);
+  const ociSha = sha256Hex(effectiveGhcrOciReleaseTool);
+  if (!validatorSource || !validatorSource.equals(effectiveDockerSaveValidator)) {
+    failures.push(
+      "docker-ghcr must embed the tested docker-save validator source byte-for-byte",
+    );
+  }
+  if (!ociSource || !ociSource.equals(effectiveGhcrOciReleaseTool)) {
+    failures.push("docker-ghcr must embed the tested OCI release tool source byte-for-byte");
+  }
+  if (
+    !dockerJob.includes(`validator_sha256="${validatorSha}"`) ||
+    !dockerJob.includes(`oci_tool_sha256="${ociSha}"`) ||
+    !dockerJob.includes("Embedded docker-save validator source hash mismatch") ||
+    !dockerJob.includes("Embedded OCI release tool source hash mismatch")
+  ) {
+    failures.push("docker-ghcr must hash-check both embedded release tools before use");
+  }
+
   const downloadImage = dockerJob.indexOf(
     "artifact-ids: ${{ needs.verify-server-image.outputs.image-artifact-id }}",
   );
+  const installTools = dockerJob.indexOf("Install reviewed checkout-free release tools");
   const validateArtifact = dockerJob.indexOf(
-    "Validate and load the verified server image artifact before login",
+    "Validate and load the verified server image artifact before registry auth",
   );
-  const tarCountCheck = dockerJob.indexOf('Expected exactly one downloaded server image tar');
-  const basenameCheck = dockerJob.indexOf('Downloaded server image tar name does not match');
-  const shaCheck = dockerJob.indexOf('Downloaded server image tar digest does not match');
+  const validatorCall = dockerJob.indexOf('node "$VALIDATE_DOCKER_SAVE_ARTIFACT"');
   const loadImage = dockerJob.indexOf('docker load --input "$tar_path"');
-  const localTagCheck = dockerJob.indexOf('does not contain the expected local release tag');
+  const localTagCheck = dockerJob.indexOf("does not contain the expected local release tag");
   const imageIdCheck = dockerJob.indexOf('"$loaded_image_id" != "$EXPECTED_IMAGE_ID"');
-  const configIdCheck = dockerJob.indexOf('"$EXPECTED_CONFIG_ID" != "$EXPECTED_IMAGE_ID"');
-  const deleteTar = dockerJob.indexOf('rm -f "$tar_path"');
-  const login = dockerJob.indexOf("uses: docker/login-action@");
   const publishImage = dockerJob.indexOf("id: publish-image");
+  const publishRelease = dockerJob.indexOf('node "$GHCR_OCI_RELEASE" publish-release');
+  const reconcileLatest = dockerJob.indexOf('node "$GHCR_OCI_RELEASE" reconcile-latest');
+  const configDigestOutput = dockerJob.indexOf('echo "config-digest=$config_digest" >> "$GITHUB_OUTPUT"');
+  const manifestDigestOutput = dockerJob.indexOf('echo "manifest-digest=$manifest_digest" >> "$GITHUB_OUTPUT"');
   if (
     downloadImage === -1 ||
-    validateArtifact <= downloadImage ||
-    tarCountCheck <= validateArtifact ||
-    basenameCheck <= tarCountCheck ||
-    shaCheck <= basenameCheck ||
-    loadImage <= shaCheck ||
+    installTools <= downloadImage ||
+    validateArtifact <= installTools ||
+    validatorCall <= validateArtifact ||
+    loadImage <= validatorCall ||
     localTagCheck <= loadImage ||
     imageIdCheck <= localTagCheck ||
-    configIdCheck <= validateArtifact ||
-    deleteTar <= imageIdCheck ||
-    login <= deleteTar ||
-    publishImage <= login
+    publishImage <= imageIdCheck ||
+    publishRelease <= publishImage ||
+    reconcileLatest <= publishRelease ||
+    configDigestOutput <= reconcileLatest ||
+    manifestDigestOutput <= configDigestOutput
   ) {
     failures.push(
-      "docker-ghcr must validate filename, SHA-256, local tag, and image/config ID before login",
+      "docker-ghcr must install reviewed tools, validate the raw tar before docker load, then publish and reconcile through OCI state",
     );
   }
 
   if (
-    !/ghcr_image\s*=\s*"ghcr\.io\/allisonmahmood\/patchpage-server"/.test(dockerJob) ||
-    !dockerJob.includes('semver_target="${ghcr_image}:${EXPECTED_VERSION}"') ||
-    !dockerJob.includes('revision_target="${ghcr_image}:${EXPECTED_REVISION}"') ||
-    !dockerJob.includes('latest_target="${ghcr_image}:latest"') ||
-    dockerJob.includes("GITHUB_REF_NAME")
-  ) {
-    failures.push("docker-ghcr must derive semver, full-revision, and latest targets safely");
-  }
-
-  if (
-    !dockerJob.includes("docker buildx imagetools inspect \"$target\"") ||
-    !dockerJob.includes("docker buildx imagetools inspect --raw \"$target\"") ||
-    !dockerJob.includes('if [[ "$remote_config_id" != "$EXPECTED_IMAGE_ID" ]]; then') ||
-    !dockerJob.includes('if ! docker pull "$target"; then') ||
-    !dockerJob.includes('"$pulled_image_id" != "$EXPECTED_IMAGE_ID"') ||
-    !dockerJob.includes("already exists with verified image ID") ||
-    dockerJob.includes("Immutable GHCR tag already exists")
+    !dockerJob.includes('--artifact-dir "$RUNNER_TEMP/server-image"') ||
+    !dockerJob.includes('--expected-filename "$EXPECTED_FILENAME"') ||
+    !dockerJob.includes('--expected-sha256 "$EXPECTED_SHA256"') ||
+    !dockerJob.includes('--expected-repo-tag "$expected_local_tag"') ||
+    !dockerJob.includes('--expected-config-id "$EXPECTED_IMAGE_ID"') ||
+    !dockerJob.includes('expected_local_tag="${ghcr_image}:${EXPECTED_VERSION}"') ||
+    !dockerJob.includes('echo "image-tar=$tar_path" >> "$GITHUB_OUTPUT"')
   ) {
     failures.push(
-      "docker-ghcr must accept only existing immutable tags with the verified image/config ID",
-    );
-  }
-  const existingImmutableBranch = dockerJob.indexOf(
-    'if inspect_remote_target "$target" remote_digest remote_config_id; then',
-  );
-  const existingImmutableMismatch = dockerJob.indexOf(
-    "Existing immutable GHCR tag ${target} has config",
-    existingImmutableBranch,
-  );
-  const existingImmutablePull = dockerJob.indexOf('if ! docker pull "$target"; then');
-  const existingImmutablePrefix =
-    existingImmutableBranch === -1 || existingImmutableMismatch === -1
-      ? ""
-      : dockerJob.slice(existingImmutableBranch, existingImmutableMismatch);
-  if (
-    existingImmutableBranch === -1 ||
-    existingImmutableMismatch <= existingImmutableBranch ||
-    existingImmutablePull <= existingImmutableMismatch ||
-    !existingImmutablePrefix.includes(
-      'if [[ "$remote_config_id" != "$EXPECTED_IMAGE_ID" ]]; then',
-    )
-  ) {
-    failures.push(
-      "docker-ghcr must reject existing immutable tag mismatches before pulling or accepting them",
+      "docker-ghcr must pass filename, artifact digest, expected RepoTag, and config ID into the tar validator",
     );
   }
 
   if (
-    !dockerJob.includes('immutable_state["$target"]="missing"') ||
-    !dockerJob.includes('push_verified_target "$target"') ||
-    !dockerJob.includes('push_verified_target "$latest_target"') ||
-    !dockerJob.includes('docker tag "$LOCAL_RELEASE_TAG" "$target"') ||
-    !dockerJob.includes('docker push "$target"') ||
-    !dockerJob.includes('remote digest ${remote_digest} drifted from pushed digest') ||
-    !dockerJob.includes('remote config ${remote_config_id} does not match')
+    !dockerJob.includes("GHCR_IMAGE_TAR: ${{ steps.load-image.outputs.image-tar }}") ||
+    !dockerJob.includes("GITHUB_TOKEN: ${{ github.token }}") ||
+    !dockerJob.includes("--registry-url https://ghcr.io") ||
+    !dockerJob.includes('--name "$ghcr_name"') ||
+    !dockerJob.includes('--version "$EXPECTED_VERSION"') ||
+    !dockerJob.includes('--revision "$EXPECTED_REVISION"') ||
+    !dockerJob.includes('--image-tar "$GHCR_IMAGE_TAR"') ||
+    !dockerJob.includes('--expected-repo-tag "${ghcr_image}:${EXPECTED_VERSION}"') ||
+    !dockerJob.includes('--expected-config-id "$EXPECTED_IMAGE_ID"') ||
+    !dockerJob.includes("--allow-first-package true") ||
+    !dockerJob.includes("const state = JSON.parse(process.argv[1])")
   ) {
     failures.push(
-      "docker-ghcr must push missing immutable tags and reconcile latest from the verified image",
+      "docker-ghcr must publish the validated tar through the reviewed OCI release tool with exact release identity",
     );
   }
 
   if (
-    !dockerJob.includes('verified_manifest_digest=""') ||
-    !dockerJob.includes('"$digest" != "$verified_manifest_digest"') ||
-    !dockerJob.includes("does not match previously verified GHCR digest") ||
-    !dockerJob.includes('echo "manifest-digest=$verified_manifest_digest" >> "$GITHUB_OUTPUT"')
+    !effectiveGhcrOciReleaseTool.includes("Docker-Content-Digest") ||
+    !effectiveGhcrOciReleaseTool.includes("if (responseMediaType !== OCI_MANIFEST_MEDIA_TYPE)") ||
+    !effectiveGhcrOciReleaseTool.includes("if (manifest?.mediaType !== OCI_MANIFEST_MEDIA_TYPE)") ||
+    !effectiveGhcrOciReleaseTool.includes("MANIFEST_UNKNOWN") ||
+    !effectiveGhcrOciReleaseTool.includes("NAME_UNKNOWN") ||
+    !effectiveGhcrOciReleaseTool.includes("/tags/list?n=100") ||
+    !effectiveGhcrOciReleaseTool.includes("repository:${this.name}:${this.scopeActions}") ||
+    !effectiveGhcrOciReleaseTool.includes("FIRST_PACKAGE_REPOSITORY") ||
+    !effectiveGhcrOciReleaseTool.includes("return error.code === expectedCode && detailMatchesTarget(error.detail, target);") ||
+    !effectiveGhcrOciReleaseTool.includes("registry bearer realm changed origin") ||
+    !effectiveGhcrOciReleaseTool.includes("blob upload Location changed registry origin") ||
+    !effectiveGhcrOciReleaseTool.includes("response.status !== 201") ||
+    !effectiveGhcrOciReleaseTool.includes("configDigestHeader") ||
+    !effectiveGhcrOciReleaseTool.includes("selectHighestCompleteRelease") ||
+    !effectiveGhcrOciReleaseTool.includes("leftMatch.slice(1).map(BigInt)") ||
+    !effectiveGhcrOciReleaseTool.includes('const MINIMUM_SUPPORTED_IMAGE_VERSION = "0.1.1"') ||
+    !effectiveGhcrOciReleaseTool.includes("isStableSemver(tag) && isSupportedImageRelease(tag)") ||
+    !effectiveGhcrOciReleaseTool.includes("const MAX_CONFIG_BYTES = 1024 * 1024") ||
+    !effectiveGhcrOciReleaseTool.includes("if (configSize > MAX_CONFIG_BYTES)") ||
+    !effectiveGhcrOciReleaseTool.includes("readCappedResponseBody") ||
+    !effectiveGhcrOciReleaseTool.includes("response.body?.getReader()") ||
+    !effectiveGhcrOciReleaseTool.includes("expectedBytes: configSize") ||
+    effectiveGhcrOciReleaseTool.includes("arrayBuffer()") ||
+    !effectiveGhcrOciReleaseTool.includes("authenticateLatestCandidate") ||
+    !effectiveGhcrOciReleaseTool.includes("post-write latest and re-enumerated highest complete release") ||
+    !effectiveGhcrOciReleaseTool.includes("post-write release pair and canonical image") ||
+    !effectiveGhcrOciReleaseTool.includes("publishRelease") ||
+    !effectiveGhcrOciReleaseTool.includes("putManifest") ||
+    effectiveGhcrOciReleaseTool.includes("If-Match") ||
+    effectiveGhcrOciReleaseTool.includes("If-None-Match")
   ) {
     failures.push(
-      "docker-ghcr must fail closed on remote digest drift and output one verified digest",
+      "ghcr-oci-release.mjs must implement exact digest-bound OCI reads, paginated highest-complete selection, latest authentication, and unconditional manifest PUTs without CAS claims",
     );
   }
 
-  const immutableDigestEstablished = dockerJob.indexOf(
-    "Immutable GHCR tags did not establish the current release manifest digest",
-  );
-  const latestInspect = dockerJob.indexOf(
-    'if inspect_remote_target "$latest_target" latest_remote_digest latest_remote_config_id; then',
-  );
-  const latestPull = dockerJob.indexOf('if ! docker pull "$latest_target"; then');
-  const latestImageId = dockerJob.indexOf(
-    'latest_pulled_image_id="$(docker image inspect --format',
-  );
-  const latestImageIdGuard = dockerJob.indexOf(
-    'if [[ "$latest_pulled_image_id" != "$latest_remote_config_id" ]]; then',
-  );
-  const latestVersionRead = dockerJob.indexOf(
-    'latest_version="$(docker image inspect --format',
-  );
-  const latestVersionGuard = dockerJob.indexOf(
-    'if [[ ! "$latest_version" =~ ^(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)$ ]]; then',
-  );
-  const latestComparison = dockerJob.indexOf('if ! latest_comparison="$(');
-  const latestCaseStart = dockerJob.indexOf('case "$latest_comparison" in');
-  const manifestDigestOutput = dockerJob.indexOf(
-    'echo "manifest-digest=$verified_manifest_digest" >> "$GITHUB_OUTPUT"',
-  );
-
   if (
-    immutableDigestEstablished === -1 ||
-    latestInspect <= immutableDigestEstablished ||
-    latestPull <= latestInspect ||
-    latestImageId <= latestPull ||
-    latestImageIdGuard <= latestImageId ||
-    latestVersionRead <= latestImageIdGuard ||
-    latestVersionGuard <= latestVersionRead ||
-    latestComparison <= latestVersionGuard ||
-    latestCaseStart <= latestComparison ||
-    manifestDigestOutput <= latestCaseStart
-  ) {
-    failures.push(
-      "docker-ghcr must establish the immutable release digest before inspecting and gating latest, then output the immutable digest afterward",
-    );
-  }
-
-  const latestGate =
-    latestInspect === -1 || manifestDigestOutput === -1
-      ? ""
-      : dockerJob.slice(latestInspect, manifestDigestOutput);
-  const latestCase = latestGate.match(
-    /case "\$latest_comparison" in([\s\S]*?)\n\s+esac/,
-  )?.[1];
-  const latestOlder = latestCase?.match(/\n\s+older\)([\s\S]*?)\n\s+;;/)?.[1] ?? "";
-  const latestEqual = latestCase?.match(/\n\s+equal\)([\s\S]*?)\n\s+;;/)?.[1] ?? "";
-  const latestNewer = latestCase?.match(/\n\s+newer\)([\s\S]*?)\n\s+;;/)?.[1] ?? "";
-  const latestUnknown = latestCase?.match(/\n\s+\*\)([\s\S]*?)\n\s+;;/)?.[1] ?? "";
-  const latestAbsent = latestGate.match(
-    /\n\s+else\n\s+echo "Latest GHCR tag is absent; publishing current release \$\{EXPECTED_VERSION\}"\n\s+push_verified_target "\$latest_target"\n\s+fi\s*$/,
-  )?.[0] ?? "";
-
-  if (
-    !latestGate.includes("raw manifest config") ||
-    !latestGate.includes("org.opencontainers.image.version") ||
-    !latestGate.includes("Existing latest GHCR tag version metadata is invalid") ||
-    !latestGate.includes('python3 - "$latest_version" "$EXPECTED_VERSION"') ||
-    !latestGate.includes("existing_parts = [int(part) for part in existing.split(\".\")]") ||
-    !latestGate.includes("expected_parts = [int(part) for part in expected.split(\".\")]") ||
-    !latestGate.includes("Could not compare existing latest version") ||
-    !latestGate.includes("Latest GHCR tag is absent; publishing current release")
-  ) {
-    failures.push(
-      "docker-ghcr must fail closed while reading latest config, version label, and numeric semver comparison state",
-    );
-  }
-
-  if (!latestAbsent) {
-    failures.push("absent latest must be published from the verified current release image");
-  }
-
-  if (
-    !latestOlder.includes('push_verified_target "$latest_target"') ||
-    !latestOlder.includes("older than current release")
-  ) {
-    failures.push("older latest must be updated from the verified current release image");
-  }
-
-  if (
-    !latestEqual.includes('if [[ "$latest_remote_config_id" != "$EXPECTED_IMAGE_ID" ]]; then') ||
-    !latestEqual.includes(
-      'if [[ "$latest_remote_digest" != "$verified_manifest_digest" ]]; then',
+    !effectiveDockerSaveValidator.includes("validateDockerSaveTar") ||
+    !effectiveDockerSaveValidator.includes("if (descriptor?.mediaType !== OCI_MANIFEST_MEDIA_TYPE)") ||
+    !effectiveDockerSaveValidator.includes("if (ociManifest?.mediaType !== OCI_MANIFEST_MEDIA_TYPE)") ||
+    !effectiveDockerSaveValidator.includes("createGunzip") ||
+    !effectiveDockerSaveValidator.includes("createZstdDecompress") ||
+    !effectiveDockerSaveValidator.includes("MAX_UNCOMPRESSED_LAYER_BYTES") ||
+    !effectiveDockerSaveValidator.includes("const MAX_LAYER_EXPANSION_RATIO = 200") ||
+    !effectiveDockerSaveValidator.includes("await uncompressedLayerDigest") ||
+    !effectiveDockerSaveValidator.includes("expected top uncompressed diff ID") ||
+    !effectiveDockerSaveValidator.includes("manifest.json must contain exactly one image") ||
+    !effectiveDockerSaveValidator.includes("tar entry is a link") ||
+    !effectiveDockerSaveValidator.includes("legacy config") ||
+    !effectiveDockerSaveValidator.includes("rootfs.diff_ids") ||
+    !effectiveDockerSaveValidator.includes("nodes.length !== diffIds.length") ||
+    !effectiveDockerSaveValidator.includes("if (roots.length !== 1)") ||
+    !effectiveDockerSaveValidator.includes("if (children.has(node.parent))") ||
+    !effectiveDockerSaveValidator.includes("graph contains disconnected nodes or a cycle") ||
+    !effectiveDockerSaveValidator.includes("if (!allowedKeys.has(key))") ||
+    !effectiveDockerSaveValidator.includes("has an invalid container_config") ||
+    !effectiveDockerSaveValidator.includes(
+      'for (const key of ["config", "architecture", "variant"])',
     ) ||
-    latestEqual.includes('push_verified_target "$latest_target"')
+    !effectiveDockerSaveValidator.includes(
+      "if (!isLeaf && hasOwn(node.legacy, key))",
+    ) ||
+    !effectiveDockerSaveValidator.includes(
+      `    const stableRuntimeFields = [
+      "User",
+      "Env",
+      "Entrypoint",
+      "Cmd",
+      "WorkingDir",
+      "Labels",
+      "ExposedPorts",
+      "Volumes",
+      "Healthcheck",
+      "StopSignal",
+      "Shell",
+      "OnBuild",
+    ];`,
+    ) ||
+    !effectiveDockerSaveValidator.includes(
+      "!isDeepStrictEqual(leafRuntimeConfig[key], ociRuntimeConfig[key])",
+    ) ||
+    !effectiveDockerSaveValidator.includes("if (node.legacy.os !== config.os)") ||
+    !effectiveDockerSaveValidator.includes(
+      "if (hasOwn(leaf.legacy, key) && leaf.legacy[key] !== config[key])",
+    ) ||
+    !effectiveDockerSaveValidator.includes(
+      "legacy config graph must contain exactly one parentless root",
+    ) ||
+    !effectiveDockerSaveValidator.includes(
+      "if (repositoryTags[tag] !== expectedRepositoryLayer)",
+    ) ||
+    !effectiveDockerSaveValidator.includes("repositories must contain exactly") ||
+    !effectiveDockerSaveValidator.includes("unreferenced or unexpected file")
   ) {
     failures.push(
-      "equal latest must already match the current release config and immutable digest without mutation",
+      "validate-docker-save-artifact.mjs must retain the structural docker-save graph validator",
     );
-  }
-
-  const newerTarget = latestNewer.indexOf(
-    'newer_target="${ghcr_image}:${latest_version}"',
-  );
-  const newerInspect = latestNewer.indexOf(
-    'if ! inspect_remote_target "$newer_target" newer_remote_digest newer_remote_config_id; then',
-  );
-  const newerPull = latestNewer.indexOf('if ! docker pull "$newer_target"; then');
-  const newerPulledImageId = latestNewer.indexOf(
-    'newer_pulled_image_id="$(docker image inspect --format',
-  );
-  const newerPulledImageIdGuard = latestNewer.indexOf(
-    'if [[ "$newer_pulled_image_id" != "$newer_remote_config_id" ]]; then',
-  );
-  const newerDigestGuard = latestNewer.indexOf(
-    'if [[ "$newer_remote_digest" != "$latest_remote_digest" ]]; then',
-  );
-  const newerConfigGuard = latestNewer.indexOf(
-    'if [[ "$newer_remote_config_id" != "$latest_remote_config_id" ]]; then',
-  );
-  const newerSkip = latestNewer.indexOf("leaving latest untouched");
-  if (
-    newerTarget === -1 ||
-    newerInspect <= newerTarget ||
-    newerPull <= newerInspect ||
-    newerPulledImageId <= newerPull ||
-    newerPulledImageIdGuard <= newerPulledImageId ||
-    newerDigestGuard <= newerPulledImageIdGuard ||
-    newerConfigGuard <= newerDigestGuard ||
-    newerSkip <= newerConfigGuard ||
-    !latestNewer.includes("newer than current release") ||
-    latestNewer.includes('push_verified_target "$latest_target"') ||
-    latestNewer.includes("$EXPECTED_IMAGE_ID") ||
-    latestNewer.includes("$verified_manifest_digest")
-  ) {
-    failures.push(
-      "newer latest must match its immutable semver tag by digest and pulled config before being left untouched",
-    );
-  }
-
-  if (!latestUnknown.includes("exit 1")) {
-    failures.push("unknown latest semver comparison results must fail closed");
   }
 }
+
+const reconcileInspectJob = jobFrom(reconcileWorkflow, "inspect", "reconcile-ghcr.yml");
+const reconcileRebuildJob = jobFrom(reconcileWorkflow, "rebuild", "reconcile-ghcr.yml");
+const reconcilePublishJob = jobFrom(
+  reconcileWorkflow,
+  "publish-ghcr",
+  "reconcile-ghcr.yml",
+);
+const reconcileLatestJob = jobFrom(
+  reconcileWorkflow,
+  "reconcile-latest",
+  "reconcile-ghcr.yml",
+);
+const reconcileBindJob = jobFrom(
+  reconcileWorkflow,
+  "bind-publish-results",
+  "reconcile-ghcr.yml",
+);
+const reconcileAnonymousJob = jobFrom(
+  reconcileWorkflow,
+  "ghcr-anonymous-acceptance",
+  "reconcile-ghcr.yml",
+);
+
+
+
+if (
+  !/^on:\n  workflow_dispatch:[\s\S]*\n  schedule:\n    - cron: /m.test(
+    reconcileWorkflow,
+  ) ||
+  !/^concurrency:\n  group: release-ghcr-patchpage-server\n  queue: max\n  cancel-in-progress: false$/m.test(
+    reconcileWorkflow,
+  )
+) {
+  failures.push(
+    "reconcile-ghcr.yml must be scheduled/manual and reuse the package-wide max queue, capped by GitHub at 100 pending runs",
+  );
+}
+
+if (reconcileInspectJob) {
+  if (
+    !sameEntries(
+      jobPermissions(reconcileInspectJob),
+      new Map([
+        ["contents", "read"],
+        ["packages", "read"],
+      ]),
+    ) ||
+    !reconcileInspectJob.includes("gh api --paginate") ||
+    !reconcileInspectJob.includes("git fetch --force --tags --prune --prune-tags") ||
+    !reconcileInspectJob.includes("inspect-release") ||
+    !reconcileInspectJob.includes("batch-size must be an integer from 1 to 25") ||
+    !reconcileInspectJob.includes("target must be an exact stable vX.Y.Z tag") ||
+    !reconcileInspectJob.includes("stable GitHub tag") ||
+    !reconcileInspectJob.includes("isSupportedImageRelease") ||
+    !reconcileInspectJob.includes("MINIMUM_SUPPORTED_IMAGE_VERSION") ||
+    !reconcileInspectJob.includes(".filter((tag) => isSupportedImageRelease(tag.slice(1)))") ||
+    !reconcileInspectJob.includes("predates first supported image release") ||
+    !reconcileInspectJob.includes("const rows = tags.map((tag) => {") ||
+    !reconcileInspectJob.includes(
+      'if [[ -z "$INPUT_TARGET" || "$tag" == "$INPUT_TARGET" ]]',
+    ) ||
+    reconcileInspectJob.includes("const selected =") ||
+    reconcileInspectJob.includes("tags.slice(") ||
+    reconcileInspectJob.split('split(".").map(BigInt)').length - 1 !== 2 ||
+    !reconcileInspectJob.includes("snapshot: ${{ steps.plan.outputs.snapshot }}") ||
+    !reconcileInspectJob.includes(
+      "complete-count: ${{ steps.plan.outputs.complete-count }}",
+    ) ||
+    !reconcileInspectJob.includes("reconcile-snapshot.json") ||
+    !reconcileInspectJob.includes("complete inspect state digests are invalid") ||
+    !reconcileInspectJob.includes('if (( needed_count < INPUT_BATCH_SIZE ))') ||
+    !reconcileInspectJob.includes("needed_count=$((needed_count + 1))") ||
+    reconcileInspectJob.includes("needed_count >= INPUT_BATCH_SIZE") ||
+    reconcileInspectJob.includes("break") ||
+    reconcileInspectJob.includes(").slice(0, batchSize)") ||
+    !reconcileInspectJob.includes("row.manifestDigest = state.manifestDigest") ||
+    !reconcileInspectJob.includes("row.configDigest = state.configDigest") ||
+    !reconcileInspectJob.includes("complete_count=") ||
+    !reconcileInspectJob.includes("missing") ||
+    !reconcileInspectJob.includes("incomplete")
+  ) {
+    failures.push(
+      "reconcile inspect must paginate stable GitHub tags, verify fetch completeness, inspect GHCR, and choose a bounded missing/incomplete batch",
+    );
+  }
+}
+
+if (reconcileRebuildJob) {
+  const buildImage = reconcileRebuildJob.indexOf("docker build");
+  const verifyImage = reconcileRebuildJob.indexOf(
+    'scripts/verify-server-image.sh "$image" "$VERSION" "$REVISION"',
+  );
+  const saveImage = reconcileRebuildJob.indexOf('docker save "$image" --output "$tar_path"');
+  const validateTar = reconcileRebuildJob.indexOf(
+    'node scripts/validate-docker-save-artifact.mjs',
+  );
+  const uploadImage = reconcileRebuildJob.indexOf("Upload exact replay server image raw tar");
+  if (
+    !sameEntries(jobPermissions(reconcileRebuildJob), new Map([["contents", "read"]])) ||
+    !reconcileRebuildJob.includes("max-parallel: 1") ||
+    reconcileRebuildJob.includes("ref: ${{ matrix.tag }}") ||
+    !reconcileRebuildJob.includes("fetch-depth: 0") ||
+    !reconcileRebuildJob.includes("git fetch --force --tags --prune --prune-tags") ||
+    !reconcileRebuildJob.includes('git worktree add --detach "$source_dir" "$REVISION"') ||
+    !reconcileRebuildJob.includes('"$actual_revision" == "$REVISION"') ||
+    buildImage === -1 ||
+    verifyImage <= buildImage ||
+    saveImage <= verifyImage ||
+    validateTar <= saveImage ||
+    uploadImage <= validateTar ||
+    !reconcileRebuildJob.includes('--artifact-dir "$artifact_dir"') ||
+    !reconcileRebuildJob.includes("archive: false") ||
+    !reconcileRebuildJob.includes("artifactId") ||
+    !reconcileRebuildJob.includes(
+      'cat > "$RUNNER_TEMP/reconcile-handoff-${{ matrix.version }}.json"',
+    ) ||
+    !reconcileRebuildJob.includes(
+      "path: ${{ runner.temp }}/reconcile-handoff-${{ matrix.version }}.json",
+    ) ||
+    !reconcileRebuildJob.includes("overwrite: true") ||
+    reconcileRebuildJob.split("retention-days: 30").length - 1 !== 2 ||
+    reconcileRebuildJob.includes(
+      "reconcile-handoff-${{ matrix.version }}-${{ github.run_attempt }}.json",
+    ) ||
+    reconcileRebuildJob.includes("          name: reconcile-handoff-") ||
+    reconcileRebuildJob.includes("docker login") ||
+    reconcileRebuildJob.includes("docker push") ||
+    reconcileRebuildJob.includes("npm publish")
+  ) {
+    failures.push(
+      "reconcile rebuild must use current reviewed verifiers on an exact detached historical source worktree before handing off a raw image artifact",
+    );
+  }
+}
+
+if (reconcilePublishJob) {
+  const validatorSource = decodedEmbeddedSource(
+    reconcilePublishJob,
+    "PATCHPAGE_VALIDATE_DOCKER_SAVE_ARTIFACT",
+  );
+  const ociSource = decodedEmbeddedSource(reconcilePublishJob, "PATCHPAGE_GHCR_OCI_RELEASE");
+  if (!validatorSource || !validatorSource.equals(effectiveDockerSaveValidator)) {
+    failures.push(
+      "reconcile publisher must embed the tested docker-save validator source byte-for-byte",
+    );
+  }
+  if (!ociSource || !ociSource.equals(effectiveGhcrOciReleaseTool)) {
+    failures.push("reconcile publisher must embed the tested OCI release tool source byte-for-byte");
+  }
+  if (
+    !sameEntries(
+      jobPermissions(reconcilePublishJob),
+      new Map([
+        ["actions", "read"],
+        ["packages", "write"],
+      ]),
+    ) ||
+    !reconcilePublishJob.includes("max-parallel: 1") ||
+    !reconcilePublishJob.includes("actions/download-artifact@") ||
+    !reconcilePublishJob.includes("Resolve replay handoff artifact ID") ||
+    !reconcilePublishJob.includes("Expected exactly one replay handoff artifact named") ||
+    !reconcilePublishJob.includes(
+      'handoff_name="reconcile-handoff-${{ matrix.version }}.json"',
+    ) ||
+    !reconcilePublishJob.includes(
+      '"reconcile-handoff-${{ matrix.version }}.json"',
+    ) ||
+    reconcilePublishJob.includes(
+      "reconcile-handoff-${{ matrix.version }}-${{ github.run_attempt }}.json",
+    ) ||
+    !reconcilePublishJob.includes("artifact-ids: ${{ steps.handoff-artifact.outputs.artifact-id }}") ||
+    !reconcilePublishJob.includes("handoff directory must contain exactly one entry") ||
+    !reconcilePublishJob.includes("handoff file must be a regular non-link file") ||
+    !reconcilePublishJob.includes("handoff JSON must be canonical") ||
+    !reconcilePublishJob.includes("handoff JSON keys are invalid") ||
+    !reconcilePublishJob.includes("const entries = fs.readdirSync(directory);") ||
+    !reconcilePublishJob.includes("if (entries.length !== 1)") ||
+    !reconcilePublishJob.includes("handoffStat.nlink !== 1") ||
+    !reconcilePublishJob.includes(
+      "JSON.stringify(Object.keys(value)) !== JSON.stringify(keys)",
+    ) ||
+    !reconcilePublishJob.includes('raw !== `${JSON.stringify(value)}\\n`') ||
+    !reconcilePublishJob.includes("imageFilenamePattern") ||
+    !reconcilePublishJob.includes(
+      "handoff image filename is invalid for the release identity",
+    ) ||
+    !reconcilePublishJob.includes("handoff configId does not match imageId") ||
+    !reconcilePublishJob.includes("artifact-ids: ${{ steps.handoff.outputs.image-artifact-id }}") ||
+    !reconcilePublishJob.includes("Validate and load replay image before registry auth") ||
+    !reconcilePublishJob.includes("Publish replay image to GHCR") ||
+    reconcilePublishJob.split("\n").filter((line) => line === "          skip-decompress: true").length < 2 ||
+    reconcilePublishJob.includes("actions/artifacts/${artifact_id}/zip") ||
+    reconcilePublishJob.includes("unzip ") ||
+    !reconcilePublishJob.includes('node "$VALIDATE_DOCKER_SAVE_ARTIFACT"') ||
+    !reconcilePublishJob.includes('docker load --input "$tar_path"') ||
+    !reconcilePublishJob.includes('node "$GHCR_OCI_RELEASE" publish-release') ||
+    !reconcilePublishJob.includes("Upload immutable replay publication result") ||
+    !reconcilePublishJob.includes(
+      'result_path="$RUNNER_TEMP/reconcile-publish-result-${version}-${revision}.json"',
+    ) ||
+    !reconcilePublishJob.includes(
+      "const bound = { version, revision, manifestDigest: value.manifestDigest, configDigest: value.configDigest };",
+    ) ||
+    !reconcilePublishJob.includes("actions/upload-artifact@") ||
+    !reconcilePublishJob.includes("path: ${{ steps.publish-image.outputs.result-path }}") ||
+    !reconcilePublishJob.includes("archive: false") ||
+    !reconcilePublishJob.includes("overwrite: true") ||
+    reconcilePublishJob.includes('node "$GHCR_OCI_RELEASE" reconcile-latest') ||
+    !reconcilePublishJob.includes("--allow-first-package true") ||
+    reconcilePublishJob.includes("uses: actions/checkout@") ||
+    reconcilePublishJob.includes("pnpm ") ||
+    reconcilePublishJob.includes("npm publish") ||
+    reconcilePublishJob.includes("docker build") ||
+    reconcilePublishJob.includes("docker push") ||
+    reconcilePublishJob.includes("docker login")
+  ) {
+    failures.push(
+      "reconcile publisher must be checkout-free packages:write only, validate exact raw artifacts, and publish only GHCR through the reviewed OCI tool",
+    );
+  }
+}
+if (reconcileLatestJob) {
+  const validatorSource = decodedEmbeddedSource(
+    reconcileLatestJob,
+    "PATCHPAGE_RECONCILE_LATEST_VALIDATOR",
+  );
+  const ociSource = decodedEmbeddedSource(
+    reconcileLatestJob,
+    "PATCHPAGE_RECONCILE_LATEST_OCI_RELEASE",
+  );
+  if (!validatorSource || !validatorSource.equals(effectiveDockerSaveValidator)) {
+    failures.push(
+      "reconcile latest must embed the tested docker-save validator dependency byte-for-byte",
+    );
+  }
+  if (!ociSource || !ociSource.equals(effectiveGhcrOciReleaseTool)) {
+    failures.push(
+      "reconcile latest must embed the tested OCI release tool source byte-for-byte",
+    );
+  }
+  if (
+    !sameEntries(jobPermissions(reconcileLatestJob), new Map([["packages", "write"]])) ||
+    !reconcileLatestJob.includes("always()") ||
+    !reconcileLatestJob.includes("needs.inspect.result == 'success'") ||
+    !reconcileLatestJob.includes("needs.publish-ghcr.result == 'success'") ||
+    !reconcileLatestJob.includes("needs.publish-ghcr.result == 'skipped'") ||
+    !reconcileLatestJob.includes("needs.inspect.outputs.count == '0'") ||
+    !reconcileLatestJob.includes("needs.inspect.outputs.complete-count != '0'") ||
+    !reconcileLatestJob.includes("Embedded docker-save validator source hash mismatch") ||
+    !reconcileLatestJob.includes(
+      'chmod 500 "$tools_dir/validate-docker-save-artifact.mjs" "$tools_dir/ghcr-oci-release.mjs"',
+    ) ||
+    !reconcileLatestJob.includes("Embedded OCI release tool source hash mismatch") ||
+    !reconcileLatestJob.includes('node "$GHCR_OCI_RELEASE" reconcile-latest') ||
+    reconcileLatestJob.includes("uses: actions/checkout@") ||
+    reconcileLatestJob.includes("uses: actions/download-artifact@") ||
+    reconcileLatestJob.includes("pnpm ") ||
+    reconcileLatestJob.includes("npm publish") ||
+    reconcileLatestJob.includes("docker ")
+  ) {
+    failures.push(
+      "reconcile latest must run checkout-free after replay or for an already-complete supported release, but skip the pre-support empty schedule",
+    );
+  }
+}
+if (reconcileBindJob) {
+  if (
+    !sameEntries(jobPermissions(reconcileBindJob), new Map([["actions", "read"]])) ||
+    !reconcileBindJob.includes("always()") ||
+    !reconcileBindJob.includes("needs.inspect.result == 'success'") ||
+    !reconcileBindJob.includes("needs.publish-ghcr.result == 'success'") ||
+    !reconcileBindJob.includes("needs.publish-ghcr.result == 'skipped'") ||
+    !reconcileBindJob.includes("needs.inspect.outputs.count == '0'") ||
+    !reconcileBindJob.includes("needs: [inspect, publish-ghcr]") ||
+    !reconcileBindJob.includes("GH_TOKEN: ${{ github.token }}") ||
+    !reconcileBindJob.includes("REPAIR_COUNT: ${{ needs.inspect.outputs.count }}") ||
+    !reconcileBindJob.includes("REPAIR_MATRIX: ${{ needs.inspect.outputs.matrix }}") ||
+    !reconcileBindJob.includes("RELEASE_SNAPSHOT: ${{ needs.inspect.outputs.snapshot }}") ||
+    !reconcileBindJob.includes("gh api --paginate") ||
+    !reconcileBindJob.includes(
+      "/actions/runs/${GITHUB_RUN_ID}/artifacts?per_page=100",
+    ) ||
+    !reconcileBindJob.includes(".created_at") ||
+    !reconcileBindJob.includes('row.status === "complete"') ||
+    !reconcileBindJob.includes('source: "snapshot"') ||
+    !reconcileBindJob.includes('source: "artifact"') ||
+    !reconcileBindJob.includes(
+      '!["missing", "incomplete"].includes(snapshotRow.status)',
+    ) ||
+    !reconcileBindJob.includes(
+      ".filter((artifact) => artifact.name === name && !artifact.expired)",
+    ) ||
+    !reconcileBindJob.includes("right.created - left.created") ||
+    !reconcileBindJob.includes("BigInt(right.id) > BigInt(left.id)") ||
+    !reconcileBindJob.includes("if (matches.length === 0)") ||
+    !reconcileBindJob.includes("artifactId: matches[0].id") ||
+    !reconcileBindJob.includes("manifestDigest: row.manifestDigest") ||
+    !reconcileBindJob.includes("configDigest: row.configDigest") ||
+    !reconcileBindJob.includes("process.stdout.write(JSON.stringify({ include }));") ||
+    reconcileBindJob.includes("resultArtifacts.length") ||
+    reconcileBindJob.includes("matches.length !== 1")
+  ) {
+    failures.push(
+      "reconcile result binder must accept every complete snapshot row, select the newest exact per-row publication artifact after successful repair, and ignore unrelated stale run artifacts",
+    );
+  }
+}
+
+async function verifyReconcileBinderBehavior() {
+  const run =
+    parsedReconcileWorkflow?.jobs?.["bind-publish-results"]?.steps?.find(
+      (step) => step.id === "bind",
+    )?.run;
+  const marker =
+    'node - "$RELEASE_SNAPSHOT" "$REPAIR_MATRIX" "$REPAIR_COUNT" "$artifacts" <<\'NODE\'\n';
+  const scriptStart = typeof run === "string" ? run.indexOf(marker) + marker.length : -1;
+  const scriptEnd = scriptStart >= marker.length ? run.indexOf("\nNODE\n", scriptStart) : -1;
+  if (scriptStart < marker.length || scriptEnd < scriptStart) {
+    return ["reconcile result binder behavioral fixture could not extract its inline program"];
+  }
+
+  const revisionA = "a".repeat(40);
+  const revisionB = "b".repeat(40);
+  const revisionC = "c".repeat(40);
+  const manifestA = `sha256:${"1".repeat(64)}`;
+  const configA = `sha256:${"2".repeat(64)}`;
+  const manifestC = `sha256:${"5".repeat(64)}`;
+  const configC = `sha256:${"6".repeat(64)}`;
+  const completeA = {
+    tag: "v1.0.0",
+    version: "1.0.0",
+    revision: revisionA,
+    status: "complete",
+    manifestDigest: manifestA,
+    configDigest: configA,
+  };
+  const completeC = {
+    tag: "v1.2.0",
+    version: "1.2.0",
+    revision: revisionC,
+    status: "complete",
+    manifestDigest: manifestC,
+    configDigest: configC,
+  };
+  const snapshotBinding = (row) => ({
+    tag: row.tag,
+    version: row.version,
+    revision: row.revision,
+    source: "snapshot",
+    artifactId: "",
+    manifestDigest: row.manifestDigest,
+    configDigest: row.configDigest,
+  });
+  const repairedB = {
+    tag: "v1.1.0",
+    version: "1.1.0",
+    revision: revisionB,
+  };
+  const artifactBindingB = {
+    ...repairedB,
+    source: "artifact",
+    artifactId: "99",
+    manifestDigest: "",
+    configDigest: "",
+  };
+  const artifactNameB = `reconcile-publish-result-1.1.0-${revisionB}.json`;
+  const artifactNameC = `reconcile-publish-result-1.2.0-${revisionC}.json`;
+  const fixtures = [
+    {
+      name: "zero-repair run accepts every complete supported release",
+      snapshot: [completeA, completeC],
+      repairMatrix: { include: [] },
+      artifacts: "",
+      expected: { include: [snapshotBinding(completeA), snapshotBinding(completeC)] },
+    },
+    {
+      name: "next run retains a successful sibling and binds the repaired row",
+      snapshot: [
+        completeA,
+        { ...repairedB, status: "missing" },
+      ],
+      repairMatrix: { include: [repairedB] },
+      artifacts: [
+        `42\t${artifactNameB}\tfalse\t2026-07-14T01:00:00Z`,
+        `99\t${artifactNameB}\tfalse\t2026-07-14T02:00:00Z`,
+        `100\treconcile-publish-result-unrelated.json\tfalse\t2026-07-14T03:00:00Z`,
+        `101\t${artifactNameB}\ttrue\t2026-07-14T04:00:00Z`,
+      ].join("\n"),
+      expected: { include: [snapshotBinding(completeA), artifactBindingB] },
+    },
+    {
+      name: "smaller rerun matrix ignores stale prior-attempt artifacts",
+      snapshot: [
+        completeA,
+        { ...repairedB, status: "incomplete" },
+        {
+          tag: "v1.2.0",
+          version: "1.2.0",
+          revision: revisionC,
+          status: "missing",
+        },
+      ],
+      repairMatrix: { include: [repairedB] },
+      artifacts: [
+        `99\t${artifactNameB}\tfalse\t2026-07-14T02:00:00Z`,
+        `77\t${artifactNameC}\tfalse\t2026-07-13T23:00:00Z`,
+      ].join("\n"),
+      expected: { include: [snapshotBinding(completeA), artifactBindingB] },
+    },
+    {
+      name: "pre-support empty schedule produces no acceptance rows",
+      snapshot: [],
+      repairMatrix: { include: [] },
+      artifacts: "",
+      expected: { include: [] },
+    },
+  ];
+
+  const directory = await mkdtemp(path.join(tmpdir(), "patchpage-reconcile-binder-"));
+  const fixtureFailures = [];
+  try {
+    for (const fixture of fixtures) {
+      const artifactPath = path.join(directory, "artifacts.tsv");
+      await writeFile(artifactPath, fixture.artifacts);
+      const result = spawnSync(
+        process.execPath,
+        [
+          "-",
+          JSON.stringify(fixture.snapshot),
+          JSON.stringify(fixture.repairMatrix),
+          String(fixture.repairMatrix.include.length),
+          artifactPath,
+        ],
+        {
+          cwd: repoRoot,
+          encoding: "utf8",
+          input: run.slice(scriptStart, scriptEnd),
+        },
+      );
+      let actual;
+      try {
+        actual = JSON.parse(result.stdout);
+      } catch {
+        actual = null;
+      }
+      if (result.status !== 0 || JSON.stringify(actual) !== JSON.stringify(fixture.expected)) {
+        fixtureFailures.push(
+          `reconcile result binder behavioral fixture failed: ${fixture.name}; ${result.stderr.trim() || result.stdout.trim() || `exit ${result.status}`}`,
+        );
+      }
+    }
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+  return fixtureFailures;
+}
+
+if (!process.env.PATCHPAGE_RELEASE_WORKFLOW_SKIP_MUTATION_CHECKS) {
+  failures.push(...(await verifyReconcileBinderBehavior()));
+}
+
+if (reconcileAnonymousJob) {
+  const semverPull = reconcileAnonymousJob.indexOf('pull_anonymously "$semver_image"');
+  const revisionPull = reconcileAnonymousJob.indexOf('pull_anonymously "$revision_image"');
+  const digestPull = reconcileAnonymousJob.indexOf('pull_anonymously "$digest_image"');
+  const boot = reconcileAnonymousJob.indexOf("docker run -d");
+  if (
+    !sameEntries(jobPermissions(reconcileAnonymousJob), new Map()) ||
+    !reconcileAnonymousJob.includes("needs.reconcile-latest.result == 'success'") ||
+    !reconcileAnonymousJob.includes("needs.bind-publish-results.result == 'success'") ||
+    !reconcileAnonymousJob.includes(
+      "matrix: ${{ fromJson(needs.bind-publish-results.outputs.matrix) }}",
+    ) ||
+    !reconcileAnonymousJob.includes("Download exact immutable publication result") ||
+    !reconcileAnonymousJob.includes("if: matrix.source == 'artifact'") ||
+    !reconcileAnonymousJob.includes("artifact-ids: ${{ matrix.artifactId }}") ||
+    !reconcileAnonymousJob.includes("skip-decompress: true") ||
+    !reconcileAnonymousJob.includes(
+      "Resolve the exact snapshot or publication result binding",
+    ) ||
+    !reconcileAnonymousJob.includes('if (source === "snapshot")') ||
+    !reconcileAnonymousJob.includes('} else if (source === "artifact")') ||
+    !reconcileAnonymousJob.includes(
+      "snapshot acceptance must not consume a publication artifact",
+    ) ||
+    !reconcileAnonymousJob.includes(
+      "publication result directory must contain exactly the expected file",
+    ) ||
+    !reconcileAnonymousJob.includes(
+      "publication result must be a regular non-link file",
+    ) ||
+    !reconcileAnonymousJob.includes("publication result JSON must be canonical") ||
+    !reconcileAnonymousJob.includes(
+      "publication result identity does not match the matrix",
+    ) ||
+    !reconcileAnonymousJob.includes(
+      "EXPECTED_MANIFEST_DIGEST: ${{ steps.bound-result.outputs.manifest-digest }}",
+    ) ||
+    !reconcileAnonymousJob.includes(
+      "EXPECTED_CONFIG_DIGEST: ${{ steps.bound-result.outputs.config-digest }}",
+    ) ||
+    semverPull === -1 ||
+    revisionPull <= semverPull ||
+    digestPull <= revisionPull ||
+    boot <= digestPull ||
+    reconcileAnonymousJob.split("require_bound_image").length - 1 < 4 ||
+    !reconcileAnonymousJob.includes(
+      'actual_digest" == "$EXPECTED_MANIFEST_DIGEST"',
+    ) ||
+    !reconcileAnonymousJob.includes(
+      'actual_config" == "$EXPECTED_CONFIG_DIGEST"',
+    ) ||
+    !reconcileAnonymousJob.includes("trap cleanup EXIT") ||
+    !reconcileAnonymousJob.includes("DOCKER_CONFIG") ||
+    !reconcileAnonymousJob.includes("/healthz") ||
+    !reconcileAnonymousJob.includes('{"ok":true}') ||
+    reconcileAnonymousJob.includes("inspect-release") ||
+    reconcileAnonymousJob.includes("github.token") ||
+    /^\s+GITHUB_TOKEN:/m.test(reconcileAnonymousJob) ||
+    /^\s+GH_TOKEN:/m.test(reconcileAnonymousJob) ||
+    /^\s+DOCKER_AUTH_CONFIG:/m.test(reconcileAnonymousJob) ||
+    reconcileAnonymousJob.includes("docker login") ||
+    reconcileAnonymousJob.includes("actions/checkout") ||
+    reconcileAnonymousJob.includes("pnpm ") ||
+    reconcileAnonymousJob.includes("npm ")
+  ) {
+    failures.push(
+      "anonymous reconciliation acceptance must consume either the exact complete-release snapshot or the newest exact publisher artifact ID, bind semver/full-SHA/config without credentials, and boot only its digest",
+    );
+  }
+}
+
+
 
 if (ciDockerJob) {
   if (
@@ -2234,6 +2948,10 @@ if (ciDockerJob) {
   }
 
   const build = ciDockerJob.indexOf("docker build");
+  const saveImage = ciDockerJob.indexOf('docker save "$image"');
+  const validateSavedImage = ciDockerJob.indexOf(
+    "node scripts/validate-docker-save-artifact.mjs",
+  );
   const verifyImage = ciDockerJob.search(
     /scripts\/verify-server-image\.sh\s+"\$image"\s+"\$VERSION"\s+"\$REVISION"/,
   );
@@ -2242,6 +2960,11 @@ if (ciDockerJob) {
     (ciDockerJob.match(/\bdocker build\b/g) ?? []).length !== 1 ||
     build === -1 ||
     verifyImage <= build ||
+    saveImage <= build ||
+    validateSavedImage <= saveImage ||
+    verifyImage <= validateSavedImage ||
+    !ciDockerJob.includes('--expected-repo-tag "$image"') ||
+    !ciDockerJob.includes('--expected-config-id "$image_id"') ||
     !buildCommand.includes('--build-arg "VERSION=$VERSION"') ||
     !buildCommand.includes('--build-arg "REVISION=$REVISION"') ||
     !/-f\s+apps\/server\/Dockerfile/.test(buildCommand) ||
@@ -2264,6 +2987,19 @@ if (ciDockerJob) {
 
 if (packageJson.scripts?.["test:server-image"] !== "bash scripts/verify-server-image.sh") {
   failures.push("package.json must expose the focused server image contract verifier");
+}
+if (packageJson.scripts?.["test:ghcr-oci"] !== "node scripts/ghcr-oci-release.test.mjs") {
+  failures.push("package.json must expose the focused GHCR OCI mock suite");
+}
+if (packageJson.scripts?.["test:docker-save"] !== "node scripts/validate-docker-save-artifact.test.mjs") {
+  failures.push("package.json must expose the focused docker-save validator fixture suite");
+}
+if (
+  !ciWorkflow.includes("pnpm test:release-workflow") ||
+  !ciWorkflow.includes("pnpm test:ghcr-oci") ||
+  !ciWorkflow.includes("pnpm test:docker-save")
+) {
+  failures.push("CI lint job must always run release verifier, GHCR OCI mocks, and docker-save fixtures");
 }
 
 if (
@@ -2291,8 +3027,12 @@ for (const required of [
 if (!/non[- ]root/i.test(selfHosting)) {
   failures.push("self-hosting docs must document the unprivileged runtime user");
 }
-if (!/semver[^\n]*immutable/i.test(selfHosting) || !/full\s+commit\s+SHA/i.test(selfHosting)) {
-  failures.push("self-hosting docs must document both immutable image tag forms");
+if (
+  !/semver[^\n]*intended not to move/i.test(selfHosting) ||
+  !/full\s+commit\s+SHA[^\n]*intended not to move/i.test(selfHosting) ||
+  !/immutable deployment pin[^\n]*manifest digest/i.test(selfHosting)
+) {
+  failures.push("self-hosting docs must distinguish intended fixed tags from immutable digest pins");
 }
 if (!/stable semver[^\n]*prerelease/i.test(selfHosting)) {
   failures.push(
@@ -2303,7 +3043,7 @@ if (!/(?:moving[^\n]*`latest`|`latest`[^\n]*(?:follows|moves))/i.test(selfHostin
   failures.push("self-hosting docs must distinguish the moving latest tag");
 }
 if (
-  !/newer `latest`[^\n]*manifest digest[^\n]*config[^\n]*immutable tag/i.test(selfHosting)
+  !/newer `latest`[^\n]*manifest digest[^\n]*config[^\n]*paired release tags/i.test(selfHosting)
 ) {
   failures.push(
     "self-hosting docs must explain how a newer latest tag is authenticated before it is retained",
@@ -2357,7 +3097,8 @@ if (anonymousImageJob) {
     }
   }
 
-  const pull = anonymousImageJob.indexOf('docker pull "$image"');
+  const tagPull = anonymousImageJob.indexOf('pull_anonymously "$tag_image"');
+  const digestPull = anonymousImageJob.indexOf('pull_anonymously "$digest_image"');
   const boot = anonymousImageJob.indexOf('docker run -d');
   const portInspect = anonymousImageJob.indexOf("docker container inspect");
   const healthRequest = anonymousImageJob.search(
@@ -2367,19 +3108,26 @@ if (anonymousImageJob) {
     /\[\[\s*"\$body"\s*==\s*'\{"ok":true\}'\s*\]\]/,
   );
   if (
-    !/image\s*=\s*"ghcr\.io\/allisonmahmood\/patchpage-server:\$\{\{\s*needs\.guard\.outputs\.version\s*\}\}"/.test(
-      anonymousImageJob,
-    ) ||
     !anonymousImageJob.includes(
       "EXPECTED_DIGEST: ${{ needs.docker-ghcr.outputs.manifest-digest }}",
     ) ||
-    pull === -1 ||
-    boot <= pull ||
+    !anonymousImageJob.includes(
+      "EXPECTED_CONFIG_ID: ${{ needs.docker-ghcr.outputs.config-digest }}",
+    ) ||
+    !anonymousImageJob.includes("VERSION: ${{ needs.guard.outputs.version }}") ||
+    !anonymousImageJob.includes('tag_image="${ghcr_image}:${VERSION}"') ||
+    !anonymousImageJob.includes('digest_image="${ghcr_image}@${EXPECTED_DIGEST}"') ||
+    tagPull === -1 ||
+    digestPull <= tagPull ||
+    boot <= digestPull ||
     portInspect <= boot ||
-    !anonymousImageJob.slice(boot).includes('"$image"')
+    !anonymousImageJob.slice(boot).includes('"$digest_image"') ||
+    anonymousImageJob.split("require_publisher_binding").length - 1 < 3 ||
+    !anonymousImageJob.includes('actual_digest" == "$EXPECTED_DIGEST"') ||
+    !anonymousImageJob.includes('actual_config" == "$EXPECTED_CONFIG_ID"')
   ) {
     failures.push(
-      "ghcr-anonymous-smoke must pull and boot the published immutable version tag",
+      "ghcr-anonymous-smoke must bind the semver tag and exact digest to the publisher manifest and verified config before boot",
     );
   }
 
@@ -2392,28 +3140,11 @@ if (anonymousImageJob) {
   if (
     !/docker_config\s*=\s*"\$\(mktemp -d\)"/.test(anonymousImageJob) ||
     !/export\s+DOCKER_CONFIG\s*=\s*"\$docker_config"/.test(anonymousImageJob) ||
+    !anonymousImageJob.includes('printf \'{"auths":{}}\\n\'') ||
     !anonymousImageJob.includes("-p 127.0.0.1::3000") ||
     !anonymousImageJob.includes("Docker did not publish the server port")
   ) {
     failures.push("ghcr-anonymous-smoke must isolate anonymous Docker credentials and host port");
-  }
-
-  const repoDigest = anonymousImageJob.indexOf("mapfile -t repo_digests");
-  const digestCompare = anonymousImageJob.indexOf('"$actual_digest" != "$EXPECTED_DIGEST"');
-  if (
-    repoDigest <= pull ||
-    digestCompare <= repoDigest ||
-    boot <= digestCompare ||
-    !anonymousImageJob.includes(
-      "does not match the publisher-verified GHCR digest",
-    ) ||
-    !anonymousImageJob.includes(
-      "Verify public pull, publisher digest, and health without credentials",
-    )
-  ) {
-    failures.push(
-      "ghcr-anonymous-smoke must compare the anonymous repo digest to the docker-ghcr output before boot",
-    );
   }
 }
 
@@ -2454,14 +3185,14 @@ async function runMutationChecks() {
         env: {
           PATCHPAGE_RELEASE_WORKFLOW_SOURCE: replaceOnce(
             workflow,
-            "      - name: Publish or accept immutable GHCR tags, then reconcile latest",
+            "      - name: Publish or accept the release tag pair with exact OCI state, then reconcile latest",
             [
               "      - name: Rebuild inside publisher",
               "        shell: bash",
               "        run: |",
               "          docker build .",
               '          scripts/verify-server-image.sh "$image" "$VERSION" "$REVISION"',
-              "      - name: Publish or accept immutable GHCR tags, then reconcile latest",
+              "      - name: Publish or accept the release tag pair with exact OCI state, then reconcile latest",
             ].join("\n"),
           ),
         },
@@ -2498,65 +3229,85 @@ async function runMutationChecks() {
         expected: /docker-ghcr must download the exact raw image artifact ID/,
       },
       {
-        name: "reject GHCR login before artifact validation",
+        name: "reject validator moved after docker load",
         env: {
           PATCHPAGE_RELEASE_WORKFLOW_SOURCE: replaceOnce(
             workflow,
-            "      - name: Validate and load the verified server image artifact before login",
+            '          docker load --input "$tar_path"',
+            [
+              '          docker load --input "$tar_path"',
+              '          node "$VALIDATE_DOCKER_SAVE_ARTIFACT" --artifact-dir "$RUNNER_TEMP/server-image" --expected-filename "$EXPECTED_FILENAME" --expected-sha256 "$EXPECTED_SHA256" --expected-repo-tag "$expected_local_tag" --expected-config-id "$EXPECTED_IMAGE_ID"',
+            ].join("\n"),
+          ).replace(
+            /\n          node "\$VALIDATE_DOCKER_SAVE_ARTIFACT" \\\n            --artifact-dir "\$RUNNER_TEMP\/server-image" \\\n            --expected-filename "\$EXPECTED_FILENAME" \\\n            --expected-sha256 "\$EXPECTED_SHA256" \\\n            --expected-repo-tag "\$expected_local_tag" \\\n            --expected-config-id "\$EXPECTED_IMAGE_ID"\n/,
+            "\n",
+          ),
+        },
+        expected: /validate the raw tar before docker load/,
+      },
+      {
+        name: "reject missing embedded validator hash check",
+        env: {
+          PATCHPAGE_RELEASE_WORKFLOW_SOURCE: replaceOnce(
+            workflow,
+            "Embedded docker-save validator source hash mismatch",
+            "validator hash check removed",
+          ),
+        },
+        expected: /docker-ghcr must hash-check both embedded release tools before use/,
+      },
+      {
+        name: "reject missing OCI publish command",
+        env: {
+          PATCHPAGE_RELEASE_WORKFLOW_SOURCE: replaceOnce(
+            workflow,
+            'node "$GHCR_OCI_RELEASE" publish-release',
+            'node "$GHCR_OCI_RELEASE" select-latest',
+          ),
+        },
+        expected: /publish and reconcile through OCI state|publish the validated tar through the reviewed OCI release tool/,
+      },
+      {
+        name: "reject missing latest reconciliation",
+        env: {
+          PATCHPAGE_RELEASE_WORKFLOW_SOURCE: replaceOnce(
+            workflow,
+            'node "$GHCR_OCI_RELEASE" reconcile-latest',
+            'node "$GHCR_OCI_RELEASE" select-latest',
+          ),
+        },
+        expected: /publish and reconcile through OCI state/,
+      },
+      {
+        name: "reject adding Docker login to publisher",
+        env: {
+          PATCHPAGE_RELEASE_WORKFLOW_SOURCE: replaceOnce(
+            workflow,
+            "      - name: Validate and load the verified server image artifact before registry auth",
             [
               "      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0",
               "        with:",
               "          registry: ghcr.io",
               "          username: ${{ github.repository_owner }}",
               "          password: ${{ github.token }}",
-              "      - name: Validate and load the verified server image artifact before login",
+              "      - name: Validate and load the verified server image artifact before registry auth",
             ].join("\n"),
           ),
         },
         expected:
-          /docker-ghcr must validate filename, SHA-256, local tag, and image\/config ID before login|release\.yml must retain all 1 reviewed docker\/login-action Action uses/,
+          /docker-ghcr publisher must not contain uses: docker\/login-action@|release\.yml must retain all 0 reviewed docker\/login-action Action uses/,
       },
       {
-        name: "reject accepting mismatched existing immutable tags",
-        env: {
-          PATCHPAGE_RELEASE_WORKFLOW_SOURCE: replaceOnce(
-            workflow,
-            [
-              '              if [[ "$remote_config_id" != "$EXPECTED_IMAGE_ID" ]]; then',
-              '                echo "::error::Existing immutable GHCR tag ${target} has config ${remote_config_id}, expected ${EXPECTED_IMAGE_ID}"',
-            ].join("\n"),
-            [
-              "              if false; then",
-              '                echo "::error::Existing immutable GHCR tag ${target} has config ${remote_config_id}, expected ${EXPECTED_IMAGE_ID}"',
-            ].join("\n"),
-          ),
-        },
-        expected:
-          /docker-ghcr must reject existing immutable tag mismatches before pulling or accepting them/,
-      },
-      {
-        name: "reject always failing on existing immutable tags",
-        env: {
-          PATCHPAGE_RELEASE_WORKFLOW_SOURCE: replaceOnce(
-            workflow,
-            "already exists with verified image ID",
-            "Immutable GHCR tag already exists",
-          ),
-        },
-        expected:
-          /docker-ghcr must accept only existing immutable tags with the verified image\/config ID/,
-      },
-      {
-        name: "reject a single pending release queue",
+        name: "reject numeric queue syntax",
         env: {
           PATCHPAGE_RELEASE_WORKFLOW_SOURCE: replaceOnce(
             workflow,
             "  queue: max",
-            "  queue: single",
+            "  queue: 100",
           ),
         },
         expected:
-          /release\.yml must serialize all patchpage-server publishes in one package-wide max queue without canceling running or pending releases/,
+          /release\.yml must serialize all patchpage-server publishes in one package-wide max queue/,
       },
       {
         name: "reject missing release concurrency",
@@ -2584,34 +3335,744 @@ async function runMutationChecks() {
             "manifest-digest-removed: true",
           ),
         },
-        expected: /docker-ghcr must expose the verified GHCR manifest digest/,
+        expected: /docker-ghcr must expose the verified GHCR manifest and config digests/,
       },
       {
-        name: "reject trusting an unattested newer latest version label",
+        name: "reject removed GHCR config digest output",
         env: {
           PATCHPAGE_RELEASE_WORKFLOW_SOURCE: replaceOnce(
             workflow,
-            '                if [[ "$newer_remote_digest" != "$latest_remote_digest" ]]; then',
-            "                if false; then",
+            "config-digest: ${{ steps.publish-image.outputs.config-digest }}",
+            "config-digest-removed: true",
           ),
         },
-        expected:
-          /newer latest must match its immutable semver tag by digest and pulled config before being left untouched/,
+        expected: /docker-ghcr must expose the verified GHCR manifest and config digests/,
       },
       {
-        name: "reject older release overwriting authenticated newer latest",
+        name: "reject release smoke skipping the anonymous semver pull",
         env: {
           PATCHPAGE_RELEASE_WORKFLOW_SOURCE: replaceOnce(
             workflow,
-            '                echo "Existing latest GHCR tag version ${latest_version} is newer than current release ${EXPECTED_VERSION} and matches immutable tag ${newer_target} at ${latest_remote_digest}; leaving latest untouched"',
+            '          pull_anonymously "$tag_image"',
+            '          echo "skipped anonymous semver pull"',
+          ),
+        },
+        expected: /ghcr-anonymous-smoke must bind the semver tag and exact digest/,
+      },
+      {
+        name: "reject release smoke semver retarget acceptance",
+        env: {
+          PATCHPAGE_RELEASE_WORKFLOW_SOURCE: replaceOnce(
+            workflow,
+            'actual_digest" == "$EXPECTED_DIGEST"',
+            '-n "$actual_digest"',
+          ),
+        },
+        expected: /ghcr-anonymous-smoke must bind the semver tag and exact digest/,
+      },
+      {
+        name: "reject release smoke config substitution",
+        env: {
+          PATCHPAGE_RELEASE_WORKFLOW_SOURCE: replaceOnce(
+            workflow,
+            'actual_config" == "$EXPECTED_CONFIG_ID"',
+            '-n "$actual_config"',
+          ),
+        },
+        expected: /ghcr-anonymous-smoke must bind the semver tag and exact digest/,
+      },
+      {
+        name: "reject reconcile single queue",
+        env: {
+          PATCHPAGE_RECONCILE_WORKFLOW_SOURCE: replaceOnce(
+            reconcileWorkflow,
+            "  queue: max",
+            "  queue: 1",
+          ),
+        },
+        expected: /reconcile-ghcr\.yml must be scheduled\/manual and reuse the package-wide max queue/,
+      },
+      {
+        name: "reject reconcile slicing before inspection",
+        env: {
+          PATCHPAGE_RECONCILE_WORKFLOW_SOURCE: replaceOnce(
+            reconcileWorkflow,
+            "const rows = tags.map((tag) => {",
+            "const rows = tags.slice(0, 1).map((tag) => {",
+          ),
+        },
+        expected: /reconcile inspect must paginate stable GitHub tags/,
+      },
+      {
+        name: "reject precision-losing reconciler semver ordering",
+        env: {
+          PATCHPAGE_RECONCILE_WORKFLOW_SOURCE: replaceOnce(
+            reconcileWorkflow,
+            'split(".").map(BigInt)',
+            'split(".").map(Number)',
+          ),
+        },
+        expected: /reconcile inspect must paginate stable GitHub tags|reconcile-ghcr inspect must match the exact reviewed job map/,
+      },
+      {
+        name: "reject reconciling legacy image tags",
+        env: {
+          PATCHPAGE_RECONCILE_WORKFLOW_SOURCE: replaceOnce(
+            reconcileWorkflow,
+            ".filter((tag) => isSupportedImageRelease(tag.slice(1)))",
+            ".filter(() => true)",
+          ),
+        },
+        expected: /reconcile inspect must paginate stable GitHub tags/,
+      },
+      {
+        name: "reject lowering the first supported image release",
+        env: {
+          PATCHPAGE_GHCR_OCI_RELEASE_SOURCE: replaceOnce(
+            effectiveGhcrOciReleaseTool.toString("utf8"),
+            'const MINIMUM_SUPPORTED_IMAGE_VERSION = "0.1.1"',
+            'const MINIMUM_SUPPORTED_IMAGE_VERSION = "0.1.0"',
+          ),
+        },
+        expected: /ghcr-oci-release\.mjs must implement exact digest-bound OCI reads/,
+      },
+      {
+        name: "reject bypassing the reviewed remote config size ceiling",
+        env: {
+          PATCHPAGE_GHCR_OCI_RELEASE_SOURCE: replaceOnce(
+            effectiveGhcrOciReleaseTool.toString("utf8"),
+            "if (configSize > MAX_CONFIG_BYTES) {",
+            "if (false) {",
+          ),
+        },
+        expected: /ghcr-oci-release\.mjs must implement exact digest-bound OCI reads/,
+      },
+      {
+        name: "reject reading a config without its exact descriptor size",
+        env: {
+          PATCHPAGE_GHCR_OCI_RELEASE_SOURCE: replaceOnce(
+            effectiveGhcrOciReleaseTool.toString("utf8"),
+            "expectedBytes: configSize",
+            "expectedBytes: null",
+          ),
+        },
+        expected: /ghcr-oci-release\.mjs must implement exact digest-bound OCI reads/,
+      },
+      {
+        name: "reject bypassing the streaming registry body reader",
+        env: {
+          PATCHPAGE_GHCR_OCI_RELEASE_SOURCE: replaceOnce(
+            effectiveGhcrOciReleaseTool.toString("utf8"),
+            "response.body?.getReader()",
+            "null",
+          ),
+        },
+        expected: /ghcr-oci-release\.mjs must implement exact digest-bound OCI reads/,
+      },
+      {
+        name: "reject comparing config diff IDs to compressed descriptors",
+        env: {
+          PATCHPAGE_DOCKER_SAVE_VALIDATOR_SOURCE: replaceOnce(
+            effectiveDockerSaveValidator.toString("utf8"),
+            "await uncompressedLayerDigest",
+            "await Promise.resolve",
+          ),
+        },
+        expected: /validate-docker-save-artifact\.mjs must retain the structural docker-save graph validator/,
+      },
+      {
+        name: "reject weakening the compressed layer expansion ceiling",
+        env: {
+          PATCHPAGE_DOCKER_SAVE_VALIDATOR_SOURCE: replaceOnce(
+            effectiveDockerSaveValidator.toString("utf8"),
+            "const MAX_LAYER_EXPANSION_RATIO = 200",
+            "const MAX_LAYER_EXPANSION_RATIO = Number.MAX_SAFE_INTEGER",
+          ),
+        },
+        expected: /validate-docker-save-artifact\.mjs must retain the structural docker-save graph validator/,
+      },
+      {
+        name: "reject accepting the wrong number of Moby legacy nodes",
+        env: {
+          PATCHPAGE_DOCKER_SAVE_VALIDATOR_SOURCE: replaceOnce(
+            effectiveDockerSaveValidator.toString("utf8"),
+            "if (nodes.length !== diffIds.length)",
+            "if (false)",
+          ),
+        },
+        expected: /validate-docker-save-artifact\.mjs must retain the structural docker-save graph validator/,
+      },
+      {
+        name: "reject accepting ambiguous Moby legacy roots",
+        env: {
+          PATCHPAGE_DOCKER_SAVE_VALIDATOR_SOURCE: replaceOnce(
+            effectiveDockerSaveValidator.toString("utf8"),
+            "if (roots.length !== 1)",
+            "if (false)",
+          ),
+        },
+        expected: /validate-docker-save-artifact\.mjs must retain the structural docker-save graph validator/,
+      },
+      {
+        name: "reject repositories detached from the final uncompressed diff ID",
+        env: {
+          PATCHPAGE_DOCKER_SAVE_VALIDATOR_SOURCE: replaceOnce(
+            effectiveDockerSaveValidator.toString("utf8"),
+            "if (repositoryTags[tag] !== expectedRepositoryLayer)",
+            "if (false)",
+          ),
+        },
+        expected: /validate-docker-save-artifact\.mjs must retain the structural docker-save graph validator/,
+      },
+      {
+        name: "reject allowing unexpected Moby V1 metadata keys",
+        env: {
+          PATCHPAGE_DOCKER_SAVE_VALIDATOR_SOURCE: replaceOnce(
+            effectiveDockerSaveValidator.toString("utf8"),
+            "if (!allowedKeys.has(key))",
+            "if (false)",
+          ),
+        },
+        expected: /validate-docker-save-artifact\.mjs must retain the structural docker-save graph validator/,
+      },
+      {
+        name: "reject accepting forked Moby legacy graphs",
+        env: {
+          PATCHPAGE_DOCKER_SAVE_VALIDATOR_SOURCE: replaceOnce(
+            effectiveDockerSaveValidator.toString("utf8"),
+            "if (children.has(node.parent))",
+            "if (false)",
+          ),
+        },
+        expected: /validate-docker-save-artifact\.mjs must retain the structural docker-save graph validator/,
+      },
+      {
+        name: "reject runtime config fields on non-leaf Moby nodes",
+        env: {
+          PATCHPAGE_DOCKER_SAVE_VALIDATOR_SOURCE: replaceOnce(
+            effectiveDockerSaveValidator.toString("utf8"),
+            "if (!isLeaf && hasOwn(node.legacy, key))",
+            "if (false)",
+          ),
+        },
+        expected: /validate-docker-save-artifact\.mjs must retain the structural docker-save graph validator/,
+      },
+      {
+        name: "reject dropping a stable leaf runtime projection",
+        env: {
+          PATCHPAGE_DOCKER_SAVE_VALIDATOR_SOURCE: replaceOnce(
+            effectiveDockerSaveValidator.toString("utf8"),
+            '      "Labels",\n',
+            "",
+          ),
+        },
+        expected: /validate-docker-save-artifact\.mjs must retain the structural docker-save graph validator/,
+      },
+      {
+        name: "reject leaf runtime projections detached from the OCI config",
+        env: {
+          PATCHPAGE_DOCKER_SAVE_VALIDATOR_SOURCE: replaceOnce(
+            effectiveDockerSaveValidator.toString("utf8"),
+            "!isDeepStrictEqual(leafRuntimeConfig[key], ociRuntimeConfig[key])",
+            "false",
+          ),
+        },
+        expected: /validate-docker-save-artifact\.mjs must retain the structural docker-save graph validator/,
+      },
+      {
+        name: "reject Moby node operating systems detached from the OCI config",
+        env: {
+          PATCHPAGE_DOCKER_SAVE_VALIDATOR_SOURCE: replaceOnce(
+            effectiveDockerSaveValidator.toString("utf8"),
+            "if (node.legacy.os !== config.os)",
+            "if (false)",
+          ),
+        },
+        expected: /validate-docker-save-artifact\.mjs must retain the structural docker-save graph validator/,
+      },
+      {
+        name: "reject leaf platform fields detached from the OCI config",
+        env: {
+          PATCHPAGE_DOCKER_SAVE_VALIDATOR_SOURCE: replaceOnce(
+            effectiveDockerSaveValidator.toString("utf8"),
+            "if (hasOwn(leaf.legacy, key) && leaf.legacy[key] !== config[key])",
+            "if (false)",
+          ),
+        },
+        expected: /validate-docker-save-artifact\.mjs must retain the structural docker-save graph validator/,
+      },
+      {
+        name: "reject CI skipping validation of the actual docker-save output",
+        env: {
+          PATCHPAGE_RELEASE_CI_WORKFLOW_SOURCE: replaceOnce(
+            ciWorkflow,
+            "node scripts/validate-docker-save-artifact.mjs",
+            "echo skipped-docker-save-validation",
+          ),
+        },
+        expected: /CI must run the behavioral contract on its one metadata-bound image build/,
+      },
+      {
+        name: "reject stopping inspection after the bounded repair batch",
+        env: {
+          PATCHPAGE_RECONCILE_WORKFLOW_SOURCE: replaceOnce(
+            reconcileWorkflow,
+            "                  needed_count=$((needed_count + 1))\n                fi",
+            "                  needed_count=$((needed_count + 1))\n                  break\n                fi",
+          ),
+        },
+        expected: /reconcile inspect must paginate stable GitHub tags/,
+      },
+      {
+        name: "reject latest reconciliation for a pre-support empty schedule",
+        env: {
+          PATCHPAGE_RECONCILE_WORKFLOW_SOURCE: replaceOnce(
+            reconcileWorkflow,
+            "      needs.inspect.outputs.complete-count != '0'))",
+            "      true))",
+          ),
+        },
+        expected: /reconcile latest must run checkout-free/,
+      },
+      {
+        name: "reject skipping zero-repair result binding and anonymous acceptance",
+        env: {
+          PATCHPAGE_RECONCILE_WORKFLOW_SOURCE: replaceOnce(
+            reconcileWorkflow,
+            "  bind-publish-results:\n    if: >-\n      always() &&",
+            "  bind-publish-results:\n    if: >-\n      needs.inspect.outputs.count != '0' &&",
+          ),
+        },
+        expected: /reconcile result binder must accept every complete snapshot row/,
+      },
+      {
+        name: "reject result binding after an aggregate publisher failure",
+        env: {
+          PATCHPAGE_RECONCILE_WORKFLOW_SOURCE: replaceOnce(
+            reconcileWorkflow,
             [
-              '                push_verified_target "$latest_target"',
-              '                echo "Existing latest GHCR tag version ${latest_version} is newer than current release ${EXPECTED_VERSION} and matches immutable tag ${newer_target} at ${latest_remote_digest}; leaving latest untouched"',
+              "  bind-publish-results:",
+              "    if: >-",
+              "      always() &&",
+              "      needs.inspect.result == 'success' &&",
+              "      (needs.publish-ghcr.result == 'success' ||",
+            ].join("\n"),
+            [
+              "  bind-publish-results:",
+              "    if: >-",
+              "      always() &&",
+              "      needs.inspect.result == 'success' &&",
+              "      (needs.publish-ghcr.result == 'failure' ||",
             ].join("\n"),
           ),
         },
-        expected:
-          /newer latest must match its immutable semver tag by digest and pulled config before being left untouched/,
+        expected: /reconcile result binder must accept every complete snapshot row/,
+      },
+      {
+        name: "reject dropping a prior successful row from the inspect snapshot",
+        env: {
+          PATCHPAGE_RECONCILE_WORKFLOW_SOURCE: replaceOnce(
+            reconcileWorkflow,
+            '                source: "snapshot",',
+            '                source: "disabled-snapshot",',
+          ),
+        },
+        expected: /reconcile result binder must accept every complete snapshot row/,
+      },
+      {
+        name: "reject selecting an unrelated stale publication result artifact",
+        env: {
+          PATCHPAGE_RECONCILE_WORKFLOW_SOURCE: replaceOnce(
+            reconcileWorkflow,
+            ".filter((artifact) => artifact.name === name && !artifact.expired)",
+            '.filter((artifact) => artifact.name.startsWith("reconcile-publish-result-") && !artifact.expired)',
+          ),
+        },
+        expected: /reconcile result binder must accept every complete snapshot row/,
+      },
+      {
+        name: "reject selecting an older exact publication result artifact",
+        env: {
+          PATCHPAGE_RECONCILE_WORKFLOW_SOURCE: replaceOnce(
+            reconcileWorkflow,
+            "artifactId: matches[0].id",
+            "artifactId: matches.at(-1).id",
+          ),
+        },
+        expected: /reconcile result binder must accept every complete snapshot row/,
+      },
+      {
+        name: "reject anonymous acceptance bypass for complete snapshot rows",
+        env: {
+          PATCHPAGE_RECONCILE_WORKFLOW_SOURCE: replaceOnce(
+            reconcileWorkflow,
+            'if (source === "snapshot")',
+            'if (source === "disabled-snapshot")',
+          ),
+        },
+        expected: /anonymous reconciliation acceptance must consume either/,
+      },
+      {
+        name: "reject anonymous publication result selected by mutable name",
+        env: {
+          PATCHPAGE_RECONCILE_WORKFLOW_SOURCE: replaceOnce(
+            reconcileWorkflow,
+            "artifact-ids: ${{ matrix.artifactId }}",
+            "name: reconcile-publish-result-${{ matrix.version }}-${{ matrix.revision }}.json",
+          ),
+        },
+        expected: /anonymous reconciliation acceptance must consume either/,
+      },
+      {
+        name: "reject credentials in anonymous reconciliation acceptance",
+        env: {
+          PATCHPAGE_RECONCILE_WORKFLOW_SOURCE: replaceOnce(
+            reconcileWorkflow,
+            [
+              "      - name: Pull both bound release tags anonymously, then boot the exact digest",
+              "        shell: bash",
+              "        env:",
+            ].join("\n"),
+            [
+              "      - name: Pull both bound release tags anonymously, then boot the exact digest",
+              "        shell: bash",
+              "        env:",
+              "          GITHUB_TOKEN: ${{ github.token }}",
+            ].join("\n"),
+          ),
+        },
+        expected: /anonymous reconciliation acceptance must consume either/,
+      },
+      {
+        name: "reject missing anonymous reconciliation semver pull",
+        env: {
+          PATCHPAGE_RECONCILE_WORKFLOW_SOURCE: replaceOnce(
+            reconcileWorkflow,
+            '          pull_anonymously "$semver_image"',
+            '          echo "skipped anonymous semver pull"',
+          ),
+        },
+        expected: /anonymous reconciliation acceptance must consume either/,
+      },
+      {
+        name: "reject missing anonymous reconciliation full-SHA pull",
+        env: {
+          PATCHPAGE_RECONCILE_WORKFLOW_SOURCE: replaceOnce(
+            reconcileWorkflow,
+            '          pull_anonymously "$revision_image"',
+            '          echo "skipped anonymous revision pull"',
+          ),
+        },
+        expected: /anonymous reconciliation acceptance must consume either/,
+      },
+      {
+        name: "reject anonymous reconciliation tag retarget race",
+        env: {
+          PATCHPAGE_RECONCILE_WORKFLOW_SOURCE: replaceOnce(
+            reconcileWorkflow,
+            'actual_digest" == "$EXPECTED_MANIFEST_DIGEST"',
+            '-n "$actual_digest"',
+          ),
+        },
+        expected: /anonymous reconciliation acceptance must consume either/,
+      },
+      {
+        name: "reject anonymous reconciliation config substitution",
+        env: {
+          PATCHPAGE_RECONCILE_WORKFLOW_SOURCE: replaceOnce(
+            reconcileWorkflow,
+            'actual_config" == "$EXPECTED_CONFIG_DIGEST"',
+            '-n "$actual_config"',
+          ),
+        },
+        expected: /anonymous reconciliation acceptance must consume either/,
+      },
+      {
+        name: "reject mutable registry reselection in anonymous reconciliation",
+        env: {
+          PATCHPAGE_RECONCILE_WORKFLOW_SOURCE: replaceOnce(
+            reconcileWorkflow,
+            '          pull_anonymously "$semver_image"',
+            [
+              '          node "$GHCR_OCI_RELEASE" inspect-release',
+              '          pull_anonymously "$semver_image"',
+            ].join("\n"),
+          ),
+        },
+        expected: /anonymous reconciliation acceptance must consume either/,
+      },
+      {
+        name: "reject inexact anonymous reconciliation health",
+        env: {
+          PATCHPAGE_RECONCILE_WORKFLOW_SOURCE: replaceOnce(
+            reconcileWorkflow,
+            `            if [[ "$body" == '{"ok":true}' ]]; then`,
+            '            if [[ -n "$body" ]]; then',
+          ),
+        },
+        expected: /anonymous reconciliation acceptance must consume either/,
+      },
+      {
+        name: "reject reconcile handoff selected by artifact name",
+        env: {
+          PATCHPAGE_RECONCILE_WORKFLOW_SOURCE: replaceOnce(
+            reconcileWorkflow,
+            "          artifact-ids: ${{ steps.handoff-artifact.outputs.artifact-id }}",
+            "          name: reconcile-handoff-${{ matrix.version }}-${{ github.run_attempt }}",
+          ),
+        },
+        expected: /reconcile publisher must be checkout-free packages:write only/,
+      },
+      {
+        name: "reject reconcile zip wrapper extraction",
+        env: {
+          PATCHPAGE_RECONCILE_WORKFLOW_SOURCE: replaceOnce(
+            reconcileWorkflow,
+            "      - name: Validate and load replay image before registry auth",
+            [
+              "      - name: Extract image artifact wrapper",
+              "        run: |",
+              "          gh api \"/repos/${GITHUB_REPOSITORY}/actions/artifacts/${artifact_id}/zip\" --output \"$RUNNER_TEMP/raw-artifact.zip\"",
+              "          unzip -q \"$RUNNER_TEMP/raw-artifact.zip\" -d \"$RUNNER_TEMP/server-image\"",
+              "      - name: Validate and load replay image before registry auth",
+            ].join("\n"),
+          ),
+        },
+        expected: /reconcile publisher must be checkout-free packages:write only/,
+      },
+      {
+        name: "reject mutable reconciler Action coordinate",
+        env: {
+          PATCHPAGE_RECONCILE_WORKFLOW_SOURCE: replaceOnce(
+            reconcileWorkflow,
+            "uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1",
+            "uses: actions/checkout@main # v4.3.1",
+          ),
+        },
+        expected: /reconcile-ghcr\.yml:\d+ must pin actions\/checkout to a full commit SHA/,
+      },
+      {
+        name: "reject reconciler YAML anchor",
+        env: {
+          PATCHPAGE_RECONCILE_WORKFLOW_SOURCE: replaceOnce(
+            reconcileWorkflow,
+            "permissions: {}",
+            "permissions: &shared {}",
+          ),
+        },
+        expected: /reconcile-ghcr\.yml must not use YAML anchors/,
+      },
+      {
+        name: "reject reconciler custom YAML tag",
+        env: {
+          PATCHPAGE_RECONCILE_WORKFLOW_SOURCE: replaceOnce(
+            reconcileWorkflow,
+            "permissions: {}",
+            "permissions: !!omap []",
+          ),
+        },
+        expected: /reconcile-ghcr\.yml must not use YAML anchors.*explicit tags are forbidden/,
+      },
+      {
+        name: "reject reconciler duplicate root key",
+        env: {
+          PATCHPAGE_RECONCILE_WORKFLOW_SOURCE: replaceOnce(
+            reconcileWorkflow,
+            "permissions: {}\n\nconcurrency:",
+            "permissions: {}\npermissions: {}\n\nconcurrency:",
+          ),
+        },
+        expected: /reconcile-ghcr\.yml must be valid YAML with unique map keys/,
+      },
+      {
+        name: "reject reconciler root environment",
+        env: {
+          PATCHPAGE_RECONCILE_WORKFLOW_SOURCE: replaceOnce(
+            reconcileWorkflow,
+            "\njobs:\n",
+            "\nenv:\n  NODE_OPTIONS: attacker\n\njobs:\n",
+          ),
+        },
+        expected: /reconcile-ghcr\.yml root must contain exactly the reviewed triggers/,
+      },
+      {
+        name: "reject privileged run added to reconciler publisher",
+        env: {
+          PATCHPAGE_RECONCILE_WORKFLOW_SOURCE: replaceOnce(
+            reconcileWorkflow,
+            "      - name: Resolve replay handoff artifact ID",
+            "      - name: Attacker package step\n        run: echo attacker\n      - name: Resolve replay handoff artifact ID",
+          ),
+        },
+        expected: /reconcile-ghcr publish-ghcr must match the exact reviewed job map/,
+      },
+      {
+        name: "reject reconciler publisher permission elevation",
+        env: {
+          PATCHPAGE_RECONCILE_WORKFLOW_SOURCE: replaceOnce(
+            reconcileWorkflow,
+            "    permissions:\n      actions: read\n      packages: write",
+            "    permissions:\n      actions: read\n      packages: write\n      id-token: write",
+          ),
+        },
+        expected: /reconcile-ghcr publish-ghcr must match the exact reviewed job map/,
+      },
+      {
+        name: "reject missing explicit first-package probe in release publisher",
+        env: {
+          PATCHPAGE_RELEASE_WORKFLOW_SOURCE: replaceOnce(
+            workflow,
+            "--allow-first-package true",
+            "--first-package-probe-disabled true",
+          ),
+        },
+        expected: /docker-ghcr must publish the validated tar through the reviewed OCI release tool/,
+      },
+      {
+        name: "reject historical checkout replacing detached source worktree",
+        env: {
+          PATCHPAGE_RECONCILE_WORKFLOW_SOURCE: replaceOnce(
+            reconcileWorkflow,
+            'git worktree add --detach "$source_dir" "$REVISION"',
+            'git checkout "$TAG"',
+          ),
+        },
+        expected: /reconcile rebuild must use current reviewed verifiers/,
+      },
+      {
+        name: "reject unvalidated reconciliation rebuild tar",
+        env: {
+          PATCHPAGE_RECONCILE_WORKFLOW_SOURCE: replaceOnce(
+            reconcileWorkflow,
+            "node scripts/validate-docker-save-artifact.mjs",
+            "echo skipped-current-docker-save-validator",
+          ),
+        },
+        expected: /reconcile rebuild must use current reviewed verifiers/,
+      },
+      {
+        name: "reject configured name for unarchived reconciliation handoff",
+        env: {
+          PATCHPAGE_RECONCILE_WORKFLOW_SOURCE: replaceOnce(
+            reconcileWorkflow,
+            "          path: ${{ runner.temp }}/reconcile-handoff-${{ matrix.version }}.json",
+            "          name: reconcile-handoff-${{ matrix.version }}\n          path: ${{ runner.temp }}/reconcile-handoff-${{ matrix.version }}.json",
+          ),
+        },
+        expected: /reconcile rebuild must use current reviewed verifiers/,
+      },
+      {
+        name: "reject attempt-scoped reconciliation handoff lookup",
+        env: {
+          PATCHPAGE_RECONCILE_WORKFLOW_SOURCE: replaceOnce(
+            reconcileWorkflow,
+            'handoff_name="reconcile-handoff-${{ matrix.version }}.json"',
+            'handoff_name="reconcile-handoff-${{ matrix.version }}-${{ github.run_attempt }}.json"',
+          ),
+        },
+        expected: /reconcile publisher must be checkout-free packages:write only/,
+      },
+      {
+        name: "reject reconciliation handoff extra-entry bypass",
+        env: {
+          PATCHPAGE_RECONCILE_WORKFLOW_SOURCE: replaceOnce(
+            reconcileWorkflow,
+            "if (entries.length !== 1)",
+            "if (entries.length < 1)",
+          ),
+        },
+        expected: /reconcile publisher must be checkout-free packages:write only/,
+      },
+      {
+        name: "reject CAS header claims in publisher",
+        env: {
+          PATCHPAGE_RELEASE_WORKFLOW_SOURCE: replaceOnce(
+            workflow,
+            'node "$GHCR_OCI_RELEASE" publish-release',
+            [
+              'curl -H "If-Match: ${EXPECTED_IMAGE_ID}" https://ghcr.io/v2/',
+              'node "$GHCR_OCI_RELEASE" publish-release',
+            ].join("\n"),
+          ),
+        },
+        expected: /docker-ghcr publisher must not contain If-Match/,
+      },
+      {
+        name: "reject missing exact OCI error target binding",
+        env: {
+          PATCHPAGE_GHCR_OCI_RELEASE_SOURCE: replaceOnce(
+            effectiveGhcrOciReleaseTool.toString("utf8"),
+            "return error.code === expectedCode && detailMatchesTarget(error.detail, target);",
+            "return error.code === expectedCode;",
+          ),
+        },
+        expected: /ghcr-oci-release\.mjs must implement exact digest-bound OCI reads/,
+      },
+      {
+        name: "reject accepting a non-OCI registry manifest",
+        env: {
+          PATCHPAGE_GHCR_OCI_RELEASE_SOURCE: replaceOnce(
+            effectiveGhcrOciReleaseTool.toString("utf8"),
+            "if (responseMediaType !== OCI_MANIFEST_MEDIA_TYPE)",
+            "if (!responseMediaType)",
+          ),
+        },
+        expected: /ghcr-oci-release\.mjs must implement exact digest-bound OCI reads/,
+      },
+      {
+        name: "reject accepting a non-OCI Docker-save manifest",
+        env: {
+          PATCHPAGE_DOCKER_SAVE_VALIDATOR_SOURCE: replaceOnce(
+            effectiveDockerSaveValidator.toString("utf8"),
+            "if (descriptor?.mediaType !== OCI_MANIFEST_MEDIA_TYPE)",
+            "if (!descriptor?.mediaType)",
+          ),
+        },
+        expected: /validate-docker-save-artifact\.mjs must retain the structural docker-save graph validator/,
+      },
+      {
+        name: "reject precision-losing OCI semver ordering",
+        env: {
+          PATCHPAGE_GHCR_OCI_RELEASE_SOURCE: replaceOnce(
+            effectiveGhcrOciReleaseTool.toString("utf8"),
+            "leftMatch.slice(1).map(BigInt)",
+            "leftMatch.slice(1).map(Number)",
+          ),
+        },
+        expected: /ghcr-oci-release\.mjs must implement exact digest-bound OCI reads/,
+      },
+      {
+        name: "reject missing manifest PUT status binding",
+        env: {
+          PATCHPAGE_GHCR_OCI_RELEASE_SOURCE: replaceOnce(
+            effectiveGhcrOciReleaseTool.toString("utf8"),
+            "response.status !== 201",
+            "!response.ok",
+          ),
+        },
+        expected: /ghcr-oci-release\.mjs must implement exact digest-bound OCI reads/,
+      },
+      {
+        name: "reject bypassing latest final reinspection",
+        env: {
+          PATCHPAGE_GHCR_OCI_RELEASE_SOURCE: replaceOnce(
+            effectiveGhcrOciReleaseTool.toString("utf8"),
+            "post-write latest and re-enumerated highest complete release",
+            "post-write latest",
+          ),
+        },
+        expected: /ghcr-oci-release\.mjs must implement exact digest-bound OCI reads/,
+      },
+      {
+        name: "reject bypassing release-pair final reinspection",
+        env: {
+          PATCHPAGE_GHCR_OCI_RELEASE_SOURCE: replaceOnce(
+            effectiveGhcrOciReleaseTool.toString("utf8"),
+            "post-write release pair and canonical image",
+            "post-write release pair",
+          ),
+        },
+        expected: /ghcr-oci-release\.mjs must implement exact digest-bound OCI reads/,
       },
       {
         name: "reject unquoted CI revision",
@@ -3548,8 +5009,8 @@ if (failures.length > 0) {
     }
     process.exitCode = 1;
   } else {
-  console.log(
-      `Verified ${actionUses.length} pinned Actions, npm@${npmVersion}, exact release image identity, anonymous GHCR gate, and mutation checks.`,
-  );
+    console.log(
+      `Verified ${actionUses.length + reconcileActionUses.length} pinned Actions, npm@${npmVersion}, exact release image identity, reconciliation rerun fixtures, anonymous GHCR gate, and mutation checks.`,
+    );
   }
 }

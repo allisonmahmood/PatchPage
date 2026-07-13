@@ -534,6 +534,7 @@ jobs:
       packages: write
     outputs:
       manifest-digest: ${{ steps.publish-image.outputs.manifest-digest }}
+      config-digest: ${{ steps.publish-image.outputs.config-digest }}
     steps:
       - name: Download the immutable verified server image artifact
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
@@ -541,7 +542,210 @@ jobs:
           artifact-ids: ${{ needs.verify-server-image.outputs.image-artifact-id }}
           path: ${{ runner.temp }}/server-image
           skip-decompress: true
-      - name: Validate and load the verified server image artifact before login
+      - name: Install reviewed checkout-free release tools
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          tools_dir="$RUNNER_TEMP/release-tools"
+          rm -rf "$tools_dir"
+          install -d -m 700 "$tools_dir"
+
+          validator_sha256="15005064a7edc0b5cd6dd9f6135187a083e407078ac4e40a868dfe490f58603e"
+          oci_tool_sha256="53cac4875220e334efa1f647466f35cdeef3c278f3693a5d48f31e1ec29a0eb7"
+
+          cat > "$RUNNER_TEMP/validate-docker-save-artifact.mjs.gz.b64" <<'PATCHPAGE_VALIDATE_DOCKER_SAVE_ARTIFACT'
+          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
+          PATCHPAGE_VALIDATE_DOCKER_SAVE_ARTIFACT
+
+          cat > "$RUNNER_TEMP/ghcr-oci-release.mjs.gz.b64" <<'PATCHPAGE_GHCR_OCI_RELEASE'
+          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
+          QYev7EMkELJ4D98sU4ntjcXOxn8DSPDoncN9AAA=
+          PATCHPAGE_GHCR_OCI_RELEASE
+
+          node - "$RUNNER_TEMP/validate-docker-save-artifact.mjs.gz.b64" "$tools_dir/validate-docker-save-artifact.mjs" <<'NODE'
+          const { readFileSync, writeFileSync } = require("node:fs");
+          const { gunzipSync } = require("node:zlib");
+          const payload = readFileSync(process.argv[2], "utf8").replace(/\s+/g, "");
+          writeFileSync(process.argv[3], gunzipSync(Buffer.from(payload, "base64")));
+          NODE
+          node - "$RUNNER_TEMP/ghcr-oci-release.mjs.gz.b64" "$tools_dir/ghcr-oci-release.mjs" <<'NODE'
+          const { readFileSync, writeFileSync } = require("node:fs");
+          const { gunzipSync } = require("node:zlib");
+          const payload = readFileSync(process.argv[2], "utf8").replace(/\s+/g, "");
+          writeFileSync(process.argv[3], gunzipSync(Buffer.from(payload, "base64")));
+          NODE
+
+          actual_validator_sha256="$(sha256sum "$tools_dir/validate-docker-save-artifact.mjs" | awk '{print $1}')"
+          if [[ "$actual_validator_sha256" != "$validator_sha256" ]]; then
+            echo "::error::Embedded docker-save validator source hash mismatch"
+            exit 1
+          fi
+          actual_oci_tool_sha256="$(sha256sum "$tools_dir/ghcr-oci-release.mjs" | awk '{print $1}')"
+          if [[ "$actual_oci_tool_sha256" != "$oci_tool_sha256" ]]; then
+            echo "::error::Embedded OCI release tool source hash mismatch"
+            exit 1
+          fi
+
+          chmod 500 "$tools_dir/validate-docker-save-artifact.mjs" "$tools_dir/ghcr-oci-release.mjs"
+          echo "VALIDATE_DOCKER_SAVE_ARTIFACT=$tools_dir/validate-docker-save-artifact.mjs" >> "$GITHUB_ENV"
+          echo "GHCR_OCI_RELEASE=$tools_dir/ghcr-oci-release.mjs" >> "$GITHUB_ENV"
+      - name: Validate and load the verified server image artifact before registry auth
         id: load-image
         shell: bash
         env:
@@ -569,24 +773,20 @@ jobs:
             exit 1
           fi
 
+          node "$VALIDATE_DOCKER_SAVE_ARTIFACT" \
+            --artifact-dir "$RUNNER_TEMP/server-image" \
+            --expected-filename "$EXPECTED_FILENAME" \
+            --expected-sha256 "$EXPECTED_SHA256" \
+            --expected-repo-tag "$expected_local_tag" \
+            --expected-config-id "$EXPECTED_IMAGE_ID"
+
           shopt -s nullglob
           tarballs=("$RUNNER_TEMP/server-image"/*.tar)
           if [[ "${#tarballs[@]}" -ne 1 ]]; then
             echo "::error::Expected exactly one downloaded server image tar, found ${#tarballs[@]}"
             exit 1
           fi
-
           tar_path="${tarballs[0]}"
-          if [[ "$(basename "$tar_path")" != "$EXPECTED_FILENAME" ]]; then
-            echo "::error::Downloaded server image tar name does not match the verified artifact"
-            exit 1
-          fi
-
-          actual_sha256="$(sha256sum "$tar_path" | awk '{print $1}')"
-          if [[ "$actual_sha256" != "$EXPECTED_SHA256" ]]; then
-            echo "::error::Downloaded server image tar digest does not match the verified artifact"
-            exit 1
-          fi
 
           docker load --input "$tar_path"
           if ! loaded_image_id="$(
@@ -600,21 +800,16 @@ jobs:
             exit 1
           fi
 
-          rm -f "$tar_path"
-          echo "local-tag=$expected_local_tag" >> "$GITHUB_OUTPUT"
-      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
-        with:
-          registry: ghcr.io
-          username: ${{ github.repository_owner }}
-          password: ${{ github.token }}
-      - name: Publish or accept immutable GHCR tags, then reconcile latest
+          echo "image-tar=$tar_path" >> "$GITHUB_OUTPUT"
+      - name: Publish or accept the release tag pair with exact OCI state, then reconcile latest
         id: publish-image
         shell: bash
         env:
           EXPECTED_IMAGE_ID: ${{ needs.verify-server-image.outputs.image-id }}
           EXPECTED_REVISION: ${{ needs.guard.outputs.revision }}
           EXPECTED_VERSION: ${{ needs.guard.outputs.version }}
-          LOCAL_RELEASE_TAG: ${{ steps.load-image.outputs.local-tag }}
+          GHCR_IMAGE_TAR: ${{ steps.load-image.outputs.image-tar }}
+          GITHUB_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
 
@@ -627,272 +822,37 @@ jobs:
             exit 1
           fi
 
-          ghcr_image="ghcr.io/allisonmahmood/patchpage-server"
-          semver_target="${ghcr_image}:${EXPECTED_VERSION}"
-          revision_target="${ghcr_image}:${EXPECTED_REVISION}"
-          latest_target="${ghcr_image}:latest"
-          immutable_targets=("$semver_target" "$revision_target")
-          verified_manifest_digest=""
-          declare -A immutable_state
+          ghcr_name="allisonmahmood/patchpage-server"
+          ghcr_image="ghcr.io/${ghcr_name}"
+          release_json="$(
+            node "$GHCR_OCI_RELEASE" publish-release \
+              --registry-url https://ghcr.io \
+              --name "$ghcr_name" \
+              --version "$EXPECTED_VERSION" \
+              --revision "$EXPECTED_REVISION" \
+              --image-tar "$GHCR_IMAGE_TAR" \
+              --expected-repo-tag "${ghcr_image}:${EXPECTED_VERSION}" \
+              --expected-config-id "$EXPECTED_IMAGE_ID" \
+              --allow-first-package true
+          )"
+          printf '%s\n' "$release_json"
 
-          inspect_remote_target() {
-            local target="$1"
-            local digest_var="$2"
-            local config_var="$3"
-            local tag="${target##*:}"
-            local inspect_output="${RUNNER_TEMP}/ghcr-inspect-${tag}.txt"
-            local manifest_json="${RUNNER_TEMP}/ghcr-manifest-${tag}.json"
-            local inspect_error="${RUNNER_TEMP}/ghcr-inspect-${tag}.err"
+          manifest_digest="$(
+            node -e 'const state = JSON.parse(process.argv[1]); if (!/^sha256:[0-9a-f]{64}$/.test(state.manifestDigest)) process.exit(1); process.stdout.write(state.manifestDigest);' "$release_json"
+          )"
+          config_digest="$(
+            node -e 'const state = JSON.parse(process.argv[1]); if (!/^sha256:[0-9a-f]{64}$/.test(state.configDigest)) process.exit(1); process.stdout.write(state.configDigest);' "$release_json"
+          )"
 
-            if ! docker buildx imagetools inspect "$target" >"$inspect_output" 2>"$inspect_error"; then
-              if grep -Eiq "manifest unknown|no such manifest|not found|name unknown|404" "$inspect_error"; then
-                return 1
-              fi
-              echo "::error::Could not inspect GHCR tag state for ${target}"
-              cat "$inspect_error" >&2
-              exit 1
-            fi
+          latest_json="$(
+            node "$GHCR_OCI_RELEASE" reconcile-latest \
+              --registry-url https://ghcr.io \
+              --name "$ghcr_name"
+          )"
+          printf '%s\n' "$latest_json"
 
-            local digest
-            digest="$(
-              sed -nE 's/^[[:space:]]*Digest:[[:space:]]+(sha256:[0-9a-f]{64}).*/\1/p' \
-                "$inspect_output" | head -n1
-            )"
-            if [[ ! "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
-              echo "::error::Could not determine remote manifest digest for ${target}"
-              cat "$inspect_output" >&2
-              exit 1
-            fi
-
-            if ! docker buildx imagetools inspect --raw "$target" >"$manifest_json" 2>"$inspect_error"; then
-              echo "::error::Could not fetch raw remote manifest for ${target}"
-              cat "$inspect_error" >&2
-              exit 1
-            fi
-
-            local config_id
-            if ! config_id="$(
-              python3 - "$manifest_json" <<'PY'
-          import json
-          import sys
-
-          with open(sys.argv[1], "r", encoding="utf-8") as handle:
-              manifest = json.load(handle)
-
-          if "manifests" in manifest:
-              raise SystemExit("release tag points at an image index, not a single verified image")
-
-          config = manifest.get("config", {}).get("digest")
-          if not isinstance(config, str) or not config.startswith("sha256:"):
-              raise SystemExit("remote manifest is missing a config digest")
-
-          print(config)
-          PY
-            )"; then
-              echo "::error::Could not determine remote config digest for ${target}"
-              exit 1
-            fi
-
-            printf -v "$digest_var" '%s' "$digest"
-            printf -v "$config_var" '%s' "$config_id"
-            return 0
-          }
-
-          record_verified_digest() {
-            local target="$1"
-            local digest="$2"
-
-            if [[ -z "$verified_manifest_digest" ]]; then
-              verified_manifest_digest="$digest"
-              return
-            fi
-            if [[ "$digest" != "$verified_manifest_digest" ]]; then
-              echo "::error::${target} digest ${digest} does not match previously verified GHCR digest ${verified_manifest_digest}"
-              exit 1
-            fi
-          }
-
-          push_verified_target() {
-            local target="$1"
-            local push_output=""
-            local push_digest=""
-            local remote_digest=""
-            local remote_config_id=""
-
-            docker tag "$LOCAL_RELEASE_TAG" "$target"
-            target_image_id="$(docker image inspect --format '{{.Id}}' "$target")"
-            if [[ "$target_image_id" != "$EXPECTED_IMAGE_ID" ]]; then
-              echo "::error::${target} does not reference the verified image before push"
-              exit 1
-            fi
-
-            if ! push_output="$(docker push "$target" 2>&1)"; then
-              printf '%s\n' "$push_output" >&2
-              exit 1
-            fi
-            printf '%s\n' "$push_output"
-
-            push_digest="$(
-              sed -nE 's/.*digest: (sha256:[0-9a-f]{64}).*/\1/p' <<<"$push_output" | tail -n1
-            )"
-            if [[ ! "$push_digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
-              echo "::error::Could not determine pushed digest for ${target}"
-              exit 1
-            fi
-
-            if ! inspect_remote_target "$target" remote_digest remote_config_id; then
-              echo "::error::Pushed GHCR tag is missing: ${target}"
-              exit 1
-            fi
-            if [[ "$remote_digest" != "$push_digest" ]]; then
-              echo "::error::${target} remote digest ${remote_digest} drifted from pushed digest ${push_digest}"
-              exit 1
-            fi
-            if [[ "$remote_config_id" != "$EXPECTED_IMAGE_ID" ]]; then
-              echo "::error::${target} remote config ${remote_config_id} does not match ${EXPECTED_IMAGE_ID}"
-              exit 1
-            fi
-
-            record_verified_digest "$target" "$remote_digest"
-          }
-
-          for target in "${immutable_targets[@]}"; do
-            remote_digest=""
-            remote_config_id=""
-            if inspect_remote_target "$target" remote_digest remote_config_id; then
-              if [[ "$remote_config_id" != "$EXPECTED_IMAGE_ID" ]]; then
-                echo "::error::Existing immutable GHCR tag ${target} has config ${remote_config_id}, expected ${EXPECTED_IMAGE_ID}"
-                exit 1
-              fi
-              if ! docker pull "$target"; then
-                echo "::error::Could not pull existing immutable GHCR tag ${target}"
-                exit 1
-              fi
-              pulled_image_id="$(docker image inspect --format '{{.Id}}' "$target")"
-              if [[ "$pulled_image_id" != "$EXPECTED_IMAGE_ID" ]]; then
-                echo "::error::Pulled immutable GHCR tag ${target} image ID ${pulled_image_id} does not match ${EXPECTED_IMAGE_ID}"
-                exit 1
-              fi
-
-              immutable_state["$target"]="present"
-              record_verified_digest "$target" "$remote_digest"
-              echo "Immutable GHCR tag ${target} already exists with verified image ID ${remote_config_id} and digest ${remote_digest}"
-            else
-              immutable_state["$target"]="missing"
-            fi
-          done
-
-          for target in "${immutable_targets[@]}"; do
-            if [[ "${immutable_state[$target]}" == "missing" ]]; then
-              push_verified_target "$target"
-            fi
-          done
-
-          if [[ ! "$verified_manifest_digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
-            echo "::error::Immutable GHCR tags did not establish the current release manifest digest"
-            exit 1
-          fi
-
-          latest_remote_digest=""
-          latest_remote_config_id=""
-          if inspect_remote_target "$latest_target" latest_remote_digest latest_remote_config_id; then
-            if ! docker pull "$latest_target"; then
-              echo "::error::Could not pull existing latest GHCR tag ${latest_target}"
-              exit 1
-            fi
-            latest_pulled_image_id="$(docker image inspect --format '{{.Id}}' "$latest_target")"
-            if [[ "$latest_pulled_image_id" != "$latest_remote_config_id" ]]; then
-              echo "::error::Latest GHCR tag raw manifest config ${latest_remote_config_id} does not match pulled image ID ${latest_pulled_image_id}"
-              exit 1
-            fi
-
-            latest_version="$(docker image inspect --format '{{ index .Config.Labels "org.opencontainers.image.version" }}' "$latest_target")"
-            if [[ ! "$latest_version" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
-              echo "::error::Existing latest GHCR tag version metadata is invalid: ${latest_version}"
-              exit 1
-            fi
-
-            if ! latest_comparison="$(
-              python3 - "$latest_version" "$EXPECTED_VERSION" <<'PY'
-          import re
-          import sys
-
-          existing, expected = sys.argv[1:3]
-          pattern = re.compile(r"^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$")
-          if not pattern.match(existing) or not pattern.match(expected):
-              raise SystemExit("versions must be exact stable semver")
-
-          existing_parts = [int(part) for part in existing.split(".")]
-          expected_parts = [int(part) for part in expected.split(".")]
-
-          if existing_parts < expected_parts:
-              print("older")
-          elif existing_parts == expected_parts:
-              print("equal")
-          elif existing_parts > expected_parts:
-              print("newer")
-          else:
-              raise SystemExit("unknown comparison")
-          PY
-            )"; then
-              echo "::error::Could not compare existing latest version ${latest_version} with ${EXPECTED_VERSION}"
-              exit 1
-            fi
-
-            case "$latest_comparison" in
-              older)
-                echo "Existing latest GHCR tag version ${latest_version} is older than current release ${EXPECTED_VERSION}; updating latest"
-                push_verified_target "$latest_target"
-                ;;
-              equal)
-                if [[ "$latest_remote_config_id" != "$EXPECTED_IMAGE_ID" ]]; then
-                  echo "::error::Existing latest GHCR tag for ${EXPECTED_VERSION} has config ${latest_remote_config_id}, expected ${EXPECTED_IMAGE_ID}"
-                  exit 1
-                fi
-                if [[ "$latest_remote_digest" != "$verified_manifest_digest" ]]; then
-                  echo "::error::Existing latest GHCR tag for ${EXPECTED_VERSION} has manifest digest ${latest_remote_digest}, expected current release digest ${verified_manifest_digest}"
-                  exit 1
-                fi
-                echo "Latest GHCR tag already points at current release ${EXPECTED_VERSION} with verified digest ${latest_remote_digest}"
-                ;;
-              newer)
-                newer_target="${ghcr_image}:${latest_version}"
-                newer_remote_digest=""
-                newer_remote_config_id=""
-                if ! inspect_remote_target "$newer_target" newer_remote_digest newer_remote_config_id; then
-                  echo "::error::Existing latest GHCR tag claims newer version ${latest_version}, but immutable tag ${newer_target} is missing"
-                  exit 1
-                fi
-                if ! docker pull "$newer_target"; then
-                  echo "::error::Could not pull immutable tag for newer latest version: ${newer_target}"
-                  exit 1
-                fi
-                newer_pulled_image_id="$(docker image inspect --format '{{.Id}}' "$newer_target")"
-                if [[ "$newer_pulled_image_id" != "$newer_remote_config_id" ]]; then
-                  echo "::error::Newer immutable GHCR tag ${newer_target} raw manifest config ${newer_remote_config_id} does not match pulled image ID ${newer_pulled_image_id}"
-                  exit 1
-                fi
-                if [[ "$newer_remote_digest" != "$latest_remote_digest" ]]; then
-                  echo "::error::Existing latest GHCR tag for newer version ${latest_version} has manifest digest ${latest_remote_digest}, but immutable tag ${newer_target} has ${newer_remote_digest}"
-                  exit 1
-                fi
-                if [[ "$newer_remote_config_id" != "$latest_remote_config_id" ]]; then
-                  echo "::error::Existing latest GHCR tag for newer version ${latest_version} has config ${latest_remote_config_id}, but immutable tag ${newer_target} has ${newer_remote_config_id}"
-                  exit 1
-                fi
-                echo "Existing latest GHCR tag version ${latest_version} is newer than current release ${EXPECTED_VERSION} and matches immutable tag ${newer_target} at ${latest_remote_digest}; leaving latest untouched"
-                ;;
-              *)
-                echo "::error::Unknown latest semver comparison result: ${latest_comparison}"
-                exit 1
-                ;;
-            esac
-          else
-            echo "Latest GHCR tag is absent; publishing current release ${EXPECTED_VERSION}"
-            push_verified_target "$latest_target"
-          fi
-
-          echo "manifest-digest=$verified_manifest_digest" >> "$GITHUB_OUTPUT"
+          echo "config-digest=$config_digest" >> "$GITHUB_OUTPUT"
+          echo "manifest-digest=$manifest_digest" >> "$GITHUB_OUTPUT"
 
   ghcr-anonymous-smoke:
     name: Anonymous GHCR public-visibility gate (manual visibility required)
@@ -900,10 +860,12 @@ jobs:
     runs-on: ubuntu-latest
     permissions: {}
     steps:
-      - name: Verify public pull, publisher digest, and health without credentials
+      - name: Verify the semver tag, exact digest, config, and health without credentials
         shell: bash
         env:
+          EXPECTED_CONFIG_ID: ${{ needs.docker-ghcr.outputs.config-digest }}
           EXPECTED_DIGEST: ${{ needs.docker-ghcr.outputs.manifest-digest }}
+          VERSION: ${{ needs.guard.outputs.version }}
         run: |
           set -euo pipefail
 
@@ -911,50 +873,72 @@ jobs:
             echo "::error::Publisher did not expose a valid GHCR manifest digest"
             exit 1
           fi
+          if [[ ! "$EXPECTED_CONFIG_ID" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "::error::Verifier did not expose a valid image config digest"
+            exit 1
+          fi
+          if [[ ! "$VERSION" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            echo "::error::Guard did not expose an exact stable semver"
+            exit 1
+          fi
 
-          image="ghcr.io/allisonmahmood/patchpage-server:${{ needs.guard.outputs.version }}"
+          ghcr_image="ghcr.io/allisonmahmood/patchpage-server"
+          tag_image="${ghcr_image}:${VERSION}"
+          digest_image="${ghcr_image}@${EXPECTED_DIGEST}"
           container="patchpage-server-anonymous-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
           docker_config="$(mktemp -d)"
           export DOCKER_CONFIG="$docker_config"
+          printf '{"auths":{}}\n' > "$DOCKER_CONFIG/config.json"
 
           cleanup() {
             docker rm -f "$container" >/dev/null 2>&1 || true
+            docker image rm -f "$tag_image" "$digest_image" >/dev/null 2>&1 || true
             rm -rf "$docker_config"
           }
           trap cleanup EXIT
+          docker image rm -f "$tag_image" "$digest_image" >/dev/null 2>&1 || true
 
-          pulled=""
-          for attempt in 1 2 3 4 5; do
-            if docker pull "$image"; then
-              pulled="true"
-              break
-            fi
-
-            if [[ "$attempt" != "5" ]]; then
-              sleep 15
-            fi
-          done
-
-          if [[ "$pulled" != "true" ]]; then
+          pull_anonymously() {
+            local image="$1"
+            for attempt in 1 2 3 4 5; do
+              if docker pull "$image"; then
+                return 0
+              fi
+              [[ "$attempt" == "5" ]] || sleep 15
+            done
             echo "::error::Published image was not anonymously pullable. The first GHCR package still requires the maintainer GHCR Public visibility step; this workflow does not change package visibility."
-            exit 1
-          fi
+            return 1
+          }
 
-          mapfile -t repo_digests < <(
-            docker image inspect --format '{{range .RepoDigests}}{{println .}}{{end}}' "$image" \
-              | grep -E '^ghcr\.io/allisonmahmood/patchpage-server@sha256:[0-9a-f]{64}$' || true
-          )
-          if [[ "${#repo_digests[@]}" -ne 1 ]]; then
-            echo "::error::Expected exactly one anonymous repo digest for ${image}, found ${#repo_digests[@]}"
-            exit 1
-          fi
-          actual_digest="${repo_digests[0]##*@}"
-          if [[ "$actual_digest" != "$EXPECTED_DIGEST" ]]; then
-            echo "::error::Anonymous repo digest ${actual_digest} does not match the publisher-verified GHCR digest ${EXPECTED_DIGEST}"
-            exit 1
-          fi
+          require_publisher_binding() {
+            local image="$1"
+            mapfile -t repo_digests < <(
+              docker image inspect --format '{{range .RepoDigests}}{{println .}}{{end}}' "$image" \
+                | grep -E '^ghcr\.io/allisonmahmood/patchpage-server@sha256:[0-9a-f]{64}$' || true
+            )
+            if [[ "${#repo_digests[@]}" -ne 1 ]]; then
+              echo "::error::Expected exactly one anonymous repo digest for ${image}, found ${#repo_digests[@]}"
+              return 1
+            fi
+            local actual_digest="${repo_digests[0]##*@}"
+            [[ "$actual_digest" == "$EXPECTED_DIGEST" ]] || {
+              echo "::error::Anonymous ${image} resolved ${actual_digest}, expected publisher-bound digest ${EXPECTED_DIGEST}"
+              return 1
+            }
+            local actual_config
+            actual_config="$(docker image inspect --format '{{.Id}}' "$image")"
+            [[ "$actual_config" == "$EXPECTED_CONFIG_ID" ]] || {
+              echo "::error::Anonymous ${image} config ${actual_config} does not match verified config ${EXPECTED_CONFIG_ID}"
+              return 1
+            }
+          }
 
-          docker run -d --name "$container" -p 127.0.0.1::3000 "$image"
+          pull_anonymously "$tag_image"
+          require_publisher_binding "$tag_image"
+          pull_anonymously "$digest_image"
+          require_publisher_binding "$digest_image"
+
+          docker run -d --name "$container" -p 127.0.0.1::3000 "$digest_image"
           host_port="$(
             docker container inspect \
               --format '{{(index (index .NetworkSettings.Ports "3000/tcp") 0).HostPort}}' \
