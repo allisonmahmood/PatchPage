@@ -2,7 +2,7 @@ import { readFile } from "node:fs/promises";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
-import { isMap, isScalar, isSeq, parseDocument } from "yaml";
+import { isAlias, isMap, isScalar, isSeq, parseDocument } from "yaml";
 
 const repoRoot = path.resolve(
   process.env.PATCHPAGE_RELEASE_WORKFLOW_REPO_ROOT ??
@@ -40,12 +40,39 @@ const failures = [];
 let parsedWorkflow = null;
 let workflowDocument = null;
 
+function hasUnsupportedYamlIndirection(node) {
+  if (node === null || typeof node !== "object") {
+    return false;
+  }
+  if (isAlias(node) || typeof node.anchor === "string") {
+    return true;
+  }
+  if (isMap(node)) {
+    return node.items.some(
+      (pair) =>
+        !isScalar(pair.key) ||
+        typeof pair.key.value !== "string" ||
+        pair.key.value === "<<" ||
+        hasUnsupportedYamlIndirection(pair.key) ||
+        hasUnsupportedYamlIndirection(pair.value),
+    );
+  }
+  if (isSeq(node)) {
+    return node.items.some(hasUnsupportedYamlIndirection);
+  }
+  return false;
+}
+
 try {
   const document = parseDocument(workflow, { keepSourceTokens: true, uniqueKeys: true });
   if (document.errors.length > 0) {
     for (const error of document.errors) {
       failures.push(`release.yml must be valid YAML with unique map keys: ${error.message}`);
     }
+  } else if (hasUnsupportedYamlIndirection(document.contents)) {
+    failures.push(
+      "release.yml must not use YAML anchors, aliases, merge keys, or non-scalar mapping keys",
+    );
   } else {
     workflowDocument = document;
     parsedWorkflow = document.toJS();
@@ -140,6 +167,67 @@ const expectedVersionProducerRun = [
   "echo \"revision=$revision\" >> \"$GITHUB_OUTPUT\"",
   "",
 ].join("\n");
+const expectedNpmCliProducerRun = [
+  "set -euo pipefail",
+  "",
+  "if [[ ! \"$EXPECTED_NPM_VERSION\" =~ ^[0-9]+\\.[0-9]+\\.[0-9]+$ ]]; then",
+  "  echo \"::error::Expected an exact npm version, got $EXPECTED_NPM_VERSION\"",
+  "  exit 1",
+  "fi",
+  "",
+  "npm_tarball=\"$RUNNER_TEMP/npm-${EXPECTED_NPM_VERSION}.tgz\"",
+  "npm_cli_dir=\"$RUNNER_TEMP/npm-cli\"",
+  "rm -f \"$npm_tarball\"",
+  "rm -rf \"$npm_cli_dir\"",
+  "",
+  "curl --fail --silent --show-error \\",
+  "  --proto '=https' \\",
+  "  --tlsv1.2 \\",
+  "  --output \"$npm_tarball\" \\",
+  "  \"https://registry.npmjs.org/npm/-/npm-${EXPECTED_NPM_VERSION}.tgz\"",
+  "",
+  "actual_integrity=\"$(",
+  "  node - \"$npm_tarball\" <<'NODE'",
+  "const { createHash } = require(\"node:crypto\");",
+  "const { readFileSync } = require(\"node:fs\");",
+  "",
+  "const digest = createHash(\"sha512\")",
+  "  .update(readFileSync(process.argv[2]))",
+  "  .digest(\"base64\");",
+  "process.stdout.write(`sha512-${digest}`);",
+  "NODE",
+  ")\"",
+  "",
+  "if [[ \"$actual_integrity\" != \"$EXPECTED_NPM_INTEGRITY\" ]]; then",
+  "  echo \"::error::npm registry tarball integrity mismatch\"",
+  "  exit 1",
+  "fi",
+  "",
+  "mkdir -p \"$npm_cli_dir\"",
+  "tar -xzf \"$npm_tarball\" -C \"$npm_cli_dir\" --strip-components=1",
+  "",
+  "actual_version=\"$(node \"$npm_cli_dir/bin/npm-cli.js\" --version)\"",
+  "if [[ \"$actual_version\" != \"$EXPECTED_NPM_VERSION\" ]]; then",
+  "  echo \"::error::Verified npm CLI reported $actual_version, expected $EXPECTED_NPM_VERSION\"",
+  "  exit 1",
+  "fi",
+  "",
+  "echo \"version=$actual_version\" >> \"$GITHUB_OUTPUT\"",
+  "",
+].join("\n");
+const expectedVerifyNpmCliRun = [
+  "set -euo pipefail",
+  "",
+  "NPM_CLI=\"$RUNNER_TEMP/npm-cli/bin/npm-cli.js\"",
+  "actual_version=\"$(node \"$NPM_CLI\" --version)\"",
+  "if [[ \"$actual_version\" != \"$EXPECTED_NPM_VERSION\" ]]; then",
+  "  echo \"::error::Downloaded npm CLI reported $actual_version, expected $EXPECTED_NPM_VERSION\"",
+  "  exit 1",
+  "fi",
+  "",
+  "echo \"NPM_CLI=$NPM_CLI\" >> \"$GITHUB_ENV\"",
+  "",
+].join("\n");
 const expectedPackageProducerRun = [
   "set -euo pipefail",
   "",
@@ -204,6 +292,33 @@ const expectedPackageProducerRun = [
   "echo \"tarball-path=$tarball\" >> \"$GITHUB_OUTPUT\"",
   "echo \"filename=$(basename \"$tarball\")\" >> \"$GITHUB_OUTPUT\"",
   "echo \"sha256=$(sha256sum \"$tarball\" | awk '{print $1}')\" >> \"$GITHUB_OUTPUT\"",
+  "",
+].join("\n");
+const expectedMinimumNodeSmokeRun = [
+  "set -euo pipefail",
+  "",
+  "tmp_dir=\"$(mktemp -d)\"",
+  "cd \"$tmp_dir\"",
+  "node \"$NPM_CLI\" install --ignore-scripts \"$TARBALL\"",
+  "",
+  "output=\"$(./node_modules/.bin/patchpage --version)\"",
+  "if [[ \"$output\" != \"$CLI_VERSION\" ]]; then",
+  "  echo \"::error::Expected patchpage --version to print $CLI_VERSION, got $output\"",
+  "  exit 1",
+  "fi",
+  "",
+  "if [[ \"$output\" == \"0.0.0-dev\" ]]; then",
+  "  echo \"::error::Installed patchpage binary reported 0.0.0-dev\"",
+  "  exit 1",
+  "fi",
+  "",
+  "./node_modules/.bin/patchpage validate \"$GITHUB_WORKSPACE/examples/plan.html\"",
+  "",
+  "actual_sha256=\"$(sha256sum \"$TARBALL\" | awk '{print $1}')\"",
+  "if [[ \"$actual_sha256\" != \"$EXPECTED_TARBALL_SHA256\" ]]; then",
+  "  echo \"::error::The tested tarball changed during the smoke install\"",
+  "  exit 1",
+  "fi",
   "",
 ].join("\n");
 const expectedPublicationRun = [
@@ -359,6 +474,18 @@ function hasExactKeys(value, expectedKeys) {
       .sort()
       .every((key, index) => key === actualKeys[index])
   );
+}
+
+function hasExactArray(value, expected) {
+  return (
+    Array.isArray(value) &&
+    value.length === expected.length &&
+    expected.every((item, index) => value[index] === item)
+  );
+}
+
+function isExactRunStep(step, run) {
+  return hasExactKeys(step, ["run"]) && step.run === run;
 }
 
 function parsedJob(name) {
@@ -669,6 +796,23 @@ const parsedGuardJob = parsedJob("guard");
 const parsedPrepareNpmJob = parsedJob("prepare-npm");
 const parsedVerifyJob = parsedJob("verify");
 const parsedPublishJob = parsedJob("publish-npm");
+const expectedReleaseJobs = [
+  "guard",
+  "prepare-npm",
+  "verify",
+  "publish-npm",
+  "github-release",
+  "verify-server-image",
+  "docker-ghcr",
+  "ghcr-anonymous-smoke",
+  "npx-smoke",
+];
+if (
+  parsedWorkflow !== null &&
+  !hasExactKeys(parsedWorkflow.jobs, expectedReleaseJobs)
+) {
+  failures.push("release.yml must contain exactly the reviewed release jobs");
+}
 const guardSteps = parsedSteps("guard", parsedGuardJob);
 const prepareNpmSteps = parsedSteps("prepare-npm", parsedPrepareNpmJob);
 const verifySteps = parsedSteps("verify", parsedVerifyJob);
@@ -687,6 +831,16 @@ const npmCliUploadStep = uniqueStep(
   prepareNpmSteps,
   (step) => step.name === "Upload the reviewed npm CLI",
   "the Upload the reviewed npm CLI step",
+);
+const npmCliProducerIdStep = uniqueStep(
+  prepareNpmSteps,
+  (step) => step.id === "npm-cli",
+  "the reviewed npm CLI producer step",
+);
+const npmCliProducerNameStep = uniqueStep(
+  prepareNpmSteps,
+  (step) => step.name === "Fetch and verify the reviewed npm CLI",
+  "the Fetch and verify the reviewed npm CLI step",
 );
 const serverImageJob = job("verify-server-image");
 const dockerJob = job("docker-ghcr");
@@ -713,11 +867,19 @@ const verifyNpmCliStep = uniqueStep(
   (step) => step.name === "Verify the isolated npm CLI",
   "the Verify the isolated npm CLI step",
 );
+const verifyNpmCliDownloadStep = uniqueStep(
+  verifySteps,
+  (step) => step.name === "Download the isolated npm CLI",
+  "the Download the isolated npm CLI step",
+);
 const smokeInstallStep = uniqueStep(
   verifySteps,
   (step) => step.name === "Install and run tarball on minimum supported Node",
   "the minimum-Node tarball smoke step",
 );
+const smokeInstallIndex = verifySteps.indexOf(smokeInstallStep);
+const minimumNodeSetupStep =
+  smokeInstallIndex > 0 ? verifySteps[smokeInstallIndex - 1] : null;
 const packageUploadStep = uniqueStep(
   verifySteps,
   (step) => step.name === "Upload the exact tested tarball",
@@ -744,6 +906,11 @@ const publicationStep = uniqueStep(
   "the Publish the verified tarball to npm step",
 );
 const publicationRun = typeof publicationStep?.run === "string" ? publicationStep.run : "";
+const prepareSetupNodeStep = prepareNpmSteps[0] ?? null;
+const verifyCheckoutStep = verifySteps[0] ?? null;
+const verifyPnpmSetupStep = verifySteps[1] ?? null;
+const verifySetupNodeStep = verifySteps[2] ?? null;
+const publishSetupNodeStep = publishSteps[0] ?? null;
 
 if (
   parsedWorkflow !== null &&
@@ -774,12 +941,51 @@ if (
 
 if (
   parsedWorkflow !== null &&
+  (parsedPrepareNpmJob === null ||
+    !hasExactKeys(parsedPrepareNpmJob, ["runs-on", "permissions", "outputs", "steps"]) ||
+    parsedPrepareNpmJob["runs-on"] !== "ubuntu-latest" ||
+    !hasExactMapping(parsedPrepareNpmJob.permissions, {}) ||
+    prepareNpmSteps.length !== 3 ||
+    prepareNpmSteps[0] !== prepareSetupNodeStep ||
+    prepareNpmSteps[1] !== npmCliProducerIdStep ||
+    prepareNpmSteps[2] !== npmCliUploadStep ||
+    !hasExactKeys(prepareSetupNodeStep, ["uses", "with"]) ||
+    prepareSetupNodeStep.uses !==
+      `actions/setup-node@${reviewedActions.get("actions/setup-node").sha}` ||
+    !hasExactMapping(prepareSetupNodeStep.with, {
+      "node-version": reviewedNodeVersion,
+    }))
+) {
+  failures.push("prepare-npm must contain exactly the reviewed job map and ordered steps");
+}
+
+if (
+  parsedWorkflow !== null &&
   !hasExactMapping(parsedPrepareNpmJob?.outputs, {
     "npm-version": "${{ steps.npm-cli.outputs.version }}",
     "npm-cli-artifact-id": "${{ steps.npm-cli-artifact.outputs.artifact-id }}",
   })
 ) {
   failures.push("prepare-npm outputs must bind the exact reviewed npm CLI producers");
+}
+
+if (
+  parsedWorkflow !== null &&
+  (npmCliProducerIdStep === null ||
+    npmCliProducerIdStep !== npmCliProducerNameStep ||
+    !hasExactKeys(npmCliProducerIdStep, ["name", "id", "shell", "env", "run"]) ||
+    npmCliProducerIdStep.shell !== "bash" ||
+    !hasExactMapping(npmCliProducerIdStep.env, {
+      EXPECTED_NPM_VERSION: reviewedNpm.version,
+      EXPECTED_NPM_INTEGRITY: reviewedNpm.integrity,
+    }) ||
+    npmCliProducerIdStep.run !== expectedNpmCliProducerRun ||
+    prepareNpmSteps.indexOf(npmCliProducerIdStep) >=
+      prepareNpmSteps.indexOf(npmCliUploadStep))
+) {
+  failures.push(
+    "prepare-npm must fetch, verify, and output the exact reviewed npm CLI before upload",
+  );
 }
 
 if (
@@ -797,6 +1003,60 @@ if (
     }))
 ) {
   failures.push("prepare-npm must produce the exact isolated npm CLI artifact");
+}
+
+if (
+  parsedWorkflow !== null &&
+  (parsedVerifyJob === null ||
+    !hasExactKeys(parsedVerifyJob, [
+      "needs",
+      "runs-on",
+      "permissions",
+      "outputs",
+      "steps",
+    ]) ||
+    !hasExactArray(parsedVerifyJob.needs, ["guard", "prepare-npm"]) ||
+    parsedVerifyJob["runs-on"] !== "ubuntu-latest" ||
+    !hasExactMapping(parsedVerifyJob.permissions, { contents: "read" }) ||
+    verifySteps.length !== 14 ||
+    verifySteps[0] !== verifyCheckoutStep ||
+    verifySteps[1] !== verifyPnpmSetupStep ||
+    verifySteps[2] !== verifySetupNodeStep ||
+    !hasExactKeys(verifyCheckoutStep, ["uses"]) ||
+    verifyCheckoutStep.uses !==
+      `actions/checkout@${reviewedActions.get("actions/checkout").sha}` ||
+    !hasExactKeys(verifyPnpmSetupStep, ["uses", "with"]) ||
+    verifyPnpmSetupStep.uses !==
+      `pnpm/action-setup@${reviewedActions.get("pnpm/action-setup").sha}` ||
+    !hasExactMapping(verifyPnpmSetupStep.with, { version: "11.5.2" }) ||
+    !hasExactKeys(verifySetupNodeStep, ["uses", "with"]) ||
+    verifySetupNodeStep.uses !==
+      `actions/setup-node@${reviewedActions.get("actions/setup-node").sha}` ||
+    !hasExactMapping(verifySetupNodeStep.with, {
+      "node-version": reviewedNodeVersion,
+      cache: "pnpm",
+    }) ||
+    !isExactRunStep(verifySteps[3], "pnpm install --frozen-lockfile") ||
+    !isExactRunStep(verifySteps[4], "pnpm lint") ||
+    !isExactRunStep(verifySteps[5], "pnpm typecheck") ||
+    !isExactRunStep(verifySteps[6], "pnpm test") ||
+    !isExactRunStep(verifySteps[7], "pnpm --filter patchpage build") ||
+    verifySteps[8] !== verifyNpmCliDownloadStep ||
+    !hasExactKeys(verifyNpmCliDownloadStep, ["name", "uses", "with"]) ||
+    verifyNpmCliDownloadStep.uses !== reviewedDownloadArtifact ||
+    !hasExactMapping(verifyNpmCliDownloadStep.with, {
+      "artifact-ids": "${{ needs.prepare-npm.outputs.npm-cli-artifact-id }}",
+      path: "${{ runner.temp }}/npm-cli",
+    }) ||
+    verifySteps[9] !== verifyNpmCliStep ||
+    verifySteps[10] !== packageMetadataStep ||
+    verifySteps[11] !== minimumNodeSetupStep ||
+    verifySteps[12] !== smokeInstallStep ||
+    verifySteps[13] !== packageUploadStep)
+) {
+  failures.push(
+    "verify must contain exactly the reviewed job map and ordered build and smoke steps",
+  );
 }
 
 if (
@@ -833,6 +1093,41 @@ if (
     }))
 ) {
   failures.push("verify must upload exactly the active single raw tarball input");
+}
+
+if (
+  parsedWorkflow !== null &&
+  (verifyNpmCliStep === null ||
+    !hasExactKeys(verifyNpmCliStep, ["name", "shell", "env", "run"]) ||
+    verifyNpmCliStep.shell !== "bash" ||
+    !hasExactMapping(verifyNpmCliStep.env, {
+      EXPECTED_NPM_VERSION: "${{ needs.prepare-npm.outputs.npm-version }}",
+    }) ||
+    verifyNpmCliStep.run !== expectedVerifyNpmCliRun)
+) {
+  failures.push("verify must bind and validate the exact isolated npm CLI");
+}
+
+if (
+  parsedWorkflow !== null &&
+  (smokeInstallStep === null ||
+    minimumNodeSetupStep === null ||
+    !hasExactKeys(minimumNodeSetupStep, ["uses", "with"]) ||
+    minimumNodeSetupStep.uses !==
+      `actions/setup-node@${reviewedActions.get("actions/setup-node").sha}` ||
+    !hasExactMapping(minimumNodeSetupStep.with, {
+      "node-version": 22,
+    }) ||
+    !hasExactKeys(smokeInstallStep, ["name", "shell", "env", "run"]) ||
+    smokeInstallStep.shell !== "bash" ||
+    !hasExactMapping(smokeInstallStep.env, {
+      EXPECTED_TARBALL_SHA256: "${{ steps.package.outputs.sha256 }}",
+    }) ||
+    smokeInstallStep.run !== expectedMinimumNodeSmokeRun)
+) {
+  failures.push(
+    "verify must run the exact tarball smoke contract on the minimum supported Node 22",
+  );
 }
 
 if (
@@ -880,6 +1175,30 @@ if (
 ) {
   failures.push(
     "verify may write GITHUB_ENV and GITHUB_OUTPUT only at the reviewed producer lines",
+  );
+}
+
+if (
+  parsedWorkflow !== null &&
+  (parsedPublishJob === null ||
+    !hasExactKeys(parsedPublishJob, ["needs", "runs-on", "permissions", "steps"]) ||
+    !hasExactArray(parsedPublishJob.needs, ["guard", "prepare-npm", "verify"]) ||
+    parsedPublishJob["runs-on"] !== "ubuntu-latest" ||
+    !hasExactMapping(parsedPublishJob.permissions, { "id-token": "write" }) ||
+    publishSteps.length !== 4 ||
+    publishSteps[0] !== publishSetupNodeStep ||
+    publishSteps[1] !== packageDownloadStep ||
+    publishSteps[2] !== npmCliDownloadStep ||
+    publishSteps[3] !== publicationStep ||
+    !hasExactKeys(publishSetupNodeStep, ["uses", "with"]) ||
+    publishSetupNodeStep.uses !==
+      `actions/setup-node@${reviewedActions.get("actions/setup-node").sha}` ||
+    !hasExactMapping(publishSetupNodeStep.with, {
+      "node-version": reviewedNodeVersion,
+    }))
+) {
+  failures.push(
+    "publish-npm must contain exactly the reviewed privileged job map and ordered publication steps",
   );
 }
 
@@ -2385,6 +2704,54 @@ async function runMutationChecks() {
         expected: /uses unreviewed Action attacker\/action/,
       },
       {
+        name: "reject unreviewed Action behind alias mapping key",
+        env: {
+          PATCHPAGE_RELEASE_WORKFLOW_SOURCE: replaceOnce(
+            replaceOnce(
+              workflow,
+              "name: Release\n",
+              "name: Release\nx-uses-key: &uses_key uses\n",
+            ),
+            "      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1\n      - id: version",
+            "      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1\n      - *uses_key : attacker/action@main # v1.0.0\n      - id: version",
+          ),
+        },
+        expected:
+          /release\.yml must not use YAML anchors, aliases, merge keys, or non-scalar mapping keys/,
+      },
+      {
+        name: "reject unreviewed Action behind alias value",
+        env: {
+          PATCHPAGE_RELEASE_WORKFLOW_SOURCE: replaceOnce(
+            replaceOnce(
+              workflow,
+              "name: Release\n",
+              "name: Release\nx-attacker-action: &attacker_action attacker/action@main\n",
+            ),
+            "      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1\n      - id: version",
+            "      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1\n      - uses: *attacker_action # v1.0.0\n      - id: version",
+          ),
+        },
+        expected:
+          /release\.yml must not use YAML anchors, aliases, merge keys, or non-scalar mapping keys/,
+      },
+      {
+        name: "reject unreviewed Action behind merged step",
+        env: {
+          PATCHPAGE_RELEASE_WORKFLOW_SOURCE: replaceOnce(
+            replaceOnce(
+              workflow,
+              "name: Release\n",
+              "name: Release\nx-attacker-step: &attacker_step\n  uses: attacker/action@main\n",
+            ),
+            "      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1\n      - id: version",
+            "      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1\n      - <<: *attacker_step\n      - id: version",
+          ),
+        },
+        expected:
+          /release\.yml must not use YAML anchors, aliases, merge keys, or non-scalar mapping keys/,
+      },
+      {
         name: "reject guard output producer rebind",
         env: {
           PATCHPAGE_RELEASE_WORKFLOW_SOURCE: replaceOnce(
@@ -2493,6 +2860,269 @@ async function runMutationChecks() {
           ),
         },
         expected: /verify may write GITHUB_ENV and GITHUB_OUTPUT only at the reviewed producer lines/,
+      },
+      {
+        name: "reject top-level jobs alias override",
+        env: {
+          PATCHPAGE_RELEASE_WORKFLOW_SOURCE: replaceOnce(
+            workflow,
+            "jobs:\n",
+            [
+              "x-jobs-key: &jobs_key jobs",
+              "? *jobs_key",
+              ":",
+              "  attacker:",
+              "    runs-on: ubuntu-latest",
+              "    permissions:",
+              "      id-token: write",
+              "    steps:",
+              "      - run: echo attacker",
+              "jobs:",
+            ].join("\n") + "\n",
+          ),
+        },
+        expected:
+          /release\.yml must not use YAML anchors, aliases, merge keys, or non-scalar mapping keys/,
+      },
+      {
+        name: "reject unexpected privileged release job",
+        env: {
+          PATCHPAGE_RELEASE_WORKFLOW_SOURCE: replaceOnce(
+            workflow,
+            "  guard:\n",
+            [
+              "  attacker:",
+              "    runs-on: ubuntu-latest",
+              "    permissions:",
+              "      contents: write",
+              "      id-token: write",
+              "      packages: write",
+              "    steps:",
+              "      - run: echo attacker",
+              "  guard:",
+            ].join("\n") + "\n",
+          ),
+        },
+        expected: /release\.yml must contain exactly the reviewed release jobs/,
+      },
+      {
+        name: "reject npm CLI replacement after producer output",
+        env: {
+          PATCHPAGE_RELEASE_WORKFLOW_SOURCE: replaceOnce(
+            workflow,
+            '          echo "version=$actual_version" >> "$GITHUB_OUTPUT"',
+            '          echo "version=$actual_version" >> "$GITHUB_OUTPUT"\n          printf "%s\\n" "#!/usr/bin/env node" "console.log(\\"$EXPECTED_NPM_VERSION\\")" > "$npm_cli_dir/bin/npm-cli.js"',
+          ),
+        },
+        expected:
+          /prepare-npm must fetch, verify, and output the exact reviewed npm CLI before upload/,
+      },
+      {
+        name: "reject executable step between npm CLI producer and upload",
+        env: {
+          PATCHPAGE_RELEASE_WORKFLOW_SOURCE: replaceOnce(
+            workflow,
+            "      - name: Upload the reviewed npm CLI",
+            '      - name: Replace reviewed npm CLI\n        shell: bash\n        run: echo attacker > "$RUNNER_TEMP/npm-cli/bin/npm-cli.js"\n      - name: Upload the reviewed npm CLI',
+          ),
+        },
+        expected: /prepare-npm must contain exactly the reviewed job map and ordered steps/,
+      },
+      {
+        name: "reject npm CLI replacement after verify-side version check",
+        env: {
+          PATCHPAGE_RELEASE_WORKFLOW_SOURCE: replaceOnce(
+            workflow,
+            '          echo "NPM_CLI=$NPM_CLI" >> "$GITHUB_ENV"',
+            '          echo "NPM_CLI=$NPM_CLI" >> "$GITHUB_ENV"\n          echo attacker > "$NPM_CLI"',
+          ),
+        },
+        expected: /verify must bind and validate the exact isolated npm CLI/,
+      },
+      {
+        name: "reject disabled minimum-Node smoke step",
+        env: {
+          PATCHPAGE_RELEASE_WORKFLOW_SOURCE: replaceOnce(
+            workflow,
+            "      - name: Install and run tarball on minimum supported Node\n        shell: bash",
+            "      - name: Install and run tarball on minimum supported Node\n        if: false\n        shell: bash",
+          ),
+        },
+        expected: /verify must run the exact tarball smoke contract on the minimum supported Node 22/,
+      },
+      {
+        name: "reject continue-on-error minimum-Node smoke step",
+        env: {
+          PATCHPAGE_RELEASE_WORKFLOW_SOURCE: replaceOnce(
+            workflow,
+            "      - name: Install and run tarball on minimum supported Node\n        shell: bash",
+            "      - name: Install and run tarball on minimum supported Node\n        continue-on-error: true\n        shell: bash",
+          ),
+        },
+        expected: /verify must run the exact tarball smoke contract on the minimum supported Node 22/,
+      },
+      {
+        name: "reject changed minimum supported Node",
+        env: {
+          PATCHPAGE_RELEASE_WORKFLOW_SOURCE: replaceOnce(
+            workflow,
+            "          node-version: 22\n      - name: Install and run tarball on minimum supported Node",
+            "          node-version: 23\n      - name: Install and run tarball on minimum supported Node",
+          ),
+        },
+        expected: /verify must run the exact tarball smoke contract on the minimum supported Node 22/,
+      },
+      {
+        name: "reject minimum-Node smoke run changes",
+        env: {
+          PATCHPAGE_RELEASE_WORKFLOW_SOURCE: replaceOnce(
+            workflow,
+            "      - name: Install and run tarball on minimum supported Node\n        shell: bash\n        env:\n          EXPECTED_TARBALL_SHA256: ${{ steps.package.outputs.sha256 }}\n        run: |\n          set -euo pipefail",
+            "      - name: Install and run tarball on minimum supported Node\n        shell: bash\n        env:\n          EXPECTED_TARBALL_SHA256: ${{ steps.package.outputs.sha256 }}\n        run: |\n          set -euo pipefail\n          : changed",
+          ),
+        },
+        expected: /verify must run the exact tarball smoke contract on the minimum supported Node 22/,
+      },
+      {
+        name: "reject minimum-Node smoke environment rebind",
+        env: {
+          PATCHPAGE_RELEASE_WORKFLOW_SOURCE: replaceOnce(
+            workflow,
+            "          EXPECTED_TARBALL_SHA256: ${{ steps.package.outputs.sha256 }}",
+            "          EXPECTED_TARBALL_SHA256: attacker",
+          ),
+        },
+        expected: /verify must run the exact tarball smoke contract on the minimum supported Node 22/,
+      },
+      {
+        name: "reject extra minimum-Node smoke key",
+        env: {
+          PATCHPAGE_RELEASE_WORKFLOW_SOURCE: replaceOnce(
+            workflow,
+            "      - name: Install and run tarball on minimum supported Node\n        shell: bash",
+            "      - name: Install and run tarball on minimum supported Node\n        timeout-minutes: 1\n        shell: bash",
+          ),
+        },
+        expected: /verify must run the exact tarball smoke contract on the minimum supported Node 22/,
+      },
+      {
+        name: "reject dist rewrite before package producer",
+        env: {
+          PATCHPAGE_RELEASE_WORKFLOW_SOURCE: replaceOnce(
+            workflow,
+            "      - name: Pack exactly one release tarball and verify contents",
+            '      - name: Rewrite built CLI\n        shell: bash\n        run: echo attacker > packages/cli/dist/index.js\n      - name: Pack exactly one release tarball and verify contents',
+          ),
+        },
+        expected:
+          /verify must contain exactly the reviewed job map and ordered build and smoke steps/,
+      },
+      {
+        name: "reject executable step between publication downloads and publish",
+        env: {
+          PATCHPAGE_RELEASE_WORKFLOW_SOURCE: replaceOnce(
+            workflow,
+            "      - name: Publish the verified tarball to npm",
+            '      - name: Replace publishing CLI\n        shell: bash\n        run: echo attacker > "$RUNNER_TEMP/npm-cli/bin/npm-cli.js"\n      - name: Publish the verified tarball to npm',
+          ),
+        },
+        expected:
+          /publish-npm must contain exactly the reviewed privileged job map and ordered publication steps/,
+      },
+      {
+        name: "reject executable step after publication",
+        env: {
+          PATCHPAGE_RELEASE_WORKFLOW_SOURCE: replaceOnce(
+            workflow,
+            "\n  github-release:",
+            '\n      - name: Run after npm publication\n        shell: bash\n        run: echo attacker\n\n  github-release:',
+          ),
+        },
+        expected:
+          /publish-npm must contain exactly the reviewed privileged job map and ordered publication steps/,
+      },
+      {
+        name: "reject prepare-npm container",
+        env: {
+          PATCHPAGE_RELEASE_WORKFLOW_SOURCE: replaceOnce(
+            workflow,
+            "  prepare-npm:\n    runs-on: ubuntu-latest",
+            "  prepare-npm:\n    runs-on: ubuntu-latest\n    container: attacker/image:latest",
+          ),
+        },
+        expected: /prepare-npm must contain exactly the reviewed job map and ordered steps/,
+      },
+      {
+        name: "reject verify container",
+        env: {
+          PATCHPAGE_RELEASE_WORKFLOW_SOURCE: replaceOnce(
+            workflow,
+            "  verify:\n    needs: [guard, prepare-npm]\n    runs-on: ubuntu-latest",
+            "  verify:\n    needs: [guard, prepare-npm]\n    runs-on: ubuntu-latest\n    container: attacker/image:latest",
+          ),
+        },
+        expected:
+          /verify must contain exactly the reviewed job map and ordered build and smoke steps/,
+      },
+      {
+        name: "reject publish-npm container",
+        env: {
+          PATCHPAGE_RELEASE_WORKFLOW_SOURCE: replaceOnce(
+            workflow,
+            "  publish-npm:\n    needs: [guard, prepare-npm, verify]\n    runs-on: ubuntu-latest",
+            "  publish-npm:\n    needs: [guard, prepare-npm, verify]\n    runs-on: ubuntu-latest\n    container: attacker/image:latest",
+          ),
+        },
+        expected:
+          /publish-npm must contain exactly the reviewed privileged job map and ordered publication steps/,
+      },
+      {
+        name: "reject publish-npm services",
+        env: {
+          PATCHPAGE_RELEASE_WORKFLOW_SOURCE: replaceOnce(
+            workflow,
+            "  publish-npm:\n    needs: [guard, prepare-npm, verify]\n    runs-on: ubuntu-latest",
+            "  publish-npm:\n    needs: [guard, prepare-npm, verify]\n    runs-on: ubuntu-latest\n    services:\n      attacker:\n        image: attacker/image:latest",
+          ),
+        },
+        expected:
+          /publish-npm must contain exactly the reviewed privileged job map and ordered publication steps/,
+      },
+      {
+        name: "reject conditional publish-npm job",
+        env: {
+          PATCHPAGE_RELEASE_WORKFLOW_SOURCE: replaceOnce(
+            workflow,
+            "  publish-npm:\n    needs: [guard, prepare-npm, verify]",
+            "  publish-npm:\n    needs: [guard, prepare-npm, verify]\n    if: false",
+          ),
+        },
+        expected:
+          /publish-npm must contain exactly the reviewed privileged job map and ordered publication steps/,
+      },
+      {
+        name: "reject publish-npm strategy",
+        env: {
+          PATCHPAGE_RELEASE_WORKFLOW_SOURCE: replaceOnce(
+            workflow,
+            "  publish-npm:\n    needs: [guard, prepare-npm, verify]\n    runs-on: ubuntu-latest",
+            "  publish-npm:\n    needs: [guard, prepare-npm, verify]\n    runs-on: ubuntu-latest\n    strategy:\n      matrix:\n        attacker: [true]",
+          ),
+        },
+        expected:
+          /publish-npm must contain exactly the reviewed privileged job map and ordered publication steps/,
+      },
+      {
+        name: "reject publish-npm job environment",
+        env: {
+          PATCHPAGE_RELEASE_WORKFLOW_SOURCE: replaceOnce(
+            workflow,
+            "  publish-npm:\n    needs: [guard, prepare-npm, verify]\n    runs-on: ubuntu-latest",
+            "  publish-npm:\n    needs: [guard, prepare-npm, verify]\n    runs-on: ubuntu-latest\n    env:\n      NODE_OPTIONS: attacker",
+          ),
+        },
+        expected:
+          /publish-npm must contain exactly the reviewed privileged job map and ordered publication steps/,
       },
     ];
   } catch (error) {
