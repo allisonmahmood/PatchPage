@@ -41,6 +41,9 @@ importers:
       vitest:
         specifier: ^3.2.4
         version: 3.2.6(@types/node@22.20.1)(tsx@4.23.0)
+      yaml:
+        specifier: 2.9.0
+        version: 2.9.0
 
   apps/server:
     dependencies:
@@ -1633,6 +1636,11 @@ packages:
     resolution: {integrity: sha512-LKYU1iAXJXUgAXn9URjiu+MWhyUXHsvfp7mcuYm9dSUKK0/CjtrUwFAxD82/mCWbtLsGjFIad0wIsod4zrTAEQ==}
     engines: {node: '>=0.4'}
 
+  yaml@2.9.0:
+    resolution: {integrity: sha512-2AvhNX3mb8zd6Zy7INTtSpl1F15HW6Wnqj0srWlkKLcpYl/gMIMJiyuGq2KeI2YFxUPjdlB+3Lc10seMLtL4cA==}
+    engines: {node: '>= 14.6'}
+    hasBin: true
+
   yocto-queue@0.1.0:
     resolution: {integrity: sha512-rVksvsnNCdJ/ohGc6xgPwyN8eheCxsiLM8mxuE/t/mOVqJewPuO1miLpTHQiRgTKCLexL4MeAFVagts7HmNZ2Q==}
     engines: {node: '>=10'}
@@ -3070,5 +3078,7 @@ snapshots:
   xml-naming@0.1.0: {}
 
   xtend@4.0.2: {}
+
+  yaml@2.9.0: {}
 
   yocto-queue@0.1.0: {}
