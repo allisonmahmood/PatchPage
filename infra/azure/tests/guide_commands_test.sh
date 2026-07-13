@@ -346,6 +346,11 @@ run_caa_block() {
             constrained_digicert_spaced:team.example.com)
               printf '%s\n' 'team.example.com. 300 IN CAA 0 issue "digicert.com ; accounturi=https://example.com/account/123"'
               ;;
+            unknown_critical:team.example.com)
+              printf '%s\n' \
+                'team.example.com. 300 IN CAA 0 issue "digicert.com"' \
+                'team.example.com. 300 IN CAA 128 unknowncritical "x"'
+              ;;
           esac
           ;;
         *)
@@ -372,7 +377,7 @@ example.com"
     fail "CAA lookup skipped a nearer policy that denies DigiCert"
   fi
 
-  for scenario in unrelated denying constrained_digicert constrained_digicert_spaced; do
+  for scenario in unrelated denying constrained_digicert constrained_digicert_spaced unknown_critical; do
     if run_caa_block "$scenario"; then
       fail "CAA lookup accepted the $scenario policy"
     fi

@@ -336,7 +336,7 @@ fi
 VALIDATION_METHOD="HTTP"
 ```
 
-Certificate authorities apply the first CAA RRset found while walking from the custom hostname toward the DNS root. The check continues to a parent only when the current label returns `NOERROR` without a CAA answer; any other DNS status is a hard failure. That effective policy, wherever it is inherited from, must allow DigiCert with an unparameterized `issue "digicert.com"` record. Parameterized DigiCert records fail this check because the guide cannot prove that Azure satisfies issuer-specific constraints:
+Certificate authorities apply the first CAA RRset found while walking from the custom hostname toward the DNS root. The check continues to a parent only when the current label returns `NOERROR` without a CAA answer; any other DNS status is a hard failure. That effective policy, wherever it is inherited from, must allow DigiCert with an unparameterized `issue "digicert.com"` record. Parameterized DigiCert records fail this check because the guide cannot prove that Azure satisfies issuer-specific constraints. Any issuer-critical property outside the standard `issue`, `issuewild`, and `iodef` tags also fails closed because the guide cannot prove DigiCert supports it:
 
 <!-- guide-test:caa-policy -->
 
@@ -398,6 +398,11 @@ if test -n "$CAA_RECORDS"; then
     awk '
       {
         tag = tolower($2)
+        flags = $1 + 0
+        if ((int(flags / 128) % 2) == 1 &&
+            tag != "issue" && tag != "issuewild" && tag != "iodef") {
+          unsupported_critical = 1
+        }
         value = ""
         for (i = 3; i <= NF; i++) {
           value = value (i == 3 ? "" : " ") $i
@@ -411,7 +416,7 @@ if test -n "$CAA_RECORDS"; then
         value = tolower(value)
         if (tag == "issue" && value == "digicert.com") found = 1
       }
-      END { exit found ? 0 : 1 }
+      END { exit found && !unsupported_critical ? 0 : 1 }
     '; then
     printf 'The effective CAA policy does not allow DigiCert.\n' >&2
     exit 1
