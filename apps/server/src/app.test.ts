@@ -656,22 +656,35 @@ describe("PatchPage server", () => {
       authenticatedError: "Malformed request target."
     },
     {
+      label: "escaped-prefix malformed percent escape",
+      protectedTarget: "HtTp://host/%61pi/%",
+      authenticatedStatus: 400,
+      authenticatedError: "Malformed request target."
+    },
+    {
       label: "overlong route parameter",
       protectedTarget: `/api/drafts/${"x".repeat(101)}/disable`,
+      authenticatedStatus: 414,
+      authenticatedError: "Request target is too long."
+    },
+    {
+      label: "encoded overlong route parameter",
+      protectedTarget: `/api/drafts/${"x".repeat(60)}%2F${"x".repeat(60)}/disable`,
       authenticatedStatus: 414,
       authenticatedError: "Request target is too long."
     }
   ])(
     "authenticates and limits pre-routing API failure: $label",
-    async ({ protectedTarget, authenticatedStatus, authenticatedError }) => {
+    async ({ label, protectedTarget, authenticatedStatus, authenticatedError }) => {
       let now = 1_000;
       const config = testConfig();
+      const caseName = label.replaceAll(/[^a-z0-9]/gi, "-");
       const db = new JsonFilePatchPageDb(
-        path.join(tempDir, `${authenticatedStatus}-pre-routing-db.json`)
+        path.join(tempDir, `${caseName}-pre-routing-db.json`)
       );
       await db.initialize("dev-token");
       const storage = new FileSystemHtmlStorage(
-        path.join(tempDir, `${authenticatedStatus}-pre-routing-drafts`)
+        path.join(tempDir, `${caseName}-pre-routing-drafts`)
       );
       const app = createApp({ config, db, storage, clock: () => now });
 
