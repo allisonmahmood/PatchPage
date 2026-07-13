@@ -648,6 +648,76 @@ describe("PatchPage server", () => {
     }
   );
 
+  it.each([
+    {
+      label: "malformed percent escape",
+      protectedTarget: "/api/%",
+      authenticatedStatus: 400,
+      authenticatedError: "Malformed request target."
+    },
+    {
+      label: "overlong route parameter",
+      protectedTarget: `/api/drafts/${"x".repeat(101)}/disable`,
+      authenticatedStatus: 414,
+      authenticatedError: "Request target is too long."
+    }
+  ])(
+    "authenticates and limits pre-routing API failure: $label",
+    async ({ protectedTarget, authenticatedStatus, authenticatedError }) => {
+      let now = 1_000;
+      const config = testConfig();
+      const db = new JsonFilePatchPageDb(
+        path.join(tempDir, `${authenticatedStatus}-pre-routing-db.json`)
+      );
+      await db.initialize("dev-token");
+      const storage = new FileSystemHtmlStorage(
+        path.join(tempDir, `${authenticatedStatus}-pre-routing-drafts`)
+      );
+      const app = createApp({ config, db, storage, clock: () => now });
+
+      try {
+        const publicMalformed = await rawHttpRequest(app, "/public/%");
+        expect(publicMalformed.statusCode).toBe(400);
+
+        for (let attempt = 1; attempt <= 60; attempt += 1) {
+          const response = await rawHttpRequest(app, protectedTarget);
+          expect(response.statusCode).toBe(401);
+          expect(response.json()).toEqual({
+            ok: false,
+            error: "Missing or invalid API token."
+          });
+        }
+
+        const limited = await rawHttpRequest(app, protectedTarget);
+        expect(limited.statusCode).toBe(429);
+        expect(limited.headers["retry-after"]).toBe("60");
+        expect(limited.json()).toEqual({
+          ok: false,
+          error: "Rate limit exceeded.",
+          code: "rate_limited",
+          retryAfterSeconds: 60
+        });
+
+        now = 61_000;
+        const authenticated = await rawHttpRequest(
+          app,
+          protectedTarget,
+          "",
+          { Authorization: "Bearer dev-token" },
+          { closeAfterWrite: false }
+        );
+        expect(authenticated.statusCode).toBe(authenticatedStatus);
+        expect(authenticated.json()).toEqual({
+          ok: false,
+          error: authenticatedError
+        });
+      } finally {
+        await app.close();
+        await db.close();
+      }
+    }
+  );
+
   it("limits authenticated upload attempts by stable token identity", async () => {
     let now = 1_000;
     const config = testConfig();

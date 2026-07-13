@@ -1,3 +1,4 @@
+import type { IncomingMessage } from "node:http";
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import Fastify from "fastify";
 import type { ServerConfig } from "@patchpage/config";
@@ -74,12 +75,22 @@ type ApiRequestTargetPolicy =
   | { protected: false }
   | { protected: true; requiredScope?: ApiPolicyScope; uploadLimit?: boolean };
 
+const FASTIFY_DEFAULT_MAX_PARAM_LENGTH = 100;
+const PRE_ROUTING_API_ERROR_TARGET = "/api/__patchpage_pre_routing_error__";
+const preRoutingApiErrorStatus = Symbol("preRoutingApiErrorStatus");
+
+type PreRoutingApiErrorStatus = 400 | 414;
+type MarkedIncomingMessage = IncomingMessage & {
+  [preRoutingApiErrorStatus]?: PreRoutingApiErrorStatus;
+};
+
 export function createApp(options: CreateAppOptions): FastifyInstance {
   const rateLimiters = createRateLimiters(options.config, { clock: options.clock });
   const app = Fastify({
     logger: false,
     bodyLimit: Math.max(options.config.maxHtmlBytes * 3, 2 * 1024 * 1024),
-    trustProxy: options.config.trustProxy
+    trustProxy: options.config.trustProxy,
+    rewriteUrl: rewriteProtectedApiRoutingFailure
   });
 
   app.addHook("onSend", async (_request, reply) => {
@@ -330,6 +341,14 @@ function protectedApiPrefixGuard(
 
     request.auth = authState.auth;
 
+    const routingErrorStatus = (request.raw as MarkedIncomingMessage)[
+      preRoutingApiErrorStatus
+    ];
+    if (routingErrorStatus) {
+      sendPreRoutingApiError(reply, routingErrorStatus);
+      return;
+    }
+
     if (targetPolicy.requiredScope) {
       if (!hasScope(authState.auth, targetPolicy.requiredScope)) {
         reply.status(403).send({ ok: false, error: "API token does not have the required scope." });
@@ -386,6 +405,49 @@ export function isProtectedApiPath(requestTarget: string): boolean {
   return classifyApiRequestTargetPolicy(requestTarget).protected;
 }
 
+function rewriteProtectedApiRoutingFailure(request: IncomingMessage): string {
+  const requestTarget = request.url ?? "/";
+  const pathname = canonicalRequestTargetPath(requestTarget);
+  let errorStatus: PreRoutingApiErrorStatus | undefined;
+
+  if (pathname === null) {
+    if (!hasLexicalProtectedApiPrefix(requestTarget)) return requestTarget;
+    errorStatus = 400;
+  } else if (isApiPolicyPath(pathname)) {
+    const originForm = requestTarget.replace(/^https?:\/\/.*?\//i, "/");
+    const end = originForm.search(/[?#]/);
+    const rawPath = end === -1 ? originForm : originForm.slice(0, end);
+    if (
+      rawPath
+        .split("/")
+        .some(
+          (segment) =>
+            decodeURIComponent(segment).length > FASTIFY_DEFAULT_MAX_PARAM_LENGTH
+        )
+    ) {
+      errorStatus = 414;
+    }
+  }
+
+  if (!errorStatus) return requestTarget;
+  (request as MarkedIncomingMessage)[preRoutingApiErrorStatus] = errorStatus;
+  return PRE_ROUTING_API_ERROR_TARGET;
+}
+
+function hasLexicalProtectedApiPrefix(requestTarget: string): boolean {
+  const originForm = requestTarget.replace(/^https?:\/\/.*?\//i, "/");
+  const end = originForm.search(/[?#]/);
+  const rawPath = end === -1 ? originForm : originForm.slice(0, end);
+  const asciiDecodedPath = rawPath.replace(/%([0-7][0-9a-f])/gi, (_escape, hex: string) =>
+    String.fromCharCode(Number.parseInt(hex, 16))
+  );
+  return isApiPolicyPath(normalizePolicyPath(asciiDecodedPath));
+}
+
+function isApiPolicyPath(pathname: string): boolean {
+  return pathname === "/api" || pathname.startsWith("/api/");
+}
+
 function canonicalRequestTargetPath(requestTarget: string): string | null {
   const originForm = requestTarget.replace(/^https?:\/\/.*?\//i, "/");
   const end = originForm.search(/[?#]/);
@@ -409,7 +471,7 @@ function classifyApiRequestTargetPolicy(requestTarget: string): ApiRequestTarget
     return { protected: true, requiredScope: "admin" };
   }
   return {
-    protected: pathname === "/api" || pathname.startsWith("/api/")
+    protected: isApiPolicyPath(pathname)
   };
 }
 
@@ -425,6 +487,16 @@ function hasScope(auth: ApiTokenAuth, scope: string): boolean {
 function markPreBodyAuthorizedScope(request: FastifyRequest, scope: string): void {
   request.preBodyAuthorizedScopes ??= new Set();
   request.preBodyAuthorizedScopes.add(scope);
+}
+
+function sendPreRoutingApiError(
+  reply: FastifyReply,
+  status: PreRoutingApiErrorStatus
+): void {
+  reply.status(status).send({
+    ok: false,
+    error: status === 400 ? "Malformed request target." : "Request target is too long."
+  });
 }
 
 function sendRateLimited(reply: FastifyReply, decision: RateLimitDecision): void {
