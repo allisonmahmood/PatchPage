@@ -1,8 +1,22 @@
 #!/usr/bin/env node
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { randomUUID } from "node:crypto";
+import {
+  closeSync,
+  constants,
+  existsSync,
+  fchmodSync,
+  mkdirSync,
+  openSync,
+  readFileSync,
+  renameSync,
+  rmSync,
+  writeFileSync
+} from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { createInterface } from "node:readline/promises";
+import { Writable } from "node:stream";
 import { Command } from "commander";
 import { sha256, validateHtml } from "@patchpage/core";
 
@@ -45,9 +59,20 @@ program
   .command("auth")
   .description("Manage CLI authentication.")
   .command("set")
-  .argument("<api-token>", "PatchPage API token")
+  .option("--token-stdin", "Read the PatchPage API token from stdin")
   .option("--api-url <url>", "Override the default PatchPage API base URL")
-  .action((apiToken: string, options: { apiUrl?: string }) => {
+  .action(async (options: { tokenStdin?: boolean; apiUrl?: string }) => {
+    if (options.tokenStdin && process.stdin.isTTY) {
+      throw new CliError(
+        "--token-stdin requires redirected input. Run patchpage auth set to use the hidden interactive prompt."
+      );
+    }
+
+    const tokenInput = options.tokenStdin
+      ? readFileSync(process.stdin.fd, "utf8")
+      : await promptForApiToken();
+    const apiToken = parseApiToken(tokenInput, Boolean(options.tokenStdin));
+
     ensureStateDir();
 
     if (options.apiUrl) {
@@ -202,7 +227,7 @@ function readAuth(apiUrlOverride?: string): { apiUrl: string; apiToken: string }
   const apiToken = process.env.PATCHPAGE_API_TOKEN || credentials.apiToken;
 
   if (!apiToken) {
-    throw new CliError(`Missing API token. Run: patchpage auth set <api-token>${defaultHostHint(apiUrl)}`);
+    throw new CliError(`Missing API token. Run: patchpage auth set${defaultHostHint(apiUrl)}`);
   }
 
   return { apiUrl, apiToken };
@@ -225,6 +250,92 @@ function ensureStateDir(): void {
   mkdirSync(STATE_DIR, { recursive: true, mode: 0o700 });
 }
 
+async function promptForApiToken(): Promise<string> {
+  const input = process.stdin;
+  const output = process.stderr;
+
+  if (!input.isTTY || !output.isTTY || typeof input.setRawMode !== "function") {
+    throw new CliError(
+      "Interactive token entry requires a terminal. For automation, pipe the token to patchpage auth set --token-stdin."
+    );
+  }
+
+  const wasRaw = Boolean(input.isRaw);
+  const hiddenOutput = new Writable({
+    write(_chunk, _encoding, callback) {
+      callback();
+    }
+  });
+  const abortController = new AbortController();
+  const abort = (error: CliError) => {
+    if (!abortController.signal.aborted) abortController.abort(error);
+  };
+  const onEnd = () => abort(new CliError("API token input ended before a token was entered."));
+  const onError = () => abort(new CliError("Could not read the API token."));
+  const onInterrupt = () => abort(new CliError("Authentication cancelled."));
+  const onClose = () => abort(new CliError("API token input ended before a token was entered."));
+  let readline: ReturnType<typeof createInterface> | undefined;
+  let promptStarted = false;
+
+  try {
+    readline = createInterface({
+      input,
+      output: hiddenOutput,
+      terminal: true,
+      historySize: 0
+    });
+    input.prependOnceListener("end", onEnd);
+    input.prependOnceListener("error", onError);
+    readline.once("SIGINT", onInterrupt);
+    readline.once("close", onClose);
+    promptStarted = true;
+    output.write("PatchPage API token: ");
+
+    try {
+      return await readline.question("", { signal: abortController.signal });
+    } catch {
+      const reason = abortController.signal.reason;
+      if (reason instanceof CliError) throw reason;
+      throw new CliError("Could not read the API token.");
+    }
+  } finally {
+    input.removeListener("end", onEnd);
+    input.removeListener("error", onError);
+    readline?.removeListener("SIGINT", onInterrupt);
+    readline?.removeListener("close", onClose);
+    try {
+      readline?.close();
+      hiddenOutput.destroy();
+    } finally {
+      if (Boolean(input.isRaw) !== wasRaw) input.setRawMode(wasRaw);
+    }
+    if (promptStarted) output.write("\n");
+  }
+}
+
+function parseApiToken(input: string, allowTrailingLineEnding: boolean): string {
+  let apiToken = input;
+  if (allowTrailingLineEnding) {
+    apiToken = apiToken.endsWith("\r\n")
+      ? apiToken.slice(0, -2)
+      : apiToken.endsWith("\n")
+        ? apiToken.slice(0, -1)
+        : apiToken;
+  }
+
+  if (/[\r\n]/.test(apiToken)) {
+    throw new CliError("API token must be provided as a single line.");
+  }
+  if (!apiToken.trim()) {
+    throw new CliError("API token cannot be empty.");
+  }
+  if (apiToken !== apiToken.trim()) {
+    throw new CliError("API token cannot begin or end with whitespace.");
+  }
+
+  return apiToken;
+}
+
 function readDrafts(): DraftCache {
   return readJson<DraftCache>(DRAFTS_PATH, { files: {} });
 }
@@ -239,7 +350,28 @@ function readJson<T>(file: string, fallback: T): T {
 
 function writeJson<T>(file: string, value: T, mode = 0o600): void {
   ensureStateDir();
-  writeFileSync(file, `${JSON.stringify(value, null, 2)}\n`, { mode });
+  const tempFile = path.join(
+    path.dirname(file),
+    `.${path.basename(file)}.${process.pid}.${randomUUID()}.tmp`
+  );
+  let fd: number | undefined;
+  try {
+    fd = openSync(
+      tempFile,
+      constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL,
+      mode
+    );
+    if (process.platform !== "win32") fchmodSync(fd, mode);
+    writeFileSync(fd, `${JSON.stringify(value, null, 2)}\n`);
+    if (process.platform !== "win32") fchmodSync(fd, mode);
+    const completedFd = fd;
+    fd = undefined;
+    closeSync(completedFd);
+    renameSync(tempFile, file);
+  } finally {
+    if (fd !== undefined) closeSync(fd);
+    rmSync(tempFile, { force: true });
+  }
 }
 
 function collectGitMetadata(cwd: string): Record<string, string | null> {

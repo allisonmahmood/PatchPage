@@ -100,7 +100,7 @@ The server listens on `0.0.0.0:$PORT` and exposes a `GET /healthz` endpoint that
 
 ## Minting API tokens
 
-The bootstrap token (`PATCHPAGE_BOOTSTRAP_API_TOKEN`) is itself a valid API token with `admin` and `upload` scopes. You can hand it straight to the CLI, but the better practice is to use it once to mint scoped, per-client tokens.
+The bootstrap token (`PATCHPAGE_BOOTSTRAP_API_TOKEN`) is itself a valid API token with `admin` and `upload` scopes. You can use it to authenticate the CLI, but the better practice is to use it once to mint scoped, per-client tokens.
 
 `POST /api/tokens` requires a token with the `admin` scope (the bootstrap token has it). The request body accepts an optional `name` and `scopes` array; if `scopes` is omitted it defaults to `["upload"]`. It returns the new token as `token` — this value is shown only in the response, so capture it.
 
@@ -128,12 +128,18 @@ You can confirm any token with `GET /api/me` (or `patchpage whoami`), which retu
 Save the minted token and your instance's base URL:
 
 ```sh
-patchpage auth set pp_your_token_here --api-url https://post.example.com
+patchpage auth set --api-url https://post.example.com
 patchpage whoami
 patchpage upload ./plan.html
 ```
 
-Alternatively, set `PATCHPAGE_API_URL` and `PATCHPAGE_API_TOKEN` in the environment (handy for CI) instead of running `auth set`.
+`auth set` reads the token from a non-echoing terminal prompt. Automation that needs to persist credentials must explicitly pipe one token to `--token-stdin`:
+
+```sh
+printf '%s' "$TOKEN" | patchpage auth set --token-stdin --api-url https://post.example.com
+```
+
+Alternatively, CI can set `PATCHPAGE_API_URL` and `PATCHPAGE_API_TOKEN` directly on ordinary authenticated commands such as `whoami` and `upload`, skipping `auth set` entirely. `auth set` does not read `PATCHPAGE_API_TOKEN`.
 
 ## Deployment notes
 

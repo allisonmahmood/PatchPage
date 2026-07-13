@@ -13,7 +13,8 @@ In another shell:
 
 ```sh
 pnpm --filter patchpage build
-PATCHPAGE_STATE_DIR=.local/cli node packages/cli/dist/index.js auth set dev-token --api-url http://localhost:3000
+# Enter the local bootstrap token at the hidden prompt.
+PATCHPAGE_STATE_DIR=.local/cli node packages/cli/dist/index.js auth set --api-url http://localhost:3000
 PATCHPAGE_STATE_DIR=.local/cli node packages/cli/dist/index.js upload examples/plan.html
 ```
 
