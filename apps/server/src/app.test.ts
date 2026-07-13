@@ -68,6 +68,7 @@ describe("PatchPage server", () => {
     expect(isProtectedApiPath("/%61pi/does-not-exist")).toBe(true);
     expect(isProtectedApiPath("http://host/api/does-not-exist?ignored=true")).toBe(true);
     expect(isProtectedApiPath("https://host/%61pi/does-not-exist#fragment")).toBe(true);
+    expect(isProtectedApiPath("HtTp://host/%61pi/does-not-exist")).toBe(true);
     expect(isProtectedApiPath("/api%2Fdoes-not-exist")).toBe(true);
     expect(isProtectedApiPath("/api//does-not-exist")).toBe(true);
     expect(isProtectedApiPath("/apix")).toBe(false);
@@ -551,6 +552,11 @@ describe("PatchPage server", () => {
     {
       label: "absolute-form API target",
       url: "http://host/api/does-not-exist",
+      rawHttp: true
+    },
+    {
+      label: "mixed-case absolute-form API target",
+      url: "HtTp://host/%61pi/does-not-exist",
       rawHttp: true
     }
   ])(

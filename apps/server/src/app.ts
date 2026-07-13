@@ -387,7 +387,7 @@ export function isProtectedApiPath(requestTarget: string): boolean {
 }
 
 function canonicalRequestTargetPath(requestTarget: string): string | null {
-  const originForm = requestTarget.replace(/^https?:\/\/.*?\//, "/");
+  const originForm = requestTarget.replace(/^https?:\/\/.*?\//i, "/");
   const end = originForm.search(/[?#]/);
   const rawPath = end === -1 ? originForm : originForm.slice(0, end);
   const rawPathWithPolicySeparators = rawPath.replace(/%2f/gi, "/");
