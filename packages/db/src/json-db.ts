@@ -70,6 +70,7 @@ interface StateMutationResult<T> {
 
 // This serializer is intentionally process-local; interprocess locking is unsupported.
 const mutationQueues = new Map<string, Promise<void>>();
+const durabilityVerifiedDirectories = new Set<string>();
 const utf8Decoder = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
 
 export class JsonFilePatchPageDb implements PatchPageDb {
@@ -376,6 +377,12 @@ async function inspectDatabaseFilePath(filePath: string): Promise<Stats | null> 
     if (fileStats.isSymbolicLink()) {
       throw new Error("JSON metadata file path must not be a symbolic link.");
     }
+    if (!fileStats.isFile()) {
+      throw new Error("JSON metadata file path must be a regular file.");
+    }
+    if (fileStats.nlink !== 1) {
+      throw new Error("JSON metadata file path must not have multiple hard links.");
+    }
     return fileStats;
   } catch (error) {
     if (hasErrorCode(error, "ENOENT")) return null;
@@ -491,6 +498,10 @@ function assertLosslessJsonValue(value: unknown, seen: WeakSet<object>): void {
 function assertNoJsonTransformation(value: object): void {
   let current: object | null = value;
   while (current) {
+    if (utilTypes.isProxy(current)) {
+      throw new Error("Proxy-backed JSON prototypes are unsupported.");
+    }
+
     const descriptor = Object.getOwnPropertyDescriptor(current, "toJSON");
     if (
       descriptor &&
@@ -542,8 +553,9 @@ function hasErrorCode(error: unknown, code: string): boolean {
 }
 
 async function ensureDurableDirectory(directoryPath: string): Promise<FileHandle | null> {
+  let directory: FileHandle | null;
   try {
-    return await openDirectoryHandle(directoryPath);
+    directory = await openDirectoryHandle(directoryPath);
   } catch (error) {
     if (!hasErrorCode(error, "ENOENT")) throw error;
 
@@ -560,11 +572,33 @@ async function ensureDurableDirectory(directoryPath: string): Promise<FileHandle
         }
       }
       await syncDirectoryHandle(parent);
+      durabilityVerifiedDirectories.add(directoryPath);
     } finally {
       if (parent) await parent.close().catch(() => undefined);
     }
 
     return openDirectoryHandle(directoryPath);
+  }
+
+  if (durabilityVerifiedDirectories.has(directoryPath)) return directory;
+
+  const parentPath = path.dirname(directoryPath);
+  if (parentPath === directoryPath) {
+    durabilityVerifiedDirectories.add(directoryPath);
+    return directory;
+  }
+
+  let parent: FileHandle | null = null;
+  try {
+    parent = await ensureDurableDirectory(parentPath);
+    await syncDirectoryHandle(parent);
+    durabilityVerifiedDirectories.add(directoryPath);
+    return directory;
+  } catch (error) {
+    if (directory) await directory.close().catch(() => undefined);
+    throw error;
+  } finally {
+    if (parent) await parent.close().catch(() => undefined);
   }
 }
 

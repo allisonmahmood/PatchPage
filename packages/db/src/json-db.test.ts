@@ -1,5 +1,14 @@
-import {
+import { execFile as execFileCallback } from "node:child_process";
+import * as fsPromises from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
+import { promisify } from "node:util";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { JsonFilePatchPageDb } from "./json-db.js";
+
+const {
   chmod,
+  link,
   lstat,
   mkdir,
   mkdtemp,
@@ -11,11 +20,8 @@ import {
   stat,
   symlink,
   writeFile
-} from "node:fs/promises";
-import os from "node:os";
-import path from "node:path";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { JsonFilePatchPageDb } from "./json-db.js";
+} = fsPromises;
+const execFile = promisify(execFileCallback);
 
 let tempDir: string;
 const supportsPosixPermissionTest =
@@ -480,6 +486,63 @@ describe("JsonFilePatchPageDb", () => {
     }
   );
 
+  it.skipIf(process.platform === "win32")(
+    "rejects a hard-linked database file without changing either alias",
+    async () => {
+      const filePath = path.join(tempDir, "db.json");
+      const aliasPath = path.join(tempDir, "db-alias.json");
+      await new JsonFilePatchPageDb(filePath).initialize("original-secret");
+      await link(filePath, aliasPath);
+      const original = await readFile(filePath);
+      const originalStats = await lstat(filePath);
+
+      const error = await new JsonFilePatchPageDb(aliasPath)
+        .initialize("replacement-secret")
+        .then(
+          () => null,
+          (reason: unknown) => reason
+        );
+
+      expect(error).toBeInstanceOf(Error);
+      expect((error as Error).message).toBe(
+        "JSON metadata file path must not have multiple hard links."
+      );
+      expect(String(error)).not.toContain("original-secret");
+      expect(String(error)).not.toContain("replacement-secret");
+      expect(await readFile(filePath)).toEqual(original);
+      expect(await readFile(aliasPath)).toEqual(original);
+      expect((await lstat(filePath)).ino).toBe(originalStats.ino);
+      expect((await lstat(aliasPath)).ino).toBe(originalStats.ino);
+      expect((await readdir(tempDir)).sort()).toEqual(["db-alias.json", "db.json"]);
+    }
+  );
+
+  it.skipIf(process.platform === "win32")(
+    "rejects a non-regular database file without modifying it",
+    async () => {
+      const filePath = path.join(tempDir, "db.json");
+      await execFile("mkfifo", [filePath]);
+      const originalStats = await lstat(filePath);
+
+      const error = await new JsonFilePatchPageDb(filePath)
+        .initialize("replacement-secret")
+        .then(
+          () => null,
+          (reason: unknown) => reason
+        );
+
+      const finalStats = await lstat(filePath);
+      expect(error).toBeInstanceOf(Error);
+      expect((error as Error).message).toBe(
+        "JSON metadata file path must be a regular file."
+      );
+      expect(String(error)).not.toContain("replacement-secret");
+      expect(finalStats.isFIFO()).toBe(true);
+      expect(finalStats.ino).toBe(originalStats.ino);
+      expect(await readdir(tempDir)).toEqual(["db.json"]);
+    }
+  );
+
   it("rejects mutation state that cannot survive JSON persistence losslessly", async () => {
     const filePath = path.join(tempDir, "db.json");
     const db = new JsonFilePatchPageDb(filePath);
@@ -514,6 +577,21 @@ describe("JsonFilePatchPageDb", () => {
     const sharedChild = { secret: "mutation-secret" };
     const sharedReferenceValue = { first: sharedChild, second: sharedChild };
     const nullPrototypeValue = Object.assign(Object.create(null), { safe: true });
+    let proxyTrapCalls = 0;
+    const proxyPrototype = new Proxy(
+      {},
+      {
+        getOwnPropertyDescriptor() {
+          proxyTrapCalls += 1;
+          throw new Error("mutation-secret");
+        },
+        getPrototypeOf() {
+          proxyTrapCalls += 1;
+          throw new Error("mutation-secret");
+        }
+      }
+    );
+    const inheritedProxyValue = Object.create(proxyPrototype) as Record<string, unknown>;
 
     const hazards: Array<{ name: string; value: unknown }> = [
       { name: "NaN", value: Number.NaN },
@@ -532,7 +610,8 @@ describe("JsonFilePatchPageDb", () => {
       { name: "symbol-keyed state", value: symbolKeyValue },
       { name: "shared object reference", value: sharedReferenceValue },
       { name: "null-prototype object", value: nullPrototypeValue },
-      { name: "exotic object", value: new Date() }
+      { name: "exotic object", value: new Date() },
+      { name: "proxy prototype", value: inheritedProxyValue }
     ];
 
     for (const hazard of hazards) {
@@ -567,6 +646,7 @@ describe("JsonFilePatchPageDb", () => {
     }
 
     expect(toJsonCalls).toBe(0);
+    expect(proxyTrapCalls).toBe(0);
   });
 
   it("rejects unsafe metadata accessors without invoking or disclosing them", async () => {
@@ -644,9 +724,7 @@ describe("JsonFilePatchPageDb", () => {
     const filePath = path.join(tempDir, "db.json");
     await new JsonFilePatchPageDb(filePath).initialize("dev-token");
     const original = await readFile(filePath);
-    const actualFs = await vi.importActual<typeof import("node:fs/promises")>(
-      "node:fs/promises"
-    );
+    const actualFs = fsPromises;
     const temporaryOpens: string[] = [];
     const trackedOpen = (async (...args: Parameters<typeof actualFs.open>) => {
       if (args[1] === "wx") temporaryOpens.push(String(args[0]));
@@ -658,6 +736,7 @@ describe("JsonFilePatchPageDb", () => {
 
     let error: unknown;
     try {
+      // A static import cannot observe the per-test mocked filesystem boundary.
       const { JsonFilePatchPageDb: TrackedJsonFilePatchPageDb } = await import(
         "./json-db.js"
       );
@@ -697,9 +776,7 @@ describe("JsonFilePatchPageDb", () => {
   it.skipIf(process.platform === "win32")(
     "flushes each new parent directory entry during fresh initialization",
     async () => {
-      const actualFs = await vi.importActual<typeof import("node:fs/promises")>(
-        "node:fs/promises"
-      );
+      const actualFs = fsPromises;
       const syncedDirectories: string[] = [];
       const trackedOpen = (async (...args: Parameters<typeof actualFs.open>) => {
         const handle = await Reflect.apply(actualFs.open, actualFs, args);
@@ -720,6 +797,7 @@ describe("JsonFilePatchPageDb", () => {
       const directoryPath = path.join(tempDir, "first", "second");
       const filePath = path.join(directoryPath, "db.json");
       try {
+        // A static import cannot observe the per-test mocked filesystem boundary.
         const { JsonFilePatchPageDb: TrackedJsonFilePatchPageDb } = await import(
           "./json-db.js"
         );
@@ -729,26 +807,106 @@ describe("JsonFilePatchPageDb", () => {
         vi.resetModules();
       }
 
-      expect(syncedDirectories).toEqual([
-        tempDir,
-        path.join(tempDir, "first"),
-        directoryPath
-      ]);
+      expect(syncedDirectories).toEqual(
+        expect.arrayContaining([
+          tempDir,
+          path.join(tempDir, "first"),
+          directoryPath
+        ])
+      );
       const auth = await new JsonFilePatchPageDb(filePath).findApiTokenByToken(
         "dev-token"
       );
       expect(auth?.id).toBe("tok_bootstrap");
     }
   );
+  it.skipIf(process.platform === "win32")(
+    "retries parent durability after a new-directory fsync failure",
+    async () => {
+      let failParentSync = true;
+      const failingOpen = (async (...args: Parameters<typeof fsPromises.open>) => {
+        const handle = await Reflect.apply(fsPromises.open, fsPromises, args);
+        if (args[1] === "r" && path.resolve(String(args[0])) === tempDir) {
+          const originalSync = handle.sync.bind(handle);
+          handle.sync = async () => {
+            if (failParentSync) {
+              failParentSync = false;
+              throw Object.assign(new Error("parent sync failed"), { code: "EIO" });
+            }
+            await originalSync();
+          };
+        }
+        return handle;
+      }) as typeof fsPromises.open;
+
+      vi.resetModules();
+      vi.doMock("node:fs/promises", () => ({ ...fsPromises, open: failingOpen }));
+
+      const directoryPath = path.join(tempDir, "first", "second");
+      const filePath = path.join(directoryPath, "db.json");
+      let error: unknown;
+      try {
+        // A static import cannot observe the per-test mocked filesystem boundary.
+        const { JsonFilePatchPageDb: FailingJsonFilePatchPageDb } = await import(
+          "./json-db.js"
+        );
+        error = await new FailingJsonFilePatchPageDb(filePath)
+          .initialize("dev-token")
+          .then(
+            () => null,
+            (reason: unknown) => reason
+          );
+      } finally {
+        vi.doUnmock("node:fs/promises");
+        vi.resetModules();
+      }
+
+      expect(error).toMatchObject({ code: "EIO" });
+      expect((await lstat(path.join(tempDir, "first"))).isDirectory()).toBe(true);
+
+      let retriedParentSyncs = 0;
+      const trackedRetryOpen = (async (...args: Parameters<typeof fsPromises.open>) => {
+        const handle = await Reflect.apply(fsPromises.open, fsPromises, args);
+        if (args[1] === "r" && path.resolve(String(args[0])) === tempDir) {
+          const originalSync = handle.sync.bind(handle);
+          handle.sync = async () => {
+            retriedParentSyncs += 1;
+            await originalSync();
+          };
+        }
+        return handle;
+      }) as typeof fsPromises.open;
+
+      vi.resetModules();
+      vi.doMock("node:fs/promises", () => ({
+        ...fsPromises,
+        open: trackedRetryOpen
+      }));
+
+      try {
+        // A static import cannot observe the per-test mocked filesystem boundary.
+        const { JsonFilePatchPageDb: RetryingJsonFilePatchPageDb } = await import(
+          "./json-db.js"
+        );
+        const db = new RetryingJsonFilePatchPageDb(filePath);
+        await db.initialize("dev-token");
+        expect((await db.findApiTokenByToken("dev-token"))?.id).toBe("tok_bootstrap");
+      } finally {
+        vi.doUnmock("node:fs/promises");
+        vi.resetModules();
+      }
+
+      expect(retriedParentSyncs).toBeGreaterThan(0);
+    }
+  );
+
 
   it("fails before commit when the target directory cannot be opened", async () => {
     const filePath = path.join(tempDir, "db.json");
     const db = new JsonFilePatchPageDb(filePath);
     await db.initialize("dev-token");
     const original = await readFile(filePath);
-    const actualFs = await vi.importActual<typeof import("node:fs/promises")>(
-      "node:fs/promises"
-    );
+    const actualFs = fsPromises;
     const failingOpen = (async (...args: Parameters<typeof actualFs.open>) => {
       if (args[1] === "r" && path.resolve(String(args[0])) === tempDir) {
         throw Object.assign(new Error("directory open failed"), { code: "EACCES" });
@@ -761,6 +919,7 @@ describe("JsonFilePatchPageDb", () => {
 
     let error: unknown;
     try {
+      // A static import cannot observe the per-test mocked filesystem boundary.
       const { JsonFilePatchPageDb: FailingJsonFilePatchPageDb } = await import(
         "./json-db.js"
       );
@@ -788,9 +947,7 @@ describe("JsonFilePatchPageDb", () => {
     async () => {
       const filePath = path.join(tempDir, "db.json");
       await new JsonFilePatchPageDb(filePath).initialize("dev-token");
-      const actualFs = await vi.importActual<typeof import("node:fs/promises")>(
-        "node:fs/promises"
-      );
+      const actualFs = fsPromises;
       let targetDirectoryOpens = 0;
       let targetDirectorySyncs = 0;
       const singleDirectoryOpen = (async (...args: Parameters<typeof actualFs.open>) => {
@@ -821,6 +978,7 @@ describe("JsonFilePatchPageDb", () => {
       }));
 
       try {
+        // A static import cannot observe the per-test mocked filesystem boundary.
         const { JsonFilePatchPageDb: SingleOpenJsonFilePatchPageDb } = await import(
           "./json-db.js"
         );
@@ -846,9 +1004,7 @@ describe("JsonFilePatchPageDb", () => {
     const filePath = path.join(tempDir, "db.json");
     await new JsonFilePatchPageDb(filePath).initialize("dev-token");
     const original = await readFile(filePath);
-    const actualFs = await vi.importActual<typeof import("node:fs/promises")>(
-      "node:fs/promises"
-    );
+    const actualFs = fsPromises;
     const failingOpen = (async (...args: Parameters<typeof actualFs.open>) => {
       const handle = await Reflect.apply(actualFs.open, actualFs, args);
       if (args[1] === "r" && path.resolve(String(args[0])) === tempDir) {
@@ -864,6 +1020,7 @@ describe("JsonFilePatchPageDb", () => {
 
     let error: unknown;
     try {
+      // A static import cannot observe the per-test mocked filesystem boundary.
       const { JsonFilePatchPageDb: FailingJsonFilePatchPageDb } = await import(
         "./json-db.js"
       );
@@ -894,9 +1051,7 @@ describe("JsonFilePatchPageDb", () => {
     const filePath = path.join(tempDir, "db.json");
     await new JsonFilePatchPageDb(filePath).initialize("dev-token");
     const original = await readFile(filePath);
-    const actualFs = await vi.importActual<typeof import("node:fs/promises")>(
-      "node:fs/promises"
-    );
+    const actualFs = fsPromises;
     const busyRename = (async () => {
       throw Object.assign(new Error("mount-secret"), { code: "EBUSY" });
     }) as typeof actualFs.rename;
@@ -911,6 +1066,7 @@ describe("JsonFilePatchPageDb", () => {
 
     let error: unknown;
     try {
+      // A static import cannot observe the per-test mocked filesystem boundary.
       const { JsonFilePatchPageDb: MountedJsonFilePatchPageDb } = await import(
         "./json-db.js"
       );
