@@ -150,6 +150,95 @@ describe("JsonFilePatchPageDb", () => {
     }
   );
 
+  it.skipIf(process.platform === "win32")(
+    "serializes aliases that share a directory identity without a shared realpath",
+    async () => {
+      const realParent = path.join(tempDir, "identity-parent");
+      const aliasedParent = path.join(tempDir, "identity-alias");
+      await mkdir(realParent);
+      await symlink(realParent, aliasedParent, "dir");
+
+      let textualIdentityCalls = 0;
+      let releaseTextualIdentities = (): void => undefined;
+      const textualIdentities = new Promise<void>((resolve) => {
+        releaseTextualIdentities = resolve;
+      });
+      const uncanonicalRealpath = (async (
+        target: Parameters<typeof fsPromises.realpath>[0]
+      ) => {
+        textualIdentityCalls += 1;
+        if (textualIdentityCalls === 2) releaseTextualIdentities();
+        await textualIdentities;
+        return path.resolve(String(target));
+      }) as typeof fsPromises.realpath;
+
+      let primaryReads = 0;
+      let releaseConcurrentReads = (): void => undefined;
+      const concurrentReads = new Promise<void>((resolve) => {
+        releaseConcurrentReads = resolve;
+      });
+      const trackedReadFile = (async (...args: Parameters<typeof fsPromises.readFile>) => {
+        if (
+          textualIdentityCalls >= 2 &&
+          path.basename(String(args[0])) === "db.json" &&
+          primaryReads < 2
+        ) {
+          primaryReads += 1;
+          if (primaryReads === 2) releaseConcurrentReads();
+          await concurrentReads;
+        }
+        return Reflect.apply(fsPromises.readFile, fsPromises, args);
+      }) as typeof fsPromises.readFile;
+
+      vi.resetModules();
+      vi.doMock("node:fs/promises", () => ({
+        ...fsPromises,
+        readFile: trackedReadFile,
+        realpath: uncanonicalRealpath
+      }));
+
+      const realFilePath = path.join(realParent, "db.json");
+      const aliasedFilePath = path.join(aliasedParent, "db.json");
+      try {
+        // A static import cannot observe the per-test mocked filesystem boundary.
+        const { JsonFilePatchPageDb: IdentityJsonFilePatchPageDb } = await import(
+          "./json-db.js"
+        );
+        const uploads = Array.from({ length: 8 }, (_, index) => {
+          const draftId = `identity_draft_${index}`;
+          const versionId = `identity_ver_${index}`;
+          const db = new IdentityJsonFilePatchPageDb(
+            index % 2 === 0 ? realFilePath : aliasedFilePath
+          );
+          return db.recordUpload({
+            draftId,
+            versionId,
+            accountId: "acct_test",
+            apiTokenId: "tok_test",
+            title: `Identity draft ${index}`,
+            objectKey: `drafts/${draftId}/versions/${versionId}.html`,
+            contentHash: `sha256:identity-${index}`,
+            fileSize: index + 1,
+            filename: `identity-${index}.html`,
+            metadata: { padding: "x".repeat(64 * 1024) },
+            sourceIp: null,
+            userAgent: "vitest"
+          });
+        });
+        await Promise.all(uploads);
+      } finally {
+        vi.doUnmock("node:fs/promises");
+        vi.resetModules();
+      }
+
+      const db = new JsonFilePatchPageDb(realFilePath);
+      for (let index = 0; index < 8; index += 1) {
+        const lookup = await db.findDraftVersion(`identity_draft_${index}`);
+        expect(lookup.version?.id).toBe(`identity_ver_${index}`);
+      }
+    }
+  );
+
   it("serializes fresh-file mutations through case aliases on case-insensitive filesystems", async () => {
     const parentPath = path.join(tempDir, "CaseParent");
     const parentAlias = path.join(tempDir, "caseparent");

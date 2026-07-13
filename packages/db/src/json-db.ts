@@ -5,7 +5,6 @@ import {
   lstat,
   open,
   readFile,
-  realpath,
   rename,
   stat,
   unlink,
@@ -396,11 +395,11 @@ async function canonicalMutationIdentity(filePath: string): Promise<string> {
 
   while (true) {
     try {
-      const canonicalAncestor = await realpath(existingAncestor);
-      // This is a process-local coordination key, not an I/O path. Conservative
-      // case folding avoids split queues before a case-insensitive filesystem can
-      // return the final component's canonical spelling.
-      return foldMutationIdentity(path.join(canonicalAncestor, ...unresolvedComponents));
+      const ancestorStats = await stat(existingAncestor, { bigint: true });
+      // Device/inode identity collapses symlink, case-insensitive, and bind-mount
+      // aliases that textual canonicalization cannot reliably recognize.
+      const unresolvedSuffix = foldMutationIdentity(path.join(...unresolvedComponents));
+      return `${ancestorStats.dev}:${ancestorStats.ino}:${unresolvedSuffix}`;
     } catch (error) {
       if (!hasErrorCode(error, "ENOENT")) throw error;
 
