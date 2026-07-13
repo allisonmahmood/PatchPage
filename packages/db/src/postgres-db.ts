@@ -98,6 +98,7 @@ export class PostgresPatchPageDb implements PatchPageDb {
 
   async recordUpload(input: RecordUploadInput): Promise<RecordUploadResult> {
     const client = await this.pool.connect();
+    let commitAttempted = false;
     try {
       await client.query("BEGIN");
 
@@ -214,10 +215,20 @@ export class PostgresPatchPageDb implements PatchPageDb {
         ]
       );
 
+      commitAttempted = true;
       await client.query("COMMIT");
       return { draftId: input.draftId, versionId: input.versionId, versionNumber, title };
     } catch (error) {
-      await client.query("ROLLBACK");
+      try {
+        await client.query("ROLLBACK");
+      } catch (rollbackError) {
+        // A definitive target rejection happened before COMMIT, so preserve it
+        // for the server's object-compensation path even if cleanup also fails.
+        if (!commitAttempted && error instanceof UploadTargetError) {
+          throw error;
+        }
+        throw rollbackError;
+      }
       throw error;
     } finally {
       client.release();

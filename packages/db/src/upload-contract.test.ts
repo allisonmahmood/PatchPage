@@ -5,6 +5,7 @@ import { describe, expect, it } from "vitest";
 import { newDraftId, newInternalId, randomToken } from "@patchpage/core";
 import { JsonFilePatchPageDb } from "./json-db.js";
 import { PostgresPatchPageDb } from "./postgres-db.js";
+import { isUploadTargetError } from "./types.js";
 import type {
   ApiTokenAuth,
   PatchPageDb,
@@ -248,6 +249,33 @@ describeUploadContract(
   Boolean(postgresTestUrl)
 );
 
+const postgresSuite = postgresTestUrl ? describe : describe.skip;
+postgresSuite("Postgres rollback error handling", () => {
+  it("preserves a typed final rejection when rollback also fails", async () => {
+    const harness = await createPostgresHarness(postgresTestUrl!);
+    const db = harness.db as PostgresPatchPageDb;
+    const draftId = newDraftId();
+    const updateInput = uploadInput("update", draftId, harness.auth);
+
+    try {
+      await db.recordUpload(uploadInput("create", draftId, harness.auth));
+      await db.assertUploadTarget(updateInput);
+      await db.disableDraft(draftId, harness.auth.accountId, "policy race");
+      failRollbackAfterExecution(db);
+
+      const error = await captureError(db.recordUpload(updateInput));
+      expect(isUploadTargetError(error)).toBe(true);
+      expect(error).toMatchObject({
+        code: "draft_unavailable",
+        message: "Draft not found.",
+        statusCode: 404
+      });
+    } finally {
+      await harness.close();
+    }
+  });
+});
+
 async function createJsonHarness(): Promise<ContractHarness> {
   const tempDir = await mkdtemp(path.join(os.tmpdir(), "patchpage-upload-contract-"));
   const filePath = path.join(tempDir, "db.json");
@@ -309,6 +337,36 @@ function uploadInput(
     sourceIp: "127.0.0.1",
     userAgent: "vitest",
     ...overrides
+  };
+}
+
+interface TestPoolClient {
+  query(text: string, values?: unknown[]): Promise<unknown>;
+  release(): void;
+}
+
+function failRollbackAfterExecution(db: PostgresPatchPageDb): void {
+  const pool = (
+    db as unknown as {
+      pool: { connect(): Promise<TestPoolClient> };
+    }
+  ).pool;
+  const connect = pool.connect.bind(pool);
+  pool.connect = async () => {
+    const client = await connect();
+    return {
+      async query(text, values) {
+        const result =
+          values === undefined ? await client.query(text) : await client.query(text, values);
+        if (text === "ROLLBACK") {
+          throw new Error("Forced rollback failure after server execution.");
+        }
+        return result;
+      },
+      release() {
+        client.release();
+      }
+    };
   };
 }
 
