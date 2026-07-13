@@ -344,8 +344,14 @@ if ! printf '%s\n' "$LIVE_INGRESS" |
     .allowInsecure == false and
     .targetPort == 3000 and
     (.transport | type == "string" and ascii_downcase == "auto") and
-    (.clientCertificateMode |
-      type == "string" and ascii_downcase == "ignore") and
+    (
+      .clientCertificateMode == null or
+      (
+        .clientCertificateMode |
+        type == "string" and
+        (length == 0 or ascii_downcase == "ignore")
+      )
+    ) and
     .corsPolicy == null and
     (.exposedPort == null or .exposedPort == 0) and
     (
@@ -365,9 +371,8 @@ if ! printf '%s\n' "$LIVE_INGRESS" |
       (.ipSecurityRestrictions | type == "array" and length == 0)
     ) and
     (.traffic | type == "array" and length == 1) and
-    .traffic[0].label == null and
+    (.traffic[0].label == null or .traffic[0].label == "") and
     .traffic[0].latestRevision == true and
-    (.traffic[0].revisionName | type == "string" and length > 0) and
     .traffic[0].weight == 100
   ' >/dev/null; then
   printf '%s\n' \
@@ -866,6 +871,7 @@ Terraform disables insecure ingress. Verify the exact HTTPS redirect, health res
 <!-- guide-test:deployed-smoke -->
 
 ```sh
+(
 set +x
 if ! SMOKE_TMP_DIR="$(mktemp -d)"; then
   printf 'Could not create a temporary directory for the deployed smoke.\n' >&2
@@ -1003,6 +1009,7 @@ printf '%s\n' "$DRAFT_URL"
 unset BOOTSTRAP_API_TOKEN
 unset SMOKE_MARKER UPLOAD_PAYLOAD
 rm -rf "$SMOKE_TMP_DIR"
+)
 ```
 
 Repository tests execute these guide blocks against failure-injection stubs, but they do not contact Azure or public DNS. DNS, certificate, HTTPS, and upload acceptance against the deployer's real subscription and zone remains intentionally human-in-the-loop.

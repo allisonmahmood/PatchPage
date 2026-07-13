@@ -59,7 +59,13 @@ resource "azurerm_container_app" "server" {
     }
 
     postcondition {
-      condition     = try(lower(self.ingress[0].client_certificate_mode) == "ignore", false)
+      condition = try(
+        self.ingress[0].client_certificate_mode == null ? true : (
+          trimspace(self.ingress[0].client_certificate_mode) == "" ||
+          lower(trimspace(self.ingress[0].client_certificate_mode)) == "ignore"
+        ),
+        false
+      )
       error_message = "Container App ingress must keep client certificates ignored."
     }
 
@@ -87,8 +93,10 @@ resource "azurerm_container_app" "server" {
         length(self.ingress[0].traffic_weight) == 1 &&
         one(self.ingress[0].traffic_weight).latest_revision == true &&
         one(self.ingress[0].traffic_weight).percentage == 100 &&
-        one(self.ingress[0].traffic_weight).label == null &&
-        one(self.ingress[0].traffic_weight).revision_suffix == null,
+        (
+          one(self.ingress[0].traffic_weight).label == null ? true :
+          trimspace(one(self.ingress[0].traffic_weight).label) == ""
+        ),
         false
       )
       error_message = "Container App ingress must route 100 percent of traffic through one unlabeled latest-revision rule."

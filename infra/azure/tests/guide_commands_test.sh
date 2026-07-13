@@ -454,7 +454,7 @@ run_ingress_verification_block() {
       allow_insecure="false"
       target_port="3000"
       transport='"Auto"'
-      traffic='[{"latestRevision":true,"weight":100,"revisionName":"app-test--abc"}]'
+      traffic='[{"latestRevision":true,"weight":100}]'
       client_certificate_mode='"Ignore"'
       cors_policy="null"
       exposed_port="null"
@@ -471,8 +471,9 @@ run_ingress_verification_block() {
         target_port_drift) target_port="8080" ;;
         transport_drift) transport='"http2"' ;;
         missing_transport) transport="null" ;;
-        client_certificate_drift) client_certificate_mode='"Accept"' ;;
-        missing_client_certificate) client_certificate_mode="null" ;;
+        client_certificate_accept_drift) client_certificate_mode='"Accept"' ;;
+        client_certificate_require_drift) client_certificate_mode='"Require"' ;;
+        null_client_certificate) client_certificate_mode="null" ;;
         cors_drift) cors_policy='{"allowedOrigins":["https://other.example"]}' ;;
         exposed_port_drift) exposed_port="8443" ;;
         additional_port_drift)
@@ -486,12 +487,14 @@ run_ingress_verification_block() {
         multiple_traffic)
           traffic='[{"latestRevision":true,"weight":50},{"latestRevision":false,"weight":50}]'
           ;;
-        revision_drift) traffic='[{"latestRevision":false,"weight":100}]' ;;
-        missing_revision_name)
-          traffic='[{"label":null,"latestRevision":true,"revisionName":null,"weight":100}]'
+        empty_label_dynamic)
+          traffic='[{"label":"","latestRevision":true,"revisionName":"","weight":100}]'
+          ;;
+        pinned_revision)
+          traffic='[{"latestRevision":false,"revisionName":"app-test--old","weight":100}]'
           ;;
         label_drift)
-          traffic='[{"label":"canary","latestRevision":true,"revisionName":"app-test--abc","weight":100}]'
+          traffic='[{"label":"canary","latestRevision":true,"weight":100}]'
           ;;
         weight_drift) traffic='[{"latestRevision":true,"weight":90}]' ;;
       esac
@@ -514,6 +517,10 @@ test_ingress_verification() {
     'containerapp ingress show --resource-group rg-test --name app-test --output json' \
     "$TMP_DIR/ingress-success.log" ||
     fail "documented ingress verification did not read the live ingress"
+  run_ingress_verification_block null_client_certificate ||
+    fail "documented ingress verification rejected Azure's null client-certificate default"
+  run_ingress_verification_block empty_label_dynamic ||
+    fail "documented ingress verification rejected AzureRM's empty dynamic-route fields"
 
   for scenario in \
     command_failure \
@@ -523,8 +530,8 @@ test_ingress_verification() {
     target_port_drift \
     transport_drift \
     missing_transport \
-    client_certificate_drift \
-    missing_client_certificate \
+    client_certificate_accept_drift \
+    client_certificate_require_drift \
     cors_drift \
     exposed_port_drift \
     additional_port_drift \
@@ -532,8 +539,7 @@ test_ingress_verification() {
     ip_restriction_drift \
     empty_traffic \
     multiple_traffic \
-    revision_drift \
-    missing_revision_name \
+    pinned_revision \
     label_drift \
     weight_drift; do
     if run_ingress_verification_block "$scenario"; then
@@ -1036,6 +1042,22 @@ run_deployed_smoke_block() {
       PUBLIC_BASE_URL="https://drafts.self-hoster.dev"
     fi
     CUSTOM_DOMAIN="drafts.self-hoster.dev"
+    smoke_tmp_dir="$TMP_DIR/deployed-smoke-$scenario-tmp"
+    caller_trap_log="$TMP_DIR/deployed-smoke-$scenario-caller-trap.log"
+    caller_trap_snapshot="$TMP_DIR/deployed-smoke-$scenario-caller-traps.txt"
+    rm -rf "$smoke_tmp_dir"
+    : > "$caller_trap_log"
+
+    mktemp() {
+      test "$*" = "-d" || return 1
+      mkdir -p "$smoke_tmp_dir" || return 1
+      printf '%s\n' "$smoke_tmp_dir"
+    }
+
+    trap 'printf "%s\n" caller-exit >> "$caller_trap_log"' EXIT
+    trap 'printf "%s\n" caller-hup >> "$caller_trap_log"' HUP
+    trap 'printf "%s\n" caller-int >> "$caller_trap_log"' INT
+    trap 'printf "%s\n" caller-term >> "$caller_trap_log"' TERM
 
     terraform() {
       test "$*" = "output -raw bootstrap_api_token"
@@ -1219,6 +1241,11 @@ run_deployed_smoke_block() {
     }
 
     eval "$DEPLOYED_SMOKE_BLOCK"
+    smoke_status=$?
+    trap > "$caller_trap_snapshot"
+    mkdir -p "$smoke_tmp_dir"
+    : > "$smoke_tmp_dir/reused-after-smoke"
+    exit "$smoke_status"
   ) >"$output" 2>&1
 }
 
@@ -1228,6 +1255,15 @@ test_deployed_smoke() {
     fail "successful deployed smoke was rejected"
   grep -Fqx 'https://drafts.self-hoster.dev/d/abc123def456' "$success_output" ||
     fail "successful deployed smoke did not print the exact draft URL"
+  grep -Fqx 'caller-exit' "$TMP_DIR/deployed-smoke-success-caller-trap.log" ||
+    fail "deployed smoke overwrote the caller EXIT trap"
+  for caller_signal_trap in caller-hup caller-int caller-term; do
+    grep -Fq "$caller_signal_trap" \
+      "$TMP_DIR/deployed-smoke-success-caller-traps.txt" ||
+      fail "deployed smoke overwrote $caller_signal_trap"
+  done
+  test -f "$TMP_DIR/deployed-smoke-success-tmp/reused-after-smoke" ||
+    fail "a stale deployed-smoke trap removed a caller-reused path"
 
   uppercase_output="$TMP_DIR/deployed-smoke-uppercase-origin.out"
   run_deployed_smoke_block uppercase_origin "$uppercase_output" ||
