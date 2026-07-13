@@ -1,5 +1,4 @@
 import { mkdtemp, readdir, readFile, rm } from "node:fs/promises";
-import { setTimeout as delay } from "node:timers/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -393,7 +392,8 @@ describe("PatchPage server", () => {
         auth.accountId,
         "unrelated policy action"
       );
-      expect(await Promise.race([disable.then(() => true), delay(100, false)])).toBe(true);
+      // Await the operation itself rather than racing the filesystem against a
+      // short wall-clock deadline. The test timeout remains the deadlock watchdog.
       await expect(disable).resolves.toBe(true);
 
       allowWrite.resolve();
@@ -403,7 +403,7 @@ describe("PatchPage server", () => {
       await app.close();
       await db.close();
     }
-  });
+  }, 10_000);
 
   it("removes only the new object when final eligibility recheck rejects", async () => {
     const config = testConfig();
