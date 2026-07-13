@@ -34,7 +34,7 @@ variable "public_base_url" {
   validation {
     condition = (
       !can(regex(
-        "^https://(?:[a-z0-9-]+\\.)*(?:patchyhq\\.com|example\\.(?:com|net|org)|example|invalid|localhost|local|test|internal|lan|home|corp)$",
+        "^https://(?:[a-z0-9-]+\\.)*(?:patchyhq\\.com|example\\.(?:com|net|org)|example|invalid|localhost|local|test|internal|lan|home|home\\.arpa|corp)$",
         lower(var.public_base_url)
       )) &&
       !can(regex(

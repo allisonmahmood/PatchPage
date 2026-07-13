@@ -24,6 +24,14 @@ resource "azurerm_container_app" "server" {
   resource_group_name          = azurerm_resource_group.patchpage.name
   revision_mode                = "Single"
 
+  # Azure CLI owns the custom hostname and managed-certificate binding. In the
+  # AzureRM schema custom_domain is computed under ingress, so ignoring only
+  # that leaf is ineffective; ignoring ingress prevents a later update from
+  # replacing the CLI-managed binding with Terraform's original ingress shape.
+  lifecycle {
+    ignore_changes = [ingress]
+  }
+
   identity {
     type         = "UserAssigned"
     identity_ids = [azurerm_user_assigned_identity.app.id]

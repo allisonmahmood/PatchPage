@@ -63,3 +63,14 @@ run "rejects_example_configuration_origin" {
 
   expect_failures = [var.public_base_url]
 }
+
+run "rejects_home_arpa_origin" {
+  command = plan
+
+  variables {
+    subscription_id = "00000000-0000-0000-0000-000000000000"
+    public_base_url = "https://patchpage.home.arpa"
+  }
+
+  expect_failures = [var.public_base_url]
+}

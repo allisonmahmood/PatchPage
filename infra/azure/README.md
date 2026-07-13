@@ -10,7 +10,7 @@ Terraform creates:
 - the Blob Storage account and private container, plus the PostgreSQL server/database; and
 - generated application secrets and the Container App environment variables, including `PATCHPAGE_PUBLIC_BASE_URL`.
 
-Terraform does **not** create or manage the remote-state resources, container image build, DNS zone or records, Container App custom hostname, managed certificate, or certificate binding. Those steps are deliberately manual and provider-neutral below.
+Terraform does **not** create or manage the remote-state resources, container image build, DNS zone or records, Container App custom hostname, managed certificate, or certificate binding. Those steps are deliberately manual and provider-neutral below. Terraform creates the initial Container App ingress and then ignores later changes to the whole ingress block so an apply cannot overwrite the CLI-managed hostname and certificate binding. Any intentional ingress change therefore remains HITL: update the lifecycle rule and restore the manual binding as one coordinated operation.
 
 ## Prerequisites
 
@@ -20,7 +20,7 @@ Terraform does **not** create or manage the remote-state resources, container im
 - `dig`, `curl`, and `jq` for the verification commands.
 - Control of a public DNS hostname. A subdomain with a direct CNAME is recommended.
 
-Do not run this example against a maintainer subscription. Check the active account before creating anything:
+Do not run this example against a maintainer subscription. Check the available account before creating anything, then set `SUBSCRIPTION_ID` to the exact target subscription. Each mutation section selects and verifies that value before changing Azure resources.
 
 ```sh
 az account show --query '{subscription:id,tenant:tenantId,user:user.name}' --output table
@@ -33,6 +33,21 @@ Create remote Terraform state once. Set `STATE_STORAGE_ACCOUNT` to a globally un
 ```sh
 AZURE_DIR="$(git rev-parse --show-toplevel)/infra/azure"
 cd "$AZURE_DIR"
+
+SUBSCRIPTION_ID="${SUBSCRIPTION_ID:?Set SUBSCRIPTION_ID to the target Azure subscription ID}"
+if ! az account set --subscription "$SUBSCRIPTION_ID"; then
+  printf 'Could not select Azure subscription %s.\n' "$SUBSCRIPTION_ID" >&2
+  exit 1
+fi
+if ! ACTIVE_SUBSCRIPTION_ID="$(az account show --query id --output tsv)"; then
+  printf 'Could not verify the active Azure subscription.\n' >&2
+  exit 1
+fi
+if test "$ACTIVE_SUBSCRIPTION_ID" != "$SUBSCRIPTION_ID"; then
+  printf 'Expected subscription %s, but Azure CLI selected %s.\n' \
+    "$SUBSCRIPTION_ID" "$ACTIVE_SUBSCRIPTION_ID" >&2
+  exit 1
+fi
 
 STATE_RESOURCE_GROUP="rg-patchpage-tfstate"
 STATE_LOCATION="centralus"
@@ -77,12 +92,27 @@ cd "$AZURE_DIR"
 cp terraform.tfvars.example terraform.tfvars
 ```
 
-- Set `subscription_id` to the ID shown by `az account show --query id --output tsv`.
+- Set `subscription_id` to the target subscription ID and export the same value as `SUBSCRIPTION_ID` in the shell.
 - Replace the deliberately invalid `public_base_url` with the deployer's real origin. It must be HTTPS with a public DNS hostname and no credentials, port, path, query, fragment, or trailing slash.
 
 Terraform rejects the maintainer's domains, localhost/private-style names, reserved example names, and common placeholder values. The first targeted apply still requires a valid deployer-owned origin even though it only creates the registry.
 
 ```sh
+SUBSCRIPTION_ID="${SUBSCRIPTION_ID:?Set SUBSCRIPTION_ID to the subscription_id in terraform.tfvars}"
+if ! az account set --subscription "$SUBSCRIPTION_ID"; then
+  printf 'Could not select Azure subscription %s.\n' "$SUBSCRIPTION_ID" >&2
+  exit 1
+fi
+if ! ACTIVE_SUBSCRIPTION_ID="$(az account show --query id --output tsv)"; then
+  printf 'Could not verify the active Azure subscription.\n' >&2
+  exit 1
+fi
+if test "$ACTIVE_SUBSCRIPTION_ID" != "$SUBSCRIPTION_ID"; then
+  printf 'Expected subscription %s, but Azure CLI selected %s.\n' \
+    "$SUBSCRIPTION_ID" "$ACTIVE_SUBSCRIPTION_ID" >&2
+  exit 1
+fi
+
 terraform init -backend-config=backend.hcl
 terraform apply -target=azurerm_container_registry.patchpage
 
@@ -111,6 +141,8 @@ The commands below follow [Microsoft's managed-certificate flow](https://learn.m
 
 Load the outputs and make sure the Azure CLI is using the same subscription:
 
+<!-- guide-test:custom-domain-context -->
+
 ```sh
 SUBSCRIPTION_ID="$(terraform output -raw subscription_id)"
 RESOURCE_GROUP="$(terraform output -raw resource_group_name)"
@@ -122,8 +154,35 @@ DOMAIN_VERIFICATION_ID="$(terraform output -raw custom_domain_verification_id)"
 PUBLIC_BASE_URL="$(terraform output -raw public_base_url)"
 CUSTOM_DOMAIN="$(terraform output -raw custom_domain_hostname)"
 
-az account set --subscription "$SUBSCRIPTION_ID"
-test "$PUBLIC_BASE_URL" = "https://$CUSTOM_DOMAIN"
+CUSTOM_DOMAIN="$(
+  printf '%s\n' "$CUSTOM_DOMAIN" |
+    sed 's/\.$//' |
+    tr '[:upper:]' '[:lower:]'
+)"
+CONTAINER_APP_FQDN="$(
+  printf '%s\n' "$CONTAINER_APP_FQDN" |
+    sed 's/\.$//' |
+    tr '[:upper:]' '[:lower:]'
+)"
+NORMALIZED_PUBLIC_BASE_URL="$(printf '%s\n' "$PUBLIC_BASE_URL" | tr '[:upper:]' '[:lower:]')"
+
+if ! az account set --subscription "$SUBSCRIPTION_ID"; then
+  printf 'Could not select Azure subscription %s.\n' "$SUBSCRIPTION_ID" >&2
+  exit 1
+fi
+if ! ACTIVE_SUBSCRIPTION_ID="$(az account show --query id --output tsv)"; then
+  printf 'Could not verify the active Azure subscription.\n' >&2
+  exit 1
+fi
+if test "$ACTIVE_SUBSCRIPTION_ID" != "$SUBSCRIPTION_ID"; then
+  printf 'Expected subscription %s, but Azure CLI selected %s.\n' \
+    "$SUBSCRIPTION_ID" "$ACTIVE_SUBSCRIPTION_ID" >&2
+  exit 1
+fi
+if test "$NORMALIZED_PUBLIC_BASE_URL" != "https://$CUSTOM_DOMAIN"; then
+  printf 'The public origin does not match the normalized custom hostname.\n' >&2
+  exit 1
+fi
 
 printf 'Custom hostname: %s\nCNAME target: %s\nA target: %s\nTXT verification value: %s\n' \
   "$CUSTOM_DOMAIN" \
@@ -148,6 +207,8 @@ The CNAME must point directly to the generated Container App FQDN, without an in
 ```sh
 DNS_ZONE="${DNS_ZONE:?Set DNS_ZONE to the DNS zone you control}"
 DNS_SUBDOMAIN="${DNS_SUBDOMAIN:?Set DNS_SUBDOMAIN to the relative hostname label}"
+DNS_ZONE="$(printf '%s\n' "$DNS_ZONE" | sed 's/\.$//' | tr '[:upper:]' '[:lower:]')"
+DNS_SUBDOMAIN="$(printf '%s\n' "$DNS_SUBDOMAIN" | sed 's/^\.*//;s/\.*$//' | tr '[:upper:]' '[:lower:]')"
 
 if test "$CUSTOM_DOMAIN" != "$DNS_SUBDOMAIN.$DNS_ZONE"; then
   printf 'DNS_ZONE and DNS_SUBDOMAIN do not compose the configured hostname.\n' >&2
@@ -156,7 +217,8 @@ fi
 
 ACTUAL_CNAME="$(
   dig +short CNAME "$CUSTOM_DOMAIN" |
-    sed -n '1{s/\.$//;p;}'
+    sed -n '1{s/\.$//;p;}' |
+    tr '[:upper:]' '[:lower:]'
 )"
 if test "$ACTUAL_CNAME" != "$CONTAINER_APP_FQDN"; then
   printf 'CNAME has not propagated to %s.\n' "$CONTAINER_APP_FQDN" >&2
@@ -181,16 +243,39 @@ For an apex domain instead, create these records:
 
 Set the real apex zone in the shell and verify propagation:
 
+<!-- guide-test:apex-dns -->
+
 ```sh
 DNS_ZONE="${DNS_ZONE:?Set DNS_ZONE to the apex DNS zone you control}"
+DNS_ZONE="$(printf '%s\n' "$DNS_ZONE" | sed 's/\.$//' | tr '[:upper:]' '[:lower:]')"
 
 if test "$CUSTOM_DOMAIN" != "$DNS_ZONE"; then
   printf 'DNS_ZONE is not the configured apex hostname.\n' >&2
   exit 1
 fi
 
-if ! dig +short A "$CUSTOM_DOMAIN" | grep -Fqx -- "$CONTAINER_APP_STATIC_IP"; then
-  printf 'The apex A record has not propagated to %s.\n' "$CONTAINER_APP_STATIC_IP" >&2
+if ! ACTUAL_A_RECORDS="$(dig +short A "$CUSTOM_DOMAIN")"; then
+  printf 'The apex A lookup failed.\n' >&2
+  exit 1
+fi
+ACTUAL_A_RECORDS="$(
+  printf '%s\n' "$ACTUAL_A_RECORDS" |
+    sed '/^$/d' |
+    LC_ALL=C sort -u
+)"
+if test "$ACTUAL_A_RECORDS" != "$CONTAINER_APP_STATIC_IP"; then
+  printf 'The apex A RRset must contain only %s; received:\n%s\n' \
+    "$CONTAINER_APP_STATIC_IP" "$ACTUAL_A_RECORDS" >&2
+  exit 1
+fi
+
+if ! ACTUAL_AAAA_RECORDS="$(dig +short AAAA "$CUSTOM_DOMAIN")"; then
+  printf 'The apex AAAA lookup failed.\n' >&2
+  exit 1
+fi
+if test -n "$ACTUAL_AAAA_RECORDS"; then
+  printf 'The apex must not publish an AAAA record; received:\n%s\n' \
+    "$ACTUAL_AAAA_RECORDS" >&2
   exit 1
 fi
 
@@ -203,16 +288,50 @@ fi
 VALIDATION_METHOD="HTTP"
 ```
 
-If the DNS zone publishes any CAA records, it must allow DigiCert with `0 issue "digicert.com"`. Check the real zone used above; if the command prints records, the `grep` must also succeed before continuing:
+Certificate authorities apply the first CAA RRset found while walking from the custom hostname toward the DNS root. That effective policy, wherever it is inherited from, must allow DigiCert with an `issue "digicert.com"` record:
+
+<!-- guide-test:caa-policy -->
 
 ```sh
-CAA_RECORDS="$(dig +short CAA "$DNS_ZONE")"
-printf '%s\n' "$CAA_RECORDS"
-if test -n "$CAA_RECORDS"; then
-  if ! printf '%s\n' "$CAA_RECORDS" | grep -F 'issue "digicert.com"'; then
-    printf 'The zone publishes CAA records but does not allow DigiCert.\n' >&2
+CAA_LOOKUP_NAME="$CUSTOM_DOMAIN"
+CAA_RECORDS=""
+
+while test -n "$CAA_LOOKUP_NAME"; do
+  if ! CAA_RESPONSE="$(dig +short CAA "$CAA_LOOKUP_NAME")"; then
+    printf 'CAA lookup failed for %s.\n' "$CAA_LOOKUP_NAME" >&2
     exit 1
   fi
+
+  CAA_RECORDS="$(
+    printf '%s\n' "$CAA_RESPONSE" |
+      awk '$1 ~ /^[0-9]+$/'
+  )"
+  test -z "$CAA_RECORDS" || break
+
+  case "$CAA_LOOKUP_NAME" in
+    *.*) CAA_LOOKUP_NAME="${CAA_LOOKUP_NAME#*.}" ;;
+    *) CAA_LOOKUP_NAME="" ;;
+  esac
+done
+
+if test -n "$CAA_RECORDS"; then
+  printf 'Effective CAA policy at %s:\n%s\n' "$CAA_LOOKUP_NAME" "$CAA_RECORDS"
+  if ! printf '%s\n' "$CAA_RECORDS" |
+    awk '
+      {
+        tag = tolower($2)
+        value = tolower($3)
+        gsub(/^"|"$/, "", value)
+        sub(/;.*/, "", value)
+        if (tag == "issue" && value == "digicert.com") found = 1
+      }
+      END { exit found ? 0 : 1 }
+    '; then
+    printf 'The effective CAA policy does not allow DigiCert.\n' >&2
+    exit 1
+  fi
+else
+  printf 'No CAA policy is published for %s or its parent labels.\n' "$CUSTOM_DOMAIN"
 fi
 ```
 
@@ -222,8 +341,25 @@ The direct CNAME/A record, public ingress, and DigiCert CAA permission must rema
 
 `hostname add` registers the validated custom hostname. The subsequent `hostname bind` command finds or creates Azure's free managed certificate, waits for issuance, and binds it to the hostname. For a subdomain, `VALIDATION_METHOD` is `CNAME`; for an apex domain it is `HTTP`.
 
+<!-- guide-test:hostname-mutation -->
+
 ```sh
 VALIDATION_METHOD="${VALIDATION_METHOD:?Run the matching DNS section first}"
+SUBSCRIPTION_ID="${SUBSCRIPTION_ID:?Load the Terraform outputs first}"
+
+if ! az account set --subscription "$SUBSCRIPTION_ID"; then
+  printf 'Could not select Azure subscription %s.\n' "$SUBSCRIPTION_ID" >&2
+  exit 1
+fi
+if ! ACTIVE_SUBSCRIPTION_ID="$(az account show --query id --output tsv)"; then
+  printf 'Could not verify the active Azure subscription.\n' >&2
+  exit 1
+fi
+if test "$ACTIVE_SUBSCRIPTION_ID" != "$SUBSCRIPTION_ID"; then
+  printf 'Expected subscription %s, but Azure CLI selected %s.\n' \
+    "$SUBSCRIPTION_ID" "$ACTIVE_SUBSCRIPTION_ID" >&2
+  exit 1
+fi
 
 az containerapp hostname add \
   --resource-group "$RESOURCE_GROUP" \
@@ -240,18 +376,58 @@ az containerapp hostname bind \
 
 Certificate issuance can take several minutes. Confirm both the managed certificate and SNI hostname binding in Azure:
 
-```sh
-az containerapp env certificate list \
-  --resource-group "$RESOURCE_GROUP" \
-  --name "$CONTAINER_APP_ENVIRONMENT" \
-  --query "[?properties.subjectName=='$CUSTOM_DOMAIN'].{name:name,state:properties.provisioningState,subject:properties.subjectName}" \
-  --output table
+<!-- guide-test:certificate-binding -->
 
-az containerapp hostname list \
-  --resource-group "$RESOURCE_GROUP" \
-  --name "$CONTAINER_APP" \
-  --query "[?name=='$CUSTOM_DOMAIN'].{hostname:name,binding:bindingType,certificate:certificateId}" \
-  --output table
+```sh
+if ! MANAGED_CERTIFICATES="$(
+  az containerapp env certificate list \
+    --resource-group "$RESOURCE_GROUP" \
+    --name "$CONTAINER_APP_ENVIRONMENT" \
+    --managed-certificates-only \
+    --query '[].[name,properties.subjectName,properties.provisioningState]' \
+    --output tsv
+)"; then
+  printf 'Could not list Azure managed certificates.\n' >&2
+  exit 1
+fi
+printf '%s\n' "$MANAGED_CERTIFICATES"
+if ! printf '%s\n' "$MANAGED_CERTIFICATES" |
+  awk -v expected="$CUSTOM_DOMAIN" '
+    {
+      subject = tolower($2)
+      sub(/^cn=/, "", subject)
+      sub(/\.$/, "", subject)
+      if (subject == expected && tolower($3) == "succeeded") found = 1
+    }
+    END { exit found ? 0 : 1 }
+  '; then
+  printf 'No succeeded managed certificate matches %s.\n' "$CUSTOM_DOMAIN" >&2
+  exit 1
+fi
+
+if ! HOSTNAME_BINDINGS="$(
+  az containerapp hostname list \
+    --resource-group "$RESOURCE_GROUP" \
+    --name "$CONTAINER_APP" \
+    --query '[].[name,bindingType,certificateId]' \
+    --output tsv
+)"; then
+  printf 'Could not list Container App hostname bindings.\n' >&2
+  exit 1
+fi
+printf '%s\n' "$HOSTNAME_BINDINGS"
+if ! printf '%s\n' "$HOSTNAME_BINDINGS" |
+  awk -v expected="$CUSTOM_DOMAIN" '
+    {
+      hostname = tolower($1)
+      sub(/\.$/, "", hostname)
+      if (hostname == expected && tolower($2) == "snienabled" && $3 != "") found = 1
+    }
+    END { exit found ? 0 : 1 }
+  '; then
+  printf 'No SNI certificate binding matches %s.\n' "$CUSTOM_DOMAIN" >&2
+  exit 1
+fi
 ```
 
 ### 3. Verify HTTPS and the configured upload origin
@@ -278,6 +454,8 @@ curl --proto '=https' --tlsv1.2 \
 
 Finally, perform one authenticated upload and assert that the server returns a draft URL on exactly the configured origin. This uses the sensitive bootstrap token from Terraform state; do not enable shell tracing or paste its value into logs.
 
+<!-- guide-test:upload-smoke -->
+
 ```sh
 set +x
 BOOTSTRAP_API_TOKEN="$(terraform output -raw bootstrap_api_token)"
@@ -301,9 +479,13 @@ case "$DRAFT_URL" in
     ;;
 esac
 
-curl --proto '=https' --tlsv1.2 \
+if ! curl --proto '=https' --tlsv1.2 \
   --fail --silent --show-error \
-  "$DRAFT_URL" >/dev/null
+  "$DRAFT_URL" >/dev/null; then
+  printf 'The uploaded draft could not be fetched.\n' >&2
+  unset BOOTSTRAP_API_TOKEN
+  exit 1
+fi
 
 printf '%s\n' "$DRAFT_URL"
 unset BOOTSTRAP_API_TOKEN
