@@ -31,6 +31,20 @@ describe("getServerConfig", () => {
     expect(config.trustProxy).toEqual(["127.0.0.1", "10.0.0.0/8", "2001:db8::/32"]);
   });
 
+  it.each([
+    "0.0.0.0/1",
+    "128.0.0.0/1, 192.0.2.0/24",
+    "192.0.2.0/24, 198.51.100.0/24, 2001:db8::/32",
+    "::1",
+    "8000::/1",
+    "::/96",
+    "0:0:0:0:0:0:c000:200/120"
+  ])("parses partial trusted-proxy network sets %j", (value) => {
+    expect(getServerConfig({ PATCHPAGE_TRUST_PROXY: value }).trustProxy).toEqual(
+      value.split(",").map((entry) => entry.trim())
+    );
+  });
+
   it("bounds trusted-proxy hop counts", () => {
     expect(getServerConfig({ PATCHPAGE_TRUST_PROXY: "32" }).trustProxy).toBe(32);
     expect(() => getServerConfig({ PATCHPAGE_TRUST_PROXY: "33" })).toThrow(
@@ -59,7 +73,11 @@ describe("getServerConfig", () => {
     "10.0.0.0/33",
     "2001:db8::/129",
     "0.0.0.0/0",
+    "::0.0.0.0/96",
+    "::192.0.2.10",
+    "::192.0.2.0/120",
     "::ffff:0:0/96",
+    "::ffff:192.0.2.10",
     "::ffff:10.0.0.0/104",
     "0:0:0:0:0:ffff:a00:0/104",
     "::fffe:0:0/95",
@@ -69,6 +87,20 @@ describe("getServerConfig", () => {
     "2001:db8::192.168.001.001/120",
     "::/0"
   ])("rejects an unsafe or malformed trusted-proxy value %j", (value) => {
+    expect(() => getServerConfig({ PATCHPAGE_TRUST_PROXY: value })).toThrow(
+      /Invalid PATCHPAGE_TRUST_PROXY/
+    );
+  });
+
+  it.each([
+    "0.0.0.0/1,128.0.0.0/1",
+    "128.0.0.0/1,0.0.0.0/1",
+    "0.0.0.0/2,64.0.0.0/2,128.0.0.0/1",
+    "192.0.0.0/2,0.0.0.0/1,128.0.0.0/2",
+    "0.0.0.0/2,64.0.0.0/2,128.0.0.0/2,192.0.0.0/2,192.0.2.0/24",
+    "::/1,8000::/1",
+    "8000::/1,::/2,4000::/2"
+  ])("rejects trusted-proxy network sets covering a full address family %j", (value) => {
     expect(() => getServerConfig({ PATCHPAGE_TRUST_PROXY: value })).toThrow(
       /Invalid PATCHPAGE_TRUST_PROXY/
     );

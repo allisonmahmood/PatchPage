@@ -71,7 +71,15 @@ variable "trust_proxy" {
                     trimspace(entry)
                   ))
                 ) &&
-                can(cidrhost("${trimspace(entry)}/128", 0))
+                can(cidrhost("${trimspace(entry)}/128", 0)) &&
+                !can(regex(
+                  "^::(?:[0-9]{1,3}\\.){3}[0-9]{1,3}$",
+                  trimspace(entry)
+                )) &&
+                !can(regex(
+                  "^[0-9]{1,3}(\\.[0-9]{1,3}){3}$",
+                  try(cidrhost("${trimspace(entry)}/128", 0), "")
+                ))
                 ) : length(split("/", trimspace(entry))) == 2 ? (
                   can(regex(
                     "^[1-9][0-9]*$",
@@ -104,6 +112,10 @@ variable "trust_proxy" {
                       ), "")
                     )) &&
                     !can(regex(
+                      "^::(?:[0-9]{1,3}\\.){3}[0-9]{1,3}$",
+                      split("/", trimspace(entry))[0]
+                    )) &&
+                    !can(regex(
                       "^::ffff:",
                       lower(try(cidrhost(trimspace(entry), 0), ""))
                     )) &&
@@ -123,7 +135,161 @@ variable "trust_proxy" {
           )
         ])
     )
-    error_message = "trust_proxy must be null, a decimal hop count from 1 to 32, or comma-separated literal IP/CIDR entries; blank, boolean, wildcard, malformed, empty, /0, IPv4-mapped IPv6 CIDR, and noncanonical dotted-tail values are not allowed."
+    error_message = "trust_proxy must be null, a decimal hop count from 1 to 32, or comma-separated literal IP/CIDR entries; blank, boolean, wildcard, malformed, empty, /0, deprecated transitional or IPv4-mapped IPv6 aliases, and noncanonical dotted-tail values are not allowed."
+  }
+
+  validation {
+    # Keep the range calculation inline: locals derived from var.trust_proxy
+    # create a validation cycle on Terraform 1.9.
+    condition = var.trust_proxy == null ? true : (
+      can(regex("^[1-9][0-9]*$", trimspace(var.trust_proxy))) ? true : alltrue([
+        for range_keys in [sort([
+          for range in [
+            for candidate in [
+              for entry in [
+                for raw_entry in split(",", var.trust_proxy) : trimspace(raw_entry)
+                ] : {
+                cidr = length(split("/", entry)) == 1 ? "${entry}/32" : entry
+                prefix = length(split("/", entry)) == 1 ? 32 : try(
+                  tonumber(split("/", entry)[1]),
+                  33
+                )
+              }
+              if (
+                length(split("/", entry)) <= 2 &&
+                can(regex(
+                  "^[0-9]{1,3}(\\.[0-9]{1,3}){3}(?:/[1-9][0-9]*)?$",
+                  entry
+                )) &&
+                try(cidrhost(length(split("/", entry)) == 1 ? "${entry}/32" : entry, 0), "") != "" &&
+                try(
+                  tonumber(length(split("/", entry)) == 1 ? "32" : split("/", entry)[1]),
+                  33
+                ) <= 32
+              )
+              ] : {
+              prefix = candidate.prefix
+              start = sum([
+                for index, octet in split(".", cidrhost(candidate.cidr, 0)) :
+                tonumber(octet) * pow(256, 3 - index)
+              ])
+            }
+            ] : format(
+            "%010d:%010d",
+            range.start,
+            range.start + pow(2, 32 - range.prefix) - 1
+          )
+          ])] : (
+          length(range_keys) == 0 ? true : (
+            tonumber(split(":", range_keys[0])[0]) != 0 ? true : (
+              max([
+                for key in range_keys : tonumber(split(":", key)[1])
+              ]...) != 4294967295 ? true : !alltrue([
+                for index, key in range_keys : index == 0 ? true : (
+                  tonumber(split(":", key)[0]) <= max([
+                    for previous_key in slice(range_keys, 0, index) :
+                    tonumber(split(":", previous_key)[1])
+                  ]...) + 1
+                )
+              ])
+            )
+          )
+        )
+      ])
+    )
+    error_message = "trust_proxy CIDR entries must not cover an entire address family."
+  }
+
+  validation {
+    # Keep this separate from the IPv4 union check: IPv6 needs 128-bit
+    # arithmetic and expansion of Terraform's compressed cidrhost output.
+    condition = var.trust_proxy == null ? true : (
+      can(regex("^[1-9][0-9]*$", trimspace(var.trust_proxy))) ? true : alltrue([
+        for range_keys in [sort([
+          for range in [
+            for candidate in [
+              for entry in [
+                for raw_entry in split(",", var.trust_proxy) : trimspace(raw_entry)
+                ] : {
+                cidr = length(split("/", entry)) == 1 ? "${entry}/128" : entry
+                prefix = length(split("/", entry)) == 1 ? 128 : try(
+                  tonumber(split("/", entry)[1]),
+                  129
+                )
+                network = try(
+                  cidrhost(length(split("/", entry)) == 1 ? "${entry}/128" : entry, 0),
+                  ""
+                )
+              }
+              if (
+                length(split("/", entry)) <= 2 &&
+                strcontains(split("/", entry)[0], ":") &&
+                !strcontains(split("/", entry)[0], "%") &&
+                try(
+                  tonumber(length(split("/", entry)) == 1 ? "128" : split("/", entry)[1]),
+                  129
+                ) <= 128 &&
+                can(cidrhost(length(split("/", entry)) == 1 ? "${entry}/128" : entry, 0)) &&
+                strcontains(
+                  try(cidrhost(length(split("/", entry)) == 1 ? "${entry}/128" : entry, 0), ""),
+                  ":"
+                )
+              )
+              ] : {
+              prefix = candidate.prefix
+              start = sum([
+                for index, segment in concat(
+                  split("::", candidate.network)[0] == "" ? [] : split(
+                    ":",
+                    split("::", candidate.network)[0]
+                  ),
+                  length(split("::", candidate.network)) == 2 ? [
+                    for zero_index in range(
+                      8 -
+                      (split("::", candidate.network)[0] == "" ? 0 : length(split(
+                        ":",
+                        split("::", candidate.network)[0]
+                      ))) -
+                      (split("::", candidate.network)[1] == "" ? 0 : length(split(
+                        ":",
+                        split("::", candidate.network)[1]
+                      )))
+                    ) : "0"
+                  ] : [],
+                  length(split("::", candidate.network)) == 2 ? (
+                    split("::", candidate.network)[1] == "" ? [] : split(
+                      ":",
+                      split("::", candidate.network)[1]
+                    )
+                  ) : []
+                ) :
+                parseint(segment, 16) * pow(65536, 7 - index)
+              ])
+            }
+            ] : format(
+            "%039.0f:%039.0f",
+            range.start,
+            range.start + pow(2, 128 - range.prefix) - 1
+          )
+          ])] : (
+          length(range_keys) == 0 ? true : (
+            tonumber(split(":", range_keys[0])[0]) != 0 ? true : (
+              max([
+                for key in range_keys : tonumber(split(":", key)[1])
+              ]...) != pow(2, 128) - 1 ? true : !alltrue([
+                for index, key in range_keys : index == 0 ? true : (
+                  tonumber(split(":", key)[0]) <= max([
+                    for previous_key in slice(range_keys, 0, index) :
+                    tonumber(split(":", previous_key)[1])
+                  ]...) + 1
+                )
+              ])
+            )
+          )
+        )
+      ])
+    )
+    error_message = "trust_proxy CIDR entries must not cover an entire address family."
   }
 }
 
