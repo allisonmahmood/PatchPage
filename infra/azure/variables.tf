@@ -328,3 +328,51 @@ variable "max_html_bytes" {
   type        = number
   default     = 524288
 }
+
+variable "protected_api_rate_limit_per_minute" {
+  description = "Protected API attempts allowed per canonical client IP per minute."
+  type        = number
+  default     = 60
+  nullable    = false
+
+  validation {
+    condition = (
+      var.protected_api_rate_limit_per_minute >= 1 &&
+      var.protected_api_rate_limit_per_minute <= 10000 &&
+      floor(var.protected_api_rate_limit_per_minute) == var.protected_api_rate_limit_per_minute
+    )
+    error_message = "protected_api_rate_limit_per_minute must be an integer from 1 through 10000."
+  }
+}
+
+variable "authenticated_upload_rate_limit_per_minute" {
+  description = "Authenticated upload attempts allowed per API token identity per minute."
+  type        = number
+  default     = 20
+  nullable    = false
+
+  validation {
+    condition = (
+      var.authenticated_upload_rate_limit_per_minute >= 1 &&
+      var.authenticated_upload_rate_limit_per_minute <= 10000 &&
+      floor(var.authenticated_upload_rate_limit_per_minute) == var.authenticated_upload_rate_limit_per_minute
+    )
+    error_message = "authenticated_upload_rate_limit_per_minute must be an integer from 1 through 10000."
+  }
+}
+
+variable "anonymous_create_rate_limit_per_minute" {
+  description = "Future anonymous-create attempts allowed per canonical client IP per minute."
+  type        = number
+  default     = 5
+  nullable    = false
+
+  validation {
+    condition = (
+      var.anonymous_create_rate_limit_per_minute >= 1 &&
+      var.anonymous_create_rate_limit_per_minute <= 10000 &&
+      floor(var.anonymous_create_rate_limit_per_minute) == var.anonymous_create_rate_limit_per_minute
+    )
+    error_message = "anonymous_create_rate_limit_per_minute must be an integer from 1 through 10000."
+  }
+}

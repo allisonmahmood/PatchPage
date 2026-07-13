@@ -1,15 +1,46 @@
-import { mkdtemp, readdir, readFile, rm } from "node:fs/promises";
+import { mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
+import { createConnection } from "node:net";
 import os from "node:os";
 import path from "node:path";
+import type { AddressInfo } from "node:net";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { getServerConfig } from "@patchpage/config";
 import type { ServerConfig } from "@patchpage/config";
 import { JsonFilePatchPageDb } from "@patchpage/db";
 import type { RecordUploadInput, RecordUploadResult } from "@patchpage/db";
 import { FileSystemHtmlStorage } from "@patchpage/storage";
-import { createApp } from "./app.js";
+import { classifyAuthorizationHeader, createApp, isProtectedApiPath } from "./app.js";
 
 let tempDir: string;
+
+const uploadLikeApiTargets: ApiTargetCase[] = [
+  {
+    label: "trailing slash",
+    url: "/api/uploads/"
+  },
+  {
+    label: "duplicate slash",
+    url: "/api//uploads"
+  },
+  {
+    label: "encoded slash",
+    url: "/api%2Fuploads"
+  },
+  {
+    label: "escaped API prefix",
+    url: "/%61pi/uploads/"
+  },
+  {
+    label: "absolute escaped API prefix",
+    url: "http://host/%61pi/uploads/",
+    rawHttp: true
+  },
+  {
+    label: "unsupported method on exact upload route",
+    url: "/api/uploads",
+    method: "PUT"
+  }
+];
 
 beforeEach(async () => {
   tempDir = await mkdtemp(path.join(os.tmpdir(), "patchpage-server-"));
@@ -20,6 +51,41 @@ afterEach(async () => {
 });
 
 describe("PatchPage server", () => {
+  it("classifies only an absent Authorization header as missing", () => {
+    expect(classifyAuthorizationHeader(undefined)).toEqual({ kind: "missing" });
+    expect(classifyAuthorizationHeader("")).toEqual({ kind: "invalid" });
+    expect(classifyAuthorizationHeader("   ")).toEqual({ kind: "invalid" });
+    expect(classifyAuthorizationHeader("Bearer   ")).toEqual({ kind: "invalid" });
+    expect(classifyAuthorizationHeader("Bearer dev-token second-token")).toEqual({
+      kind: "invalid"
+    });
+    expect(classifyAuthorizationHeader("Bearer dev-token")).toEqual({
+      kind: "bearer",
+      token: "dev-token"
+    });
+    const longPadding = " ".repeat(100_000);
+    expect(
+      classifyAuthorizationHeader(`bEaReR${longPadding}dev-token${longPadding}`)
+    ).toEqual({
+      kind: "bearer",
+      token: "dev-token"
+    });
+  });
+
+  it("classifies router-equivalent protected API request targets", () => {
+    expect(isProtectedApiPath("/api?ignored=true")).toBe(true);
+    expect(isProtectedApiPath("/api#fragment")).toBe(true);
+    expect(isProtectedApiPath("/%61pi/does-not-exist")).toBe(true);
+    expect(isProtectedApiPath("http://host/api/does-not-exist?ignored=true")).toBe(true);
+    expect(isProtectedApiPath("https://host/%61pi/does-not-exist#fragment")).toBe(true);
+    expect(isProtectedApiPath("http://host?x=/api/%")).toBe(false);
+    expect(isProtectedApiPath("HtTp://host/%61pi/does-not-exist")).toBe(true);
+    expect(isProtectedApiPath("/api%2Fdoes-not-exist")).toBe(true);
+    expect(isProtectedApiPath("/api//does-not-exist")).toBe(true);
+    expect(isProtectedApiPath("/apix")).toBe(false);
+    expect(isProtectedApiPath("/%")).toBe(true);
+  });
+
   it("returns uploaded draft URLs on the configured public origin", async () => {
     const publicBaseUrl = "https://drafts.self-hoster.dev";
     const apiToken = "configured-origin-token";
@@ -91,6 +157,739 @@ describe("PatchPage server", () => {
 
     await app.close();
     await db.close();
+  });
+
+  it("rejects bad upload credentials before parsing attacker-controlled JSON bodies", async () => {
+    const config = testConfig();
+    const dbFile = path.join(tempDir, "pre-body-auth-db.json");
+    const db = new JsonFilePatchPageDb(dbFile);
+    await db.initialize("admin-token");
+    const adminAuth = await db.findApiTokenByToken("admin-token");
+    expect(adminAuth).not.toBeNull();
+    await db.createApiToken({
+      accountId: adminAuth!.accountId,
+      name: "Read-only token",
+      token: "read-token",
+      scopes: ["read"]
+    });
+    await db.createApiToken({
+      accountId: adminAuth!.accountId,
+      name: "Revoked token",
+      token: "revoked-token",
+      scopes: ["upload"]
+    });
+    await markJsonTokenRevoked(dbFile, "Revoked token");
+
+    const storage = new FileSystemHtmlStorage(path.join(tempDir, "pre-body-auth-drafts"));
+    const app = createApp({ config, db, storage });
+    const attackerJson = `{"html":"${"x".repeat(2 * 1024 * 1024)}`;
+
+    try {
+      const cases = [
+        {
+          label: "missing",
+          authorization: undefined,
+          statusCode: 401,
+          error: "Missing or invalid API token."
+        },
+        {
+          label: "empty",
+          authorization: "",
+          statusCode: 401,
+          error: "Missing or invalid API token."
+        },
+        {
+          label: "whitespace",
+          authorization: "   ",
+          statusCode: 401,
+          error: "Missing or invalid API token."
+        },
+        {
+          label: "malformed",
+          authorization: "Basic not-a-bearer-token",
+          statusCode: 401,
+          error: "Missing or invalid API token."
+        },
+        {
+          label: "unknown",
+          authorization: "Bearer unknown-token",
+          statusCode: 401,
+          error: "Missing or invalid API token."
+        },
+        {
+          label: "revoked",
+          authorization: "Bearer revoked-token",
+          statusCode: 401,
+          error: "Missing or invalid API token."
+        },
+        {
+          label: "insufficient-scope",
+          authorization: "Bearer read-token",
+          statusCode: 403,
+          error: "API token does not have the required scope."
+        }
+      ];
+
+      for (const testCase of cases) {
+        const response = await app.inject({
+          method: "POST",
+          url: "/api/uploads",
+          headers: {
+            "content-type": "application/json",
+            ...(testCase.authorization !== undefined
+              ? { authorization: testCase.authorization }
+              : {})
+          },
+          payload: attackerJson
+        });
+
+        expect(response.statusCode, testCase.label).toBe(testCase.statusCode);
+        expect(response.json(), testCase.label).toEqual({
+          ok: false,
+          error: testCase.error
+        });
+      }
+    } finally {
+      await app.close();
+      await db.close();
+    }
+  });
+
+  it.each(uploadLikeApiTargets)(
+    "rejects insufficient upload scope before parsing upload-like target: $label",
+    async (target) => {
+      const { app, db } = await createScopedTokenApp(`insufficient-${target.label}`);
+
+      try {
+        const response = await oversizedJsonApiRequest(app, {
+          target,
+          token: "read-token"
+        });
+
+        expect(response.statusCode).toBe(403);
+        expect(response.json()).toEqual({
+          ok: false,
+          error: "API token does not have the required scope."
+        });
+      } finally {
+        await app.close();
+        await db.close();
+      }
+    }
+  );
+
+  it.each(uploadLikeApiTargets)(
+    "returns API 404 before parsing authorized upload-like unmatched target: $label",
+    async (target) => {
+      const { app, db } = await createScopedTokenApp(`authorized-${target.label}`);
+
+      try {
+        const response = await oversizedJsonApiRequest(app, {
+          target,
+          token: "upload-token"
+        });
+
+        expect(response.statusCode).toBe(404);
+        expect(response.json()).toEqual({
+          ok: false,
+          error: "Not found."
+        });
+      } finally {
+        await app.close();
+        await db.close();
+      }
+    }
+  );
+
+  it("allows admin scope to satisfy upload-like policy before unmatched API 404", async () => {
+    const { app, db } = await createScopedTokenApp("authorized-admin-upload-like");
+
+    try {
+      const response = await oversizedJsonApiRequest(app, {
+        target: uploadLikeApiTargets[0],
+        token: "admin-only-token"
+      });
+
+      expect(response.statusCode).toBe(404);
+      expect(response.json()).toEqual({
+        ok: false,
+        error: "Not found."
+      });
+    } finally {
+      await app.close();
+      await db.close();
+    }
+  });
+
+  it("returns API 404 before parsing arbitrary authenticated unmatched API targets", async () => {
+    const { app, db } = await createScopedTokenApp("authorized-arbitrary-unmatched-api");
+
+    try {
+      const response = await oversizedJsonApiRequest(app, {
+        target: {
+          label: "arbitrary unmatched API",
+          url: "/api/does-not-exist"
+        },
+        token: "read-token"
+      });
+
+      expect(response.statusCode).toBe(404);
+      expect(response.json()).toEqual({
+        ok: false,
+        error: "Not found."
+      });
+    } finally {
+      await app.close();
+      await db.close();
+    }
+  });
+
+  it("limits authorized upload-like unmatched targets by stable token identity", async () => {
+    let now = 1_000;
+    const { app, db } = await createScopedTokenApp("upload-like-unmatched-limit", () => now);
+    const target: ApiTargetCase = {
+      label: "encoded slash upload-like target",
+      url: "/api%2Fuploads"
+    };
+
+    try {
+      for (let attempt = 0; attempt < 20; attempt += 1) {
+        const response = await app.inject({
+          method: "POST",
+          url: target.url,
+          headers: { authorization: "Bearer upload-token" }
+        });
+        expect(response.statusCode).toBe(404);
+        expect(response.json()).toEqual({
+          ok: false,
+          error: "Not found."
+        });
+      }
+
+      const limited = await app.inject({
+        method: "POST",
+        url: target.url,
+        headers: { authorization: "Bearer upload-token" }
+      });
+      expect(limited.statusCode).toBe(429);
+      expect(limited.headers["retry-after"]).toBe("60");
+      expect(Number.isInteger(Number(limited.headers["retry-after"]))).toBe(true);
+      expect(limited.json()).toEqual({
+        ok: false,
+        error: "Rate limit exceeded.",
+        code: "rate_limited",
+        retryAfterSeconds: 60
+      });
+
+      now = 61_000;
+      const reset = await app.inject({
+        method: "POST",
+        url: target.url,
+        headers: { authorization: "Bearer upload-token" }
+      });
+      expect(reset.statusCode).toBe(404);
+    } finally {
+      await app.close();
+      await db.close();
+    }
+  });
+
+  it("limits protected API attempts by canonical request IP", async () => {
+    let now = 1_000;
+    const config = getServerConfig({ PATCHPAGE_TRUST_PROXY: "1" });
+    const db = new JsonFilePatchPageDb(path.join(tempDir, "protected-limit-db.json"));
+    await db.initialize("unused-token");
+    const storage = new FileSystemHtmlStorage(path.join(tempDir, "protected-limit-drafts"));
+    const app = createApp({ config, db, storage, clock: () => now });
+
+    try {
+      for (let attempt = 0; attempt < 60; attempt += 1) {
+        const response = await app.inject({
+          method: "GET",
+          url: "/api/me",
+          remoteAddress: "10.0.0.5",
+          headers: { "x-forwarded-for": "203.0.113.9" }
+        });
+
+        expect(response.statusCode).toBe(401);
+      }
+
+      const limited = await app.inject({
+        method: "GET",
+        url: "/api/me",
+        remoteAddress: "10.0.0.5",
+        headers: { "x-forwarded-for": "203.0.113.9" }
+      });
+
+      expect(limited.statusCode).toBe(429);
+      expect(limited.headers["retry-after"]).toBe("60");
+      expect(Number.isInteger(Number(limited.headers["retry-after"]))).toBe(true);
+      expect(limited.json()).toEqual({
+        ok: false,
+        error: "Rate limit exceeded.",
+        code: "rate_limited",
+        retryAfterSeconds: 60
+      });
+
+      const otherIp = await app.inject({
+        method: "GET",
+        url: "/api/me",
+        remoteAddress: "10.0.0.5",
+        headers: { "x-forwarded-for": "203.0.113.10" }
+      });
+      expect(otherIp.statusCode).toBe(401);
+
+      const health = await app.inject({
+        method: "GET",
+        url: "/healthz",
+        remoteAddress: "10.0.0.5",
+        headers: { "x-forwarded-for": "203.0.113.9" }
+      });
+      expect(health.statusCode).toBe(200);
+
+      now = 61_000;
+      const reset = await app.inject({
+        method: "GET",
+        url: "/api/me",
+        remoteAddress: "10.0.0.5",
+        headers: { "x-forwarded-for": "203.0.113.9" }
+      });
+      expect(reset.statusCode).toBe(401);
+    } finally {
+      await app.close();
+      await db.close();
+    }
+  });
+
+  it("protects unmatched API paths before parsing and counts them once per IP", async () => {
+    let now = 1_000;
+    const config = testConfig();
+    const db = new JsonFilePatchPageDb(path.join(tempDir, "unmatched-api-limit-db.json"));
+    await db.initialize("dev-token");
+    const storage = new FileSystemHtmlStorage(path.join(tempDir, "unmatched-api-limit-drafts"));
+    const app = createApp({ config, db, storage, clock: () => now });
+
+    try {
+      const upload = await app.inject({
+        method: "POST",
+        url: "/api/uploads",
+        remoteAddress: "198.51.100.10",
+        headers: { authorization: "Bearer dev-token" },
+        payload: {
+          html: "<!doctype html><html><head><title>Public Draft</title></head><body></body></html>"
+        }
+      });
+      expect(upload.statusCode).toBe(201);
+      const { draftId } = upload.json() as { draftId: string };
+
+      const attackerJson = `{"html":"${"x".repeat(2 * 1024 * 1024)}`;
+      const oversized = await app.inject({
+        method: "POST",
+        url: "/api/does-not-exist",
+        remoteAddress: "203.0.113.9",
+        headers: { "content-type": "application/json" },
+        payload: attackerJson
+      });
+      expect(oversized.statusCode).toBe(401);
+      expect(oversized.json()).toEqual({
+        ok: false,
+        error: "Missing or invalid API token."
+      });
+
+      for (let attempt = 1; attempt < 60; attempt += 1) {
+        const response = await app.inject({
+          method: "POST",
+          url: "/api/does-not-exist",
+          remoteAddress: "203.0.113.9"
+        });
+        expect(response.statusCode).toBe(401);
+      }
+
+      const limited = await app.inject({
+        method: "POST",
+        url: "/api/does-not-exist",
+        remoteAddress: "203.0.113.9"
+      });
+      expect(limited.statusCode).toBe(429);
+      expect(limited.headers["retry-after"]).toBe("60");
+      expect(limited.json()).toEqual({
+        ok: false,
+        error: "Rate limit exceeded.",
+        code: "rate_limited",
+        retryAfterSeconds: 60
+      });
+
+      const lookalike = await app.inject({
+        method: "GET",
+        url: "/apix",
+        remoteAddress: "203.0.113.9"
+      });
+      expect(lookalike.statusCode).toBe(404);
+
+      const health = await app.inject({
+        method: "GET",
+        url: "/healthz",
+        remoteAddress: "203.0.113.9"
+      });
+      expect(health.statusCode).toBe(200);
+
+      const viewer = await app.inject({
+        method: "GET",
+        url: `/d/${draftId}`,
+        remoteAddress: "203.0.113.9"
+      });
+      expect(viewer.statusCode).toBe(200);
+      expect(viewer.body).toContain("Public Draft");
+
+      now = 61_000;
+      const reset = await app.inject({
+        method: "POST",
+        url: "/api/does-not-exist",
+        remoteAddress: "203.0.113.9"
+      });
+      expect(reset.statusCode).toBe(401);
+    } finally {
+      await app.close();
+      await db.close();
+    }
+  });
+
+  it.each([
+    {
+      label: "origin-form escaped API prefix",
+      url: "/%61pi/does-not-exist",
+      rawHttp: false
+    },
+    {
+      label: "absolute-form API target",
+      url: "http://host/api/does-not-exist",
+      rawHttp: true
+    },
+    {
+      label: "mixed-case absolute-form API target",
+      url: "HtTp://host/%61pi/does-not-exist",
+      rawHttp: true
+    }
+  ])(
+    "protects router-equivalent unmatched API target before parsing and counts it once per IP: $label",
+    async ({ rawHttp, url }) => {
+      let now = 1_000;
+      const config = testConfig();
+      const db = new JsonFilePatchPageDb(path.join(tempDir, `${url.replaceAll(/[^a-z0-9]/gi, "-")}-db.json`));
+      await db.initialize("dev-token");
+      const storage = new FileSystemHtmlStorage(
+        path.join(tempDir, `${url.replaceAll(/[^a-z0-9]/gi, "-")}-drafts`)
+      );
+      const app = createApp({ config, db, storage, clock: () => now });
+
+      try {
+        const attackerJson = `{"html":"${"x".repeat(2 * 1024 * 1024)}`;
+        const oversized = rawHttp
+          ? await rawHttpRequest(
+              app,
+              url,
+              "{\"html\":\"",
+              {
+                "Content-Type": "application/json",
+                "Content-Length": String(2 * 1024 * 1024 + 1)
+              },
+              { closeAfterWrite: false }
+            )
+          : await app.inject({
+              method: "POST",
+              url,
+              remoteAddress: "203.0.113.9",
+              headers: { "content-type": "application/json" },
+              payload: attackerJson
+            });
+        expect(oversized.statusCode).toBe(401);
+        expect(oversized.json()).toEqual({
+          ok: false,
+          error: "Missing or invalid API token."
+        });
+
+        for (let attempt = 1; attempt < 60; attempt += 1) {
+          const response = rawHttp
+            ? await rawHttpRequest(app, url)
+            : await app.inject({
+                method: "POST",
+                url,
+                remoteAddress: "203.0.113.9"
+              });
+          expect(response.statusCode).toBe(401);
+        }
+
+        const limited = rawHttp
+          ? await rawHttpRequest(app, url)
+          : await app.inject({
+              method: "POST",
+              url,
+              remoteAddress: "203.0.113.9"
+            });
+        expect(limited.statusCode).toBe(429);
+        expect(limited.headers["retry-after"]).toBe("60");
+        expect(Number.isInteger(Number(limited.headers["retry-after"]))).toBe(true);
+        expect(limited.json()).toEqual({
+          ok: false,
+          error: "Rate limit exceeded.",
+          code: "rate_limited",
+          retryAfterSeconds: 60
+        });
+
+        const health = await app.inject({
+          method: "GET",
+          url: "/healthz",
+          remoteAddress: "203.0.113.9"
+        });
+        expect(health.statusCode).toBe(200);
+
+        now = 61_000;
+        const reset = rawHttp
+          ? await rawHttpRequest(app, url)
+          : await app.inject({
+              method: "POST",
+              url,
+              remoteAddress: "203.0.113.9"
+            });
+        expect(reset.statusCode).toBe(401);
+      } finally {
+        await app.close();
+        await db.close();
+      }
+    }
+  );
+
+  it.each([
+    {
+      label: "malformed percent escape",
+      protectedTarget: "/api/%",
+      authenticatedStatus: 400,
+      authenticatedError: "Malformed request target."
+    },
+    {
+      label: "escaped-prefix malformed percent escape",
+      protectedTarget: "HtTp://host/%61pi/%",
+      authenticatedStatus: 400,
+      authenticatedError: "Malformed request target."
+    },
+    {
+      label: "overlong route parameter",
+      protectedTarget: `/api/drafts/${"x".repeat(101)}/disable`,
+      authenticatedStatus: 414,
+      authenticatedError: "Request target is too long."
+    },
+    {
+      label: "encoded overlong route parameter",
+      protectedTarget: `/api/drafts/${"x".repeat(60)}%2F${"x".repeat(60)}/disable`,
+      authenticatedStatus: 414,
+      authenticatedError: "Request target is too long."
+    }
+  ])(
+    "authenticates and limits pre-routing API failure: $label",
+    async ({ label, protectedTarget, authenticatedStatus, authenticatedError }) => {
+      let now = 1_000;
+      const config = testConfig();
+      const caseName = label.replaceAll(/[^a-z0-9]/gi, "-");
+      const db = new JsonFilePatchPageDb(
+        path.join(tempDir, `${caseName}-pre-routing-db.json`)
+      );
+      await db.initialize("dev-token");
+      const storage = new FileSystemHtmlStorage(
+        path.join(tempDir, `${caseName}-pre-routing-drafts`)
+      );
+      const app = createApp({ config, db, storage, clock: () => now });
+
+      try {
+        const publicMalformed = await rawHttpRequest(app, "/public/%");
+        expect(publicMalformed.statusCode).toBe(400);
+
+        for (let attempt = 1; attempt <= 60; attempt += 1) {
+          const response = await rawHttpRequest(app, protectedTarget);
+          expect(response.statusCode).toBe(401);
+          expect(response.json()).toEqual({
+            ok: false,
+            error: "Missing or invalid API token."
+          });
+        }
+
+        const limited = await rawHttpRequest(app, protectedTarget);
+        expect(limited.statusCode).toBe(429);
+        expect(limited.headers["retry-after"]).toBe("60");
+        expect(limited.json()).toEqual({
+          ok: false,
+          error: "Rate limit exceeded.",
+          code: "rate_limited",
+          retryAfterSeconds: 60
+        });
+
+        now = 61_000;
+        const authenticated = await rawHttpRequest(
+          app,
+          protectedTarget,
+          "",
+          { Authorization: "Bearer dev-token" },
+          { closeAfterWrite: false }
+        );
+        expect(authenticated.statusCode).toBe(authenticatedStatus);
+        expect(authenticated.json()).toEqual({
+          ok: false,
+          error: authenticatedError
+        });
+      } finally {
+        await app.close();
+        await db.close();
+      }
+    }
+  );
+
+  it("preserves authenticated 404s for long unmatched API route shapes", async () => {
+    const config = testConfig();
+    const db = new JsonFilePatchPageDb(path.join(tempDir, "long-unmatched-api-db.json"));
+    await db.initialize("dev-token");
+    const storage = new FileSystemHtmlStorage(
+      path.join(tempDir, "long-unmatched-api-drafts")
+    );
+    const app = createApp({ config, db, storage });
+    const longSegment = "x".repeat(101);
+
+    try {
+      for (const { method, requestTarget } of [
+        { method: "POST", requestTarget: `/api/unmatched/${longSegment}` },
+        {
+          method: "PUT",
+          requestTarget: `/api/drafts/${longSegment}/disable`
+        }
+      ]) {
+        const response = await rawHttpRequest(
+          app,
+          requestTarget,
+          "",
+          { Authorization: "Bearer dev-token" },
+          { closeAfterWrite: false, method }
+        );
+        expect(response.statusCode).toBe(404);
+        expect(response.json()).toEqual({ ok: false, error: "Not found." });
+      }
+    } finally {
+      await app.close();
+      await db.close();
+    }
+  });
+
+  it("does not classify an absolute URI query as an API path or consume its bucket", async () => {
+    const config = testConfig();
+    const db = new JsonFilePatchPageDb(path.join(tempDir, "absolute-query-db.json"));
+    await db.initialize("dev-token");
+    const storage = new FileSystemHtmlStorage(path.join(tempDir, "absolute-query-drafts"));
+    const app = createApp({ config, db, storage });
+
+    try {
+      const publicQuery = await rawHttpRequest(app, "http://host?x=/api/%");
+      expect(publicQuery.statusCode).toBe(400);
+
+      for (let attempt = 1; attempt <= 60; attempt += 1) {
+        const response = await rawHttpRequest(app, "/api/does-not-exist");
+        expect(response.statusCode).toBe(401);
+      }
+
+      const limited = await rawHttpRequest(app, "/api/does-not-exist");
+      expect(limited.statusCode).toBe(429);
+      expect(limited.headers["retry-after"]).toBe("60");
+    } finally {
+      await app.close();
+      await db.close();
+    }
+  });
+
+  it("limits authenticated upload attempts by stable token identity", async () => {
+    let now = 1_000;
+    const config = testConfig();
+    const db = new JsonFilePatchPageDb(path.join(tempDir, "upload-limit-db.json"));
+    await db.initialize("upload-token");
+    const auth = await db.findApiTokenByToken("upload-token");
+    expect(auth).not.toBeNull();
+    await db.createApiToken({
+      accountId: auth!.accountId,
+      name: "Other upload token",
+      token: "other-upload-token",
+      scopes: ["upload"]
+    });
+    const storage = new FileSystemHtmlStorage(path.join(tempDir, "upload-limit-drafts"));
+    const app = createApp({ config, db, storage, clock: () => now });
+
+    try {
+      const upload = await app.inject({
+        method: "POST",
+        url: "/api/uploads",
+        headers: { authorization: "Bearer upload-token" },
+        payload: {
+          html: "<!doctype html><html><head><title>Limited Draft</title></head><body><h1>Hello</h1></body></html>"
+        }
+      });
+      expect(upload.statusCode).toBe(201);
+      const { draftId } = upload.json() as { draftId: string };
+
+      for (let attempt = 0; attempt < 9; attempt += 1) {
+        const response = await app.inject({
+          method: "POST",
+          url: "/api/uploads",
+          headers: { authorization: "Bearer upload-token" },
+          payload: {}
+        });
+        expect(response.statusCode).toBe(400);
+      }
+
+      await db.initialize("rotated-upload-token");
+
+      for (let attempt = 0; attempt < 10; attempt += 1) {
+        const response = await app.inject({
+          method: "POST",
+          url: "/api/uploads",
+          headers: { authorization: "Bearer rotated-upload-token" },
+          payload: {}
+        });
+        expect(response.statusCode).toBe(400);
+      }
+
+      const limited = await app.inject({
+        method: "POST",
+        url: "/api/uploads",
+        headers: { authorization: "Bearer rotated-upload-token" },
+        payload: {}
+      });
+      expect(limited.statusCode).toBe(429);
+      expect(limited.headers["retry-after"]).toBe("60");
+      expect(limited.json()).toEqual({
+        ok: false,
+        error: "Rate limit exceeded.",
+        code: "rate_limited",
+        retryAfterSeconds: 60
+      });
+
+      const otherToken = await app.inject({
+        method: "POST",
+        url: "/api/uploads",
+        headers: { authorization: "Bearer other-upload-token" },
+        payload: {}
+      });
+      expect(otherToken.statusCode).toBe(400);
+
+      const viewer = await app.inject({ method: "GET", url: `/d/${draftId}` });
+      expect(viewer.statusCode).toBe(200);
+      expect(viewer.body).toContain("Limited Draft");
+
+      now = 61_000;
+      const reset = await app.inject({
+        method: "POST",
+        url: "/api/uploads",
+        headers: { authorization: "Bearer rotated-upload-token" },
+        payload: {}
+      });
+      expect(reset.statusCode).toBe(400);
+    } finally {
+      await app.close();
+      await db.close();
+    }
   });
 
   it("persists the direct socket address when proxy trust is not configured", async () => {
@@ -675,6 +1474,210 @@ async function uploadSourceIp(options: {
   }
 }
 
+async function markJsonTokenRevoked(filePath: string, name: string): Promise<void> {
+  const state = JSON.parse(await readFile(filePath, "utf8")) as {
+    apiTokens: Array<{ name: string; revokedAt: string | null }>;
+  };
+  const token = state.apiTokens.find((row) => row.name === name);
+  expect(token).toBeDefined();
+  token!.revokedAt = "2026-01-01T00:00:00.000Z";
+  await writeFile(filePath, JSON.stringify(state, null, 2));
+}
+
+async function createScopedTokenApp(label: string, clock?: () => number): Promise<ScopedTokenApp> {
+  const safeLabel = label.replaceAll(/[^a-z0-9]/gi, "-");
+  const config = testConfig();
+  const db = new JsonFilePatchPageDb(path.join(tempDir, `${safeLabel}-db.json`));
+  await db.initialize("admin-token");
+  const adminAuth = await db.findApiTokenByToken("admin-token");
+  expect(adminAuth).not.toBeNull();
+  await db.createApiToken({
+    accountId: adminAuth!.accountId,
+    name: "Read token",
+    token: "read-token",
+    scopes: ["read"]
+  });
+  await db.createApiToken({
+    accountId: adminAuth!.accountId,
+    name: "Upload token",
+    token: "upload-token",
+    scopes: ["upload"]
+  });
+  await db.createApiToken({
+    accountId: adminAuth!.accountId,
+    name: "Admin only token",
+    token: "admin-only-token",
+    scopes: ["admin"]
+  });
+  const storage = new FileSystemHtmlStorage(path.join(tempDir, `${safeLabel}-drafts`));
+  const app = createApp({ config, db, storage, clock });
+  return { app, db };
+}
+
+async function oversizedJsonApiRequest(
+  app: ReturnType<typeof createApp>,
+  options: { target: ApiTargetCase; token: string }
+) {
+  const authorization = `Bearer ${options.token}`;
+  if (options.target.rawHttp) {
+    return rawHttpRequest(
+      app,
+      options.target.url,
+      "{\"html\":\"",
+      {
+        Authorization: authorization,
+        "Content-Type": "application/json",
+        "Content-Length": String(2 * 1024 * 1024 + 1)
+      },
+      { closeAfterWrite: false }
+    );
+  }
+
+  return app.inject({
+    method: options.target.method || "POST",
+    url: options.target.url,
+    headers: {
+      authorization,
+      "content-type": "application/json"
+    },
+    payload: `{"html":"${"x".repeat(2 * 1024 * 1024)}`
+  });
+}
+
+async function rawHttpRequest(
+  app: ReturnType<typeof createApp>,
+  requestTarget: string,
+  payload = "",
+  headers: Record<string, string> = {},
+  options: { closeAfterWrite?: boolean; method?: string } = {}
+): Promise<RawHttpResponse> {
+  const address = app.server.address();
+  const port =
+    address && typeof address !== "string"
+      ? address.port
+      : await listenOnLoopback(app);
+
+  const raw = await new Promise<string>((resolve, reject) => {
+    const socket = createConnection({ host: "127.0.0.1", port });
+    let settled = false;
+    let response = "";
+    const resolveOnce = () => {
+      if (settled) return;
+      settled = true;
+      resolve(response);
+    };
+    const rejectOnce = (error: Error) => {
+      if (settled) return;
+      settled = true;
+      reject(error);
+    };
+    socket.setEncoding("utf8");
+    socket.setTimeout(2_000, () => {
+      socket.destroy();
+      rejectOnce(new Error("Timed out waiting for raw HTTP response."));
+    });
+    socket.on("data", (chunk) => {
+      response += chunk;
+    });
+    socket.on("end", resolveOnce);
+    socket.on("error", (error) => {
+      if (response) {
+        resolveOnce();
+        return;
+      }
+      rejectOnce(error);
+    });
+    socket.on("connect", () => {
+      const requestHeaders = {
+        Host: "host",
+        Connection: "close",
+        "Content-Length": String(Buffer.byteLength(payload)),
+        ...headers
+      };
+      const headerLines = Object.entries(requestHeaders).map(
+        ([name, value]) => `${name}: ${value}`
+      );
+      const request = [
+        `${options.method ?? "POST"} ${requestTarget} HTTP/1.1`,
+        ...headerLines,
+        "",
+        payload
+      ].join("\r\n");
+      if (options.closeAfterWrite === false) {
+        socket.write(request);
+        return;
+      }
+      socket.end(request);
+    });
+  });
+
+  return parseRawHttpResponse(raw);
+}
+
+async function listenOnLoopback(app: ReturnType<typeof createApp>): Promise<number> {
+  await app.listen({ host: "127.0.0.1", port: 0 });
+  const address = app.server.address();
+  if (!address || typeof address === "string") {
+    throw new Error("Expected Fastify test server to listen on a TCP address.");
+  }
+  return (address as AddressInfo).port;
+}
+
+function parseRawHttpResponse(raw: string): RawHttpResponse {
+  const [head = "", encodedBody = ""] = raw.split("\r\n\r\n", 2);
+  const [statusLine = "", ...headerLines] = head.split("\r\n");
+  const statusCode = Number(statusLine.split(" ")[1]);
+  const headers: Record<string, string> = {};
+  for (const line of headerLines) {
+    const index = line.indexOf(":");
+    if (index === -1) continue;
+    headers[line.slice(0, index).toLowerCase()] = line.slice(index + 1).trim();
+  }
+  const body =
+    headers["transfer-encoding"]?.toLowerCase() === "chunked"
+      ? decodeChunkedBody(encodedBody)
+      : encodedBody;
+
+  return {
+    statusCode,
+    headers,
+    json: () => JSON.parse(body)
+  };
+}
+
+function decodeChunkedBody(encodedBody: string): string {
+  let cursor = 0;
+  let decoded = "";
+  while (cursor < encodedBody.length) {
+    const lineEnd = encodedBody.indexOf("\r\n", cursor);
+    if (lineEnd === -1) break;
+    const size = Number.parseInt(encodedBody.slice(cursor, lineEnd), 16);
+    if (!size) break;
+    const chunkStart = lineEnd + 2;
+    decoded += encodedBody.slice(chunkStart, chunkStart + size);
+    cursor = chunkStart + size + 2;
+  }
+  return decoded;
+}
+
+type RawHttpResponse = {
+  statusCode: number;
+  headers: Record<string, string>;
+  json: () => unknown;
+};
+
+type ApiTargetCase = {
+  label: string;
+  url: string;
+  method?: string;
+  rawHttp?: boolean;
+};
+
+type ScopedTokenApp = {
+  app: ReturnType<typeof createApp>;
+  db: JsonFilePatchPageDb;
+};
+
 function testConfig(): ServerConfig {
   return {
     port: 3000,
@@ -683,6 +1686,9 @@ function testConfig(): ServerConfig {
     bootstrapApiToken: "dev-token",
     allowAnonymousUploads: false,
     maxHtmlBytes: 512 * 1024,
+    protectedApiRateLimitPerMinute: 60,
+    authenticatedUploadRateLimitPerMinute: 20,
+    anonymousCreateRateLimitPerMinute: 5,
     dbDriver: "json",
     databaseUrl: null,
     jsonDbFile: path.join(tempDir, "db.json"),

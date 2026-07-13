@@ -1,3 +1,4 @@
+import type { IncomingMessage } from "node:http";
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import Fastify from "fastify";
 import type { ServerConfig } from "@patchpage/config";
@@ -19,12 +20,18 @@ import {
 } from "@patchpage/core";
 import type { UploadMetadata } from "@patchpage/core";
 import { getDraftPublicUrl } from "./public-url.js";
+import {
+  createRateLimiters,
+  type FixedWindowRateLimiter,
+  type RateLimitDecision
+} from "./rate-limit.js";
 import { renderDraftWrapper, renderHome, renderNotFound } from "./render.js";
 
 export interface CreateAppOptions {
   config: ServerConfig;
   db: PatchPageDb;
   storage: HtmlStorage;
+  clock?: () => number;
 }
 
 interface UploadBody {
@@ -42,14 +49,48 @@ interface TokenBody {
 declare module "fastify" {
   interface FastifyRequest {
     auth?: ApiTokenAuth;
+    authState?: ApiRequestAuthState;
+    preBodyAuthorizedScopes?: Set<string>;
+    preBodyUploadLimiterConsumed?: boolean;
   }
 }
 
+type ApiRequestAuthState =
+  | { kind: "missing" }
+  | { kind: "invalid" }
+  | { kind: "authenticated"; auth: ApiTokenAuth };
+
+export type AuthorizationCredential =
+  | { kind: "missing" }
+  | { kind: "invalid" }
+  | { kind: "bearer"; token: string };
+
+interface ProtectedApiHookOptions {
+  uploadLimiter?: FixedWindowRateLimiter;
+}
+
+type ApiPolicyScope = "admin" | "upload";
+
+type ApiRequestTargetPolicy =
+  | { protected: false }
+  | { protected: true; requiredScope?: ApiPolicyScope; uploadLimit?: boolean };
+
+const FASTIFY_DEFAULT_MAX_PARAM_LENGTH = 100;
+const PRE_ROUTING_API_ERROR_TARGET = "/api/__patchpage_pre_routing_error__";
+const preRoutingApiErrorStatus = Symbol("preRoutingApiErrorStatus");
+
+type PreRoutingApiErrorStatus = 400 | 414;
+type MarkedIncomingMessage = IncomingMessage & {
+  [preRoutingApiErrorStatus]?: PreRoutingApiErrorStatus;
+};
+
 export function createApp(options: CreateAppOptions): FastifyInstance {
+  const rateLimiters = createRateLimiters(options.config, { clock: options.clock });
   const app = Fastify({
     logger: false,
     bodyLimit: Math.max(options.config.maxHtmlBytes * 3, 2 * 1024 * 1024),
-    trustProxy: options.config.trustProxy
+    trustProxy: options.config.trustProxy,
+    rewriteUrl: rewriteProtectedApiRoutingFailure
   });
 
   app.addHook("onSend", async (_request, reply) => {
@@ -57,15 +98,22 @@ export function createApp(options: CreateAppOptions): FastifyInstance {
     reply.header("Cache-Control", "no-store");
   });
 
+  app.addHook(
+    "onRequest",
+    protectedApiPrefixGuard(options.db, rateLimiters.protectedApi, rateLimiters.authenticatedUpload)
+  );
+
+  const protectedApi = (requiredScope?: string, hookOptions: ProtectedApiHookOptions = {}) =>
+    protectedApiRouteHook(requiredScope, hookOptions);
+
   app.get("/", async (_request, reply) => {
     return reply.type("text/html").send(renderHome({ publicBaseUrl: options.config.publicBaseUrl }));
   });
 
   app.get("/healthz", async () => ({ ok: true }));
 
-  app.get("/api/me", async (request, reply) => {
-    const auth = await requireAuth(options.db, request, reply);
-    if (!auth) return;
+  app.get("/api/me", { onRequest: protectedApi() }, async (request) => {
+    const auth = authenticatedRequest(request);
 
     return {
       accountId: auth.accountId,
@@ -76,9 +124,8 @@ export function createApp(options: CreateAppOptions): FastifyInstance {
     };
   });
 
-  app.post("/api/tokens", async (request, reply) => {
-    const auth = await requireAuth(options.db, request, reply, "admin");
-    if (!auth) return;
+  app.post("/api/tokens", { onRequest: protectedApi("admin") }, async (request, reply) => {
+    const auth = authenticatedRequest(request);
 
     const body = (request.body || {}) as TokenBody;
     const token = `pp_${randomToken(32)}`;
@@ -97,107 +144,117 @@ export function createApp(options: CreateAppOptions): FastifyInstance {
     });
   });
 
-  app.post("/api/uploads", async (request, reply) => {
-    const auth = await requireAuth(options.db, request, reply, "upload");
-    if (!auth) return;
+  app.post(
+    "/api/uploads",
+    { onRequest: protectedApi("upload", { uploadLimiter: rateLimiters.authenticatedUpload }) },
+    async (request, reply) => {
+      const auth = authenticatedRequest(request);
 
-    const body = (request.body || {}) as UploadBody;
-    if (typeof body.html !== "string") {
-      return reply.status(400).send({ ok: false, error: "Missing HTML document." });
-    }
-    const html = body.html;
+      const body = (request.body || {}) as UploadBody;
+      if (typeof body.html !== "string") {
+        return reply.status(400).send({ ok: false, error: "Missing HTML document." });
+      }
+      const html = body.html;
 
-    const validation = validateHtml(html, { maxBytes: options.config.maxHtmlBytes });
-    if (!validation.ok) {
-      return reply.status(422).send({
-        ok: false,
-        errors: validation.errors,
+      const validation = validateHtml(html, { maxBytes: options.config.maxHtmlBytes });
+      if (!validation.ok) {
+        return reply.status(422).send({
+          ok: false,
+          errors: validation.errors,
+          warnings: validation.warnings
+        });
+      }
+
+      const requestedDraftId =
+        body.draftId === undefined || body.draftId === null ? null : body.draftId;
+      if (
+        requestedDraftId !== null &&
+        (typeof requestedDraftId !== "string" || !isDraftId(requestedDraftId))
+      ) {
+        return reply.status(400).send({ ok: false, error: "Invalid draft ID." });
+      }
+
+      const draftId = requestedDraftId || newDraftId();
+      const versionId = newInternalId("ver");
+      const objectKey = `drafts/${draftId}/versions/${versionId}.html`;
+      const filename = cleanText(body.filename);
+      const metadata = normalizeMetadata(body.metadata);
+      const title = validation.title || filename || "Untitled Draft";
+
+      const uploadInput: RecordUploadInput = {
+        intent: requestedDraftId ? "update" : "create",
+        draftId,
+        versionId,
+        accountId: auth.accountId,
+        apiTokenId: auth.id,
+        title,
+        objectKey,
+        contentHash: contentHash(html),
+        fileSize: Buffer.byteLength(html, "utf8"),
+        filename,
+        metadata,
+        sourceIp: request.ip || null,
+        userAgent: request.headers["user-agent"] || null
+      };
+
+      await options.db.assertUploadTarget(uploadInput);
+      await options.storage.putHtmlObject(objectKey, html);
+
+      let upload: RecordUploadResult;
+      try {
+        upload = await options.db.recordUpload(uploadInput);
+      } catch (error) {
+        if (!isUploadTargetError(error)) throw error;
+        try {
+          await options.storage.deleteHtmlObject(objectKey);
+        } catch (cleanupError) {
+          app.log.error(cleanupError);
+          throw new Error("Upload cleanup failed.");
+        }
+        throw error;
+      }
+
+      const publicUrl = getDraftPublicUrl({
+        draftId,
+        publicBaseUrl: options.config.publicBaseUrl
+      });
+
+      return reply.status(requestedDraftId ? 200 : 201).send({
+        ok: true,
+        ...upload,
+        publicUrl,
         warnings: validation.warnings
       });
     }
+  );
 
-    const requestedDraftId =
-      body.draftId === undefined || body.draftId === null ? null : body.draftId;
-    if (
-      requestedDraftId !== null &&
-      (typeof requestedDraftId !== "string" || !isDraftId(requestedDraftId))
-    ) {
-      return reply.status(400).send({ ok: false, error: "Invalid draft ID." });
+  app.post(
+    "/api/drafts/:draftId/disable",
+    { onRequest: protectedApi() },
+    async (request, reply) => {
+      const auth = authenticatedRequest(request);
+
+      const draftId = (request.params as { draftId: string }).draftId;
+      const reason =
+        cleanText((request.body as { reason?: unknown } | null)?.reason) || "Disabled.";
+      const disabled = await options.db.disableDraft(draftId, auth.accountId, reason);
+      if (!disabled) return reply.status(404).send({ ok: false, error: "Draft not found." });
+      return { ok: true };
     }
+  );
 
-    const draftId = requestedDraftId || newDraftId();
-    const versionId = newInternalId("ver");
-    const objectKey = `drafts/${draftId}/versions/${versionId}.html`;
-    const filename = cleanText(body.filename);
-    const metadata = normalizeMetadata(body.metadata);
-    const title = validation.title || filename || "Untitled Draft";
+  app.delete(
+    "/api/drafts/:draftId",
+    { onRequest: protectedApi() },
+    async (request, reply) => {
+      const auth = authenticatedRequest(request);
 
-    const uploadInput: RecordUploadInput = {
-      intent: requestedDraftId ? "update" : "create",
-      draftId,
-      versionId,
-      accountId: auth.accountId,
-      apiTokenId: auth.id,
-      title,
-      objectKey,
-      contentHash: contentHash(html),
-      fileSize: Buffer.byteLength(html, "utf8"),
-      filename,
-      metadata,
-      sourceIp: request.ip || null,
-      userAgent: request.headers["user-agent"] || null
-    };
-
-    await options.db.assertUploadTarget(uploadInput);
-    await options.storage.putHtmlObject(objectKey, html);
-
-    let upload: RecordUploadResult;
-    try {
-      upload = await options.db.recordUpload(uploadInput);
-    } catch (error) {
-      if (!isUploadTargetError(error)) throw error;
-      try {
-        await options.storage.deleteHtmlObject(objectKey);
-      } catch (cleanupError) {
-        app.log.error(cleanupError);
-        throw new Error("Upload cleanup failed.");
-      }
-      throw error;
+      const draftId = (request.params as { draftId: string }).draftId;
+      const deleted = await options.db.deleteDraft(draftId, auth.accountId);
+      if (!deleted) return reply.status(404).send({ ok: false, error: "Draft not found." });
+      return { ok: true };
     }
-
-    const publicUrl = getDraftPublicUrl({
-      draftId,
-      publicBaseUrl: options.config.publicBaseUrl
-    });
-
-    return reply.status(requestedDraftId ? 200 : 201).send({
-      ok: true,
-      ...upload,
-      publicUrl,
-      warnings: validation.warnings
-    });
-  });
-
-  app.post("/api/drafts/:draftId/disable", async (request, reply) => {
-    const auth = await requireAuth(options.db, request, reply);
-    if (!auth) return;
-
-    const draftId = (request.params as { draftId: string }).draftId;
-    const reason = cleanText((request.body as { reason?: unknown } | null)?.reason) || "Disabled.";
-    const disabled = await options.db.disableDraft(draftId, auth.accountId, reason);
-    if (!disabled) return reply.status(404).send({ ok: false, error: "Draft not found." });
-    return { ok: true };
-  });
-
-  app.delete("/api/drafts/:draftId", async (request, reply) => {
-    const auth = await requireAuth(options.db, request, reply);
-    if (!auth) return;
-
-    const draftId = (request.params as { draftId: string }).draftId;
-    const deleted = await options.db.deleteDraft(draftId, auth.accountId);
-    if (!deleted) return reply.status(404).send({ ok: false, error: "Draft not found." });
-    return { ok: true };
-  });
+  );
 
   app.get("/d/:draftId", async (request, reply) => {
     const draftId = (request.params as { draftId: string }).draftId;
@@ -259,33 +316,298 @@ async function renderDraft(
   );
 }
 
-async function requireAuth(
+function protectedApiPrefixGuard(
   db: PatchPageDb,
-  request: FastifyRequest,
+  protectedApiLimiter: FixedWindowRateLimiter,
+  authenticatedUploadLimiter: FixedWindowRateLimiter
+) {
+  return async (request: FastifyRequest, reply: FastifyReply): Promise<void> => {
+    const targetPolicy = classifyApiRequestTargetPolicy(request.url);
+    if (!targetPolicy.protected) return;
+
+    const protectedAttempt = protectedApiLimiter.consume(request.ip);
+    if (!protectedAttempt.allowed) {
+      sendRateLimited(reply, protectedAttempt);
+      return;
+    }
+
+    const authState = await authenticateApiRequest(db, request);
+    request.authState = authState;
+
+    if (authState.kind === "missing" || authState.kind === "invalid") {
+      reply.status(401).send({ ok: false, error: "Missing or invalid API token." });
+      return;
+    }
+
+    request.auth = authState.auth;
+
+    const routingErrorStatus = (request.raw as MarkedIncomingMessage)[
+      preRoutingApiErrorStatus
+    ];
+    if (routingErrorStatus) {
+      sendPreRoutingApiError(reply, routingErrorStatus);
+      return;
+    }
+
+    if (targetPolicy.requiredScope) {
+      if (!hasScope(authState.auth, targetPolicy.requiredScope)) {
+        reply.status(403).send({ ok: false, error: "API token does not have the required scope." });
+        return;
+      }
+      markPreBodyAuthorizedScope(request, targetPolicy.requiredScope);
+    }
+
+    if (targetPolicy.uploadLimit) {
+      const uploadAttempt = authenticatedUploadLimiter.consume(authState.auth.id);
+      request.preBodyUploadLimiterConsumed = true;
+      if (!uploadAttempt.allowed) {
+        sendRateLimited(reply, uploadAttempt);
+        return;
+      }
+    }
+
+    if (request.is404) {
+      sendApiNotFound(reply);
+      return;
+    }
+  };
+}
+
+function protectedApiRouteHook(requiredScope: string | undefined, options: ProtectedApiHookOptions) {
+  return async (request: FastifyRequest, reply: FastifyReply): Promise<void> => {
+    const auth = request.auth;
+    if (!auth) {
+      reply.status(401).send({ ok: false, error: "Missing or invalid API token." });
+      return;
+    }
+
+    const scopeAlreadyChecked =
+      requiredScope && request.preBodyAuthorizedScopes?.has(requiredScope);
+    if (requiredScope && !scopeAlreadyChecked && !hasScope(auth, requiredScope)) {
+      reply.status(403).send({ ok: false, error: "API token does not have the required scope." });
+      return;
+    }
+
+    if (options.uploadLimiter && !request.preBodyUploadLimiterConsumed) {
+      const uploadAttempt = options.uploadLimiter.consume(auth.id);
+      request.preBodyUploadLimiterConsumed = true;
+      if (!uploadAttempt.allowed) {
+        sendRateLimited(reply, uploadAttempt);
+        return;
+      }
+    }
+
+    request.auth = auth;
+  };
+}
+
+export function isProtectedApiPath(requestTarget: string): boolean {
+  return classifyApiRequestTargetPolicy(requestTarget).protected;
+}
+
+function rawRequestTargetPath(requestTarget: string): string {
+  const end = requestTarget.search(/[?#]/);
+  const targetWithoutQuery = end === -1 ? requestTarget : requestTarget.slice(0, end);
+  const absolutePrefix = /^https?:\/\//i.exec(targetWithoutQuery)?.[0];
+  if (!absolutePrefix) return targetWithoutQuery;
+
+  const pathStart = targetWithoutQuery.indexOf("/", absolutePrefix.length);
+  return pathStart === -1 ? "/" : targetWithoutQuery.slice(pathStart);
+}
+
+function registeredApiParamExceedsRouterLimit(
+  method: string | undefined,
+  rawPath: string
+): boolean {
+  if (method !== "POST" && method !== "DELETE") return false;
+
+  const [leading, rawApi, rawDrafts, rawParameter] = rawPath.split("/");
+  if (
+    leading !== "" ||
+    rawApi === undefined ||
+    rawDrafts === undefined ||
+    rawParameter === undefined ||
+    decodeURI(rawApi) !== "api" ||
+    decodeURI(rawDrafts) !== "drafts"
+  ) {
+    return false;
+  }
+
+  return decodeURIComponent(rawParameter).length > FASTIFY_DEFAULT_MAX_PARAM_LENGTH;
+}
+
+function rewriteProtectedApiRoutingFailure(request: IncomingMessage): string {
+  const requestTarget = request.url ?? "/";
+  const rawPath = rawRequestTargetPath(requestTarget);
+  const pathname = canonicalRequestTargetPath(requestTarget);
+  let errorStatus: PreRoutingApiErrorStatus | undefined;
+
+  if (pathname === null) {
+    if (!hasLexicalProtectedApiPrefix(requestTarget)) return requestTarget;
+    errorStatus = 400;
+  } else if (
+    isApiPolicyPath(pathname) &&
+    registeredApiParamExceedsRouterLimit(request.method, rawPath)
+  ) {
+    errorStatus = 414;
+  }
+
+  if (!errorStatus) return requestTarget;
+  (request as MarkedIncomingMessage)[preRoutingApiErrorStatus] = errorStatus;
+  return PRE_ROUTING_API_ERROR_TARGET;
+}
+
+function hasLexicalProtectedApiPrefix(requestTarget: string): boolean {
+  const rawPath = rawRequestTargetPath(requestTarget);
+  const asciiDecodedPath = rawPath.replace(/%([0-7][0-9a-f])/gi, (_escape, hex: string) =>
+    String.fromCharCode(Number.parseInt(hex, 16))
+  );
+  return isApiPolicyPath(normalizePolicyPath(asciiDecodedPath));
+}
+
+function isApiPolicyPath(pathname: string): boolean {
+  return pathname === "/api" || pathname.startsWith("/api/");
+}
+
+function canonicalRequestTargetPath(requestTarget: string): string | null {
+  const rawPath = rawRequestTargetPath(requestTarget);
+  const rawPathWithPolicySeparators = rawPath.replace(/%2f/gi, "/");
+
+  try {
+    return normalizePolicyPath(decodeURI(rawPathWithPolicySeparators));
+  } catch {
+    return null;
+  }
+}
+
+function classifyApiRequestTargetPolicy(requestTarget: string): ApiRequestTargetPolicy {
+  const pathname = canonicalRequestTargetPath(requestTarget);
+  if (pathname === null) return { protected: true };
+  if (pathname === "/api/uploads") {
+    return { protected: true, requiredScope: "upload", uploadLimit: true };
+  }
+  if (pathname === "/api/tokens") {
+    return { protected: true, requiredScope: "admin" };
+  }
+  return {
+    protected: isApiPolicyPath(pathname)
+  };
+}
+
+function normalizePolicyPath(pathname: string): string {
+  const collapsed = pathname.replace(/\/+/g, "/");
+  return collapsed.length > 1 ? collapsed.replace(/\/+$/g, "") : collapsed;
+}
+
+function hasScope(auth: ApiTokenAuth, scope: string): boolean {
+  return auth.scopes.includes(scope) || auth.scopes.includes("admin");
+}
+
+function markPreBodyAuthorizedScope(request: FastifyRequest, scope: string): void {
+  request.preBodyAuthorizedScopes ??= new Set();
+  request.preBodyAuthorizedScopes.add(scope);
+}
+
+function sendPreRoutingApiError(
   reply: FastifyReply,
-  requiredScope?: string
-): Promise<ApiTokenAuth | null> {
-  const authHeader = request.headers.authorization || "";
-  const match = authHeader.match(/^Bearer\s+(.+)$/i);
-  const token = match?.[1]?.trim();
-  if (!token) {
-    reply.status(401).send({ ok: false, error: "Missing or invalid API token." });
-    return null;
+  status: PreRoutingApiErrorStatus
+): void {
+  reply.status(status).send({
+    ok: false,
+    error: status === 400 ? "Malformed request target." : "Request target is too long."
+  });
+}
+
+function sendRateLimited(reply: FastifyReply, decision: RateLimitDecision): void {
+  const retryAfterSeconds = decision.retryAfterSeconds ?? 1;
+  reply.header("Retry-After", String(retryAfterSeconds));
+  reply.status(429).send({
+    ok: false,
+    error: "Rate limit exceeded.",
+    code: "rate_limited",
+    retryAfterSeconds
+  });
+}
+
+function sendApiNotFound(reply: FastifyReply): void {
+  reply.status(404).send({
+    ok: false,
+    error: "Not found."
+  });
+}
+
+async function authenticateApiRequest(
+  db: PatchPageDb,
+  request: FastifyRequest
+): Promise<ApiRequestAuthState> {
+  const credential = authorizationCredential(request);
+  if (credential.kind === "missing") return { kind: "missing" };
+  if (credential.kind === "invalid") return { kind: "invalid" };
+
+  const auth = await db.findApiTokenByToken(credential.token);
+  return auth ? { kind: "authenticated", auth } : { kind: "invalid" };
+}
+
+function authorizationCredential(
+  request: FastifyRequest
+): AuthorizationCredential {
+  return classifyAuthorizationHeader(request.headers.authorization);
+}
+
+export function classifyAuthorizationHeader(
+  authHeader: string | undefined
+): AuthorizationCredential {
+  if (authHeader === undefined) return { kind: "missing" };
+
+  const bearerScheme = "bearer";
+  if (authHeader.length <= bearerScheme.length) return { kind: "invalid" };
+  for (let index = 0; index < bearerScheme.length; index += 1) {
+    if ((authHeader.charCodeAt(index) | 32) !== bearerScheme.charCodeAt(index)) {
+      return { kind: "invalid" };
+    }
   }
 
-  const auth = await db.findApiTokenByToken(token);
-  if (!auth) {
-    reply.status(401).send({ ok: false, error: "Missing or invalid API token." });
-    return null;
+  let cursor = bearerScheme.length;
+  if (!isAuthorizationWhitespace(authHeader.charCodeAt(cursor))) {
+    return { kind: "invalid" };
+  }
+  while (
+    cursor < authHeader.length &&
+    isAuthorizationWhitespace(authHeader.charCodeAt(cursor))
+  ) {
+    cursor += 1;
   }
 
-  if (requiredScope && !auth.scopes.includes(requiredScope) && !auth.scopes.includes("admin")) {
-    reply.status(403).send({ ok: false, error: "API token does not have the required scope." });
-    return null;
+  const tokenStart = cursor;
+  while (
+    cursor < authHeader.length &&
+    !isAuthorizationWhitespace(authHeader.charCodeAt(cursor))
+  ) {
+    cursor += 1;
   }
+  if (cursor === tokenStart) return { kind: "invalid" };
 
-  request.auth = auth;
-  return auth;
+  const token = authHeader.slice(tokenStart, cursor);
+  while (
+    cursor < authHeader.length &&
+    isAuthorizationWhitespace(authHeader.charCodeAt(cursor))
+  ) {
+    cursor += 1;
+  }
+  return cursor === authHeader.length
+    ? { kind: "bearer", token }
+    : { kind: "invalid" };
+}
+
+function isAuthorizationWhitespace(charCode: number): boolean {
+  return charCode === 0x20 || charCode === 0x09;
+}
+
+function authenticatedRequest(request: FastifyRequest): ApiTokenAuth {
+  if (!request.auth) {
+    throw new Error("Authenticated request is missing API token auth state.");
+  }
+  return request.auth;
 }
 
 function normalizeMetadata(value: unknown): UploadMetadata {

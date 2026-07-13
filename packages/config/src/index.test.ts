@@ -11,6 +11,54 @@ describe("getServerConfig", () => {
     expect(config.trustProxy).toBe(false);
   });
 
+  it("defaults abuse-protection limits per minute", () => {
+    const config = getServerConfig({});
+
+    expect(config.protectedApiRateLimitPerMinute).toBe(60);
+    expect(config.authenticatedUploadRateLimitPerMinute).toBe(20);
+    expect(config.anonymousCreateRateLimitPerMinute).toBe(5);
+  });
+
+  it("parses configured abuse-protection limits per minute", () => {
+    const config = getServerConfig({
+      PATCHPAGE_PROTECTED_API_RATE_LIMIT_PER_MINUTE: "120",
+      PATCHPAGE_AUTHENTICATED_UPLOAD_RATE_LIMIT_PER_MINUTE: "40",
+      PATCHPAGE_ANONYMOUS_CREATE_RATE_LIMIT_PER_MINUTE: "10"
+    });
+
+    expect(config.protectedApiRateLimitPerMinute).toBe(120);
+    expect(config.authenticatedUploadRateLimitPerMinute).toBe(40);
+    expect(config.anonymousCreateRateLimitPerMinute).toBe(10);
+  });
+
+  it("requires abuse-protection limits to be decimal integers from 1 through 10000", () => {
+    const settings = [
+      [
+        "PATCHPAGE_PROTECTED_API_RATE_LIMIT_PER_MINUTE",
+        "protectedApiRateLimitPerMinute"
+      ],
+      [
+        "PATCHPAGE_AUTHENTICATED_UPLOAD_RATE_LIMIT_PER_MINUTE",
+        "authenticatedUploadRateLimitPerMinute"
+      ],
+      [
+        "PATCHPAGE_ANONYMOUS_CREATE_RATE_LIMIT_PER_MINUTE",
+        "anonymousCreateRateLimitPerMinute"
+      ]
+    ] as const;
+
+    for (const [envName, configName] of settings) {
+      expect(getServerConfig({ [envName]: "1" })[configName]).toBe(1);
+      expect(getServerConfig({ [envName]: "10000" })[configName]).toBe(10000);
+
+      for (const value of ["0", "-1", "+1", "01", "1.5", "1e2", "10001"]) {
+        expect(() => getServerConfig({ [envName]: value })).toThrow(
+          new RegExp(envName)
+        );
+      }
+    }
+  });
+
   it("defaults to postgres db when DATABASE_URL is present", () => {
     const config = getServerConfig({ DATABASE_URL: "postgres://example" });
 
