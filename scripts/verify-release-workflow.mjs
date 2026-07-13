@@ -79,6 +79,50 @@ function job(name) {
   return lines.slice(start, end === -1 ? undefined : end).join("\n");
 }
 
+function stepContaining(jobSource, marker) {
+  const lines = jobSource.split("\n");
+  const markerIndex = lines.findIndex((line) => line.trim() === marker);
+
+  if (markerIndex === -1) {
+    return "";
+  }
+
+  let start = markerIndex;
+  while (start >= 0 && !/^      - /.test(lines[start])) {
+    start -= 1;
+  }
+
+  const end = lines.findIndex(
+    (line, index) => index > markerIndex && /^      - /.test(line),
+  );
+  return lines.slice(start, end === -1 ? undefined : end).join("\n");
+}
+
+function exactLineCount(source, line) {
+  return source.split("\n").filter((candidate) => candidate === line).length;
+}
+
+function failClosedGuardPosition(source, guardLine) {
+  const lines = source.split("\n");
+  const start = lines.findIndex((line) => line.trim() === guardLine);
+
+  if (start === -1) {
+    return -1;
+  }
+
+  const end = lines.findIndex(
+    (line, index) => index > start && line.trim() === "fi",
+  );
+  if (
+    end === -1 ||
+    !lines.slice(start + 1, end).some((line) => line.trim() === "exit 1")
+  ) {
+    return -1;
+  }
+
+  return lines.slice(0, start).join("\n").length + (start === 0 ? 0 : 1);
+}
+
 const actionLines = workflow
   .split("\n")
   .map((line, index) => ({ line, lineNumber: index + 1 }))
@@ -156,6 +200,11 @@ for (const ecosystem of ["npm", "github-actions"]) {
 const prepareNpmJob = job("prepare-npm");
 const verifyJob = job("verify");
 const publishJob = job("publish-npm");
+const packageUploadStep = stepContaining(verifyJob, "id: package-artifact");
+const packageDownloadStep = stepContaining(
+  publishJob,
+  "- name: Download the exact tested tarball",
+);
 
 if (prepareNpmJob) {
   if (!/^    permissions: \{\}$/m.test(prepareNpmJob)) {
@@ -339,6 +388,122 @@ if (
   )
 ) {
   failures.push("publish-npm must download the exact package artifact ID from verify");
+}
+
+const originalTarballDiscovery = verifyJob.indexOf("mapfile -t tarballs");
+const originalTarballCountGuard = verifyJob.indexOf(
+  'if [[ "${#tarballs[@]}" -ne 1 ]]; then',
+);
+const originalTarballAssignment = verifyJob.indexOf('tarball="${tarballs[0]}"');
+const reportedTarballGuard = verifyJob.indexOf(
+  'if [[ "$tarball" != "$reported_tarball" ]]; then',
+);
+const uniqueTarballName = verifyJob.indexOf(
+  'unique_tarball="$package_dir/patchpage-${cli_version}-run-attempt-${GITHUB_RUN_ATTEMPT}.tgz"',
+);
+const uniqueTarballMove = verifyJob.indexOf('mv -- "$tarball" "$unique_tarball"');
+const uniqueTarballAssignment = verifyJob.indexOf('tarball="$unique_tarball"');
+const tarballEnvironmentOutput = verifyJob.indexOf(
+  'echo "TARBALL=$tarball" >> "$GITHUB_ENV"',
+);
+const tarballPathOutput = verifyJob.indexOf(
+  'echo "tarball-path=$tarball" >> "$GITHUB_OUTPUT"',
+);
+const tarballFilenameOutput = verifyJob.indexOf(
+  'echo "filename=$(basename "$tarball")" >> "$GITHUB_OUTPUT"',
+);
+const tarballDigestOutput = verifyJob.indexOf(
+  'echo "sha256=$(sha256sum "$tarball"',
+);
+const smokeInstall = verifyJob.indexOf(
+  'node "$NPM_CLI" install --ignore-scripts "$TARBALL"',
+);
+const smokeDigestGuard = verifyJob.indexOf(
+  'if [[ "$actual_sha256" != "$EXPECTED_TARBALL_SHA256" ]]; then',
+);
+const packageUpload = verifyJob.indexOf("id: package-artifact");
+const rawTarballDiscovery = publishJob.indexOf(
+  'tarballs=("$RUNNER_TEMP/patchpage-package"/*.tgz)',
+);
+const rawTarballCountGuard = publishJob.indexOf(
+  'if [[ "${#tarballs[@]}" -ne 1 ]]; then',
+);
+const rawTarballAssignment = publishJob.indexOf('tarball="${tarballs[0]}"');
+const rawBasenameGuard = publishJob.indexOf(
+  'if [[ "$(basename "$tarball")" != "$EXPECTED_FILENAME" ]]; then',
+);
+const rawDigestCalculation = publishJob.indexOf(
+  'actual_sha256="$(sha256sum "$tarball"',
+);
+const rawDigestGuard = publishJob.indexOf(
+  'if [[ "$actual_sha256" != "$EXPECTED_SHA256" ]]; then',
+);
+const packageMetadataRead = publishJob.indexOf(
+  'tar -xOf "$tarball" package/package.json',
+);
+const publishTarCommands = publishJob.match(/^\s+tar\s+/gm) ?? [];
+const publishUnzipCommands = publishJob.match(/^\s+unzip(?:\s|$)/gm) ?? [];
+const packageArtifactIdDownloads = exactLineCount(
+  publishJob,
+  "          artifact-ids: ${{ needs.verify.outputs.package-artifact-id }}",
+);
+
+if (
+  !packageUploadStep.includes("uses: actions/upload-artifact@") ||
+  exactLineCount(
+    packageUploadStep,
+    "          path: ${{ steps.package.outputs.tarball-path }}",
+  ) !== 1 ||
+  exactLineCount(packageUploadStep, "          archive: false") !== 1 ||
+  packageUploadStep.includes("\n          name:") ||
+  packageUploadStep.includes("compression-level:") ||
+  packageUploadStep.includes("*.tgz") ||
+  !packageDownloadStep.includes("uses: actions/download-artifact@") ||
+  exactLineCount(
+    packageDownloadStep,
+    "          artifact-ids: ${{ needs.verify.outputs.package-artifact-id }}",
+  ) !== 1 ||
+  exactLineCount(
+    packageDownloadStep,
+    "          path: ${{ runner.temp }}/patchpage-package",
+  ) !== 1 ||
+  exactLineCount(packageDownloadStep, "          skip-decompress: true") !== 1 ||
+  packageArtifactIdDownloads !== 1 ||
+  originalTarballDiscovery === -1 ||
+  originalTarballCountGuard <= originalTarballDiscovery ||
+  originalTarballAssignment <= originalTarballCountGuard ||
+  !verifyJob
+    .slice(originalTarballCountGuard, originalTarballAssignment)
+    .includes("exit 1") ||
+  reportedTarballGuard <= originalTarballAssignment ||
+  uniqueTarballName <= reportedTarballGuard ||
+  uniqueTarballMove <= uniqueTarballName ||
+  uniqueTarballAssignment <= uniqueTarballMove ||
+  tarballEnvironmentOutput <= uniqueTarballAssignment ||
+  tarballPathOutput <= uniqueTarballAssignment ||
+  tarballFilenameOutput <= uniqueTarballAssignment ||
+  tarballDigestOutput <= uniqueTarballAssignment ||
+  smokeInstall <= tarballDigestOutput ||
+  smokeDigestGuard <= smokeInstall ||
+  packageUpload <= smokeDigestGuard ||
+  rawTarballDiscovery === -1 ||
+  rawTarballCountGuard <= rawTarballDiscovery ||
+  rawTarballAssignment <= rawTarballCountGuard ||
+  !publishJob
+    .slice(rawTarballCountGuard, rawTarballAssignment)
+    .includes("exit 1") ||
+  rawBasenameGuard <= rawTarballAssignment ||
+  rawDigestCalculation <= rawBasenameGuard ||
+  !publishJob.slice(rawBasenameGuard, rawDigestCalculation).includes("exit 1") ||
+  rawDigestGuard <= rawDigestCalculation ||
+  packageMetadataRead <= rawDigestGuard ||
+  !publishJob.slice(rawDigestGuard, packageMetadataRead).includes("exit 1") ||
+  publishTarCommands.length !== 1 ||
+  publishUnzipCommands.length !== 0
+) {
+  failures.push(
+    "the package artifact must cross into publish-npm as one run-isolated raw tarball and pass basename and digest checks before metadata is read",
+  );
 }
 
 if (
@@ -537,6 +702,30 @@ if (registryCaseEnd === -1 || npmPublish <= registryCaseEnd) {
   failures.push("npm publish must occur only after the registry HTTP state machine");
 }
 
+const packageNameGuard = failClosedGuardPosition(
+  publishJob,
+  'if [[ "$package_name" != "patchpage" ]]; then',
+);
+const packageVersionGuard = failClosedGuardPosition(
+  publishJob,
+  'if [[ "$package_version" != "$EXPECTED_VERSION" ]]; then',
+);
+const npmCliVersionExecution = publishJob.indexOf('node "$npm_cli" --version');
+
+if (
+  packageMetadataRead === -1 ||
+  packageNameGuard <= packageMetadataRead ||
+  packageVersionGuard <= packageNameGuard ||
+  npmCliVersionExecution <= packageVersionGuard ||
+  registryRequestStart <= packageVersionGuard ||
+  npmPublish <= npmCliVersionExecution ||
+  npmPublish <= registryRequestStart
+) {
+  failures.push(
+    "publish-npm must read package metadata, fail closed on exact patchpage name and expected version, then perform registry or npm CLI activity before publishing",
+  );
+}
+
 if ((verifyJob.match(/node "\$NPM_CLI" pack/g) ?? []).length !== 1) {
   failures.push("verify must pack exactly one release tarball with the pinned npm CLI");
 }
@@ -549,20 +738,17 @@ if (!/node "\$NPM_CLI" install --ignore-scripts "\$TARBALL"/.test(verifyJob)) {
   failures.push("verify must smoke-install the same tarball with the pinned npm CLI");
 }
 
-if (!verifyJob.includes("path: ${{ runner.temp }}/patchpage-package/*.tgz")) {
-  failures.push("verify must upload only the tested PatchPage tarball as the package artifact");
-}
-
+const npmPublishCommands =
+  publishJob.match(/^[ \t]+node "\$npm_cli" publish\b/gm) ?? [];
+const exactProductionPublish =
+  /^[ \t]+node "\$npm_cli" publish "\$tarball" --ignore-scripts --provenance(?:[ \t]+--registry=https:\/\/registry\.npmjs\.org|[ \t]+\\\n[ \t]+--registry=https:\/\/registry\.npmjs\.org)[ \t]*$/m;
 if (
-  !verifyJob.includes(
-    "name: patchpage-package-${{ github.run_attempt }}",
-  )
+  npmPublishCommands.length !== 1 ||
+  !exactProductionPublish.test(publishJob)
 ) {
-  failures.push("verify must isolate package artifacts by workflow run attempt");
-}
-
-if (!/publish\s+"\$tarball"[^\n]*--ignore-scripts[^\n]*--provenance/.test(publishJob)) {
-  failures.push("publish-npm must publish the downloaded tarball with lifecycle scripts disabled");
+  failures.push(
+    "publish-npm must use the exact reviewed npm publish command and production registry",
+  );
 }
 
 if (failures.length > 0) {
