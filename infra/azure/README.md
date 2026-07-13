@@ -860,7 +860,7 @@ smoke_fail() {
   exit 1
 }
 
-EXPECTED_HEALTH_URL="$PUBLIC_BASE_URL/healthz"
+EXPECTED_HEALTH_URL="https://$CUSTOM_DOMAIN/healthz"
 if ! HTTP_STATUS="$(
   curl --silent --show-error \
     --output /dev/null \

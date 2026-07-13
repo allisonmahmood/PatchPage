@@ -943,7 +943,11 @@ run_deployed_smoke_block() {
   output="$2"
 
   (
-    PUBLIC_BASE_URL="https://drafts.self-hoster.dev"
+    if test "$scenario" = "uppercase_origin"; then
+      PUBLIC_BASE_URL="https://Drafts.Self-Hoster.Dev"
+    else
+      PUBLIC_BASE_URL="https://drafts.self-hoster.dev"
+    fi
     CUSTOM_DOMAIN="drafts.self-hoster.dev"
 
     terraform() {
@@ -1026,7 +1030,7 @@ run_deployed_smoke_block() {
             printf '%s' "200"
           fi
           ;;
-        https://drafts.self-hoster.dev/api/uploads)
+        https://drafts.self-hoster.dev/api/uploads | https://Drafts.Self-Hoster.Dev/api/uploads)
           test "$scenario" != "upload_command_failure" || return 1
           test -n "$output_file" || return 1
           case "$scenario" in
@@ -1049,9 +1053,9 @@ run_deployed_smoke_block() {
                 > "$output_file"
               ;;
             *)
-              printf '%s' \
-                '{"ok":true,"draftId":"abc123def456","publicUrl":"https://drafts.self-hoster.dev/d/abc123def456"}' \
-                > "$output_file"
+              printf \
+                '{"ok":true,"draftId":"abc123def456","publicUrl":"%s/d/abc123def456"}' \
+                "$PUBLIC_BASE_URL" > "$output_file"
               ;;
           esac
           if test "$scenario" = "upload_status_mismatch"; then
@@ -1060,7 +1064,7 @@ run_deployed_smoke_block() {
             printf '%s' "201"
           fi
           ;;
-        https://drafts.self-hoster.dev/d/abc123def456)
+        https://drafts.self-hoster.dev/d/abc123def456 | https://Drafts.Self-Hoster.Dev/d/abc123def456)
           test "$scenario" != "fetch_command_failure" || return 1
           test -n "$output_file" || return 1
           if test "$scenario" = "fetch_body_mismatch"; then
@@ -1092,6 +1096,12 @@ test_deployed_smoke() {
     fail "successful deployed smoke was rejected"
   grep -Fqx 'https://drafts.self-hoster.dev/d/abc123def456' "$success_output" ||
     fail "successful deployed smoke did not print the exact draft URL"
+
+  uppercase_output="$TMP_DIR/deployed-smoke-uppercase-origin.out"
+  run_deployed_smoke_block uppercase_origin "$uppercase_output" ||
+    fail "uppercase configured upload origin broke normalized health verification"
+  grep -Fqx 'https://Drafts.Self-Hoster.Dev/d/abc123def456' "$uppercase_output" ||
+    fail "uppercase configured upload origin was not asserted exactly"
 
   for scenario in \
     http_command_failure \
