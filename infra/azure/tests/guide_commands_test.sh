@@ -759,6 +759,21 @@ run_caa_block() {
             'team.example.com. 300 IN CAA 0 issue "digicert.com"' \
             'team.example.com. 300 IN CAA 128 unknowncritical "x"'
           ;;
+        CAA:malformed_flags:team.example.com)
+          printf '%s\n' \
+            'team.example.com. 300 IN CAA 0 issue "digicert.com"' \
+            'team.example.com. 300 IN CAA invalid issue "letsencrypt.org"'
+          ;;
+        CAA:malformed_fields:team.example.com)
+          printf '%s\n' \
+            'team.example.com. 300 IN CAA 0 issue "digicert.com"' \
+            'team.example.com. 300 IN CAA 0 issue'
+          ;;
+        CAA:malformed_value:team.example.com)
+          printf '%s\n' \
+            'team.example.com. 300 IN CAA 0 issue "digicert.com"' \
+            'team.example.com. 300 IN CAA 0 iodef mailto:security@example.com'
+          ;;
       esac
     }
 
@@ -807,7 +822,15 @@ CNAME alias.example.net"
   test "$(cat "$TMP_DIR/caa-cname_loop.log")" = "$expected_loop_queries" ||
     fail "CAA lookup continued after a normalized CNAME loop"
 
-  for scenario in unrelated denying constrained_digicert constrained_digicert_spaced unknown_critical; do
+  for scenario in \
+    unrelated \
+    denying \
+    constrained_digicert \
+    constrained_digicert_spaced \
+    unknown_critical \
+    malformed_flags \
+    malformed_fields \
+    malformed_value; do
     if run_caa_block "$scenario"; then
       fail "CAA lookup accepted the $scenario policy"
     fi
@@ -981,11 +1004,13 @@ run_deployed_smoke_block() {
                 > "$header_file"
               ;;
           esac
-          if test "$scenario" = "http_status_mismatch"; then
-            printf '%s' "200"
-          else
-            printf '%s' "308"
-          fi
+          case "$scenario" in
+            http_status_mismatch) printf '%s' "200" ;;
+            redirect_status_301) printf '%s' "301" ;;
+            redirect_status_302) printf '%s' "302" ;;
+            redirect_status_307) printf '%s' "307" ;;
+            *) printf '%s' "308" ;;
+          esac
           ;;
         https://drafts.self-hoster.dev/healthz)
           test "$scenario" != "health_command_failure" || return 1
@@ -1074,6 +1099,9 @@ test_deployed_smoke() {
     redirect_missing \
     redirect_ambiguous \
     redirect_mismatch \
+    redirect_status_301 \
+    redirect_status_302 \
+    redirect_status_307 \
     health_command_failure \
     health_status_mismatch \
     health_body_mismatch \

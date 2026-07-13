@@ -618,21 +618,56 @@ while test -n "$CAA_TREE_NAME"; do
     exit 1
   fi
 
-  CAA_RECORDS="$(
+  if ! CAA_RECORDS="$(
     printf '%s\n' "$CAA_RESPONSE" |
       awk -v expected="$CAA_QUERY_NAME" '
+        function valid_value(value,    character, escaped, i) {
+          if (length(value) < 2 ||
+              substr(value, 1, 1) != "\"" ||
+              substr(value, length(value), 1) != "\"") {
+            return 0
+          }
+          escaped = 0
+          for (i = 2; i < length(value); i++) {
+            character = substr(value, i, 1)
+            if (escaped) {
+              escaped = 0
+            } else if (character == "\\") {
+              escaped = 1
+            } else if (character == "\"") {
+              return 0
+            }
+          }
+          return !escaped
+        }
+
         $1 !~ /^;/ && toupper($4) == "CAA" {
           owner = tolower($1)
           sub(/\.$/, "", owner)
           if (owner == expected) {
-            for (i = 5; i <= NF; i++) {
-              printf "%s%s", (i == 5 ? "" : " "), $i
+            if ($2 !~ /^[0-9]+$/ ||
+                toupper($3) != "IN" ||
+                NF < 7 ||
+                $5 !~ /^[0-9]+$/ ||
+                ($5 + 0) > 255 ||
+                $6 !~ /^[A-Za-z0-9]+$/ ||
+                length($6) > 15) {
+              exit 1
             }
-            print ""
+            value = ""
+            for (i = 7; i <= NF; i++) {
+              value = value (i == 7 ? "" : " ") $i
+            }
+            if (!valid_value(value)) exit 1
+            print $5, $6, value
           }
         }
       '
-  )"
+  )"; then
+    printf 'CAA lookup for %s returned malformed CAA record data.\n' \
+      "$CAA_QUERY_NAME" >&2
+    exit 1
+  fi
   CAA_LOOKUP_NAME="$CAA_QUERY_NAME"
   test -z "$CAA_RECORDS" || break
 
@@ -835,10 +870,9 @@ if ! HTTP_STATUS="$(
 )"; then
   smoke_fail 'The HTTP health request failed.'
 fi
-case "$HTTP_STATUS" in
-  301|302|307|308) ;;
-  *) smoke_fail "Expected an HTTPS redirect, received HTTP $HTTP_STATUS." ;;
-esac
+if test "$HTTP_STATUS" != "308"; then
+  smoke_fail "Expected HTTP status 308, received HTTP $HTTP_STATUS."
+fi
 if ! HTTP_LOCATION="$(
   awk '
     tolower($1) == "location:" {
