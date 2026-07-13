@@ -118,7 +118,9 @@ PatchPage applies deterministic fixed-window in-memory limits inside each server
 - Authenticated upload requests are limited to `PATCHPAGE_AUTHENTICATED_UPLOAD_RATE_LIMIT_PER_MINUTE` attempts per minute per API token database identity. Rotating the raw bearer secret for the same token record does not create a fresh upload bucket.
 - A real anonymous-create limiter is configured at `PATCHPAGE_ANONYMOUS_CREATE_RATE_LIMIT_PER_MINUTE` attempts per minute per canonical `request.ip` for future anonymous upload support. Anonymous uploads are still disabled today; `POST /api/uploads` requires a token with the `upload` scope.
 
-When a bucket is exceeded, PatchPage returns HTTP `429` with JSON `{ "ok": false, "code": "rate_limited", ... }` and an integer `Retry-After` header. Public `GET /healthz` and draft viewer routes under `/d/...` do not consume protected API or upload buckets.
+When a bucket is exceeded, PatchPage returns HTTP `429` with JSON `{ "ok": false, "code": "rate_limited", ... }` and an integer `Retry-After` header. Each limiter tracks up to `10000` live keys in memory. If all live key slots are occupied, an unseen key receives the same bounded `429` response until the earliest live bucket resets. Live buckets are never evicted to make room for an unseen key, because eviction would let an attacker bypass limits by cycling key values.
+
+Expired buckets are pruned deterministically when the process observes a request at or after their reset boundary. A request exactly at the reset time starts a new fixed window for that key. Public `GET /healthz` and draft viewer routes under `/d/...` do not consume protected API or upload buckets.
 
 These counters are process-local and memory-only. They reset on restart and are not shared across Node processes, containers, or replicas. For multi-instance deployments, treat them as a local safety net and add an ingress, load balancer, CDN, or shared external rate limiter if you need a global limit.
 

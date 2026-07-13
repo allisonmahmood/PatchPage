@@ -7,7 +7,7 @@ import type { ServerConfig } from "@patchpage/config";
 import { JsonFilePatchPageDb } from "@patchpage/db";
 import type { RecordUploadInput, RecordUploadResult } from "@patchpage/db";
 import { FileSystemHtmlStorage } from "@patchpage/storage";
-import { createApp } from "./app.js";
+import { classifyAuthorizationHeader, createApp } from "./app.js";
 
 let tempDir: string;
 
@@ -20,6 +20,17 @@ afterEach(async () => {
 });
 
 describe("PatchPage server", () => {
+  it("classifies only an absent Authorization header as missing", () => {
+    expect(classifyAuthorizationHeader(undefined)).toEqual({ kind: "missing" });
+    expect(classifyAuthorizationHeader("")).toEqual({ kind: "invalid" });
+    expect(classifyAuthorizationHeader("   ")).toEqual({ kind: "invalid" });
+    expect(classifyAuthorizationHeader("Bearer   ")).toEqual({ kind: "invalid" });
+    expect(classifyAuthorizationHeader("Bearer dev-token")).toEqual({
+      kind: "bearer",
+      token: "dev-token"
+    });
+  });
+
   it("returns uploaded draft URLs on the configured public origin", async () => {
     const publicBaseUrl = "https://drafts.self-hoster.dev";
     const apiToken = "configured-origin-token";
@@ -127,6 +138,18 @@ describe("PatchPage server", () => {
           error: "Missing or invalid API token."
         },
         {
+          label: "empty",
+          authorization: "",
+          statusCode: 401,
+          error: "Missing or invalid API token."
+        },
+        {
+          label: "whitespace",
+          authorization: "   ",
+          statusCode: 401,
+          error: "Missing or invalid API token."
+        },
+        {
           label: "malformed",
           authorization: "Basic not-a-bearer-token",
           statusCode: 401,
@@ -158,7 +181,9 @@ describe("PatchPage server", () => {
           url: "/api/uploads",
           headers: {
             "content-type": "application/json",
-            ...(testCase.authorization ? { authorization: testCase.authorization } : {})
+            ...(testCase.authorization !== undefined
+              ? { authorization: testCase.authorization }
+              : {})
           },
           payload: attackerJson
         });
@@ -234,6 +259,99 @@ describe("PatchPage server", () => {
         url: "/api/me",
         remoteAddress: "10.0.0.5",
         headers: { "x-forwarded-for": "203.0.113.9" }
+      });
+      expect(reset.statusCode).toBe(401);
+    } finally {
+      await app.close();
+      await db.close();
+    }
+  });
+
+  it("protects unmatched API paths before parsing and counts them once per IP", async () => {
+    let now = 1_000;
+    const config = testConfig();
+    const db = new JsonFilePatchPageDb(path.join(tempDir, "unmatched-api-limit-db.json"));
+    await db.initialize("dev-token");
+    const storage = new FileSystemHtmlStorage(path.join(tempDir, "unmatched-api-limit-drafts"));
+    const app = createApp({ config, db, storage, clock: () => now });
+
+    try {
+      const upload = await app.inject({
+        method: "POST",
+        url: "/api/uploads",
+        remoteAddress: "198.51.100.10",
+        headers: { authorization: "Bearer dev-token" },
+        payload: {
+          html: "<!doctype html><html><head><title>Public Draft</title></head><body></body></html>"
+        }
+      });
+      expect(upload.statusCode).toBe(201);
+      const { draftId } = upload.json() as { draftId: string };
+
+      const attackerJson = `{"html":"${"x".repeat(2 * 1024 * 1024)}`;
+      const oversized = await app.inject({
+        method: "POST",
+        url: "/api/does-not-exist",
+        remoteAddress: "203.0.113.9",
+        headers: { "content-type": "application/json" },
+        payload: attackerJson
+      });
+      expect(oversized.statusCode).toBe(401);
+      expect(oversized.json()).toEqual({
+        ok: false,
+        error: "Missing or invalid API token."
+      });
+
+      for (let attempt = 1; attempt < 60; attempt += 1) {
+        const response = await app.inject({
+          method: "POST",
+          url: "/api/does-not-exist",
+          remoteAddress: "203.0.113.9"
+        });
+        expect(response.statusCode).toBe(401);
+      }
+
+      const limited = await app.inject({
+        method: "POST",
+        url: "/api/does-not-exist",
+        remoteAddress: "203.0.113.9"
+      });
+      expect(limited.statusCode).toBe(429);
+      expect(limited.headers["retry-after"]).toBe("60");
+      expect(limited.json()).toEqual({
+        ok: false,
+        error: "Rate limit exceeded.",
+        code: "rate_limited",
+        retryAfterSeconds: 60
+      });
+
+      const lookalike = await app.inject({
+        method: "GET",
+        url: "/apix",
+        remoteAddress: "203.0.113.9"
+      });
+      expect(lookalike.statusCode).toBe(404);
+
+      const health = await app.inject({
+        method: "GET",
+        url: "/healthz",
+        remoteAddress: "203.0.113.9"
+      });
+      expect(health.statusCode).toBe(200);
+
+      const viewer = await app.inject({
+        method: "GET",
+        url: `/d/${draftId}`,
+        remoteAddress: "203.0.113.9"
+      });
+      expect(viewer.statusCode).toBe(200);
+      expect(viewer.body).toContain("Public Draft");
+
+      now = 61_000;
+      const reset = await app.inject({
+        method: "POST",
+        url: "/api/does-not-exist",
+        remoteAddress: "203.0.113.9"
       });
       expect(reset.statusCode).toBe(401);
     } finally {

@@ -10,6 +10,12 @@ export interface FixedWindowRateLimiterOptions {
   windowMs: number;
   maxKeys: number;
   clock?: () => number;
+  diagnostics?: FixedWindowRateLimiterDiagnostics;
+}
+
+export interface FixedWindowRateLimiterDiagnostics {
+  onExpirationInspection?: (key: string) => void;
+  onExpirationRemoval?: (key: string) => void;
 }
 
 export interface RateLimitConfig {
@@ -32,6 +38,8 @@ export interface CreateRateLimitersOptions {
 interface Bucket {
   count: number;
   resetAt: number;
+  previousExpiringKey: string | null;
+  nextExpiringKey: string | null;
 }
 
 const ONE_MINUTE_MS = 60_000;
@@ -71,23 +79,29 @@ export class FixedWindowRateLimiter {
   private readonly windowMs: number;
   private readonly maxKeys: number;
   private readonly clock: () => number;
+  private readonly diagnostics: FixedWindowRateLimiterDiagnostics | undefined;
   private readonly buckets = new Map<string, Bucket>();
+  private expirationHead: string | null = null;
+  private expirationTail: string | null = null;
+  private nextExpirationAt: number | null = null;
+  private lastNow = 0;
 
   constructor(options: FixedWindowRateLimiterOptions) {
     this.limit = boundedInteger("limit", options.limit, MAX_ATTEMPTS_PER_WINDOW);
     this.windowMs = boundedInteger("windowMs", options.windowMs, MAX_WINDOW_MS);
     this.maxKeys = boundedInteger("maxKeys", options.maxKeys, MAX_STORED_KEYS);
     this.clock = options.clock ?? Date.now;
+    this.diagnostics = options.diagnostics;
   }
 
   consume(key: string): RateLimitDecision {
-    const now = this.clock();
+    const now = this.now();
     this.pruneExpired(now);
     const bucket = this.buckets.get(key);
 
-    if (!bucket || now >= bucket.resetAt) {
-      if (!bucket && this.buckets.size >= this.maxKeys) {
-        const resetAt = this.earliestResetAt() ?? now + this.windowMs;
+    if (!bucket) {
+      if (this.buckets.size >= this.maxKeys) {
+        const resetAt = this.nextExpirationAt ?? now + this.windowMs;
         return {
           allowed: false,
           remaining: 0,
@@ -96,9 +110,7 @@ export class FixedWindowRateLimiter {
         };
       }
 
-      const resetAt = now + this.windowMs;
-      this.buckets.set(key, { count: 1, resetAt });
-      return { allowed: true, remaining: this.limit - 1, resetAt };
+      return this.createBucket(key, now);
     }
 
     if (bucket.count >= this.limit) {
@@ -118,20 +130,75 @@ export class FixedWindowRateLimiter {
     };
   }
 
+  private now(): number {
+    const current = this.clock();
+    this.lastNow = Math.max(this.lastNow, current);
+    return this.lastNow;
+  }
+
+  private createBucket(key: string, now: number): RateLimitDecision {
+    const resetAt = now + this.windowMs;
+    const bucket: Bucket = {
+      count: 1,
+      resetAt,
+      previousExpiringKey: this.expirationTail,
+      nextExpiringKey: null
+    };
+
+    if (this.expirationTail) {
+      const tail = this.buckets.get(this.expirationTail);
+      if (tail) tail.nextExpiringKey = key;
+    } else {
+      this.expirationHead = key;
+      this.nextExpirationAt = resetAt;
+    }
+
+    this.expirationTail = key;
+    this.buckets.set(key, bucket);
+    return { allowed: true, remaining: this.limit - 1, resetAt };
+  }
+
   private pruneExpired(now: number): void {
-    for (const [key, bucket] of this.buckets) {
-      if (now >= bucket.resetAt) {
-        this.buckets.delete(key);
+    if (this.nextExpirationAt === null || now < this.nextExpirationAt) return;
+
+    while (this.expirationHead && this.nextExpirationAt !== null && now >= this.nextExpirationAt) {
+      const key = this.expirationHead;
+      const bucket = this.buckets.get(key);
+      if (!bucket) {
+        this.expirationHead = null;
+        this.expirationTail = null;
+        this.nextExpirationAt = null;
+        return;
       }
+
+      this.diagnostics?.onExpirationInspection?.(key);
+      this.removeBucket(key, bucket);
+      this.diagnostics?.onExpirationRemoval?.(key);
     }
   }
 
-  private earliestResetAt(): number | null {
-    let resetAt: number | null = null;
-    for (const bucket of this.buckets.values()) {
-      resetAt = resetAt === null ? bucket.resetAt : Math.min(resetAt, bucket.resetAt);
+  private removeBucket(key: string, bucket: Bucket): void {
+    const previous = bucket.previousExpiringKey;
+    const next = bucket.nextExpiringKey;
+
+    if (previous) {
+      const previousBucket = this.buckets.get(previous);
+      if (previousBucket) previousBucket.nextExpiringKey = next;
+    } else {
+      this.expirationHead = next;
     }
-    return resetAt;
+
+    if (next) {
+      const nextBucket = this.buckets.get(next);
+      if (nextBucket) nextBucket.previousExpiringKey = previous;
+    } else {
+      this.expirationTail = previous;
+    }
+
+    this.buckets.delete(key);
+    this.nextExpirationAt = this.expirationHead
+      ? this.buckets.get(this.expirationHead)?.resetAt ?? null
+      : null;
   }
 }
 

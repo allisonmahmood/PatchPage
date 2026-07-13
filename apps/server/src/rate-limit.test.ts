@@ -70,6 +70,57 @@ describe("FixedWindowRateLimiter", () => {
     });
   });
 
+  it("does not scan live buckets on active or capacity-blocked consumes", () => {
+    let now = 1_000;
+    const inspected: string[] = [];
+    const removed: string[] = [];
+    const limiter = new FixedWindowRateLimiter({
+      limit: 1,
+      windowMs: 1_000,
+      maxKeys: 3,
+      clock: () => now,
+      diagnostics: {
+        onExpirationInspection: (key) => inspected.push(key),
+        onExpirationRemoval: (key) => removed.push(key)
+      }
+    });
+
+    expect(limiter.consume("client-a")).toMatchObject({ allowed: true, resetAt: 2_000 });
+    expect(limiter.consume("client-b")).toMatchObject({ allowed: true, resetAt: 2_000 });
+    expect(limiter.consume("client-c")).toMatchObject({ allowed: true, resetAt: 2_000 });
+    inspected.length = 0;
+    removed.length = 0;
+
+    expect(limiter.consume("client-a")).toMatchObject({
+      allowed: false,
+      resetAt: 2_000
+    });
+    expect(limiter.consume("client-d")).toMatchObject({
+      allowed: false,
+      resetAt: 2_000
+    });
+    expect(inspected).toEqual([]);
+    expect(removed).toEqual([]);
+
+    now = 2_000;
+    expect(limiter.consume("client-a")).toMatchObject({
+      allowed: true,
+      resetAt: 3_000
+    });
+    expect(inspected).toEqual(["client-a", "client-b", "client-c"]);
+    expect(removed).toEqual(["client-a", "client-b", "client-c"]);
+
+    inspected.length = 0;
+    removed.length = 0;
+    now = 2_500;
+    expect(limiter.consume("client-a")).toMatchObject({
+      allowed: false,
+      resetAt: 3_000
+    });
+    expect(inspected).toEqual([]);
+    expect(removed).toEqual([]);
+  });
+
   it("exposes a real anonymous-create limiter at five attempts per IP", () => {
     let now = 1_000;
     const limiters = createRateLimiters(
