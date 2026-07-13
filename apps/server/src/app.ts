@@ -540,9 +540,48 @@ export function classifyAuthorizationHeader(
 ): AuthorizationCredential {
   if (authHeader === undefined) return { kind: "missing" };
 
-  const match = authHeader.match(/^Bearer\s+(.+)$/i);
-  const token = match?.[1]?.trim();
-  return token ? { kind: "bearer", token } : { kind: "invalid" };
+  const bearerScheme = "bearer";
+  if (authHeader.length <= bearerScheme.length) return { kind: "invalid" };
+  for (let index = 0; index < bearerScheme.length; index += 1) {
+    if ((authHeader.charCodeAt(index) | 32) !== bearerScheme.charCodeAt(index)) {
+      return { kind: "invalid" };
+    }
+  }
+
+  let cursor = bearerScheme.length;
+  if (!isAuthorizationWhitespace(authHeader.charCodeAt(cursor))) {
+    return { kind: "invalid" };
+  }
+  while (
+    cursor < authHeader.length &&
+    isAuthorizationWhitespace(authHeader.charCodeAt(cursor))
+  ) {
+    cursor += 1;
+  }
+
+  const tokenStart = cursor;
+  while (
+    cursor < authHeader.length &&
+    !isAuthorizationWhitespace(authHeader.charCodeAt(cursor))
+  ) {
+    cursor += 1;
+  }
+  if (cursor === tokenStart) return { kind: "invalid" };
+
+  const token = authHeader.slice(tokenStart, cursor);
+  while (
+    cursor < authHeader.length &&
+    isAuthorizationWhitespace(authHeader.charCodeAt(cursor))
+  ) {
+    cursor += 1;
+  }
+  return cursor === authHeader.length
+    ? { kind: "bearer", token }
+    : { kind: "invalid" };
+}
+
+function isAuthorizationWhitespace(charCode: number): boolean {
+  return charCode === 0x20 || charCode === 0x09;
 }
 
 function authenticatedRequest(request: FastifyRequest): ApiTokenAuth {

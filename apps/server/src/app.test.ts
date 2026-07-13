@@ -56,7 +56,17 @@ describe("PatchPage server", () => {
     expect(classifyAuthorizationHeader("")).toEqual({ kind: "invalid" });
     expect(classifyAuthorizationHeader("   ")).toEqual({ kind: "invalid" });
     expect(classifyAuthorizationHeader("Bearer   ")).toEqual({ kind: "invalid" });
+    expect(classifyAuthorizationHeader("Bearer dev-token second-token")).toEqual({
+      kind: "invalid"
+    });
     expect(classifyAuthorizationHeader("Bearer dev-token")).toEqual({
+      kind: "bearer",
+      token: "dev-token"
+    });
+    const longPadding = " ".repeat(100_000);
+    expect(
+      classifyAuthorizationHeader(`bEaReR${longPadding}dev-token${longPadding}`)
+    ).toEqual({
       kind: "bearer",
       token: "dev-token"
     });
