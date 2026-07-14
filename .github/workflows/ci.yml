@@ -77,7 +77,6 @@ jobs:
       - run: pnpm typecheck
 
   cli-smoke:
-    name: Packed CLI real-server E2E
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -90,7 +89,17 @@ jobs:
           node-version: 22
           cache: pnpm
       - run: pnpm install --frozen-lockfile
+      - name: Exercise packed CLI harness lifecycle probes
+        run: |
+          node scripts/packed-cli-e2e.mjs --platform-probes
+          node scripts/packed-cli-e2e.mjs --lifecycle-probes
+          node scripts/packed-cli-e2e.mjs --signal-probes
       - name: Exercise the packed CLI against an isolated real server
+        env:
+          PATCHPAGE_API_TOKEN: ambient-invalid-token
+          PATCHPAGE_API_URL: http://127.0.0.1:9/ambient-poison
+          PATCHPAGE_MAX_HTML_BYTES: "1"
+          PATCHPAGE_UNKNOWN_AMBIENT_POISON: must-not-leak
         run: pnpm test:packed-cli-e2e
 
   docker:
