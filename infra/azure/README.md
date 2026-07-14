@@ -228,7 +228,7 @@ fi
 if ! az acr build \
   --registry "$ACR" \
   --image "patchpage-server:$TAG" \
-  --file apps/server/Dockerfile \
+  --file ../../apps/server/Dockerfile \
   ../..; then
   printf 'ACR did not complete the server image build successfully.\n' >&2
   exit 1
