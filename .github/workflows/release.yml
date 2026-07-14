@@ -4,7 +4,7 @@ name: Release
 
 on:
   push:
-    tags: ['v*']
+    tags: ["v*"]
 
 permissions: {}
 
@@ -196,11 +196,7 @@ jobs:
           const missing = required.filter((file) => !files.has(file));
 
           if (missing.length > 0) {
-            console.error(`Missing files from npm pack: ${missing.join(", ")}`);
-            console.error("Packed files:");
-            for (const file of [...files].sort()) {
-              console.error(`- ${file}`);
-            }
+            console.error(`Missing reviewed required npm pack files (${missing.length}): ${missing.join(", ")}`);
             process.exit(1);
           }
           NODE
@@ -211,7 +207,7 @@ jobs:
           const path = require("node:path");
 
           const pack = JSON.parse(fs.readFileSync(process.argv[2], "utf8"))[0];
-          console.log(path.resolve(process.argv[3], pack.filename));
+          process.stdout.write(path.resolve(process.argv[3], pack.filename));
           NODE
           )"
 
@@ -223,7 +219,7 @@ jobs:
 
           tarball="${tarballs[0]}"
           if [[ "$tarball" != "$reported_tarball" ]]; then
-            echo "::error::npm pack reported $reported_tarball, but found $tarball"
+            echo "::error::npm pack reported a different tarball than the sole produced artifact"
             exit 1
           fi
 
@@ -231,6 +227,10 @@ jobs:
           unique_tarball="$package_dir/patchpage-${cli_version}-run-attempt-${GITHUB_RUN_ATTEMPT}.tgz"
           mv -- "$tarball" "$unique_tarball"
           tarball="$unique_tarball"
+
+          node ../../scripts/verify-release-privacy.mjs \
+            --pack-json "$RUNNER_TEMP/patchpage-pack.json" \
+            --tarball "$tarball"
 
           echo "TARBALL=$tarball" >> "$GITHUB_ENV"
           echo "CLI_VERSION=$cli_version" >> "$GITHUB_ENV"
