@@ -8,18 +8,30 @@ Upload access requires a token by default. Self-hosters may explicitly enable an
 
 The CLI is published to npm as [`patchpage`](https://www.npmjs.com/package/patchpage) and can be run with `npx`.
 
+Requires Node.js 22 or newer.
+
+Set `PATCHPAGE_SETUP_TOKEN` in a secret environment variable, then run this self-hosted workflow:
+
 ```sh
-# Save a token through the non-echoing prompt (and store the self-hosted base URL)
-npx patchpage auth set --api-url https://post.example.com
+(
+  set +x
+  set -eu
+  PATCHPAGE_API_URL='https://post.example.com'
+  export PATCHPAGE_API_URL
+  unset PATCHPAGE_API_TOKEN
+  unset TOKEN
+  : "${PATCHPAGE_SETUP_TOKEN:?Set PATCHPAGE_SETUP_TOKEN to a PatchPage API token}"
+  ARTIFACT_PATH='./plan.html'
 
-# Validate a file locally without uploading
-npx patchpage validate ./plan.html
-
-# Upload (creates a new draft, or updates the last one uploaded from this path)
-npx patchpage upload ./plan.html
+  printf '%s' "$PATCHPAGE_SETUP_TOKEN" | npx --yes patchpage auth set --token-stdin --api-url "$PATCHPAGE_API_URL"
+  unset PATCHPAGE_SETUP_TOKEN
+  npx --yes patchpage whoami &&
+    npx --yes patchpage validate "$ARTIFACT_PATH" &&
+    npx --yes patchpage upload "$ARTIFACT_PATH"
+)
 ```
 
-Because the default host is the maintainer's private instance, the token you enter at the hidden `auth set` prompt must come from a PatchPage server you control — that means your own self-hosted deployment. See [docs/SELF_HOSTING.md](docs/SELF_HOSTING.md) for deploying a server and minting tokens.
+The example origin and setup token must come from a PatchPage server you control. The workflow pins that origin, clears inherited credential overrides, and verifies the stored token before validation or upload. See [docs/SELF_HOSTING.md](docs/SELF_HOSTING.md) for deploying a server and minting tokens.
 
 If your self-hosted operator has explicitly enabled anonymous uploads, the CLI automatically attempts a create when no environment or stored token exists; `--anonymous` forces that create-only mode. The self-hosting default remains disabled, and this repository does not claim anonymous creation is enabled on the maintainer's hosted instance.
 
@@ -61,17 +73,30 @@ This is a Turborepo monorepo managed with pnpm.
 The default local mode needs no Postgres: it uses a JSON metadata file and filesystem HTML storage.
 
 ```sh
-pnpm install
-PATCHPAGE_BOOTSTRAP_API_TOKEN=dev-token pnpm --filter @patchpage/server dev
+pnpm install &&
+  PATCHPAGE_BOOTSTRAP_API_TOKEN=dev-token pnpm --filter @patchpage/server dev
 ```
 
-In another shell:
+In another shell, use the local bootstrap token in the same pinned workflow:
 
 ```sh
-pnpm --filter patchpage build
-# Enter the local bootstrap token at the hidden prompt.
-PATCHPAGE_STATE_DIR=.local/cli node packages/cli/dist/index.js auth set --api-url http://localhost:3000
-PATCHPAGE_STATE_DIR=.local/cli node packages/cli/dist/index.js upload examples/plan.html
+pnpm --filter patchpage build &&
+(
+  set +x
+  set -eu
+  PATCHPAGE_API_URL='http://localhost:3000'
+  export PATCHPAGE_API_URL
+  unset PATCHPAGE_API_TOKEN
+  unset TOKEN
+  PATCHPAGE_SETUP_TOKEN='dev-token'
+  ARTIFACT_PATH='examples/plan.html'
+
+  printf '%s' "$PATCHPAGE_SETUP_TOKEN" | PATCHPAGE_STATE_DIR='.local/cli' node packages/cli/dist/index.js auth set --token-stdin --api-url "$PATCHPAGE_API_URL"
+  unset PATCHPAGE_SETUP_TOKEN
+  PATCHPAGE_STATE_DIR='.local/cli' node packages/cli/dist/index.js whoami &&
+    PATCHPAGE_STATE_DIR='.local/cli' node packages/cli/dist/index.js validate "$ARTIFACT_PATH" &&
+    PATCHPAGE_STATE_DIR='.local/cli' node packages/cli/dist/index.js upload "$ARTIFACT_PATH"
+)
 ```
 
 See [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md) for Postgres mode and production storage notes.

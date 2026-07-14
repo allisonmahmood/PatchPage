@@ -2,11 +2,12 @@
 
 PatchPage is a normal Node HTTP service and runs anywhere that supports Node or containers. Azure Container Apps is the maintainer's deployment target, not a requirement — this guide covers the container image contract that release automation will publish and running your own instance from source. The [Azure Terraform](../infra/azure) directory is a worked example you can adapt.
 
-Once your server is running, point the CLI at it and you have a self-hosted PatchPage. Upload access requires a token by default; an operator can opt in to anonymous creation. In either mode, draft viewer URLs are public and unlisted, so anyone with the link can view them.
+Once your server is running, point the CLI at it and you have a self-hosted PatchPage. Upload access requires a token by default; an operator can opt in to anonymous creation. Automatic anonymous creation happens only when no environment or stored credentials exist, and credential failures are returned instead of retried anonymously. Pass `--anonymous` to explicitly force create-only anonymous mode and bypass available credentials. In either mode, draft viewer URLs are public and unlisted, so anyone with the link can view them.
 
 ## Prerequisites
 
 - Docker or another OCI-compatible runtime when using the supported image.
+- OpenSSL when using the example command to generate a bootstrap credential.
 - Node.js 22.13 or newer when running from source (the CLI and server require Node 22+, and pnpm 11 needs at least 22.13). The container image bundles its own Node.
 - pnpm when running from source (the repo pins `pnpm@11.5.2` via `packageManager`).
 - A PostgreSQL database, if you use the `postgres` metadata driver. The default `json` driver needs no database and is fine for small or single-user instances.
@@ -36,18 +37,120 @@ PATCHPAGE_DB_FILE=/data/patchpage-db.json
 PATCHPAGE_STORAGE_DIR=/data/drafts
 ```
 
-After a release has published the image, start an instance with a named volume and a stable release version:
+After a release has published the image, start an instance with a named volume and a stable release version. The snippet uses a pre-existing non-empty `PATCHPAGE_BOOTSTRAP_API_TOKEN` first. When it is absent, the snippet reads `PATCHPAGE_BOOTSTRAP_TOKEN_FILE` or creates and reuses a mode-`0600` file at the default path. It exports the credential only to the current subshell and gives Docker only the environment variable name.
 
 ```sh
-docker volume create patchpage-data
+(
+set +x
+BOOTSTRAP_TOKEN_CREATED=false
+BOOTSTRAP_TOKEN_READY=false
+
+bootstrap_cleanup() {
+  unset PATCHPAGE_BOOTSTRAP_API_TOKEN
+  if test "$BOOTSTRAP_TOKEN_CREATED" = true &&
+     test "$BOOTSTRAP_TOKEN_READY" != true; then
+    rm -f "$BOOTSTRAP_TOKEN_FILE"
+  fi
+}
+trap 'bootstrap_cleanup' 0
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+if test "${PATCHPAGE_BOOTSTRAP_API_TOKEN+x}" = x; then
+  if test -z "$PATCHPAGE_BOOTSTRAP_API_TOKEN"; then
+    printf 'PATCHPAGE_BOOTSTRAP_API_TOKEN is set but empty.\n' >&2
+    exit 1
+  fi
+else
+  GENERATE_BOOTSTRAP_TOKEN=false
+  if test -n "${PATCHPAGE_BOOTSTRAP_TOKEN_FILE:-}"; then
+    BOOTSTRAP_TOKEN_FILE=$PATCHPAGE_BOOTSTRAP_TOKEN_FILE
+  else
+    GENERATE_BOOTSTRAP_TOKEN=true
+    BOOTSTRAP_TOKEN_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/patchpage/bootstrap-api-token"
+    BOOTSTRAP_TOKEN_DIR=$(dirname "$BOOTSTRAP_TOKEN_FILE")
+    if ! mkdir -p "$BOOTSTRAP_TOKEN_DIR" || ! chmod 700 "$BOOTSTRAP_TOKEN_DIR"; then
+      printf 'Could not secure the bootstrap token directory.\n' >&2
+      exit 1
+    fi
+  fi
+
+  if test -L "$BOOTSTRAP_TOKEN_FILE"; then
+    printf 'The bootstrap token file must not be a symbolic link.\n' >&2
+    exit 1
+  fi
+  if test -f "$BOOTSTRAP_TOKEN_FILE"; then
+    :
+  elif test "$GENERATE_BOOTSTRAP_TOKEN" = true &&
+       ! test -e "$BOOTSTRAP_TOKEN_FILE"; then
+    BOOTSTRAP_TOKEN_CREATED=true
+    if ! (umask 077; set -C; openssl rand -hex 32 > "$BOOTSTRAP_TOKEN_FILE"); then
+      rm -f "$BOOTSTRAP_TOKEN_FILE"
+      printf 'Could not generate the bootstrap API token.\n' >&2
+      exit 1
+    fi
+  else
+    printf 'The bootstrap token path must be an existing regular file.\n' >&2
+    exit 1
+  fi
+  if test "$GENERATE_BOOTSTRAP_TOKEN" = true; then
+    if ! chmod 600 "$BOOTSTRAP_TOKEN_FILE" ||
+       test -L "$BOOTSTRAP_TOKEN_FILE" ||
+       ! test -f "$BOOTSTRAP_TOKEN_FILE" ||
+       ! test -r "$BOOTSTRAP_TOKEN_FILE"; then
+      printf 'Could not verify the generated bootstrap token file.\n' >&2
+      exit 1
+    fi
+    BOOTSTRAP_TOKEN_MODE=$(LC_ALL=C ls -ld "$BOOTSTRAP_TOKEN_FILE" | awk '{ print $1 }')
+    case "$BOOTSTRAP_TOKEN_MODE" in
+      -rw-------|-rw-------@|-rw-------.) ;;
+      *)
+        printf 'The generated bootstrap token file must have mode 0600.\n' >&2
+        exit 1
+        ;;
+    esac
+  else
+    if test -L "$BOOTSTRAP_TOKEN_FILE" ||
+       ! test -f "$BOOTSTRAP_TOKEN_FILE" ||
+       ! test -r "$BOOTSTRAP_TOKEN_FILE"; then
+      printf 'The custom bootstrap token must be a readable regular file, not a symbolic link.\n' >&2
+      exit 1
+    fi
+    BOOTSTRAP_TOKEN_MODE=$(LC_ALL=C ls -ld "$BOOTSTRAP_TOKEN_FILE" | awk '{ print $1 }')
+    case "$BOOTSTRAP_TOKEN_MODE" in
+      -r--------|-r--------@|-r--------.|-rw-------|-rw-------@|-rw-------.) ;;
+      *)
+        printf 'The custom bootstrap token file must have mode 0400 or 0600.\n' >&2
+        exit 1
+        ;;
+    esac
+  fi
+
+  PATCHPAGE_BOOTSTRAP_API_TOKEN=''
+  IFS= read -r PATCHPAGE_BOOTSTRAP_API_TOKEN < "$BOOTSTRAP_TOKEN_FILE" ||
+    test -n "$PATCHPAGE_BOOTSTRAP_API_TOKEN" || {
+      printf 'Could not read a non-empty bootstrap API token.\n' >&2
+      exit 1
+    }
+  if test -z "$PATCHPAGE_BOOTSTRAP_API_TOKEN"; then
+    printf 'Could not read a non-empty bootstrap API token.\n' >&2
+    exit 1
+  fi
+fi
+BOOTSTRAP_TOKEN_READY=true
+export PATCHPAGE_BOOTSTRAP_API_TOKEN
+
+docker volume create patchpage-data &&
 docker run -d \
   --name patchpage \
   -p 3000:3000 \
   -e PATCHPAGE_PUBLIC_BASE_URL=https://post.example.com \
-  -e PATCHPAGE_BOOTSTRAP_API_TOKEN=change-me-to-a-long-random-string \
+  -e PATCHPAGE_BOOTSTRAP_API_TOKEN \
   -e PATCHPAGE_ALLOW_ANONYMOUS_UPLOADS=false \
   -v patchpage-data:/data \
   ghcr.io/allisonmahmood/patchpage-server:1.2.3
+)
 ```
 
 Named volumes inherit the image's `/data` ownership. If you use a host bind mount instead, make that directory writable by UID/GID 1000 before starting the container. Persist `/data` for the single-instance JSON/filesystem setup; Postgres and Azure Blob deployments keep their durable data in those external services. Every configuration variable below is supported in the image and can be supplied with `-e` or your orchestrator's environment configuration.
@@ -74,8 +177,8 @@ PATCHPAGE_PUBLIC_BASE_URL=https://post.example.com
 
 # Auth
 # The bootstrap token becomes a usable admin+upload API token on startup/migration.
-# Set it to a long random string and keep it secret.
-PATCHPAGE_BOOTSTRAP_API_TOKEN=change-me-to-a-long-random-string
+# Supply it through your secret manager; do not write the value in shell history.
+# PATCHPAGE_BOOTSTRAP_API_TOKEN=
 PATCHPAGE_ALLOW_ANONYMOUS_UPLOADS=false
 
 # Upload limits
@@ -151,31 +254,250 @@ Do not share one JSON file between multiple PatchPage processes, workers, or rep
 
 ## Database migration
 
-If you use the `postgres` driver, create the schema and the bootstrap token before starting the server. The migration reads the same environment variables as the server:
+If you use the `postgres` driver, create the schema and the bootstrap token before starting the server. The migration uses a pre-existing non-empty `PATCHPAGE_BOOTSTRAP_API_TOKEN` first. When it is absent, the snippet reads `PATCHPAGE_BOOTSTRAP_TOKEN_FILE` or creates and reuses the protected default token file:
 
 ```sh
+(
+set +x
+BOOTSTRAP_TOKEN_CREATED=false
+BOOTSTRAP_TOKEN_READY=false
+
+migration_cleanup() {
+  unset PATCHPAGE_BOOTSTRAP_API_TOKEN
+  if test "$BOOTSTRAP_TOKEN_CREATED" = true &&
+     test "$BOOTSTRAP_TOKEN_READY" != true; then
+    rm -f "$BOOTSTRAP_TOKEN_FILE"
+  fi
+}
+trap 'migration_cleanup' 0
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+if test "${PATCHPAGE_BOOTSTRAP_API_TOKEN+x}" = x; then
+  if test -z "$PATCHPAGE_BOOTSTRAP_API_TOKEN"; then
+    printf 'PATCHPAGE_BOOTSTRAP_API_TOKEN is set but empty.\n' >&2
+    exit 1
+  fi
+else
+  GENERATE_BOOTSTRAP_TOKEN=false
+  if test -n "${PATCHPAGE_BOOTSTRAP_TOKEN_FILE:-}"; then
+    BOOTSTRAP_TOKEN_FILE=$PATCHPAGE_BOOTSTRAP_TOKEN_FILE
+  else
+    GENERATE_BOOTSTRAP_TOKEN=true
+    BOOTSTRAP_TOKEN_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/patchpage/bootstrap-api-token"
+    BOOTSTRAP_TOKEN_DIR=$(dirname "$BOOTSTRAP_TOKEN_FILE")
+    if ! mkdir -p "$BOOTSTRAP_TOKEN_DIR" || ! chmod 700 "$BOOTSTRAP_TOKEN_DIR"; then
+      printf 'Could not secure the bootstrap token directory.\n' >&2
+      exit 1
+    fi
+  fi
+
+  if test -L "$BOOTSTRAP_TOKEN_FILE"; then
+    printf 'The bootstrap token file must not be a symbolic link.\n' >&2
+    exit 1
+  fi
+  if test -f "$BOOTSTRAP_TOKEN_FILE"; then
+    :
+  elif test "$GENERATE_BOOTSTRAP_TOKEN" = true &&
+       ! test -e "$BOOTSTRAP_TOKEN_FILE"; then
+    BOOTSTRAP_TOKEN_CREATED=true
+    if ! (umask 077; set -C; openssl rand -hex 32 > "$BOOTSTRAP_TOKEN_FILE"); then
+      rm -f "$BOOTSTRAP_TOKEN_FILE"
+      printf 'Could not generate the bootstrap API token.\n' >&2
+      exit 1
+    fi
+  else
+    printf 'The bootstrap token path must be an existing regular file.\n' >&2
+    exit 1
+  fi
+  if test "$GENERATE_BOOTSTRAP_TOKEN" = true; then
+    if ! chmod 600 "$BOOTSTRAP_TOKEN_FILE" ||
+       test -L "$BOOTSTRAP_TOKEN_FILE" ||
+       ! test -f "$BOOTSTRAP_TOKEN_FILE" ||
+       ! test -r "$BOOTSTRAP_TOKEN_FILE"; then
+      printf 'Could not verify the generated bootstrap token file.\n' >&2
+      exit 1
+    fi
+    BOOTSTRAP_TOKEN_MODE=$(LC_ALL=C ls -ld "$BOOTSTRAP_TOKEN_FILE" | awk '{ print $1 }')
+    case "$BOOTSTRAP_TOKEN_MODE" in
+      -rw-------|-rw-------@|-rw-------.) ;;
+      *)
+        printf 'The generated bootstrap token file must have mode 0600.\n' >&2
+        exit 1
+        ;;
+    esac
+  else
+    if test -L "$BOOTSTRAP_TOKEN_FILE" ||
+       ! test -f "$BOOTSTRAP_TOKEN_FILE" ||
+       ! test -r "$BOOTSTRAP_TOKEN_FILE"; then
+      printf 'The custom bootstrap token must be a readable regular file, not a symbolic link.\n' >&2
+      exit 1
+    fi
+    BOOTSTRAP_TOKEN_MODE=$(LC_ALL=C ls -ld "$BOOTSTRAP_TOKEN_FILE" | awk '{ print $1 }')
+    case "$BOOTSTRAP_TOKEN_MODE" in
+      -r--------|-r--------@|-r--------.|-rw-------|-rw-------@|-rw-------.) ;;
+      *)
+        printf 'The custom bootstrap token file must have mode 0400 or 0600.\n' >&2
+        exit 1
+        ;;
+    esac
+  fi
+
+  PATCHPAGE_BOOTSTRAP_API_TOKEN=''
+  IFS= read -r PATCHPAGE_BOOTSTRAP_API_TOKEN < "$BOOTSTRAP_TOKEN_FILE" ||
+    test -n "$PATCHPAGE_BOOTSTRAP_API_TOKEN" || {
+      printf 'Could not read a non-empty bootstrap API token.\n' >&2
+      exit 1
+    }
+  if test -z "$PATCHPAGE_BOOTSTRAP_API_TOKEN"; then
+    printf 'Could not read a non-empty bootstrap API token.\n' >&2
+    exit 1
+  fi
+fi
+BOOTSTRAP_TOKEN_READY=true
+export PATCHPAGE_BOOTSTRAP_API_TOKEN
 PATCHPAGE_DB_DRIVER=postgres \
 DATABASE_URL=postgres://user:password@host:5432/patchpage \
-PATCHPAGE_BOOTSTRAP_API_TOKEN=change-me-to-a-long-random-string \
 pnpm db:migrate
+)
 ```
 
 This creates the `accounts`, `api_tokens`, `drafts`, `draft_versions`, and `upload_events` tables (idempotently), initializes the dedicated internal anonymous owner/audit actor without a usable bearer credential, and — when `PATCHPAGE_BOOTSTRAP_API_TOKEN` is set — provisions a bootstrap account and a bootstrap API token with `admin` and `upload` scopes. The `json` driver applies the same initialization automatically on startup, so no separate migration is needed for it.
 
 ## Running the server
 
-Development (auto-reload):
+The same credential-loading block serves both source startup paths. It defaults to a production build and start; set `PATCHPAGE_SERVER_MODE=development` before running it for auto-reload. A pre-existing credential is copied into a shell-local variable and immediately removed from the inherited environment. The selected server child receives it, while the production build does not.
 
+<!-- guide-test:self-hosting-source-start:start -->
 ```sh
-pnpm --filter @patchpage/server dev
-```
+(
+set +x
+BOOTSTRAP_TOKEN_CREATED=false
+BOOTSTRAP_TOKEN_READY=false
+SERVER_BOOTSTRAP_API_TOKEN=''
+SERVER_MODE="${PATCHPAGE_SERVER_MODE:-production}"
 
-Production (from the built output):
+server_cleanup() {
+  unset PATCHPAGE_BOOTSTRAP_API_TOKEN SERVER_BOOTSTRAP_API_TOKEN
+  if test "$BOOTSTRAP_TOKEN_CREATED" = true &&
+     test "$BOOTSTRAP_TOKEN_READY" != true; then
+    rm -f "$BOOTSTRAP_TOKEN_FILE"
+  fi
+}
+trap 'server_cleanup' 0
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
-```sh
-pnpm --filter @patchpage/server build
-pnpm --filter @patchpage/server start
+if test "${PATCHPAGE_BOOTSTRAP_API_TOKEN+x}" = x; then
+  if test -z "$PATCHPAGE_BOOTSTRAP_API_TOKEN"; then
+    printf 'PATCHPAGE_BOOTSTRAP_API_TOKEN is set but empty.\n' >&2
+    exit 1
+  fi
+  SERVER_BOOTSTRAP_API_TOKEN=$PATCHPAGE_BOOTSTRAP_API_TOKEN
+  unset PATCHPAGE_BOOTSTRAP_API_TOKEN
+else
+  GENERATE_BOOTSTRAP_TOKEN=false
+  if test -n "${PATCHPAGE_BOOTSTRAP_TOKEN_FILE:-}"; then
+    BOOTSTRAP_TOKEN_FILE=$PATCHPAGE_BOOTSTRAP_TOKEN_FILE
+  else
+    GENERATE_BOOTSTRAP_TOKEN=true
+    BOOTSTRAP_TOKEN_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/patchpage/bootstrap-api-token"
+    BOOTSTRAP_TOKEN_DIR=$(dirname "$BOOTSTRAP_TOKEN_FILE")
+    if ! mkdir -p "$BOOTSTRAP_TOKEN_DIR" || ! chmod 700 "$BOOTSTRAP_TOKEN_DIR"; then
+      printf 'Could not secure the bootstrap token directory.\n' >&2
+      exit 1
+    fi
+  fi
+
+  if test -L "$BOOTSTRAP_TOKEN_FILE"; then
+    printf 'The bootstrap token file must not be a symbolic link.\n' >&2
+    exit 1
+  fi
+  if test -f "$BOOTSTRAP_TOKEN_FILE"; then
+    :
+  elif test "$GENERATE_BOOTSTRAP_TOKEN" = true &&
+       ! test -e "$BOOTSTRAP_TOKEN_FILE"; then
+    BOOTSTRAP_TOKEN_CREATED=true
+    if ! (umask 077; set -C; openssl rand -hex 32 > "$BOOTSTRAP_TOKEN_FILE"); then
+      rm -f "$BOOTSTRAP_TOKEN_FILE"
+      printf 'Could not generate the bootstrap API token.\n' >&2
+      exit 1
+    fi
+  else
+    printf 'The bootstrap token path must be an existing regular file.\n' >&2
+    exit 1
+  fi
+  if test "$GENERATE_BOOTSTRAP_TOKEN" = true; then
+    if ! chmod 600 "$BOOTSTRAP_TOKEN_FILE" ||
+       test -L "$BOOTSTRAP_TOKEN_FILE" ||
+       ! test -f "$BOOTSTRAP_TOKEN_FILE" ||
+       ! test -r "$BOOTSTRAP_TOKEN_FILE"; then
+      printf 'Could not verify the generated bootstrap token file.\n' >&2
+      exit 1
+    fi
+    BOOTSTRAP_TOKEN_MODE=$(LC_ALL=C ls -ld "$BOOTSTRAP_TOKEN_FILE" | awk '{ print $1 }')
+    case "$BOOTSTRAP_TOKEN_MODE" in
+      -rw-------|-rw-------@|-rw-------.) ;;
+      *)
+        printf 'The generated bootstrap token file must have mode 0600.\n' >&2
+        exit 1
+        ;;
+    esac
+  else
+    if test -L "$BOOTSTRAP_TOKEN_FILE" ||
+       ! test -f "$BOOTSTRAP_TOKEN_FILE" ||
+       ! test -r "$BOOTSTRAP_TOKEN_FILE"; then
+      printf 'The custom bootstrap token must be a readable regular file, not a symbolic link.\n' >&2
+      exit 1
+    fi
+    BOOTSTRAP_TOKEN_MODE=$(LC_ALL=C ls -ld "$BOOTSTRAP_TOKEN_FILE" | awk '{ print $1 }')
+    case "$BOOTSTRAP_TOKEN_MODE" in
+      -r--------|-r--------@|-r--------.|-rw-------|-rw-------@|-rw-------.) ;;
+      *)
+        printf 'The custom bootstrap token file must have mode 0400 or 0600.\n' >&2
+        exit 1
+        ;;
+    esac
+  fi
+
+  SERVER_BOOTSTRAP_API_TOKEN=''
+  IFS= read -r SERVER_BOOTSTRAP_API_TOKEN < "$BOOTSTRAP_TOKEN_FILE" ||
+    test -n "$SERVER_BOOTSTRAP_API_TOKEN" || {
+      printf 'Could not read a non-empty bootstrap API token.\n' >&2
+      exit 1
+    }
+  if test -z "$SERVER_BOOTSTRAP_API_TOKEN"; then
+    printf 'Could not read a non-empty bootstrap API token.\n' >&2
+    exit 1
+  fi
+fi
+BOOTSTRAP_TOKEN_READY=true
+
+case "$SERVER_MODE" in
+  development)
+    PATCHPAGE_BOOTSTRAP_API_TOKEN=$SERVER_BOOTSTRAP_API_TOKEN
+    export PATCHPAGE_BOOTSTRAP_API_TOKEN
+    pnpm --filter @patchpage/server dev
+    ;;
+  production)
+    if ! pnpm --filter @patchpage/server build; then
+      printf 'The production build failed; the server was not started.\n' >&2
+      exit 1
+    fi
+    PATCHPAGE_BOOTSTRAP_API_TOKEN=$SERVER_BOOTSTRAP_API_TOKEN
+    export PATCHPAGE_BOOTSTRAP_API_TOKEN
+    pnpm --filter @patchpage/server start
+    ;;
+  *)
+    printf 'PATCHPAGE_SERVER_MODE must be development or production.\n' >&2
+    exit 1
+    ;;
+esac
+)
 ```
+<!-- guide-test:self-hosting-source-start:end -->
 
 The server listens on `0.0.0.0:$PORT` and exposes a `GET /healthz` endpoint that returns exactly `{"ok":true}` for health checks. To build an image from your checkout instead of pulling the supported release, run `pnpm --filter @patchpage/server docker` (see `apps/server/Dockerfile`).
 
@@ -183,16 +505,127 @@ The server listens on `0.0.0.0:$PORT` and exposes a `GET /healthz` endpoint that
 
 The bootstrap token (`PATCHPAGE_BOOTSTRAP_API_TOKEN`) is itself a valid API token with `admin` and `upload` scopes. You can use it to authenticate the CLI, but the better practice is to use it once to mint scoped, per-client tokens.
 
-`POST /api/tokens` requires a token with the `admin` scope (the bootstrap token has it). The request body accepts an optional `name` and `scopes` array; if `scopes` is omitted it defaults to `["upload"]`. It returns the new token as `token` — this value is shown only in the response, so capture it.
+`POST /api/tokens` requires a token with the `admin` scope (the bootstrap token has it). The request body accepts an optional `name` and `scopes` array; if `scopes` is omitted it defaults to `["upload"]`. The snippet uses a pre-existing non-empty `PATCHPAGE_BOOTSTRAP_API_TOKEN` first and reads an owner-only regular token file only when the variable is absent. It captures the one-time response in a protected directory, validates the token without printing it, sends it to `auth set` through stdin, and verifies the saved credential. Any failure after the server mints the token retains the protected response or extracted token and prints only its recovery path.
 
 ```sh
-curl -sS -X POST https://post.example.com/api/tokens \
-  -H "Authorization: Bearer $PATCHPAGE_BOOTSTRAP_API_TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{"name":"laptop","scopes":["upload"]}'
+(
+set +x
+API_URL='https://post.example.com'
+PATCHPAGE_API_URL=$API_URL
+export PATCHPAGE_API_URL
+unset PATCHPAGE_API_TOKEN
+MINT_TMP_DIR=''
+AUTH_HEADER_FILE=''
+RESPONSE_FILE=''
+MINTED_TOKEN_FILE=''
+MINT_PRESERVE=false
+
+mint_cleanup() {
+  unset PATCHPAGE_BOOTSTRAP_API_TOKEN
+  if test -n "$AUTH_HEADER_FILE"; then
+    rm -f "$AUTH_HEADER_FILE"
+  fi
+  if test -n "$MINT_TMP_DIR" &&
+     test "$MINT_PRESERVE" != true; then
+    rm -rf "$MINT_TMP_DIR"
+  fi
+}
+trap 'mint_cleanup' 0
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+if test "${PATCHPAGE_BOOTSTRAP_API_TOKEN+x}" = x; then
+  if test -z "$PATCHPAGE_BOOTSTRAP_API_TOKEN"; then
+    printf 'PATCHPAGE_BOOTSTRAP_API_TOKEN is set but empty.\n' >&2
+    exit 1
+  fi
+else
+  BOOTSTRAP_TOKEN_FILE="${PATCHPAGE_BOOTSTRAP_TOKEN_FILE:-${XDG_CONFIG_HOME:-$HOME/.config}/patchpage/bootstrap-api-token}"
+  if test -L "$BOOTSTRAP_TOKEN_FILE" ||
+     ! test -f "$BOOTSTRAP_TOKEN_FILE" ||
+     ! test -r "$BOOTSTRAP_TOKEN_FILE"; then
+    printf 'The bootstrap token must be a readable regular file, not a symbolic link.\n' >&2
+    exit 1
+  fi
+  BOOTSTRAP_TOKEN_MODE=$(LC_ALL=C ls -ld "$BOOTSTRAP_TOKEN_FILE" | awk '{ print $1 }')
+  case "$BOOTSTRAP_TOKEN_MODE" in
+    -r--------|-r--------@|-r--------.|-rw-------|-rw-------@|-rw-------.) ;;
+    *)
+      printf 'The bootstrap token file must have mode 0400 or 0600.\n' >&2
+      exit 1
+      ;;
+  esac
+  PATCHPAGE_BOOTSTRAP_API_TOKEN=''
+  IFS= read -r PATCHPAGE_BOOTSTRAP_API_TOKEN < "$BOOTSTRAP_TOKEN_FILE" ||
+    test -n "$PATCHPAGE_BOOTSTRAP_API_TOKEN" || {
+      printf 'Could not read a non-empty bootstrap API token.\n' >&2
+      exit 1
+    }
+  if test -z "$PATCHPAGE_BOOTSTRAP_API_TOKEN"; then
+    printf 'Could not read a non-empty bootstrap API token.\n' >&2
+    exit 1
+  fi
+fi
+if ! MINT_TMP_DIR="$(mktemp -d)" || ! chmod 700 "$MINT_TMP_DIR"; then
+  printf 'Could not create the token-mint temporary directory.\n' >&2
+  exit 1
+fi
+AUTH_HEADER_FILE="$MINT_TMP_DIR/auth.headers"
+RESPONSE_FILE="$MINT_TMP_DIR/response.json"
+MINTED_TOKEN_FILE="$MINT_TMP_DIR/minted-upload-token"
+if ! (umask 077; printf 'Authorization: Bearer %s\n' \
+  "$PATCHPAGE_BOOTSTRAP_API_TOKEN" > "$AUTH_HEADER_FILE") ||
+   ! chmod 600 "$AUTH_HEADER_FILE" ||
+   ! (umask 077; : > "$RESPONSE_FILE") ||
+   ! chmod 600 "$RESPONSE_FILE"; then
+  printf 'Could not create protected token-mint files.\n' >&2
+  exit 1
+fi
+unset PATCHPAGE_BOOTSTRAP_API_TOKEN
+
+if ! curl --fail --silent --show-error --request POST \
+  --output "$RESPONSE_FILE" \
+  --header "@$AUTH_HEADER_FILE" \
+  --header "Content-Type: application/json" \
+  --data '{"name":"laptop","scopes":["upload"]}' \
+  "$API_URL/api/tokens"; then
+  printf 'Could not mint the scoped token.\n' >&2
+  exit 1
+fi
+MINT_PRESERVE=true
+if ! rm -f "$AUTH_HEADER_FILE"; then
+  MINT_PRESERVE=false
+  printf 'Could not remove the temporary administrator authorization header.\n' >&2
+  exit 1
+fi
+AUTH_HEADER_FILE=''
+if ! (umask 077; set -C; jq -er \
+  '.token | select(type == "string" and length > 0)' \
+  "$RESPONSE_FILE" > "$MINTED_TOKEN_FILE") ||
+   ! chmod 600 "$MINTED_TOKEN_FILE"; then
+  printf 'Token extraction failed. Inspect the protected response at %s\n' \
+    "$RESPONSE_FILE" >&2
+  exit 1
+fi
+
+if ! patchpage auth set --token-stdin --api-url "$API_URL" < "$MINTED_TOKEN_FILE"; then
+  MINT_PRESERVE=true
+  printf 'Credential save failed. Recover the minted token from %s\n' \
+    "$MINTED_TOKEN_FILE" >&2
+  exit 1
+fi
+if ! patchpage whoami; then
+  MINT_PRESERVE=true
+  printf 'Credential verification failed. Recover the minted token from %s\n' \
+    "$MINTED_TOKEN_FILE" >&2
+  exit 1
+fi
+MINT_PRESERVE=false
+)
 ```
 
-Response (HTTP 201):
+The server's HTTP 201 body has this shape, but the command above never writes it to the terminal:
 
 ```json
 {
@@ -202,19 +635,49 @@ Response (HTTP 201):
 }
 ```
 
-You can confirm any token with `GET /api/me` (or `patchpage whoami`), which returns the account, token name, and scopes.
+After the minting block succeeds, the CLI is already configured for your instance and the new scoped token has been verified.
 
 ## Pointing the CLI at your instance
 
-Save the minted token and your instance's base URL:
+The CLI defaults to `https://post.patchyhq.com`, which is the maintainer's private instance, has no public token signup, and must not be assumed to accept anonymous uploads. The minting block selects the self-hosted origin explicitly and saves the new credential. On another machine, use this fail-closed quick start with a scoped token in a protected owner-readable file:
 
 ```sh
-patchpage auth set --api-url https://post.example.com
+(
+set -eu
+set +x
+PATCHPAGE_API_URL='https://post.example.com'
+export PATCHPAGE_API_URL
+unset PATCHPAGE_API_TOKEN
+UPLOAD_TOKEN_FILE="${PATCHPAGE_UPLOAD_TOKEN_FILE:?Set PATCHPAGE_UPLOAD_TOKEN_FILE to the protected scoped-token file}"
+if test -L "$UPLOAD_TOKEN_FILE" ||
+   ! test -f "$UPLOAD_TOKEN_FILE" ||
+   ! test -r "$UPLOAD_TOKEN_FILE"; then
+  printf 'The upload token must be a readable regular file, not a symbolic link.\n' >&2
+  exit 1
+fi
+UPLOAD_TOKEN_MODE=$(LC_ALL=C ls -ld "$UPLOAD_TOKEN_FILE" | awk '{ print $1 }')
+case "$UPLOAD_TOKEN_MODE" in
+  -r--------|-r--------@|-r--------.|-rw-------|-rw-------@|-rw-------.) ;;
+  *)
+    printf 'The upload token file must have mode 0400 or 0600.\n' >&2
+    exit 1
+    ;;
+esac
+patchpage auth set --token-stdin --api-url "$PATCHPAGE_API_URL" < "$UPLOAD_TOKEN_FILE"
 patchpage whoami
+patchpage validate ./plan.html
 patchpage upload ./plan.html
+)
 ```
 
-An upload without a draft ID creates a draft with a cryptographically generated server ID. To add a version to a specific draft, use `patchpage upload ./plan.html --draft <draft-id>`. The `--draft` option is update-only: the target must already be active and owned by the authenticated account, and unknown, deleted, disabled, or unowned targets all return the same generic unavailable response without creating a draft. Use `--new` for an explicit create; `--new` and `--draft` cannot be combined.
+An upload without a draft ID creates a draft with a cryptographically generated server ID. To add a version to a specific draft, assign the ID returned by the server and pass the quoted value:
+
+```sh
+DRAFT_ID='abc123def456'
+patchpage upload ./plan.html --draft "$DRAFT_ID"
+```
+
+The `--draft` option is update-only: the target must already be active and owned by the authenticated account, and unknown, deleted, disabled, or unowned targets all return the same generic unavailable response without creating a draft. Use `--new` for an explicit create; `--new` and `--draft` cannot be combined.
 
 When neither `PATCHPAGE_API_TOKEN` nor a stored token exists, `patchpage upload` attempts an anonymous create. It ignores cached draft IDs and does not write anonymous results to the update cache. This succeeds only when the target self-hosted server has explicitly set `PATCHPAGE_ALLOW_ANONYMOUS_UPLOADS=true`; the default is `false`. Pass `--anonymous` to force create-only anonymous mode and bypass available credentials, or combine `--anonymous --new` for an explicit new anonymous draft. `--draft` is incompatible with anonymous mode because all updates require authentication. Authentication failures are returned directly and are never retried anonymously.
 

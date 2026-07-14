@@ -6,19 +6,37 @@ The CLI defaults to the host `https://post.patchyhq.com`, which is the maintaine
 
 ## Install and use
 
-Run without installing:
+Requires Node.js 22 or newer.
 
+Set `PATCHPAGE_SETUP_URL` to your self-hosted origin and provide `PATCHPAGE_SETUP_TOKEN` through a secret environment variable. This scoped workflow pins the intended server, clears inherited credential overrides, verifies the stored token, and exits before upload if authentication or validation fails:
+
+<!-- patchpage-packed-cli-e2e:start -->
 ```sh
-npx patchpage validate ./plan.html
-npx patchpage auth set --api-url https://patchpage.example.com
-npx patchpage upload ./plan.html
-```
+(
+  set +x
+  set -eu
+  : "${PATCHPAGE_SETUP_URL:?Set PATCHPAGE_SETUP_URL to your self-hosted server}"
+  : "${PATCHPAGE_SETUP_TOKEN:?Set PATCHPAGE_SETUP_TOKEN to a PatchPage API token}"
+  PATCHPAGE_API_URL="$PATCHPAGE_SETUP_URL"
+  export PATCHPAGE_API_URL
+  unset PATCHPAGE_SETUP_URL
+  unset PATCHPAGE_API_TOKEN
+  unset TOKEN
+  ARTIFACT_PATH='./review artifact.html'
 
-Or install globally:
+  printf '%s' "$PATCHPAGE_SETUP_TOKEN" | npx --yes patchpage auth set --token-stdin --api-url "$PATCHPAGE_API_URL"
+  unset PATCHPAGE_SETUP_TOKEN
+  npx --yes patchpage whoami &&
+    npx --yes patchpage validate "$ARTIFACT_PATH" &&
+    npx --yes patchpage upload "$ARTIFACT_PATH"
+)
+```
+<!-- patchpage-packed-cli-e2e:end -->
+
+Or install globally, then replace `npx --yes patchpage` above with `patchpage`:
 
 ```sh
 npm install -g patchpage
-patchpage upload ./plan.html
 ```
 
 ## Commands
@@ -31,11 +49,7 @@ Save an API token to local state. By default, `auth set` requires a terminal and
 patchpage auth set --api-url https://post.example.com
 ```
 
-Automation must select redirected input explicitly; a non-TTY invocation without `--token-stdin` fails:
-
-```sh
-printf '%s' "$TOKEN" | patchpage auth set --token-stdin --api-url https://post.example.com
-```
+For automation, use the fail-closed workflow above. It clears inherited URL and token overrides, stores the setup token through stdin, and verifies the stored credential before validation or upload.
 
 ### `patchpage whoami [--api-url <url>]`
 

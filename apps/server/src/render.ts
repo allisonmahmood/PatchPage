@@ -2,6 +2,7 @@ import type { DraftRecord, DraftVersionRecord } from "@patchpage/db";
 
 export function renderHome(options: { publicBaseUrl: string }): string {
   const publicBaseUrl = escapeHtml(options.publicBaseUrl);
+  const shellPublicBaseUrl = escapeHtml(quoteShellArgument(options.publicBaseUrl));
 
   return htmlPage({
     title: "PatchPage",
@@ -24,10 +25,25 @@ export function renderHome(options: { publicBaseUrl: string }): string {
         <section class="panel">
           <div>
             <h2>Publish a draft</h2>
-            <p>Use the CLI to validate and upload a single-file HTML plan, report, or briefing.</p>
+            <p>Requires Node.js 22 or newer.</p>
+            <p>Provide <code>PATCHPAGE_SETUP_TOKEN</code> through a secret environment. This scoped workflow pins this endpoint, clears inherited credential overrides, and verifies the stored token before validation or upload.</p>
           </div>
-          <pre><code>npx patchpage validate ./plan.html
-npx patchpage upload ./plan.html</code></pre>
+          <pre><code data-patchpage-quick-start>(
+  set +x
+  set -eu
+  PATCHPAGE_API_URL=${shellPublicBaseUrl}
+  export PATCHPAGE_API_URL
+  unset PATCHPAGE_API_TOKEN
+  unset TOKEN
+  : "\${PATCHPAGE_SETUP_TOKEN:?Set PATCHPAGE_SETUP_TOKEN to a PatchPage API token}"
+  ARTIFACT_PATH='./plan.html'
+
+  printf '%s' "$PATCHPAGE_SETUP_TOKEN" | npx --yes patchpage auth set --token-stdin --api-url "$PATCHPAGE_API_URL"
+  unset PATCHPAGE_SETUP_TOKEN
+  npx --yes patchpage whoami &amp;&amp;
+    npx --yes patchpage validate "$ARTIFACT_PATH" &amp;&amp;
+    npx --yes patchpage upload "$ARTIFACT_PATH"
+)</code></pre>
         </section>
 
         <section class="grid">
@@ -498,6 +514,10 @@ function htmlPage(options: { title: string; body: string }): string {
 </head>
 <body>${options.body}</body>
 </html>`;
+}
+
+function quoteShellArgument(value: unknown): string {
+  return `'${String(value).replaceAll("'", "'\\''")}'`;
 }
 
 export function escapeHtml(value: unknown): string {

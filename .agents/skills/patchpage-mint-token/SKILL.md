@@ -46,35 +46,142 @@ how the operator deploys:
 - infrastructure-as-code variables, outputs, or state, if the token is generated there
 - a previously minted `admin`-scoped token the operator saved
 
-Treat whatever you find as a secret: keep it in a shell variable and never print it into
-logs, transcripts, or commits.
+Treat whatever you find as a secret: acquire it through a non-echoing prompt or directly
+from the secret store, and never print it into logs, transcripts, or commits.
 
-## Step 2 — mint a scoped token
+## Step 2 — mint, save, and verify a scoped token
 
+Requires Node.js 22 or newer.
+
+<!-- guide-test:operator-mint:start -->
 ```bash
-API="https://patchpage.example.com"   # your instance
-ADMIN_TOKEN="pp_..."                  # from step 1 — do not echo this
+(
+set +x
+API="https://patchpage.example.com" # your instance
+PATCHPAGE_API_URL=$API
+export PATCHPAGE_API_URL
+unset PATCHPAGE_API_TOKEN
+MINT_TMP_DIR=''
+AUTH_HEADER_FILE=''
+RESPONSE_FILE=''
+MINTED_TOKEN_FILE=''
+MINT_PRESERVE=false
+ADMIN_TOKEN=''
+NEW_TOKEN=''
 
-NEW_TOKEN=$(curl -sS -X POST "$API/api/tokens" \
-  -H "Authorization: Bearer $ADMIN_TOKEN" \
-  -H "content-type: application/json" \
-  -d '{"name":"laptop agent","scopes":["upload"]}' | jq -r '.token')
+mint_cleanup() {
+  unset ADMIN_TOKEN NEW_TOKEN
+  if test -n "$AUTH_HEADER_FILE"; then
+    rm -f "$AUTH_HEADER_FILE"
+  fi
+  if test -n "$MINT_TMP_DIR" &&
+     test "$MINT_PRESERVE" != true; then
+    rm -rf "$MINT_TMP_DIR"
+  fi
+}
+trap 'mint_cleanup' 0
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+printf 'Admin token: ' > /dev/tty
+if ! IFS= read -r -s ADMIN_TOKEN < /dev/tty; then
+  ADMIN_TOKEN=''
+  IFS= read -r -s ADMIN_TOKEN ||
+    test -n "$ADMIN_TOKEN" || {
+      printf '\nCould not read the admin token.\n' > /dev/tty
+      exit 1
+    }
+fi
+printf '\n' > /dev/tty
+if test -z "$ADMIN_TOKEN"; then
+  printf 'The admin token must not be empty.\n' >&2
+  exit 1
+fi
+if ! MINT_TMP_DIR="$(mktemp -d)" || ! chmod 700 "$MINT_TMP_DIR"; then
+  printf 'Could not create the token-mint temporary directory.\n' >&2
+  exit 1
+fi
+AUTH_HEADER_FILE="$MINT_TMP_DIR/auth.headers"
+RESPONSE_FILE="$MINT_TMP_DIR/response.json"
+MINTED_TOKEN_FILE="$MINT_TMP_DIR/minted-upload-token"
+if ! (umask 077; printf 'Authorization: Bearer %s\n' \
+  "$ADMIN_TOKEN" > "$AUTH_HEADER_FILE") ||
+   ! chmod 600 "$AUTH_HEADER_FILE" ||
+   ! (umask 077; : > "$RESPONSE_FILE") ||
+   ! chmod 600 "$RESPONSE_FILE"; then
+  printf 'Could not create protected token-mint files.\n' >&2
+  exit 1
+fi
+unset ADMIN_TOKEN
+
+if ! curl --fail --silent --show-error --request POST \
+  --output "$RESPONSE_FILE" \
+  --header "@$AUTH_HEADER_FILE" \
+  --header "content-type: application/json" \
+  --data '{"name":"laptop agent","scopes":["upload"]}' \
+  "$API/api/tokens"; then
+  printf 'Could not mint the scoped token.\n' >&2
+  exit 1
+fi
+MINT_PRESERVE=true
+if ! rm -f "$AUTH_HEADER_FILE"; then
+  MINT_PRESERVE=false
+  printf 'Could not remove the temporary administrator authorization header.\n' >&2
+  exit 1
+fi
+AUTH_HEADER_FILE=''
+if ! (umask 077; set -C; jq -er \
+  '.token | select(type == "string" and length > 0)' \
+  "$RESPONSE_FILE" > "$MINTED_TOKEN_FILE") ||
+   ! chmod 600 "$MINTED_TOKEN_FILE"; then
+  printf 'Token extraction failed. Inspect the protected response at %s\n' \
+    "$RESPONSE_FILE" >&2
+  exit 1
+fi
+
+NEW_TOKEN=''
+IFS= read -r NEW_TOKEN < "$MINTED_TOKEN_FILE" ||
+  test -n "$NEW_TOKEN" || {
+    printf 'Credential handoff failed. Recover the minted token from %s\n' \
+      "$MINTED_TOKEN_FILE" >&2
+    exit 1
+  }
+if test -z "$NEW_TOKEN"; then
+  printf 'Credential handoff failed. Recover the minted token from %s\n' \
+    "$MINTED_TOKEN_FILE" >&2
+  exit 1
+fi
+if printf '%s' "$NEW_TOKEN" | npx --yes patchpage auth set --token-stdin --api-url "$API"; then
+  unset NEW_TOKEN
+else
+  auth_status=$?
+  unset NEW_TOKEN
+  printf 'Credential save failed. Recover the minted token from %s\n' \
+    "$MINTED_TOKEN_FILE" >&2
+  exit "$auth_status"
+fi
+if ! npx --yes patchpage whoami; then
+  printf 'Credential verification failed. Recover the minted token from %s\n' \
+    "$MINTED_TOKEN_FILE" >&2
+  exit 1
+fi
+MINT_PRESERVE=false
+)
 ```
+<!-- guide-test:operator-mint:end -->
+
+## Step 3 — retain only the saved credential
+
+The scoped token is minted, captured, and consumed inside one `set +x` subshell, so an
+inherited xtrace setting cannot print the admin token, mint response, extracted token, or
+stdin handoff. The explicit stdin path keeps the token out of process arguments. Once the
+server returns a token, extraction, save, or verification failure retains the protected
+response or token and prints only its recovery path. Full success removes every temporary
+secret.
 
 Name tokens after the machine or agent that will hold them — one token per client keeps
 revocation painless.
-
-## Step 3 — save and verify
-
-On the machine that will upload:
-
-```bash
-printf '%s' "$NEW_TOKEN" | npx patchpage auth set --token-stdin --api-url "$API"
-npx patchpage whoami
-```
-
-The explicit stdin path keeps `$NEW_TOKEN` out of process arguments; automation must not
-use redirected stdin without `--token-stdin`.
 
 `whoami` calls `GET /api/me` and prints the account, token name, and scopes. Credentials
 land in `~/.patchpage/credentials.json`; every save creates or repairs that file to

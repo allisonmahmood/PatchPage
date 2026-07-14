@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>PatchPage hosted testbed</title>
+  <title>PatchPage artifact workflow</title>
   <style>
     :root {
       --paper: #fffdf4;
@@ -543,72 +543,84 @@
     <header class="doc-head">
       <div class="head-line">
         <span class="brand"><span class="glyph" aria-hidden="true"></span>PatchPage</span>
-        <span class="kicker">Hosted testbed</span>
+        <span class="kicker">Artifact workflow</span>
       </div>
-      <h1>Upload-gated HTML draft hosting.</h1>
-      <p class="lede">PatchPage takes one validated static HTML file, stores it behind an authenticated upload path, and returns a public review link for the draft.</p>
+      <h1>A static artifact, ready to share.</h1>
+      <p class="lede">PatchPage validates one self-contained HTML document, gates publishing with token authentication by default, and returns a public, unlisted review URL.</p>
       <div class="meta">
-        <span class="pill pill-progress">Upload auth</span>
-        <span class="pill pill-done">Sandboxed view</span>
-        <span>Owner: Patchy</span>
+        <span class="pill pill-progress">Token default</span>
+        <span class="pill pill-done">Public, unlisted views</span>
+        <span>Self-hostable</span>
       </div>
     </header>
 
     <ul class="toc" aria-label="Sections">
       <li><a href="#overview">Overview</a></li>
-      <li><a href="#flow">Flow</a></li>
-      <li><a href="#checks">Checks</a></li>
-      <li><a href="#next">Next</a></li>
+      <li><a href="#flow">Workflow</a></li>
+      <li><a href="#access">Access</a></li>
+      <li><a href="#artifact">Artifact</a></li>
     </ul>
 
     <section id="overview">
-      <h2>Overview</h2>
-      <p>The first version stays intentionally small. Agents can publish polished plans and reports without opening a bespoke deploy loop, while the service keeps scripts, forms, embeds, and local-file tricks out of draft uploads.</p>
+      <h2>One file, one review link</h2>
+      <p>PatchPage turns plans, briefs, architecture notes, and reports into durable single-file HTML artifacts. The service rejects active content such as scripts, forms, embeds, and unsafe URL schemes before storing the document.</p>
       <div class="note note-info">
-        <span class="note-title">Visibility model</span>
-        <p>Upload access is private. Draft view URLs are public and unlisted. Treat every uploaded draft as link-viewable until viewer auth is added later.</p>
+        <span class="note-title">Public by link</span>
+        <p>Draft viewer URLs are public and unlisted. Anyone with the link can open the rendered artifact, so publish only material that is safe to share with every link holder.</p>
       </div>
     </section>
 
     <section id="flow">
-      <h2>Publishing Flow</h2>
-      <div class="flow" role="img" aria-label="Flow: Write, Validate, Upload, Review">
+      <h2>Publish from a server you control</h2>
+      <p>Requires Node.js 22 or newer. Provide <code>PATCHPAGE_SETUP_TOKEN</code> through a secret environment. The scoped flow pins the self-hosted origin, clears inherited credential overrides, and verifies the stored token before validation or upload.</p>
+      <div class="flow" role="img" aria-label="Flow: Write, configure, verify, validate, upload, review">
         <span class="node">Write HTML</span>
+        <span class="arrow" aria-hidden="true">&rarr;</span>
+        <span class="node">Configure</span>
+        <span class="arrow" aria-hidden="true">&rarr;</span>
+        <span class="node">Verify</span>
         <span class="arrow" aria-hidden="true">&rarr;</span>
         <span class="node">Validate</span>
         <span class="arrow" aria-hidden="true">&rarr;</span>
         <span class="node">Upload</span>
         <span class="arrow" aria-hidden="true">&rarr;</span>
-        <span class="node is-accent">Review Link</span>
+        <span class="node is-accent">Share Link</span>
       </div>
-      <pre><code>npx patchpage validate ./plan.html
-npx patchpage upload ./plan.html</code></pre>
+      <pre><code>(
+  set +x
+  set -eu
+  PATCHPAGE_API_URL='https://patchpage.example.com'
+  export PATCHPAGE_API_URL
+  unset PATCHPAGE_API_TOKEN
+  unset TOKEN
+  : "${PATCHPAGE_SETUP_TOKEN:?Set PATCHPAGE_SETUP_TOKEN to a PatchPage API token}"
+  ARTIFACT_PATH='./plan.html'
+
+  printf '%s' "$PATCHPAGE_SETUP_TOKEN" | npx --yes patchpage auth set --token-stdin --api-url "$PATCHPAGE_API_URL"
+  unset PATCHPAGE_SETUP_TOKEN
+  npx --yes patchpage whoami &amp;&amp;
+    npx --yes patchpage validate "$ARTIFACT_PATH" &amp;&amp;
+    npx --yes patchpage upload "$ARTIFACT_PATH"
+)</code></pre>
+      <div class="note note-warn">
+        <span class="note-title">About the hosted default</span>
+        <p>The CLI defaults to <code>https://post.patchyhq.com</code>. This is the maintainer's private instance: it has no public token signup and must not be assumed to accept anonymous uploads.</p>
+      </div>
     </section>
 
-    <section id="checks">
-      <h2>Build Checks</h2>
+    <section id="access">
+      <h2>Access is explicit</h2>
       <div class="task-grid">
         <article class="task">
-          <h3><span class="num">1</span> Safe static document <span class="pill pill-done">Done</span></h3>
-          <p>The draft is one complete HTML document with inline CSS and no JavaScript, forms, iframes, external fonts, or external design assets.</p>
-          <ul class="check">
-            <li class="is-done">Semantic headings and readable body copy</li>
-            <li class="is-done">Patchy paper, grid, ink borders, and hard shadows</li>
-            <li class="is-done">No blocked tags or unsafe URL schemes</li>
-          </ul>
-          <div class="task-meta">
-            <span>Risk: leaking sensitive content</span>
-            <span>Rollback: delete or disable the draft</span>
-          </div>
+          <h3><span class="num">1</span> Token-authenticated publishing <span class="pill pill-done">Default</span></h3>
+          <p>Self-hosted servers require an API token by default. Authenticated uploads can create drafts and update drafts the publisher owns; uploading the same known file updates its cached draft unless <code>--new</code> is passed.</p>
         </article>
 
         <article class="task">
-          <h3><span class="num">2</span> Portable host <span class="pill pill-progress">Live</span></h3>
-          <p>The default Patchy deployment runs at <code>post.patchyhq.com</code>, but the CLI can target a self-hosted PatchPage service with <code>--api-url</code> or <code>PATCHPAGE_API_URL</code>.</p>
-          <div class="task-meta">
-            <span>Owner: deployer</span>
-            <span>Rollback: point the CLI back at the previous host</span>
-          </div>
+          <h3><span class="num">2</span> Optional anonymous creation <span class="pill pill-warn">Opt-in</span></h3>
+          <p>A self-hoster may explicitly enable create-only anonymous uploads. With no environment or stored credentials, the CLI automatically attempts an anonymous create. If credentials exist, their failures are returned rather than retried anonymously; <code>--anonymous</code> explicitly bypasses them and always starts a new draft.</p>
+          <pre><code>PATCHPAGE_URL='https://patchpage.example.com'
+npx --yes patchpage upload './plan.html' --anonymous --api-url "$PATCHPAGE_URL"</code></pre>
         </article>
       </div>
 
@@ -617,20 +629,25 @@ npx patchpage upload ./plan.html</code></pre>
           <thead>
             <tr>
               <th>Surface</th>
-              <th>Default</th>
-              <th>Reason</th>
+              <th>Current behavior</th>
+              <th>What it means</th>
             </tr>
           </thead>
           <tbody>
             <tr>
-              <td>Upload API</td>
-              <td>Bearer token required</td>
-              <td>Only trusted publishers can create or update drafts.</td>
+              <td>Authenticated upload</td>
+              <td>Token required</td>
+              <td>Create new drafts or update drafts owned by the publisher.</td>
+            </tr>
+            <tr>
+              <td>Anonymous upload</td>
+              <td>Self-hoster opt-in</td>
+              <td>Create only; no ownership-based updates or cached draft reuse.</td>
             </tr>
             <tr>
               <td>Draft URL</td>
               <td>Public and unlisted</td>
-              <td>Reviewers can open the link without an account.</td>
+              <td>Anyone with the link can open the artifact without an account.</td>
             </tr>
             <tr>
               <td>Viewer</td>
@@ -642,17 +659,17 @@ npx patchpage upload ./plan.html</code></pre>
       </div>
     </section>
 
-    <section id="next">
-      <h2>Next Steps</h2>
-      <div class="note note-warn">
-        <span class="note-title">Before npm publish</span>
-        <p>Keep the package pointed at the hosted default, include the PatchPage skill, and document that public links are not private document storage.</p>
-      </div>
-      <ul class="check">
-        <li class="is-done">Verify the hosted upload path with a real token.</li>
-        <li class="is-done">Ship a Patchy-styled starter page in the repo.</li>
-        <li>Publish the npm package after the hosted flow has been tested end to end.</li>
-      </ul>
+    <section id="artifact">
+      <h2>The artifact contract</h2>
+      <article class="task">
+        <h3><span class="num">3</span> Safe, portable HTML <span class="pill pill-done">Ready</span></h3>
+        <p>Each upload is one complete HTML document with inline CSS and no JavaScript, forms, iframes, external fonts, or external design assets.</p>
+        <ul class="check">
+          <li class="is-done">Semantic headings and readable body copy</li>
+          <li class="is-done">Responsive layout and visible keyboard focus</li>
+          <li class="is-done">No blocked tags, secrets, or unsafe URL schemes</li>
+        </ul>
+      </article>
     </section>
   </main>
 </body>

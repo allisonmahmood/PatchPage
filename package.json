@@ -9,6 +9,7 @@
     "dev": "turbo run dev --parallel",
     "test": "turbo run test",
     "test:packed-cli-e2e": "node scripts/packed-cli-e2e.mjs",
+    "test:public-surfaces": "node scripts/public-surface-contract.test.mjs",
     "test:release-workflow": "node scripts/verify-release-workflow.mjs",
     "test:ghcr-oci": "node scripts/ghcr-oci-release.test.mjs",
     "test:docker-save": "node scripts/validate-docker-save-artifact.test.mjs",

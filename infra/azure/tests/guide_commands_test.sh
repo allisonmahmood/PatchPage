@@ -4,13 +4,24 @@ set -eu
 
 ROOT="$(CDPATH= cd -- "$(dirname "$0")/../../.." && pwd)"
 README="$ROOT/infra/azure/README.md"
-TMP_DIR="$(mktemp -d)"
-trap 'rm -rf "$TMP_DIR"' EXIT HUP INT TERM
+TMP_ROOT="$(mktemp -d)"
+TMP_DIR="$TMP_ROOT/guide commands"
+mkdir -p "$TMP_DIR"
+trap 'rm -rf "$TMP_ROOT"' 0 HUP INT TERM
 
 fail() {
   printf 'guide_commands_test: %s\n' "$1" >&2
   exit 1
 }
+
+case "$TMP_DIR" in
+  *' '*) ;;
+  *) fail "guide harness temporary path does not contain spaces" ;;
+esac
+
+if grep -Fq -- '--header "Authorization: Bearer $BOOTSTRAP_API_TOKEN"' "$README"; then
+  fail "deployed smoke exposes the bootstrap token in curl argv"
+fi
 
 extract_block() {
   marker="<!-- guide-test:$1 -->"
@@ -1047,9 +1058,11 @@ run_deployed_smoke_block() {
     fi
     CUSTOM_DOMAIN="drafts.self-hoster.dev"
     smoke_tmp_dir="$TMP_DIR/deployed-smoke-$scenario-tmp"
+    curl_argv_log="$TMP_DIR/deployed-smoke-$scenario-curl-argv.log"
     caller_trap_log="$TMP_DIR/deployed-smoke-$scenario-caller-trap.log"
     caller_trap_snapshot="$TMP_DIR/deployed-smoke-$scenario-caller-traps.txt"
     rm -rf "$smoke_tmp_dir"
+    : > "$curl_argv_log"
     : > "$caller_trap_log"
 
     mktemp() {
@@ -1073,24 +1086,35 @@ run_deployed_smoke_block() {
     curl() {
       output_file=""
       header_file=""
+      authorization_header_file=""
       url=""
+      url_count=0
       request=""
-      authorization=""
       content_type=""
       data=""
+      body_source_count=0
+      for curl_arg do
+        printf '%s\n' "$curl_arg" >> "$curl_argv_log"
+        case "$curl_arg" in
+          *test-token*) return 1 ;;
+        esac
+      done
       while test "$#" -gt 0; do
         case "$1" in
           --output)
+            test -z "$output_file" || return 1
             shift
             test "$#" -gt 0 || return 1
             output_file="$1"
             ;;
           --dump-header)
+            test -z "$header_file" || return 1
             shift
             test "$#" -gt 0 || return 1
             header_file="$1"
             ;;
           --request)
+            test -z "$request" || return 1
             shift
             test "$#" -gt 0 || return 1
             request="$1"
@@ -1099,25 +1123,57 @@ run_deployed_smoke_block() {
             shift
             test "$#" -gt 0 || return 1
             case "$1" in
-              "Authorization: "*) authorization="$1" ;;
-              "Content-Type: "*) content_type="$1" ;;
+              @*)
+                test -z "$authorization_header_file" || return 1
+                authorization_header_file="${1#@}"
+                ;;
+              "Authorization: "*) return 1 ;;
+              "Content-Type: "*)
+                test -z "$content_type" || return 1
+                content_type="$1"
+                ;;
+              *) return 1 ;;
             esac
             ;;
           --data)
+            body_source_count=$((body_source_count + 1))
+            test "$body_source_count" -eq 1 || return 1
             shift
             test "$#" -gt 0 || return 1
             data="$1"
             ;;
-          --write-out|--proto)
+          --write-out)
             shift
             test "$#" -gt 0 || return 1
+            test "$1" = '%{http_code}' || return 1
+            ;;
+          --proto)
+            shift
+            test "$#" -gt 0 || return 1
+            test "$1" = '=https' || return 1
+            ;;
+          --silent|--show-error|--tlsv1.2)
             ;;
           http://*|https://*)
+            test "$url_count" -eq 0 || return 1
             url="$1"
+            url_count=1
+            ;;
+          *)
+            return 1
             ;;
         esac
         shift
       done
+      test "$url_count" -eq 1 || return 1
+      case "$url" in
+        */api/uploads)
+          test "$body_source_count" -eq 1 || return 1
+          ;;
+        *)
+          test "$body_source_count" -eq 0 || return 1
+          ;;
+      esac
 
       case "$url" in
         http://drafts.self-hoster.dev/healthz)
@@ -1125,30 +1181,30 @@ run_deployed_smoke_block() {
           test -n "$header_file" || return 1
           case "$scenario" in
             redirect_missing)
-              printf 'HTTP/1.1 308 Permanent Redirect\r\n\r\n' > "$header_file"
+              printf 'HTTP/1.1 301 Moved Permanently\r\n\r\n' > "$header_file"
               ;;
             redirect_ambiguous)
               printf \
-                'HTTP/1.1 308 Permanent Redirect\r\nLocation: https://drafts.self-hoster.dev/healthz\r\nLocation: https://other.example/healthz\r\n\r\n' \
+                'HTTP/1.1 301 Moved Permanently\r\nLocation: https://drafts.self-hoster.dev/healthz\r\nLocation: https://other.example/healthz\r\n\r\n' \
                 > "$header_file"
               ;;
             redirect_mismatch)
               printf \
-                'HTTP/1.1 308 Permanent Redirect\r\nLocation: https://drafts.self-hoster.dev/other\r\n\r\n' \
+                'HTTP/1.1 301 Moved Permanently\r\nLocation: https://drafts.self-hoster.dev/other\r\n\r\n' \
                 > "$header_file"
               ;;
             *)
               printf \
-                'HTTP/1.1 308 Permanent Redirect\r\nLocation: https://drafts.self-hoster.dev/healthz\r\n\r\n' \
+                'HTTP/1.1 301 Moved Permanently\r\nLocation: https://drafts.self-hoster.dev/healthz\r\n\r\n' \
                 > "$header_file"
               ;;
           esac
           case "$scenario" in
             http_status_mismatch) printf '%s' "200" ;;
-            redirect_status_301) printf '%s' "301" ;;
             redirect_status_302) printf '%s' "302" ;;
             redirect_status_307) printf '%s' "307" ;;
-            *) printf '%s' "308" ;;
+            redirect_status_308) printf '%s' "308" ;;
+            *) printf '%s' "301" ;;
           esac
           ;;
         https://drafts.self-hoster.dev/healthz)
@@ -1169,7 +1225,11 @@ run_deployed_smoke_block() {
           test "$scenario" != "upload_command_failure" || return 1
           test -n "$output_file" || return 1
           test "$request" = "POST" || return 1
-          test "$authorization" = "Authorization: Bearer test-token" || return 1
+          test -f "$authorization_header_file" || return 1
+          test "$(LC_ALL=C ls -l "$authorization_header_file" | cut -c1-10)" = \
+            "-rw-------" || return 1
+          test "$(cat "$authorization_header_file")" = \
+            "Authorization: Bearer test-token" || return 1
           test "$content_type" = "Content-Type: application/json" || return 1
           printf '%s\n' "$data" |
             jq -e --arg marker "$SMOKE_MARKER" '
@@ -1244,7 +1304,41 @@ run_deployed_smoke_block() {
       esac
     }
 
-    eval "$DEPLOYED_SMOKE_BLOCK"
+    smoke_block="$DEPLOYED_SMOKE_BLOCK"
+    case "$scenario" in
+      upload_body_header_file_mutation)
+        if ! smoke_block="$(
+          printf '%s\n' "$DEPLOYED_SMOKE_BLOCK" |
+            awk '
+              $0 == "    --data \"$UPLOAD_PAYLOAD\" \\" {
+                replacements++
+                print "    --data-binary \"@$AUTH_HEADER_FILE\" \\"
+                next
+              }
+              { print }
+              END { if (replacements != 1) exit 1 }
+            '
+        )"; then
+          return 1
+        fi
+        ;;
+      upload_duplicate_body_mutation)
+        if ! smoke_block="$(
+          printf '%s\n' "$DEPLOYED_SMOKE_BLOCK" |
+            awk '
+              $0 == "    --data \"$UPLOAD_PAYLOAD\" \\" {
+                replacements++
+                print
+              }
+              { print }
+              END { if (replacements != 1) exit 1 }
+            '
+        )"; then
+          return 1
+        fi
+        ;;
+    esac
+    eval "$smoke_block"
     smoke_status=$?
     trap > "$caller_trap_snapshot"
     mkdir -p "$smoke_tmp_dir"
@@ -1259,6 +1353,13 @@ test_deployed_smoke() {
     fail "successful deployed smoke was rejected"
   grep -Fqx 'https://drafts.self-hoster.dev/d/abc123def456' "$success_output" ||
     fail "successful deployed smoke did not print the exact draft URL"
+  if grep -Fq 'test-token' "$TMP_DIR/deployed-smoke-success-curl-argv.log"; then
+    fail "successful deployed smoke exposed the bootstrap token in raw curl argv"
+  fi
+  grep -Fqx \
+    "@$TMP_DIR/deployed-smoke-success-tmp/upload.headers" \
+    "$TMP_DIR/deployed-smoke-success-curl-argv.log" ||
+    fail "successful deployed smoke did not pass the spaced header-file path intact"
   grep -Fqx 'caller-exit' "$TMP_DIR/deployed-smoke-success-caller-trap.log" ||
     fail "deployed smoke overwrote the caller EXIT trap"
   for caller_signal_trap in caller-hup caller-int caller-term; do
@@ -1268,6 +1369,8 @@ test_deployed_smoke() {
   done
   test -f "$TMP_DIR/deployed-smoke-success-tmp/reused-after-smoke" ||
     fail "a stale deployed-smoke trap removed a caller-reused path"
+  test ! -e "$TMP_DIR/deployed-smoke-success-tmp/upload.headers" ||
+    fail "successful deployed smoke did not remove its authorization header"
 
   uppercase_output="$TMP_DIR/deployed-smoke-uppercase-origin.out"
   run_deployed_smoke_block uppercase_origin "$uppercase_output" ||
@@ -1281,15 +1384,17 @@ test_deployed_smoke() {
     redirect_missing \
     redirect_ambiguous \
     redirect_mismatch \
-    redirect_status_301 \
     redirect_status_302 \
     redirect_status_307 \
+    redirect_status_308 \
     health_command_failure \
     health_status_mismatch \
     health_body_mismatch \
     token_failure \
     token_empty \
     upload_command_failure \
+    upload_body_header_file_mutation \
+    upload_duplicate_body_mutation \
     upload_status_mismatch \
     upload_invalid_json \
     upload_ok_mismatch \
@@ -1308,6 +1413,8 @@ test_deployed_smoke() {
       "$failure_output"; then
       fail "deployed smoke printed success after $scenario"
     fi
+    test ! -e "$TMP_DIR/deployed-smoke-$scenario-tmp/upload.headers" ||
+      fail "deployed smoke retained its authorization header after $scenario"
   done
 }
 
