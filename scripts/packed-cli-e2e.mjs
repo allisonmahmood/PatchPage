@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
+import { randomBytes } from "node:crypto";
 import { access, appendFile, mkdtemp, mkdir, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { createServer as createHttpServer } from "node:http";
 import { createConnection, createServer } from "node:net";
 import os from "node:os";
 import path from "node:path";
@@ -11,6 +13,8 @@ const cliPackageDir = path.join(repoRoot, "packages/cli");
 const serverEntry = path.join(repoRoot, "apps/server/dist/start.js");
 const npmCliEntry = path.join(repoRoot, "node_modules/npm/bin/npm-cli.js");
 const bootstrapToken = "patchpage-packed-e2e-bootstrap-token";
+const packedCliTempRootBasePrefix = "patchpage-packed-cli-e2e-";
+const probeOwnerEnvName = "PATCHPAGE_PACKED_CLI_E2E_PROBE_OWNER_ID";
 const expectedViewerCsp = [
   "default-src 'none'",
   "style-src 'unsafe-inline'",
@@ -20,6 +24,7 @@ const expectedViewerCsp = [
   "form-action 'none'"
 ].join("; ");
 const activeChildren = new Set();
+const childProcessGroupOwnership = new WeakMap();
 const trackedProcessGroups = new Set();
 const signalProbe = {
   target: process.env.PATCHPAGE_PACKED_CLI_E2E_SIGNAL_PROBE,
@@ -28,11 +33,18 @@ const signalProbe = {
     process.env.PATCHPAGE_PACKED_CLI_E2E_SIGNAL_PROBE_STUB_RUN_AFTER_SIGNAL === "1",
   observedSignal: undefined
 };
+const outerSignalProbe = {
+  target: process.env.PATCHPAGE_PACKED_CLI_E2E_OUTER_SIGNAL_PROBE
+};
 const lifecycleProbe = {
   mode: process.env.PATCHPAGE_PACKED_CLI_E2E_LIFECYCLE_PROBE,
   markerPath: process.env.PATCHPAGE_PACKED_CLI_E2E_LIFECYCLE_MARKER,
   cleanupCount: 0
 };
+const probeOwnerId = readProbeOwnerIdFromEnv();
+const tempRootPrefix = probeOwnerId
+  ? ownedTempRootPrefix(probeOwnerId)
+  : packedCliTempRootBasePrefix;
 let latchedSignal;
 let latchedSignalExitCode;
 let tempRoot;
@@ -40,21 +52,10 @@ let cleanupPromise;
 let portReservation;
 let serverProcess;
 let serverProcessFailure;
+let serverReadyStdoutObserved = false;
 let serverStdout = "";
 let serverStderr = "";
-
-if (process.argv[2] === "--signal-probes") {
-  await runSignalProbes();
-  process.exit(0);
-}
-if (process.argv[2] === "--platform-probes") {
-  await runPlatformProbes();
-  process.exit(0);
-}
-if (process.argv[2] === "--lifecycle-probes") {
-  await runLifecycleProbes();
-  process.exit(0);
-}
+let serverBindCollisionProbe;
 
 class SignalAbort extends Error {
   constructor(signal) {
@@ -68,6 +69,15 @@ class ProbeComplete extends Error {
   constructor() {
     super("probe completed");
     this.name = "ProbeComplete";
+  }
+}
+
+class ServerStartupError extends Error {
+  constructor(message, options = {}) {
+    super(message);
+    this.name = "ServerStartupError";
+    this.code = options.code;
+    this.cause = options.cause;
   }
 }
 
@@ -95,6 +105,19 @@ for (const signal of ["SIGINT", "SIGTERM"]) {
   process.on(signal, () => latchSignal(signal));
 }
 
+assertRuntimeModeSupportedOnPlatform({
+  platform: process.platform,
+  argvMode: process.argv[2]
+});
+
+if (
+  process.argv[2] === "--signal-probes" ||
+  process.argv[2] === "--platform-probes" ||
+  process.argv[2] === "--lifecycle-probes"
+) {
+  await runProbeMode(process.argv[2]);
+}
+
 let mainFailure;
 try {
   const nodeMajor = Number.parseInt(process.versions.node.split(".")[0], 10);
@@ -102,10 +125,16 @@ try {
 
   await signalProbeCheckpoint("before-temp-creation");
   throwIfSignalLatched();
-  tempRoot = await mkdtemp(path.join(os.tmpdir(), "patchpage-packed-cli-e2e-"));
+  tempRoot = await mkdtemp(path.join(os.tmpdir(), tempRootPrefix));
+  await recordProbeTempRoot();
   throwIfSignalLatched();
-  await signalProbeCheckpoint("after-temp-created");
+  await signalProbeCheckpoint("after-temp-created", probeTempRootDetails());
   throwIfSignalLatched();
+  if (lifecycleProbe.mode === "timeout-owned-temp-root") {
+    await runTimeoutOwnedTempRootWorkload();
+    throw new Error("timeout-owned-temp-root probe unexpectedly completed");
+  }
+
   const packDir = path.join(tempRoot, "pack");
   const consumerDir = path.join(tempRoot, "consumer");
   const serverStateDir = path.join(tempRoot, "server-state");
@@ -119,9 +148,19 @@ try {
   if (lifecycleProbe.mode === "server-spawn-error") {
     portReservation = await reserveLoopbackPort();
     const publicBaseUrl = `http://127.0.0.1:${portReservation.port}`;
-    await startServer({ publicBaseUrl, metadataPath, objectDir });
-    await waitForReady(`${publicBaseUrl}/healthz`);
+    const startedServer = await startServer({ publicBaseUrl, metadataPath, objectDir });
+    await waitForReady(`${startedServer.publicBaseUrl}/healthz`);
     throw new Error("server spawn error probe unexpectedly reached readiness");
+  }
+
+  if (lifecycleProbe.mode === "server-bind-race-retry") {
+    await runServerBindRaceRetryProbe({ metadataPath, objectDir });
+    throw new ProbeComplete();
+  }
+
+  if (lifecycleProbe.mode === "missing-server-entry-negative-control") {
+    await runMissingServerEntryNegativeControl({ metadataPath, objectDir });
+    throw new Error("missing server entry negative control unexpectedly completed");
   }
 
   if (lifecycleProbe.mode === "term-orphaned-process-group") {
@@ -133,10 +172,14 @@ try {
     console.log("[packed-cli-e2e] building the real server for signal probe");
     await run("pnpm", ["--filter", "@patchpage/server...", "build"], { cwd: repoRoot });
     portReservation = await reserveLoopbackPort();
-    const publicBaseUrl = `http://127.0.0.1:${portReservation.port}`;
-    await startServer({ publicBaseUrl, metadataPath, objectDir });
+    let publicBaseUrl = `http://127.0.0.1:${portReservation.port}`;
+    const startedServer = await startServer({ publicBaseUrl, metadataPath, objectDir });
+    publicBaseUrl = startedServer.publicBaseUrl;
     await waitForReady(`${publicBaseUrl}/healthz`);
-    await signalProbeCheckpoint("after-real-server-ready", { publicBaseUrl });
+    await signalProbeCheckpoint("after-real-server-ready", {
+      publicBaseUrl,
+      ...probeTempRootDetails()
+    });
     throw new Error("after-real-server signal probe unexpectedly resumed");
   }
 
@@ -191,14 +234,18 @@ try {
   assert.notEqual(version.stdout.trim(), "0.0.0-dev");
 
   portReservation = await reserveLoopbackPort();
-  const publicBaseUrl = `http://127.0.0.1:${portReservation.port}`;
-  await startServer({
+  let publicBaseUrl = `http://127.0.0.1:${portReservation.port}`;
+  const startedServer = await startServer({
     publicBaseUrl,
     metadataPath,
     objectDir
   });
+  publicBaseUrl = startedServer.publicBaseUrl;
   await waitForReady(`${publicBaseUrl}/healthz`);
-  await signalProbeCheckpoint("after-real-server-ready", { publicBaseUrl });
+  await signalProbeCheckpoint("after-real-server-ready", {
+    publicBaseUrl,
+    ...probeTempRootDetails()
+  });
 
   const cliEnv = environment(
     {
@@ -463,7 +510,39 @@ try {
 if (latchedSignal) process.exit(latchedSignalExitCode);
 if (mainFailure) throw mainFailure;
 
+async function runProbeMode(mode) {
+  let modeFailure;
+  try {
+    if (mode === "--signal-probes") {
+      await runSignalProbes();
+    } else if (mode === "--platform-probes") {
+      await runPlatformProbes();
+    } else if (mode === "--lifecycle-probes") {
+      await runLifecycleProbes();
+    } else {
+      throw new Error(`unknown probe mode ${mode}`);
+    }
+  } catch (error) {
+    if (!(error instanceof SignalAbort)) modeFailure = error;
+  } finally {
+    try {
+      await cleanup();
+    } catch (error) {
+      modeFailure ??= error;
+    }
+  }
+
+  if (latchedSignal) process.exit(latchedSignalExitCode);
+  if (modeFailure) throw modeFailure;
+  process.exit(0);
+}
+
 async function runSignalProbes() {
+  if (outerSignalProbe.target) {
+    await runOuterSignalProbeRunnerTarget(outerSignalProbe.target);
+    return;
+  }
+
   const probes = [
     { checkpoint: "before-temp-creation", signal: "SIGINT", expectedCode: 130 },
     { checkpoint: "after-temp-created", signal: "SIGTERM", expectedCode: 143 },
@@ -480,9 +559,25 @@ async function runSignalProbes() {
     await runSignalProbe(probe);
     console.log(`[signal-probe] PASS ${probe.checkpoint} ${probe.signal}`);
   }
+  await runSignalOverlapProbe();
+  console.log("[signal-probe] PASS overlap-owned-temp-roots");
+  await runOuterSignalRunnerProbe({
+    checkpoint: "before-temp-creation",
+    signal: "SIGINT",
+    expectedCode: 130
+  });
+  console.log("[signal-probe] PASS outer-runner before-temp-creation SIGINT");
+  await runOuterSignalRunnerProbe({
+    checkpoint: "after-real-server-ready",
+    signal: "SIGTERM",
+    expectedCode: 143
+  });
+  console.log("[signal-probe] PASS outer-runner after-real-server-ready SIGTERM");
 }
 
 async function runPlatformProbes() {
+  assertWin32LifecycleRejectionContract();
+
   const fakePnpmEntry = path.win32.join("C:\\tools", "pnpm", "pnpm.cjs");
   const winEnv = sanitizedProcessEnv({
     PATH: "C:\\Windows\\System32",
@@ -539,15 +634,67 @@ async function runPlatformProbes() {
     /npm_execpath/
   );
 
-  console.log("[platform-probe] PASS win32 command resolution and PATCHPAGE env stripping");
+  console.log("[platform-probe] PASS win32 lifecycle rejection, command resolution, and PATCHPAGE env stripping");
+}
+
+function assertWin32LifecycleRejectionContract() {
+  const unsupportedCases = [
+    { label: "full E2E", argvMode: undefined },
+    { label: "signal probe runner", argvMode: "--signal-probes" },
+    { label: "lifecycle probe runner", argvMode: "--lifecycle-probes" },
+    { label: "signal probe child", argvMode: undefined },
+    { label: "lifecycle probe child", argvMode: undefined }
+  ];
+
+  for (const runtime of unsupportedCases) {
+    assert.throws(
+      () => assertRuntimeModeSupportedOnPlatform({ platform: "win32", argvMode: runtime.argvMode }),
+      /not supported on win32.*macOS\+Ubuntu\/POSIX.*--platform-probes/,
+      `${runtime.label} should reject on win32 before temp or process mutation`
+    );
+  }
+  assert.doesNotThrow(() =>
+    assertRuntimeModeSupportedOnPlatform({ platform: "win32", argvMode: "--platform-probes" })
+  );
+  assert.doesNotThrow(() =>
+    assertRuntimeModeSupportedOnPlatform({ platform: "linux", argvMode: undefined })
+  );
+  assert.doesNotThrow(() =>
+    assertRuntimeModeSupportedOnPlatform({ platform: "darwin", argvMode: "--signal-probes" })
+  );
+}
+
+function assertRuntimeModeSupportedOnPlatform({ platform, argvMode }) {
+  if (platform !== "win32" || argvMode === "--platform-probes") return;
+  throw new Error(
+    "packed CLI E2E lifecycle, signal, and full E2E modes are not supported on win32; " +
+      "the lifecycle contract is macOS+Ubuntu/POSIX CI only. " +
+      "Use --platform-probes for static Windows command-resolution coverage."
+  );
 }
 
 async function runLifecycleProbes() {
+  await runLifecycleTimeoutCleanupProbe();
+  console.log("[lifecycle-probe] PASS timeout-owned-temp-root-cleanup");
+
   const probes = [
     {
       mode: "server-spawn-error",
       expectFailure: true,
-      expectedStderr: /patchpage-packed-cli-e2e-missing-server-spawn|ENOENT/
+      expectedStderr:
+        /server spawn failed before ready stdout \(ENOENT .*patchpage-packed-cli-e2e-missing-server-spawn/
+    },
+    {
+      mode: "server-bind-race-retry",
+      expectFailure: false,
+      timeoutMs: 120_000
+    },
+    {
+      mode: "missing-server-entry-negative-control",
+      expectFailure: true,
+      expectedStderr:
+        /server entry missing before spawn .*patchpage-packed-cli-e2e-missing-server-entry-negative-control/,
+      unexpectedStderr: /patchpage-packed-cli-e2e-missing-server-spawn/
     },
     {
       mode: "term-orphaned-process-group",
@@ -561,11 +708,204 @@ async function runLifecycleProbes() {
   }
 }
 
+async function runLifecycleTimeoutCleanupProbe() {
+  const targetOwnerId = createProbeOwnerId();
+  const foreignOwnerId = createProbeOwnerId();
+  const targetMarkerPath = path.join(
+    os.tmpdir(),
+    `patchpage-packed-cli-e2e-lifecycle-probe-${process.pid}-${targetOwnerId}-timeout-owned-temp-root.jsonl`
+  );
+  const foreignMarkerPath = path.join(
+    os.tmpdir(),
+    `patchpage-packed-cli-e2e-signal-probe-${process.pid}-${foreignOwnerId}-timeout-foreign.jsonl`
+  );
+  await Promise.all([rm(targetMarkerPath, { force: true }), rm(foreignMarkerPath, { force: true })]);
+
+  const target = spawn(process.execPath, [fileURLToPath(import.meta.url)], {
+    cwd: repoRoot,
+    env: {
+      ...process.env,
+      [probeOwnerEnvName]: targetOwnerId,
+      PATCHPAGE_PACKED_CLI_E2E_LIFECYCLE_PROBE: "timeout-owned-temp-root",
+      PATCHPAGE_PACKED_CLI_E2E_LIFECYCLE_MARKER: targetMarkerPath
+    },
+    detached: process.platform !== "win32",
+    stdio: ["ignore", "pipe", "pipe"],
+    shell: false
+  });
+  registerSpawnedChild(target);
+
+  let targetStdout = "";
+  let targetStderr = "";
+  let targetLineBuffer = "";
+  const targetEvents = [];
+  let targetRecords = [];
+  let targetTempRoot;
+  let targetDescendantPort;
+  let targetCleanupComplete = false;
+  let foreign;
+  let foreignTempRoot;
+  let foreignRecords = [];
+  let foreignLeakFailures;
+  let foreignCleanupComplete = false;
+
+  target.stdout.setEncoding("utf8");
+  target.stderr.setEncoding("utf8");
+  target.stdout.on("data", (chunk) => {
+    targetStdout += chunk;
+    targetLineBuffer += chunk;
+    const lines = targetLineBuffer.split("\n");
+    targetLineBuffer = lines.pop() ?? "";
+    for (const line of lines) {
+      const event = parseLifecycleProbeEvent(line);
+      if (event) targetEvents.push(event);
+    }
+  });
+  target.stderr.on("data", (chunk) => {
+    targetStderr += chunk;
+  });
+
+  try {
+    const targetReady = await waitForJsonlRecord(
+      targetMarkerPath,
+      (record) => record.type === "timeout-owned-temp-root-ready",
+      30_000
+    );
+    targetRecords = await readJsonlRecords(targetMarkerPath);
+    targetTempRoot = validateOwnedTempRootPath(targetOwnerId, targetReady.tempRoot);
+    targetDescendantPort = targetReady.port;
+    assert.ok(
+      await pathExists(targetTempRoot),
+      `timeout target should own an active temp root before parent cleanup: ${targetTempRoot}\nstdout:\n${targetStdout}\nstderr:\n${targetStderr}`
+    );
+    assert.ok(
+      Number.isInteger(targetDescendantPort) && (await isTcpPortOpen(targetDescendantPort)),
+      `timeout target descendant port should be open before timeout cleanup: ${targetDescendantPort}\nstdout:\n${targetStdout}\nstderr:\n${targetStderr}`
+    );
+
+    foreign = spawnSignalProbeChild("after-temp-created", foreignMarkerPath, foreignOwnerId);
+    const foreignCheckpoint = await foreign.waitForCheckpoint("after-temp-created", 30_000);
+    foreignTempRoot = validateOwnedTempRootPath(foreignOwnerId, foreignCheckpoint.details?.tempRoot);
+    assert.ok(
+      await pathExists(foreignTempRoot),
+      `foreign probe root should exist before target timeout cleanup: ${foreignTempRoot}`
+    );
+
+    try {
+      await assert.rejects(
+        () => waitForProbeChild(target, 250),
+        /probe child timed out after 250ms/,
+        "timeout-owned-temp-root should fail through the parent timeout"
+      );
+    } finally {
+      targetRecords = await readJsonlRecords(targetMarkerPath);
+      let assertionFailure;
+      try {
+        assert.ok(
+          targetTempRoot && (await pathExists(targetTempRoot)),
+          `timeout target root should still exist before owner-scoped parent cleanup: ${targetTempRoot}\nstdout:\n${targetStdout}\nstderr:\n${targetStderr}`
+        );
+        assert.equal(
+          targetDescendantPort ? await isTcpPortOpen(targetDescendantPort) : false,
+          false,
+          `timeout kill should terminate the POSIX process group before cleanup; port ${targetDescendantPort} is still open`
+        );
+        assert.ok(
+          await pathExists(foreignTempRoot),
+          `foreign root must remain before target owner cleanup: ${foreignTempRoot}`
+        );
+        assert.ok(
+          Number.isInteger(foreign.child.pid) && isPidAlive(foreign.child.pid),
+          `foreign probe should remain alive before target owner cleanup\nstdout:\n${foreign.stdout()}\nstderr:\n${foreign.stderr()}`
+        );
+      } catch (error) {
+        assertionFailure = error;
+      }
+
+      await emergencyCleanupLifecycleProbe({
+        ownerId: targetOwnerId,
+        markerPath: targetMarkerPath,
+        records: targetRecords,
+        events: targetEvents,
+        leakedTempRoots: await listOwnedPackedCliTempRoots(targetOwnerId)
+      });
+      targetCleanupComplete = true;
+      assert.equal(
+        targetTempRoot ? await pathExists(targetTempRoot) : false,
+        false,
+        `parent finally should remove exact owned timeout root ${targetTempRoot}`
+      );
+      if (assertionFailure) throw assertionFailure;
+    }
+
+    assert.ok(
+      await pathExists(foreignTempRoot),
+      `target cleanup must not remove foreign root ${foreignTempRoot}`
+    );
+    assert.ok(
+      Number.isInteger(foreign.child.pid) && isPidAlive(foreign.child.pid),
+      `foreign probe should remain alive after target cleanup\nstdout:\n${foreign.stdout()}\nstderr:\n${foreign.stderr()}`
+    );
+
+    try {
+      foreign.child.kill("SIGTERM");
+      const foreignResult = await waitForProbeChild(foreign.child, 30_000);
+      foreignRecords = await readSignalProbeChildRecords(foreignMarkerPath);
+      foreignLeakFailures = await collectSignalProbeLeaks({
+        ownerId: foreignOwnerId,
+        childRecords: foreignRecords,
+        checkpointDetails: { tempRoot: foreignTempRoot }
+      });
+
+      assert.equal(
+        foreignResult.code,
+        143,
+        `foreign probe should exit 143 after separate signal\nstdout:\n${foreign.stdout()}\nstderr:\n${foreign.stderr()}`
+      );
+      assert.deepEqual(
+        foreignLeakFailures.messages,
+        [],
+        `foreign probe leaked after separate cleanup:\n${foreignLeakFailures.messages.join("\n")}\nstdout:\n${foreign.stdout()}\nstderr:\n${foreign.stderr()}`
+      );
+    } finally {
+      await cleanupSignalProbeArtifacts(
+        foreignMarkerPath,
+        foreignRecords.length > 0 ? foreignRecords : await readJsonlRecords(foreignMarkerPath),
+        foreignLeakFailures?.leakedTempRoots ?? [],
+        foreignOwnerId
+      );
+      foreignCleanupComplete = true;
+    }
+  } finally {
+    if (!targetCleanupComplete) {
+      terminateProcessGroup(target, "SIGKILL");
+      await Promise.race([waitForProbeChild(target, 1_000).catch(() => undefined), delay(1_000)]);
+      targetRecords = targetRecords.length > 0 ? targetRecords : await readJsonlRecords(targetMarkerPath);
+      await emergencyCleanupLifecycleProbe({
+        ownerId: targetOwnerId,
+        markerPath: targetMarkerPath,
+        records: targetRecords,
+        events: targetEvents,
+        leakedTempRoots: await listOwnedPackedCliTempRoots(targetOwnerId)
+      });
+    }
+    if (!foreignCleanupComplete) {
+      await forceCleanupSignalProbeChild(
+        foreign,
+        foreignMarkerPath,
+        foreignRecords,
+        foreignLeakFailures?.leakedTempRoots ?? [],
+        foreignOwnerId
+      );
+    }
+  }
+}
+
 async function runLifecycleProbe(probe) {
-  const beforeTempRoots = await listPackedCliTempRoots();
+  const ownerId = createProbeOwnerId();
   const markerPath = path.join(
     os.tmpdir(),
-    `patchpage-packed-cli-e2e-lifecycle-probe-${process.pid}-${probe.mode}.jsonl`
+    `patchpage-packed-cli-e2e-lifecycle-probe-${process.pid}-${ownerId}-${probe.mode}.jsonl`
   );
   await rm(markerPath, { force: true });
 
@@ -573,12 +913,15 @@ async function runLifecycleProbe(probe) {
     cwd: repoRoot,
     env: {
       ...process.env,
+      [probeOwnerEnvName]: ownerId,
       PATCHPAGE_PACKED_CLI_E2E_LIFECYCLE_PROBE: probe.mode,
       PATCHPAGE_PACKED_CLI_E2E_LIFECYCLE_MARKER: markerPath
     },
+    detached: process.platform !== "win32",
     stdio: ["ignore", "pipe", "pipe"],
     shell: false
   });
+  registerSpawnedChild(child);
 
   let stdout = "";
   let stderr = "";
@@ -607,7 +950,7 @@ async function runLifecycleProbe(probe) {
     result = await waitForProbeChild(child, probe.timeoutMs ?? 60_000);
     records = await readJsonlRecords(markerPath);
     leakFailures = await collectLifecycleProbeLeaks({
-      beforeTempRoots,
+      ownerId,
       records,
       events
     });
@@ -634,6 +977,7 @@ async function runLifecycleProbe(probe) {
         `${probe.mode} should reject main\nstdout:\n${stdout}\nstderr:\n${stderr}`
       );
       assert.match(stderr, probe.expectedStderr);
+      if (probe.unexpectedStderr) assert.doesNotMatch(stderr, probe.unexpectedStderr);
     } else {
       assert.equal(
         result.code,
@@ -651,19 +995,20 @@ async function runLifecycleProbe(probe) {
     const cleanupRecords = records.length > 0 ? records : await readJsonlRecords(markerPath);
     const cleanupEvents = events;
     await emergencyCleanupLifecycleProbe({
+      ownerId,
       markerPath,
       records: cleanupRecords,
       events: cleanupEvents,
-      leakedTempRoots: leakFailures?.newTempRoots ?? []
+      leakedTempRoots: leakFailures?.leakedTempRoots ?? []
     });
   }
 }
 
 async function runSignalProbe(probe) {
-  const beforeTempRoots = await listPackedCliTempRoots();
+  const ownerId = createProbeOwnerId();
   const markerPath = path.join(
     os.tmpdir(),
-    `patchpage-packed-cli-e2e-signal-probe-${process.pid}-${probe.checkpoint}.jsonl`
+    `patchpage-packed-cli-e2e-signal-probe-${process.pid}-${ownerId}-${probe.checkpoint}.jsonl`
   );
   await rm(markerPath, { force: true });
 
@@ -671,15 +1016,18 @@ async function runSignalProbe(probe) {
     cwd: repoRoot,
     env: {
       ...process.env,
+      [probeOwnerEnvName]: ownerId,
       PATCHPAGE_PACKED_CLI_E2E_SIGNAL_PROBE: probe.checkpoint,
       PATCHPAGE_PACKED_CLI_E2E_SIGNAL_PROBE_CHILDREN: markerPath,
       ...(probe.stubRunAfterSignal
         ? { PATCHPAGE_PACKED_CLI_E2E_SIGNAL_PROBE_STUB_RUN_AFTER_SIGNAL: "1" }
         : {})
     },
+    detached: process.platform !== "win32",
     stdio: ["ignore", "pipe", "pipe"],
     shell: false
   });
+  registerSpawnedChild(child);
 
   let stdout = "";
   let stderr = "";
@@ -713,7 +1061,7 @@ async function runSignalProbe(probe) {
     result = await waitForProbeChild(child, probe.timeoutMs ?? 180_000);
     childRecords = await readSignalProbeChildRecords(markerPath);
     leakFailures = await collectSignalProbeLeaks({
-      beforeTempRoots,
+      ownerId,
       childRecords,
       checkpointDetails
     });
@@ -737,10 +1085,373 @@ async function runSignalProbe(probe) {
     await cleanupSignalProbeArtifacts(
       markerPath,
       cleanupRecords,
-      leakFailures?.newTempRoots ?? []
+      leakFailures?.leakedTempRoots ?? [],
+      ownerId
     );
   }
 }
+
+async function runOuterSignalRunnerProbe(probe) {
+  const outer = spawn(process.execPath, [fileURLToPath(import.meta.url), "--signal-probes"], {
+    cwd: repoRoot,
+    env: {
+      ...process.env,
+      PATCHPAGE_PACKED_CLI_E2E_OUTER_SIGNAL_PROBE: probe.checkpoint
+    },
+    detached: process.platform !== "win32",
+    stdio: ["ignore", "pipe", "pipe"],
+    shell: false
+  });
+  registerSpawnedChild(outer);
+
+  let stdout = "";
+  let stderr = "";
+  let lineBuffer = "";
+  const events = [];
+  const waiters = [];
+  let result;
+  let childRecords = [];
+  let leakFailures;
+  outer.stdout.setEncoding("utf8");
+  outer.stderr.setEncoding("utf8");
+  outer.stdout.on("data", (chunk) => {
+    stdout += chunk;
+    lineBuffer += chunk;
+    const lines = lineBuffer.split("\n");
+    lineBuffer = lines.pop() ?? "";
+    for (const line of lines) {
+      const event = parseOuterSignalProbeEvent(line);
+      if (!event) continue;
+      events.push(event);
+      for (const waiter of [...waiters]) waiter();
+    }
+  });
+  outer.stderr.on("data", (chunk) => {
+    stderr += chunk;
+  });
+
+  let checkpointEvent;
+  try {
+    checkpointEvent = await waitForSignalProbeChildEvent(
+      outer,
+      events,
+      waiters,
+      (event) => event.checkpoint === probe.checkpoint,
+      probe.timeoutMs ?? 180_000,
+      () => ({ stdout, stderr })
+    );
+    outer.kill(probe.signal);
+    result = await waitForProbeChild(outer, 30_000);
+    childRecords = await readSignalProbeChildRecords(checkpointEvent.markerPath);
+    leakFailures = await collectSignalProbeLeaks({
+      ownerId: checkpointEvent.ownerId,
+      childRecords,
+      checkpointDetails: {
+        ...(checkpointEvent.details ?? {}),
+        pid: checkpointEvent.childPid
+      }
+    });
+
+    assert.equal(
+      result.code,
+      probe.expectedCode,
+      `outer runner ${probe.checkpoint} ${probe.signal} should exit ${probe.expectedCode}\nresult:\n${JSON.stringify(result)}\nstdout:\n${stdout}\nstderr:\n${stderr}`
+    );
+    assert.deepEqual(
+      leakFailures.messages,
+      [],
+      `outer runner ${probe.checkpoint} ${probe.signal} leaked state:\n${leakFailures.messages.join("\n")}\nstdout:\n${stdout}\nstderr:\n${stderr}`
+    );
+  } finally {
+    if (outer.exitCode === null && outer.signalCode === null) {
+      terminateProcessGroup(outer, "SIGKILL");
+      await Promise.race([
+        waitForProbeChild(outer, 1_000).catch(() => undefined),
+        delay(1_000)
+      ]);
+    }
+    if (checkpointEvent) {
+      const cleanupRecords =
+        childRecords.length > 0 ? childRecords : await readJsonlRecords(checkpointEvent.markerPath);
+      await cleanupSignalProbeArtifacts(
+        checkpointEvent.markerPath,
+        cleanupRecords,
+        leakFailures?.leakedTempRoots ?? [],
+        checkpointEvent.ownerId
+      );
+    }
+  }
+}
+
+async function runOuterSignalProbeRunnerTarget(checkpoint) {
+  const ownerId = createProbeOwnerId();
+  const markerPath = path.join(
+    os.tmpdir(),
+    `patchpage-packed-cli-e2e-outer-signal-probe-${process.pid}-${ownerId}-${checkpoint}.jsonl`
+  );
+  await rm(markerPath, { force: true });
+
+  const probeChild = spawnSignalProbeChild(checkpoint, markerPath, ownerId);
+  let childRecords = [];
+  let leakFailures;
+  try {
+    const checkpointEvent = await probeChild.waitForCheckpoint(
+      checkpoint,
+      checkpoint === "after-real-server-ready" ? 180_000 : 30_000
+    );
+    console.log(
+      `__PATCHPAGE_OUTER_SIGNAL_PROBE__${JSON.stringify({
+        checkpoint,
+        ownerId,
+        markerPath,
+        childPid: probeChild.child.pid,
+        details: checkpointEvent.details ?? {}
+      })}`
+    );
+    while (!latchedSignal) await delay(100);
+    throwIfSignalLatched();
+  } finally {
+    await waitForProbeChild(probeChild.child, 30_000).catch(() => undefined);
+    childRecords = await readSignalProbeChildRecords(markerPath);
+    leakFailures = await collectSignalProbeLeaks({
+      ownerId,
+      childRecords,
+      checkpointDetails: {}
+    });
+    await cleanupSignalProbeArtifacts(
+      markerPath,
+      childRecords,
+      leakFailures?.leakedTempRoots ?? [],
+      ownerId
+    );
+    assert.deepEqual(
+      leakFailures.messages,
+      [],
+      `outer signal target leaked nested state:\n${leakFailures.messages.join("\n")}\nstdout:\n${probeChild.stdout()}\nstderr:\n${probeChild.stderr()}`
+    );
+  }
+}
+
+async function runSignalOverlapProbe() {
+  const aOwnerId = createProbeOwnerId();
+  const bOwnerId = createProbeOwnerId();
+  const aMarkerPath = path.join(
+    os.tmpdir(),
+    `patchpage-packed-cli-e2e-signal-probe-${process.pid}-${aOwnerId}-overlap-a.jsonl`
+  );
+  const bMarkerPath = path.join(
+    os.tmpdir(),
+    `patchpage-packed-cli-e2e-signal-probe-${process.pid}-${bOwnerId}-overlap-b.jsonl`
+  );
+  await Promise.all([rm(aMarkerPath, { force: true }), rm(bMarkerPath, { force: true })]);
+
+  let a;
+  let b;
+  let aRecords = [];
+  let aLeakFailures;
+  let bRecords = [];
+  let bLeakFailures;
+  let aCleanupComplete = false;
+  let bCleanupComplete = false;
+  try {
+    a = spawnSignalProbeChild("before-temp-creation", aMarkerPath, aOwnerId);
+    const aCheckpoint = await a.waitForCheckpoint("before-temp-creation", 30_000);
+    b = spawnSignalProbeChild("after-temp-created", bMarkerPath, bOwnerId);
+    const bCheckpoint = await b.waitForCheckpoint("after-temp-created", 30_000);
+    const bTempRoot = validateOwnedTempRootPath(bOwnerId, bCheckpoint.details?.tempRoot);
+    const bTempRootName = path.basename(bTempRoot);
+    assert.deepEqual(
+      await listOwnedPackedCliTempRoots(bOwnerId),
+      [bTempRootName],
+      "overlap B should have exactly one owned active temp root"
+    );
+
+    try {
+      a.child.kill("SIGINT");
+      const aResult = await waitForProbeChild(a.child, 30_000);
+      aRecords = await readSignalProbeChildRecords(aMarkerPath);
+      aLeakFailures = await collectSignalProbeLeaks({
+        ownerId: aOwnerId,
+        childRecords: aRecords,
+        checkpointDetails: aCheckpoint.details ?? {}
+      });
+
+      assert.equal(
+        aResult.code,
+        130,
+        `overlap A should exit 130\nstdout:\n${a.stdout()}\nstderr:\n${a.stderr()}`
+      );
+      assert.deepEqual(
+        aLeakFailures.messages,
+        [],
+        `overlap A must not flag B's active temp root ${bTempRootName}\nmessages:\n${aLeakFailures.messages.join("\n")}\nA stdout:\n${a.stdout()}\nA stderr:\n${a.stderr()}\nB stdout:\n${b.stdout()}\nB stderr:\n${b.stderr()}\nB checkpoint:\n${JSON.stringify(bCheckpoint)}`
+      );
+    } finally {
+      await cleanupSignalProbeArtifacts(
+        aMarkerPath,
+        aRecords,
+        aLeakFailures?.leakedTempRoots ?? [],
+        aOwnerId
+      );
+      aCleanupComplete = true;
+    }
+
+    assert.ok(
+      await pathExists(bTempRoot),
+      `overlap A must not remove B's active temp root ${bTempRoot}`
+    );
+    assert.ok(
+      Number.isInteger(b.child.pid) && isPidAlive(b.child.pid),
+      `overlap B should remain alive after A cleanup\nB stdout:\n${b.stdout()}\nB stderr:\n${b.stderr()}`
+    );
+
+    try {
+      b.child.kill("SIGTERM");
+      const bResult = await waitForProbeChild(b.child, 30_000);
+      bRecords = await readSignalProbeChildRecords(bMarkerPath);
+      bLeakFailures = await collectSignalProbeLeaks({
+        ownerId: bOwnerId,
+        childRecords: bRecords,
+        checkpointDetails: bCheckpoint.details ?? {}
+      });
+
+      assert.equal(
+        bResult.code,
+        143,
+        `overlap B should exit 143\nstdout:\n${b.stdout()}\nstderr:\n${b.stderr()}`
+      );
+      assert.deepEqual(
+        bLeakFailures.messages,
+        [],
+        `overlap B leaked state:\n${bLeakFailures.messages.join("\n")}\nstdout:\n${b.stdout()}\nstderr:\n${b.stderr()}`
+      );
+      assert.equal(await pathExists(bTempRoot), false, `overlap B should remove ${bTempRoot}`);
+    } finally {
+      await cleanupSignalProbeArtifacts(
+        bMarkerPath,
+        bRecords,
+        bLeakFailures?.leakedTempRoots ?? [],
+        bOwnerId
+      );
+      bCleanupComplete = true;
+    }
+  } finally {
+    if (!aCleanupComplete) {
+      await forceCleanupSignalProbeChild(
+        a,
+        aMarkerPath,
+        aRecords,
+        aLeakFailures?.leakedTempRoots ?? [],
+        aOwnerId
+      );
+    }
+    if (!bCleanupComplete) {
+      await forceCleanupSignalProbeChild(
+        b,
+        bMarkerPath,
+        bRecords,
+        bLeakFailures?.leakedTempRoots ?? [],
+        bOwnerId
+      );
+    }
+  }
+}
+
+async function forceCleanupSignalProbeChild(probeChild, markerPath, records, leakedTempRoots, ownerId) {
+  if (probeChild?.child.exitCode === null && probeChild.child.signalCode === null) {
+    terminateProcessGroup(probeChild.child, "SIGKILL");
+    await Promise.race([
+      waitForProbeChild(probeChild.child, 1_000).catch(() => undefined),
+      delay(1_000)
+    ]);
+  }
+  const cleanupRecords = records.length > 0 ? records : await readJsonlRecords(markerPath);
+  await cleanupSignalProbeArtifacts(markerPath, cleanupRecords, leakedTempRoots, ownerId);
+}
+
+function spawnSignalProbeChild(checkpoint, markerPath, ownerId) {
+  assertValidProbeOwnerId(ownerId);
+  const child = spawn(process.execPath, [fileURLToPath(import.meta.url)], {
+    cwd: repoRoot,
+    env: {
+      ...process.env,
+      [probeOwnerEnvName]: ownerId,
+      PATCHPAGE_PACKED_CLI_E2E_SIGNAL_PROBE: checkpoint,
+      PATCHPAGE_PACKED_CLI_E2E_SIGNAL_PROBE_CHILDREN: markerPath
+    },
+    detached: process.platform !== "win32",
+    stdio: ["ignore", "pipe", "pipe"],
+    shell: false
+  });
+  registerSpawnedChild(child);
+
+  let stdout = "";
+  let stderr = "";
+  let lineBuffer = "";
+  const events = [];
+  const waiters = [];
+  child.stdout.setEncoding("utf8");
+  child.stderr.setEncoding("utf8");
+  child.stdout.on("data", (chunk) => {
+    stdout += chunk;
+    lineBuffer += chunk;
+    const lines = lineBuffer.split("\n");
+    lineBuffer = lines.pop() ?? "";
+    for (const line of lines) {
+      const event = parseSignalProbeEvent(line);
+      if (!event) continue;
+      events.push(event);
+      for (const waiter of [...waiters]) waiter();
+    }
+  });
+  child.stderr.on("data", (chunk) => {
+    stderr += chunk;
+  });
+
+  return {
+    child,
+    stdout: () => stdout,
+    stderr: () => stderr,
+    waitForCheckpoint: (checkpointName, timeoutMs) =>
+      waitForSignalProbeChildEvent(
+        child,
+        events,
+        waiters,
+        (event) => event.checkpoint === checkpointName,
+        timeoutMs,
+        () => ({ stdout, stderr })
+      )
+  };
+}
+
+async function waitForSignalProbeChildEvent(child, events, waiters, predicate, timeoutMs, output) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const event = events.find(predicate);
+    if (event) return event;
+    await new Promise((resolve) => {
+      let timeout;
+      const waiter = () => {
+        clearTimeout(timeout);
+        const waiterIndex = waiters.indexOf(waiter);
+        if (waiterIndex !== -1) waiters.splice(waiterIndex, 1);
+        resolve();
+      };
+      timeout = setTimeout(waiter, Math.min(100, Math.max(0, deadline - Date.now())));
+      waiters.push(waiter);
+    });
+    if (child.exitCode !== null || child.signalCode !== null) {
+      const { stdout, stderr } = output();
+      throw new Error(
+        `signal probe child exited before expected checkpoint\nstdout:\n${stdout}\nstderr:\n${stderr}`
+      );
+    }
+  }
+  const { stdout, stderr } = output();
+  terminateProcessGroup(child, "SIGKILL");
+  throw new Error(`timed out waiting for signal probe checkpoint\nstdout:\n${stdout}\nstderr:\n${stderr}`);
+}
+
 
 function parseSignalProbeEvent(line) {
   const prefix = "__PATCHPAGE_SIGNAL_PROBE__";
@@ -754,31 +1465,40 @@ function parseLifecycleProbeEvent(line) {
   return JSON.parse(line.slice(prefix.length));
 }
 
+function parseOuterSignalProbeEvent(line) {
+  const prefix = "__PATCHPAGE_OUTER_SIGNAL_PROBE__";
+  if (!line.startsWith(prefix)) return undefined;
+  return JSON.parse(line.slice(prefix.length));
+}
+
 async function waitForProbeChild(child, timeoutMs) {
+  if (child.exitCode !== null || child.signalCode !== null) {
+    return { code: child.exitCode, signal: child.signalCode };
+  }
   let timedOut = false;
   const timeout = setTimeout(() => {
     timedOut = true;
-    child.kill("SIGKILL");
+    terminateProcessGroup(child, "SIGKILL");
   }, timeoutMs);
   try {
     const result = await new Promise((resolve, reject) => {
       child.once("error", reject);
       child.once("close", (code, signal) => resolve({ code, signal }));
     });
-    assert.ok(!timedOut, `signal probe timed out after ${timeoutMs}ms`);
+    assert.ok(!timedOut, `probe child timed out after ${timeoutMs}ms`);
     return result;
   } finally {
     clearTimeout(timeout);
   }
 }
 
-async function collectLifecycleProbeLeaks({ beforeTempRoots, records, events }) {
+async function collectLifecycleProbeLeaks({ ownerId, records, events }) {
+  assertValidProbeOwnerId(ownerId);
   await delay(300);
-  const afterTempRoots = await listPackedCliTempRoots();
-  const newTempRoots = afterTempRoots.filter((entry) => !beforeTempRoots.includes(entry));
+  const leakedTempRoots = await listOwnedPackedCliTempRoots(ownerId);
   const messages = [];
-  if (newTempRoots.length > 0) {
-    messages.push(`new temp roots remained: ${newTempRoots.join(", ")}`);
+  if (leakedTempRoots.length > 0) {
+    messages.push(`owned temp roots remained: ${leakedTempRoots.join(", ")}`);
   }
 
   const descendantEvents = events.filter((event) => event.type === "descendant-ready");
@@ -796,17 +1516,38 @@ async function collectLifecycleProbeLeaks({ beforeTempRoots, records, events }) 
 
   for (const record of records) {
     if (record.type === "cleanup-end" && record.tempRoot) {
-      const tempRootName = path.basename(record.tempRoot);
-      if (afterTempRoots.includes(tempRootName)) {
+      const tempRootName = path.basename(validateOwnedTempRootPath(ownerId, record.tempRoot));
+      if (leakedTempRoots.includes(tempRootName)) {
         messages.push(`cleanup temp root remained: ${tempRootName}`);
       }
     }
   }
 
-  return { messages, newTempRoots };
+  return { messages, leakedTempRoots };
 }
 
-async function emergencyCleanupLifecycleProbe({ markerPath, records, events, leakedTempRoots }) {
+async function emergencyCleanupLifecycleProbe({ ownerId, markerPath, records, events, leakedTempRoots }) {
+  assertValidProbeOwnerId(ownerId);
+  for (const record of records) {
+    if (Number.isInteger(record.pid)) {
+      if (process.platform === "win32") {
+        try {
+          process.kill(record.pid, "SIGKILL");
+        } catch (error) {
+          if (error?.code !== "ESRCH") throw error;
+        }
+      } else {
+        terminatePosixProcessGroup(record.pid, "SIGKILL");
+      }
+    }
+    if (Number.isInteger(record.descendantPid)) {
+      try {
+        process.kill(record.descendantPid, "SIGKILL");
+      } catch (error) {
+        if (error?.code !== "ESRCH") throw error;
+      }
+    }
+  }
   for (const event of events) {
     if (Number.isInteger(event.launcherPid) && process.platform !== "win32") {
       terminatePosixProcessGroup(event.launcherPid, "SIGKILL");
@@ -819,24 +1560,37 @@ async function emergencyCleanupLifecycleProbe({ markerPath, records, events, lea
       }
     }
   }
+  const tempRootsToRemove = new Set();
   for (const record of records) {
-    if (record.type === "cleanup-end" && record.tempRoot) {
-      await rm(record.tempRoot, { recursive: true, force: true });
-    }
+    if (record.tempRoot) tempRootsToRemove.add(validateOwnedTempRootPath(ownerId, record.tempRoot));
   }
   for (const tempRootName of leakedTempRoots) {
-    await rm(path.join(os.tmpdir(), tempRootName), { recursive: true, force: true });
+    tempRootsToRemove.add(ownedTempRootPathFromName(ownerId, tempRootName));
+  }
+  for (const ownedTempRoot of tempRootsToRemove) {
+    await rm(ownedTempRoot, { recursive: true, force: true });
   }
   await rm(markerPath, { force: true });
 }
 
-async function collectSignalProbeLeaks({ beforeTempRoots, childRecords, checkpointDetails }) {
+async function collectSignalProbeLeaks({ ownerId, childRecords, checkpointDetails }) {
+  assertValidProbeOwnerId(ownerId);
   await delay(300);
-  const afterTempRoots = await listPackedCliTempRoots();
-  const newTempRoots = afterTempRoots.filter((entry) => !beforeTempRoots.includes(entry));
+  const leakedTempRoots = await listOwnedPackedCliTempRoots(ownerId);
   const messages = [];
-  if (newTempRoots.length > 0) {
-    messages.push(`new temp roots remained: ${newTempRoots.join(", ")}`);
+  if (leakedTempRoots.length > 0) {
+    messages.push(`owned temp roots remained: ${leakedTempRoots.join(", ")}`);
+  }
+
+  const knownTempRoots = ownedTempRootPathsFromRecords(ownerId, [
+    ...childRecords,
+    checkpointDetails
+  ]);
+  for (const knownTempRoot of knownTempRoots) {
+    const tempRootName = path.basename(knownTempRoot);
+    if (leakedTempRoots.includes(tempRootName) || (await pathExists(knownTempRoot))) {
+      messages.push(`known temp root remained: ${tempRootName}`);
+    }
   }
 
   const ports = new Set();
@@ -853,10 +1607,11 @@ async function collectSignalProbeLeaks({ beforeTempRoots, childRecords, checkpoi
     if (await isTcpPortOpen(port)) messages.push(`server/sentinel port ${port} remained open`);
   }
 
-  return { messages, newTempRoots };
+  return { messages, leakedTempRoots };
 }
 
-async function cleanupSignalProbeArtifacts(markerPath, childRecords, leakedTempRoots) {
+async function cleanupSignalProbeArtifacts(markerPath, childRecords, leakedTempRoots, ownerId) {
+  assertValidProbeOwnerId(ownerId);
   for (const record of childRecords) {
     if (Number.isInteger(record.pid)) {
       try {
@@ -866,8 +1621,12 @@ async function cleanupSignalProbeArtifacts(markerPath, childRecords, leakedTempR
       }
     }
   }
+  const tempRootsToRemove = new Set(ownedTempRootPathsFromRecords(ownerId, childRecords));
   for (const tempRootName of leakedTempRoots) {
-    await rm(path.join(os.tmpdir(), tempRootName), { recursive: true, force: true });
+    tempRootsToRemove.add(ownedTempRootPathFromName(ownerId, tempRootName));
+  }
+  for (const ownedTempRoot of tempRootsToRemove) {
+    await rm(ownedTempRoot, { recursive: true, force: true });
   }
   await rm(markerPath, { force: true });
 }
@@ -890,6 +1649,91 @@ async function readJsonlRecords(markerPath) {
     .map((line) => JSON.parse(line));
 }
 
+async function runServerBindRaceRetryProbe({ metadataPath, objectDir }) {
+  console.log("[lifecycle-probe] building real server for bind race probe");
+  await run("pnpm", ["--filter", "@patchpage/server...", "build"], { cwd: repoRoot });
+
+  serverBindCollisionProbe = {
+    armed: true,
+    started: false,
+    firstPort: undefined,
+    hits: 0,
+    server: undefined
+  };
+
+  try {
+    portReservation = await reserveLoopbackPort();
+    const firstPort = portReservation.port;
+    const publicBaseUrl = `http://127.0.0.1:${firstPort}`;
+    const startedServer = await startServer({ publicBaseUrl, metadataPath, objectDir });
+    const readyBaseUrl = startedServer?.publicBaseUrl ?? publicBaseUrl;
+    await waitForReady(`${readyBaseUrl}/healthz`);
+
+    assert.equal(
+      serverBindCollisionProbe.hits,
+      0,
+      "bind race probe accepted the collision service as server health"
+    );
+    assert.notEqual(
+      Number(new URL(readyBaseUrl).port),
+      serverBindCollisionProbe.firstPort,
+      "bind race probe should retry on a newly reserved port"
+    );
+  } finally {
+    await closeServerBindCollisionProbe();
+  }
+}
+
+async function runMissingServerEntryNegativeControl({ metadataPath, objectDir }) {
+  const missingServerEntry = path.join(
+    tempRoot,
+    "patchpage-packed-cli-e2e-missing-server-entry-negative-control",
+    "start.js"
+  );
+  portReservation = await reserveLoopbackPort();
+  const publicBaseUrl = `http://127.0.0.1:${portReservation.port}`;
+  const startedServer = await startServer({
+    publicBaseUrl,
+    metadataPath,
+    objectDir,
+    serverEntryPath: missingServerEntry
+  });
+  await waitForReady(`${startedServer.publicBaseUrl}/healthz`);
+  throw new Error("missing server entry negative control unexpectedly reached readiness");
+}
+
+async function maybeStartServerBindCollisionProbe(publicBaseUrl) {
+  if (!serverBindCollisionProbe?.armed || serverBindCollisionProbe.started) return;
+
+  const port = Number(new URL(publicBaseUrl).port);
+  serverBindCollisionProbe.started = true;
+  serverBindCollisionProbe.firstPort = port;
+  const collisionServer = createHttpServer((request, response) => {
+    serverBindCollisionProbe.hits += 1;
+    response.writeHead(200, { "content-type": "application/json" });
+    response.end(JSON.stringify({ ok: true, collision: true, url: request.url }));
+  });
+  serverBindCollisionProbe.server = collisionServer;
+
+  await new Promise((resolve, reject) => {
+    collisionServer.once("error", reject);
+    collisionServer.listen({ host: "0.0.0.0", port, exclusive: true }, resolve);
+  });
+  console.log(
+    `__PATCHPAGE_LIFECYCLE_PROBE__${JSON.stringify({
+      type: "bind-collision-service",
+      port
+    })}`
+  );
+}
+
+async function closeServerBindCollisionProbe() {
+  const collisionServer = serverBindCollisionProbe?.server;
+  serverBindCollisionProbe = undefined;
+  if (!collisionServer?.listening) return;
+  await new Promise((resolve) => collisionServer.close(() => resolve()));
+}
+
 async function runTermOrphanedProcessGroupWorkload() {
   assert.ok(lifecycleProbe.markerPath, "term orphan lifecycle probe requires a marker path");
   const launcher = spawn(process.execPath, ["-e", termOrphanLauncherScript(), lifecycleProbe.markerPath], {
@@ -899,10 +1743,8 @@ async function runTermOrphanedProcessGroupWorkload() {
     stdio: ["ignore", "ignore", "pipe"],
     shell: false
   });
-  const launcherLifecycle = observeSpawnedChild(launcher);
+  const launcherLifecycle = registerSpawnedChild(launcher);
   launcherLifecycle.errorPromise.catch(() => {});
-  activeChildren.add(launcher);
-  trackProcessGroup(launcher);
 
   let launcherStderr = "";
   launcher.stderr.setEncoding("utf8");
@@ -961,12 +1803,163 @@ async function waitForJsonlRecord(markerPath, predicate, timeoutMs) {
   throw new Error(`timed out waiting for lifecycle probe record in ${markerPath}`);
 }
 
-async function listPackedCliTempRoots() {
+async function runTimeoutOwnedTempRootWorkload() {
+  assert.ok(lifecycleProbe.markerPath, "timeout owned root probe requires a marker path");
+  const descendant = spawn(
+    process.execPath,
+    ["-e", timeoutOwnedTempRootDescendantScript(), lifecycleProbe.markerPath],
+    {
+      cwd: repoRoot,
+      env: sanitizedProcessEnv(),
+      detached: false,
+      stdio: "ignore",
+      shell: false
+    }
+  );
+  registerSpawnedChild(descendant, { ownsProcessGroup: false });
+  const descendantRecord = await waitForJsonlRecord(
+    lifecycleProbe.markerPath,
+    (record) => record.type === "timeout-descendant-ready",
+    5_000
+  );
+  const readyRecord = {
+    type: "timeout-owned-temp-root-ready",
+    pid: process.pid,
+    tempRoot,
+    descendantPid: descendantRecord.pid,
+    port: descendantRecord.port
+  };
+  await recordLifecycleProbe(readyRecord);
+  console.log(`__PATCHPAGE_LIFECYCLE_PROBE__${JSON.stringify(readyRecord)}`);
+  const keepAlive = setInterval(() => {}, 1000);
+  try {
+    await new Promise(() => {});
+  } finally {
+    clearInterval(keepAlive);
+  }
+}
+
+function timeoutOwnedTempRootDescendantScript() {
+  return [
+    "const fs = require('node:fs');",
+    "const net = require('node:net');",
+    "const marker = process.argv[1];",
+    "process.on('SIGTERM', () => {});",
+    "const server = net.createServer();",
+    "server.listen(0, '127.0.0.1', () => {",
+    "  fs.appendFileSync(marker, JSON.stringify({ type: 'timeout-descendant-ready', pid: process.pid, port: server.address().port }) + '\\n');",
+    "});",
+    "setInterval(() => {}, 1000);"
+  ].join("\n");
+}
+
+function createProbeOwnerId() {
+  return assertValidProbeOwnerId(randomBytes(16).toString("hex"));
+}
+
+function readProbeOwnerIdFromEnv() {
+  const ownerId = process.env[probeOwnerEnvName];
+  if (!isProbeChildProcess()) return undefined;
+  assert.ok(ownerId, `probe child requires ${probeOwnerEnvName}`);
+  return assertValidProbeOwnerId(ownerId);
+}
+
+function isProbeChildProcess() {
+  return (
+    process.argv[2] !== "--signal-probes" &&
+    process.argv[2] !== "--platform-probes" &&
+    process.argv[2] !== "--lifecycle-probes" &&
+    Boolean(signalProbe.target || lifecycleProbe.mode)
+  );
+}
+
+function assertValidProbeOwnerId(ownerId) {
+  assert.match(
+    ownerId,
+    /^[a-f0-9]{32}$/,
+    `probe owner id must be 32 lowercase hex characters, got ${JSON.stringify(ownerId)}`
+  );
+  return ownerId;
+}
+
+function ownedTempRootPrefix(ownerId) {
+  return `${packedCliTempRootBasePrefix}${assertValidProbeOwnerId(ownerId)}-`;
+}
+
+function validateOwnedTempRootName(ownerId, tempRootName) {
+  assert.equal(path.basename(tempRootName), tempRootName, "owned temp root name must be a basename");
+  const prefix = ownedTempRootPrefix(ownerId);
+  assert.ok(
+    tempRootName.startsWith(prefix),
+    `owned temp root ${tempRootName} must start with ${prefix}`
+  );
+  assert.match(
+    tempRootName.slice(prefix.length),
+    /^[A-Za-z0-9]+$/,
+    `owned temp root ${tempRootName} has an invalid mkdtemp suffix`
+  );
+  return tempRootName;
+}
+
+function validateOwnedTempRootPath(ownerId, ownedTempRoot) {
+  assert.equal(typeof ownedTempRoot, "string", "owned temp root path must be a string");
+  assert.equal(
+    path.dirname(ownedTempRoot),
+    os.tmpdir(),
+    `owned temp root must live directly under ${os.tmpdir()}`
+  );
+  validateOwnedTempRootName(ownerId, path.basename(ownedTempRoot));
+  return ownedTempRoot;
+}
+
+function ownedTempRootPathFromName(ownerId, tempRootName) {
+  return path.join(os.tmpdir(), validateOwnedTempRootName(ownerId, tempRootName));
+}
+
+function ownedTempRootPathsFromRecords(ownerId, records) {
+  const ownedTempRoots = new Set();
+  for (const record of records) {
+    if (record?.tempRoot) {
+      ownedTempRoots.add(validateOwnedTempRootPath(ownerId, record.tempRoot));
+    }
+  }
+  return ownedTempRoots;
+}
+
+function probeTempRootDetails() {
+  if (!probeOwnerId || !tempRoot) return {};
+  return {
+    ownerId: probeOwnerId,
+    tempRoot,
+    tempRootName: path.basename(validateOwnedTempRootPath(probeOwnerId, tempRoot))
+  };
+}
+
+async function recordProbeTempRoot() {
+  if (!probeOwnerId || !tempRoot) return;
+  const record = { type: "temp-root", ...probeTempRootDetails() };
+  await recordSignalProbeChild(record);
+  await recordLifecycleProbe(record);
+}
+
+async function listOwnedPackedCliTempRoots(ownerId) {
+  assertValidProbeOwnerId(ownerId);
   const entries = await readdir(os.tmpdir(), { withFileTypes: true });
+  const prefix = ownedTempRootPrefix(ownerId);
   return entries
-    .filter((entry) => entry.isDirectory() && entry.name.startsWith("patchpage-packed-cli-e2e-"))
+    .filter((entry) => entry.isDirectory() && entry.name.startsWith(prefix))
     .map((entry) => entry.name)
     .sort();
+}
+
+async function pathExists(filePath) {
+  try {
+    await access(filePath);
+    return true;
+  } catch (error) {
+    if (error?.code === "ENOENT") return false;
+    throw error;
+  }
 }
 
 function isProcessGroupAlive(pid) {
@@ -1078,15 +2071,42 @@ async function reserveLoopbackPort() {
   return { server, port: address.port };
 }
 
-async function startServer({ publicBaseUrl, metadataPath, objectDir }) {
+async function startServer({ publicBaseUrl, metadataPath, objectDir, serverEntryPath = serverEntry }) {
+  let nextPublicBaseUrl = publicBaseUrl;
+  const maxAttempts = 3;
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    try {
+      return await startServerAttempt({
+        publicBaseUrl: nextPublicBaseUrl,
+        metadataPath,
+        objectDir,
+        serverEntryPath
+      });
+    } catch (error) {
+      if (!isEaddrInUseServerStartupError(error) || attempt === maxAttempts) throw error;
+      await waitForClose(serverProcess).catch(() => undefined);
+      portReservation = await reserveLoopbackPort();
+      nextPublicBaseUrl = `http://127.0.0.1:${portReservation.port}`;
+      console.log(
+        `[packed-cli-e2e] retrying real server at ${nextPublicBaseUrl} after EADDRINUSE`
+      );
+    }
+  }
+  throw new Error("unreachable server startup retry state");
+}
+
+async function startServerAttempt({ publicBaseUrl, metadataPath, objectDir, serverEntryPath }) {
   throwIfSignalLatched();
-  await access(serverEntry);
+  const serverArgs = [serverEntryPath];
+  const injectsServerSpawnError = shouldInjectServerSpawnError(process.execPath, serverArgs);
+  if (!injectsServerSpawnError) await assertServerEntryExists(serverEntryPath);
   throwIfSignalLatched();
   assert.ok(portReservation, "loopback port must be reserved before server launch");
   await new Promise((resolve, reject) => {
     portReservation.server.close((error) => (error ? reject(error) : resolve()));
   });
   portReservation = undefined;
+  await maybeStartServerBindCollisionProbe(publicBaseUrl);
   throwIfSignalLatched();
 
   const serverEnv = environment(
@@ -1115,9 +2135,18 @@ async function startServer({ publicBaseUrl, metadataPath, objectDir }) {
 
   throwIfSignalLatched();
   console.log(`[packed-cli-e2e] launching real server at ${publicBaseUrl}`);
-  const serverInvocation = resolveSpawnInvocation(process.execPath, [serverEntry], {
+  serverProcessFailure = undefined;
+  serverReadyStdoutObserved = false;
+  const serverInvocation = resolveSpawnInvocation(process.execPath, serverArgs, {
     cwd: repoRoot,
     env: serverEnv
+  });
+  let childStdout = "";
+  let childStderr = "";
+  let readyResolve;
+  const readyLine = expectedServerReadyLine(publicBaseUrl);
+  const readyPromise = new Promise((resolve) => {
+    readyResolve = resolve;
   });
   serverProcess = spawn(serverInvocation.command, serverInvocation.args, {
     cwd: repoRoot,
@@ -1132,31 +2161,49 @@ async function startServer({ publicBaseUrl, metadataPath, objectDir }) {
   });
   activeChildren.add(serverProcess);
   trackProcessGroup(serverProcess);
-  await recordSignalProbeChild({
+  const serverRecord = {
     type: "server",
     pid: serverProcess.pid,
     port: Number(new URL(publicBaseUrl).port)
-  });
+  };
+  await recordSignalProbeChild(serverRecord);
+  await recordLifecycleProbe(serverRecord);
   throwIfSignalLatched();
   serverProcess.stdout.setEncoding("utf8");
   serverProcess.stderr.setEncoding("utf8");
   serverProcess.stdout.on("data", (chunk) => {
+    childStdout += chunk;
     serverStdout += chunk;
+    if (hasExactLine(childStdout, readyLine)) readyResolve();
   });
   serverProcess.stderr.on("data", (chunk) => {
+    childStderr += chunk;
     serverStderr += chunk;
   });
   serverProcess.once("close", () => {
     activeChildren.delete(serverProcess);
     releaseTrackedProcessGroupIfEmpty(serverProcess);
   });
-  await Promise.race([
-    serverLifecycle.errorPromise,
-    new Promise((resolve) => setImmediate(resolve))
-  ]);
+  try {
+    await waitForServerReadyStdout({
+      publicBaseUrl,
+      readyPromise,
+      serverLifecycle,
+      output: () => ({ stdout: childStdout, stderr: childStderr })
+    });
+  } catch (error) {
+    serverProcessFailure = error;
+    throw error;
+  }
+  serverReadyStdoutObserved = true;
+  return { publicBaseUrl };
 }
 
 async function waitForReady(healthUrl) {
+  assert.ok(
+    serverReadyStdoutObserved,
+    "server health must not be probed before exact child ready stdout"
+  );
   const deadline = Date.now() + 20_000;
   let lastError;
   while (Date.now() < deadline) {
@@ -1186,8 +2233,87 @@ async function waitForReady(healthUrl) {
   );
 }
 
+async function assertServerEntryExists(serverEntryPath) {
+  try {
+    await access(serverEntryPath);
+  } catch (error) {
+    if (error?.code === "ENOENT") {
+      throw new ServerStartupError(`server entry missing before spawn ${serverEntryPath}`, {
+        code: "SERVER_ENTRY_MISSING",
+        cause: error
+      });
+    }
+    throw error;
+  }
+}
+
 function serverDiagnostics() {
-  return `\nserver stdout:\n${redactSensitive(serverStdout, [bootstrapToken]) || "<empty>"}\nserver stderr:\n${redactSensitive(serverStderr, [bootstrapToken]) || "<empty>"}`;
+  return formatServerDiagnostics(serverStdout, serverStderr);
+}
+
+async function waitForServerReadyStdout({ publicBaseUrl, readyPromise, serverLifecycle, output }) {
+  let timeout;
+  try {
+    await Promise.race([
+      readyPromise,
+      serverLifecycle.errorPromise.catch((error) => {
+        throw new ServerStartupError(
+          `server spawn failed before ready stdout (${describeSpawnError(error)})${formatServerDiagnostics(
+            output().stdout,
+            output().stderr
+          )}`,
+          { code: error.code, cause: error }
+        );
+      }),
+      serverLifecycle.closePromise.then((result) => {
+        throw serverStartupErrorFromClose(publicBaseUrl, result, output());
+      }),
+      new Promise((_, reject) => {
+        timeout = setTimeout(() => {
+          reject(
+            new ServerStartupError(
+              `server did not emit exact ready stdout ${JSON.stringify(
+                expectedServerReadyLine(publicBaseUrl)
+              )}${formatServerDiagnostics(output().stdout, output().stderr)}`
+            )
+          );
+        }, 20_000);
+      })
+    ]);
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+function serverStartupErrorFromClose(publicBaseUrl, result, output) {
+  const combinedOutput = `${output.stdout}\n${output.stderr}`;
+  return new ServerStartupError(
+    `server exited before exact ready stdout (${result.code ?? result.signal}) for ${publicBaseUrl}${formatServerDiagnostics(
+      output.stdout,
+      output.stderr
+    )}`,
+    { code: combinedOutput.includes("EADDRINUSE") ? "EADDRINUSE" : undefined }
+  );
+}
+
+function describeSpawnError(error) {
+  return [error.code, error.path ?? error.message].filter(Boolean).join(" ");
+}
+
+function isEaddrInUseServerStartupError(error) {
+  return error instanceof ServerStartupError && error.code === "EADDRINUSE";
+}
+
+function expectedServerReadyLine(publicBaseUrl) {
+  return `PatchPage server listening on http://0.0.0.0:${new URL(publicBaseUrl).port}`;
+}
+
+function hasExactLine(output, expectedLine) {
+  return output.split(/\r?\n/).includes(expectedLine);
+}
+
+function formatServerDiagnostics(stdout, stderr) {
+  return `\nserver stdout:\n${redactSensitive(stdout, [bootstrapToken]) || "<empty>"}\nserver stderr:\n${redactSensitive(stderr, [bootstrapToken]) || "<empty>"}`;
 }
 
 async function runCli(cliPath, args, options) {
@@ -1554,8 +2680,30 @@ function observeSpawnedChild(child) {
   return { errorPromise, closePromise };
 }
 
+function registerSpawnedChild(child, options = {}) {
+  const ownsProcessGroup = options.ownsProcessGroup ?? true;
+  childProcessGroupOwnership.set(child, ownsProcessGroup);
+  const lifecycle = observeSpawnedChild(child);
+  activeChildren.add(child);
+  trackProcessGroup(child);
+  lifecycle.closePromise.finally(() => {
+    activeChildren.delete(child);
+    releaseTrackedProcessGroupIfEmpty(child);
+  });
+  lifecycle.errorPromise.catch(() => {
+    activeChildren.delete(child);
+    releaseTrackedProcessGroupIfEmpty(child);
+  });
+  if (latchedSignal) terminateProcessGroup(child, "SIGTERM");
+  return lifecycle;
+}
+
 function trackProcessGroup(child) {
-  if (process.platform !== "win32" && Number.isInteger(child.pid)) {
+  if (
+    process.platform !== "win32" &&
+    Number.isInteger(child.pid) &&
+    childOwnsProcessGroup(child)
+  ) {
     trackedProcessGroups.add(child.pid);
   }
 }
@@ -1564,10 +2712,15 @@ function releaseTrackedProcessGroupIfEmpty(child) {
   if (
     process.platform !== "win32" &&
     Number.isInteger(child.pid) &&
+    childOwnsProcessGroup(child) &&
     !isProcessGroupAlive(child.pid)
   ) {
     trackedProcessGroups.delete(child.pid);
   }
+}
+
+function childOwnsProcessGroup(child) {
+  return childProcessGroupOwnership.get(child) !== false;
 }
 
 function redactSensitive(value, sensitiveValues) {
@@ -1582,7 +2735,9 @@ function terminateProcessGroup(child, signal) {
   if (child.exitCode !== null || child.signalCode !== null) return;
   if (!Number.isInteger(child.pid)) return;
   try {
-    process.kill(process.platform === "win32" ? child.pid : -child.pid, signal);
+    const targetPid =
+      process.platform === "win32" || !childOwnsProcessGroup(child) ? child.pid : -child.pid;
+    process.kill(targetPid, signal);
   } catch (error) {
     if (error?.code !== "ESRCH") throw error;
   }
