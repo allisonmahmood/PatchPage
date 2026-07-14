@@ -10,6 +10,8 @@
     "test": "turbo run test",
     "test:packed-cli-e2e": "node scripts/packed-cli-e2e.mjs",
     "test:release-workflow": "node scripts/verify-release-workflow.mjs",
+    "test:ghcr-oci": "node scripts/ghcr-oci-release.test.mjs",
+    "test:docker-save": "node scripts/validate-docker-save-artifact.test.mjs",
     "test:server-image": "bash scripts/verify-server-image.sh",
     "lint": "turbo run lint",
     "typecheck": "turbo run typecheck",

@@ -73,6 +73,8 @@ jobs:
           cache: pnpm
       - run: pnpm install --frozen-lockfile
       - run: pnpm test:release-workflow
+      - run: pnpm test:ghcr-oci
+      - run: pnpm test:docker-save
       - run: pnpm lint
       - run: pnpm typecheck
 
@@ -120,6 +122,19 @@ jobs:
             --build-arg "REVISION=$REVISION" \
             -f apps/server/Dockerfile \
             -t "$image" .
+
+          artifact_dir="$RUNNER_TEMP/server-image-artifact"
+          filename="patchpage-server-${VERSION}.tar"
+          mkdir -p "$artifact_dir"
+          docker save "$image" --output "$artifact_dir/$filename"
+          tar_sha256="$(sha256sum "$artifact_dir/$filename" | awk '{print $1}')"
+          image_id="$(docker image inspect --format '{{.Id}}' "$image")"
+          node scripts/validate-docker-save-artifact.mjs \
+            --artifact-dir "$artifact_dir" \
+            --expected-filename "$filename" \
+            --expected-sha256 "$tar_sha256" \
+            --expected-repo-tag "$image" \
+            --expected-config-id "$image_id"
 
           scripts/verify-server-image.sh "$image" "$VERSION" "$REVISION"
 
