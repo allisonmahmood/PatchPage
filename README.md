@@ -80,6 +80,10 @@ See [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md) for Postgres mode and production 
 
 PatchPage is inspired by Postplan, the static HTML draft publishing tool created by Theo. The goal is to preserve that useful agent artifact pattern while building an open-source, self-hostable version with upload-gated publishing.
 
+## Security
+
+Report vulnerabilities privately by following the [security policy](SECURITY.md).
+
 ## License
 
 MIT

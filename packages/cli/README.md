@@ -102,6 +102,10 @@ This package bundles an agent skill at `skills/patchpage/SKILL.md` that teaches 
 
 See the [self-hosting guide](https://github.com/allisonmahmood/PatchPage/blob/main/docs/SELF_HOSTING.md) to deploy your own PatchPage server and mint tokens.
 
+## Security
+
+Report vulnerabilities privately by following the [PatchPage security policy](https://github.com/allisonmahmood/PatchPage/blob/main/SECURITY.md).
+
 ## License
 
 MIT
