@@ -46,7 +46,11 @@ export function getServerConfig(env: NodeJS.ProcessEnv = process.env): ServerCon
     publicBaseUrl: stringValue(env.PATCHPAGE_PUBLIC_BASE_URL) ?? "http://localhost:3000",
     trustProxy: trustProxyValue(env.PATCHPAGE_TRUST_PROXY),
     bootstrapApiToken: stringValue(env.PATCHPAGE_BOOTSTRAP_API_TOKEN),
-    allowAnonymousUploads: boolValue(env.PATCHPAGE_ALLOW_ANONYMOUS_UPLOADS, false),
+    allowAnonymousUploads: strictBoolValue(
+      "PATCHPAGE_ALLOW_ANONYMOUS_UPLOADS",
+      env.PATCHPAGE_ALLOW_ANONYMOUS_UPLOADS,
+      false
+    ),
     maxHtmlBytes: intValue(env.PATCHPAGE_MAX_HTML_BYTES, 512 * 1024),
     protectedApiRateLimitPerMinute: rateLimitPerMinuteValue(
       "PATCHPAGE_PROTECTED_API_RATE_LIMIT_PER_MINUTE",
@@ -270,12 +274,16 @@ function rateLimitPerMinuteValue(
   return parsed;
 }
 
-function boolValue(value: string | undefined, fallback: boolean): boolean {
+function strictBoolValue(
+  name: string,
+  value: string | undefined,
+  fallback: boolean
+): boolean {
   const trimmed = stringValue(value);
   if (!trimmed) return fallback;
-  if (["1", "true", "yes", "on"].includes(trimmed.toLowerCase())) return true;
-  if (["0", "false", "no", "off"].includes(trimmed.toLowerCase())) return false;
-  throw new Error(`Expected a boolean value, received: ${value}`);
+  if (trimmed.toLowerCase() === "true") return true;
+  if (trimmed.toLowerCase() === "false") return false;
+  throw new Error(`${name} must be true or false, received: ${value}`);
 }
 
 function enumValue<const T extends readonly string[]>(

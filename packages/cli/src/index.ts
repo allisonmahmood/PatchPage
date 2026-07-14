@@ -137,11 +137,20 @@ program
   .argument("<file>", "HTML file path")
   .option("--draft <draft-id>", "Update an existing draft only; never creates a draft")
   .option("--new", "Always create a new draft")
+  .option("--anonymous", "Create without credentials; never updates a draft")
   .option("--api-url <url>", "Override the configured PatchPage API base URL")
   .description("Upload or update an HTML draft.")
-  .action(async (file: string, options: { draft?: string; new?: boolean; apiUrl?: string }) => {
+  .action(async (
+    file: string,
+    options: { draft?: string; new?: boolean; anonymous?: boolean; apiUrl?: string }
+  ) => {
     if (options.draft !== undefined && options.new) {
       throw new CliError("--draft and --new cannot be used together.");
+    }
+    if (options.draft !== undefined && options.anonymous) {
+      throw new CliError(
+        "Anonymous uploads are create-only; --draft requires credentials."
+      );
     }
 
     const resolvedFile = path.resolve(file);
@@ -152,19 +161,33 @@ program
       throw new CliError(`HTML failed PatchPage validation:\n- ${validation.errors.join("\n- ")}`);
     }
 
-    const { apiUrl, apiToken } = readAuth(options.apiUrl);
-    const drafts = readDrafts();
-    const knownDraft = drafts.files?.[resolvedFile];
-    const draftId = options.new ? null : (options.draft ?? knownDraft?.draftId ?? null);
+    const { apiUrl, apiToken, anonymous } = readUploadAuth(
+      options.apiUrl,
+      Boolean(options.anonymous)
+    );
+    if (anonymous && options.draft !== undefined) {
+      throw new CliError(
+        "Anonymous uploads are create-only; --draft requires credentials."
+      );
+    }
+    const drafts = anonymous ? null : readDrafts();
+    const knownDraft = drafts?.files?.[resolvedFile];
+    const draftId = anonymous
+      ? null
+      : options.new
+        ? null
+        : (options.draft ?? knownDraft?.draftId ?? null);
     const isUpdateAttempt = draftId !== null;
+
+    const headers: Record<string, string> = {
+      "Content-Type": "application/json",
+      "User-Agent": `patchpage/${VERSION}`
+    };
+    if (apiToken !== null) headers.Authorization = `Bearer ${apiToken}`;
 
     const response = await fetch(`${apiUrl}/api/uploads`, {
       method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "User-Agent": `patchpage/${VERSION}`,
-        Authorization: `Bearer ${apiToken}`
-      },
+      headers,
       body: JSON.stringify({
         html,
         filename: path.basename(resolvedFile),
@@ -194,16 +217,18 @@ program
       throw new CliError(`${body.error || "Upload failed."}${details}${hint}`);
     }
 
-    drafts.files ||= {};
-    drafts.files[resolvedFile] = {
-      draftId: body.draftId,
-      publicUrl: body.publicUrl,
-      latestVersionNumber: body.versionNumber,
-      updatedAt: new Date().toISOString()
-    };
-    writeJson(DRAFTS_PATH, drafts, 0o600);
+    if (drafts) {
+      drafts.files ||= {};
+      drafts.files[resolvedFile] = {
+        draftId: body.draftId,
+        publicUrl: body.publicUrl,
+        latestVersionNumber: body.versionNumber,
+        updatedAt: new Date().toISOString()
+      };
+      writeJson(DRAFTS_PATH, drafts, 0o600);
+    }
 
-    console.log(draftId ? "Updated draft" : "Uploaded draft");
+    console.log(isUpdateAttempt ? "Updated draft" : "Uploaded draft");
     console.log(`URL: ${body.publicUrl}`);
     console.log(`Draft ID: ${body.draftId}`);
     console.log(`Version: ${body.versionNumber}`);
@@ -246,6 +271,59 @@ function readAuth(apiUrlOverride?: string): { apiUrl: string; apiToken: string }
   }
 
   return { apiUrl, apiToken };
+}
+
+function readUploadAuth(
+  apiUrlOverride: string | undefined,
+  forceAnonymous: boolean
+): { apiUrl: string; apiToken: string | null; anonymous: boolean } {
+  const config = readJson<CliConfig>(CONFIG_PATH, {});
+  const apiUrl = normalizeApiUrl(
+    apiUrlOverride || process.env.PATCHPAGE_API_URL || config.apiUrl || DEFAULT_API_URL
+  );
+  if (forceAnonymous) return { apiUrl, apiToken: null, anonymous: true };
+
+  if (process.env.PATCHPAGE_API_TOKEN !== undefined) {
+    return { apiUrl, apiToken: process.env.PATCHPAGE_API_TOKEN, anonymous: false };
+  }
+  const credentials = readUploadCredentials();
+  if (credentials.apiToken !== undefined) {
+    return { apiUrl, apiToken: credentials.apiToken, anonymous: false };
+  }
+  return { apiUrl, apiToken: null, anonymous: true };
+}
+
+function readUploadCredentials(): Credentials {
+  let serialized: string;
+  try {
+    serialized = readFileSync(CREDENTIALS_PATH, "utf8");
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return {};
+    throw new CliError(
+      "Stored credentials could not be read. Check permissions or run: patchpage auth set to replace them."
+    );
+  }
+
+  let value: unknown;
+  try {
+    value = JSON.parse(serialized);
+  } catch {
+    throw new CliError(
+      "Stored credentials are invalid. Run: patchpage auth set to replace them."
+    );
+  }
+
+  const apiToken =
+    value && typeof value === "object" && !Array.isArray(value)
+      ? (value as Record<string, unknown>).apiToken
+      : undefined;
+  if (typeof apiToken !== "string" || apiToken.length === 0) {
+    throw new CliError(
+      "Stored credentials are invalid. Run: patchpage auth set to replace them."
+    );
+  }
+
+  return { apiToken };
 }
 
 function defaultHostHint(apiUrl: string): string {

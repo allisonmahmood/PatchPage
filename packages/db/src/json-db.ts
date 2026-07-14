@@ -13,11 +13,18 @@ import {
 import path from "node:path";
 import { TextDecoder, types as utilTypes } from "node:util";
 import { newInternalId, sha256 } from "@patchpage/core";
+import {
+  ANONYMOUS_INTERNAL_REVOKED_AT,
+  ANONYMOUS_INTERNAL_TOKEN_HASH,
+  ANONYMOUS_UPLOAD_PRINCIPAL
+} from "./internal-principals.js";
 import { UploadTargetError } from "./types.js";
 import type {
+  AnonymousUploadPrincipal,
   ApiTokenAuth,
   CreateApiTokenInput,
   DraftRecord,
+  DraftModerationOptions,
   DraftVersionLookup,
   DraftVersionRecord,
   PatchPageDb,
@@ -83,9 +90,28 @@ export class JsonFilePatchPageDb implements PatchPageDb {
 
   async initialize(bootstrapApiToken: string | null): Promise<void> {
     await this.mutateState((state) => {
+      ensureAnonymousUploadPrincipal(state);
       ensureBootstrapState(state, bootstrapApiToken);
       return { value: undefined, changed: true };
     });
+  }
+
+  async getAnonymousUploadPrincipal(): Promise<AnonymousUploadPrincipal> {
+    const state = await this.readState();
+    const account = state.accounts.find(
+      (row) => row.id === ANONYMOUS_UPLOAD_PRINCIPAL.accountId
+    );
+    const auditActor = state.apiTokens.find(
+      (row) =>
+        row.id === ANONYMOUS_UPLOAD_PRINCIPAL.apiTokenId &&
+        row.accountId === ANONYMOUS_UPLOAD_PRINCIPAL.accountId &&
+        row.tokenHash === ANONYMOUS_INTERNAL_TOKEN_HASH &&
+        row.revokedAt !== null
+    );
+    if (!account || !auditActor) {
+      throw new Error("Anonymous upload principal is not initialized.");
+    }
+    return { ...ANONYMOUS_UPLOAD_PRINCIPAL };
   }
 
   async findApiTokenByToken(token: string): Promise<ApiTokenAuth | null> {
@@ -235,11 +261,21 @@ export class JsonFilePatchPageDb implements PatchPageDb {
     return { draft, version };
   }
 
-  async disableDraft(draftId: string, accountId: string, reason: string): Promise<boolean> {
+  async disableDraft(
+    draftId: string,
+    accountId: string,
+    reason: string,
+    options: DraftModerationOptions = {}
+  ): Promise<boolean> {
     return this.mutateState((state) => {
       const draft =
         state.drafts.find(
-          (row) => row.id === draftId && row.accountId === accountId && !row.deletedAt
+          (row) =>
+            row.id === draftId &&
+            (row.accountId === accountId ||
+              (options.canModerateAnonymous &&
+                row.accountId === ANONYMOUS_UPLOAD_PRINCIPAL.accountId)) &&
+            !row.deletedAt
         ) || null;
       if (!draft) return { value: false, changed: false };
 
@@ -250,11 +286,20 @@ export class JsonFilePatchPageDb implements PatchPageDb {
     });
   }
 
-  async deleteDraft(draftId: string, accountId: string): Promise<boolean> {
+  async deleteDraft(
+    draftId: string,
+    accountId: string,
+    options: DraftModerationOptions = {}
+  ): Promise<boolean> {
     return this.mutateState((state) => {
       const draft =
         state.drafts.find(
-          (row) => row.id === draftId && row.accountId === accountId && !row.deletedAt
+          (row) =>
+            row.id === draftId &&
+            (row.accountId === accountId ||
+              (options.canModerateAnonymous &&
+                row.accountId === ANONYMOUS_UPLOAD_PRINCIPAL.accountId)) &&
+            !row.deletedAt
         ) || null;
       if (!draft) return { value: false, changed: false };
 
@@ -822,6 +867,46 @@ function ensureBootstrapState(state: JsonDbState, bootstrapApiToken: string | nu
       createdAt: now,
       lastUsedAt: null,
       revokedAt: null
+    });
+  }
+}
+
+function ensureAnonymousUploadPrincipal(state: JsonDbState): void {
+  const now = new Date().toISOString();
+  const account = state.accounts.find(
+    (row) => row.id === ANONYMOUS_UPLOAD_PRINCIPAL.accountId
+  );
+  if (account) {
+    account.name = "Anonymous Uploads";
+    account.updatedAt = now;
+  } else {
+    state.accounts.push({
+      id: ANONYMOUS_UPLOAD_PRINCIPAL.accountId,
+      name: "Anonymous Uploads",
+      createdAt: now,
+      updatedAt: now
+    });
+  }
+
+  const auditActor = state.apiTokens.find(
+    (row) => row.id === ANONYMOUS_UPLOAD_PRINCIPAL.apiTokenId
+  );
+  if (auditActor) {
+    auditActor.accountId = ANONYMOUS_UPLOAD_PRINCIPAL.accountId;
+    auditActor.name = "Anonymous Upload Audit Actor";
+    auditActor.tokenHash = ANONYMOUS_INTERNAL_TOKEN_HASH;
+    auditActor.scopes = [];
+    auditActor.revokedAt = ANONYMOUS_INTERNAL_REVOKED_AT;
+  } else {
+    state.apiTokens.push({
+      id: ANONYMOUS_UPLOAD_PRINCIPAL.apiTokenId,
+      accountId: ANONYMOUS_UPLOAD_PRINCIPAL.accountId,
+      name: "Anonymous Upload Audit Actor",
+      tokenHash: ANONYMOUS_INTERNAL_TOKEN_HASH,
+      scopes: [],
+      createdAt: now,
+      lastUsedAt: null,
+      revokedAt: ANONYMOUS_INTERNAL_REVOKED_AT
     });
   }
 }

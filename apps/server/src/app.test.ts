@@ -159,8 +159,250 @@ describe("PatchPage server", () => {
     await db.close();
   });
 
-  it("rejects bad upload credentials before parsing attacker-controlled JSON bodies", async () => {
-    const config = testConfig();
+  it("creates a server-identified anonymous draft only when explicitly enabled", async () => {
+    const config = { ...testConfig(), allowAnonymousUploads: true };
+    const db = new JsonFilePatchPageDb(path.join(tempDir, "anonymous-create-db.json"));
+    await db.initialize(null);
+    const principal = await db.getAnonymousUploadPrincipal();
+    const storage = new FileSystemHtmlStorage(
+      path.join(tempDir, "anonymous-create-drafts")
+    );
+    const app = createApp({ config, db, storage });
+
+    const upload = await app.inject({
+      method: "POST",
+      url: "/api/uploads",
+      payload: {
+        html: "<!doctype html><html><head><title>Anonymous</title></head><body>anonymous-marker</body></html>"
+      }
+    });
+
+    expect(upload.statusCode).toBe(201);
+    const body = upload.json() as { draftId: string; versionNumber: number };
+    expect(body.draftId).toMatch(/^[a-z0-9]{12}$/);
+    expect(body.versionNumber).toBe(1);
+    const lookup = await db.findDraftVersion(body.draftId);
+    expect(lookup.draft?.accountId).toBe(principal.accountId);
+    expect(lookup.version?.createdByApiTokenId).toBe(principal.apiTokenId);
+
+    await app.close();
+    await db.close();
+  });
+
+  it("requires anonymous create requests to omit the draftId property", async () => {
+    const config = { ...testConfig(), allowAnonymousUploads: true };
+    const db = new JsonFilePatchPageDb(path.join(tempDir, "anonymous-intent-db.json"));
+    await db.initialize(null);
+    const storage = new FileSystemHtmlStorage(
+      path.join(tempDir, "anonymous-intent-drafts")
+    );
+    const app = createApp({ config, db, storage });
+    const html =
+      "<!doctype html><html><head><title>Anonymous intent</title></head><body></body></html>";
+
+    for (const draftId of [null, "abcdefghijkl"]) {
+      const upload = await app.inject({
+        method: "POST",
+        url: "/api/uploads",
+        payload: { html, draftId }
+      });
+
+      expect(upload.statusCode).toBe(400);
+      expect(upload.json()).toEqual({
+        ok: false,
+        error: "Anonymous uploads must omit draftId."
+      });
+    }
+
+    await app.close();
+    await db.close();
+  });
+
+  it("does not admit an absent credential on a non-create upload method", async () => {
+    const config = { ...testConfig(), allowAnonymousUploads: true };
+    const db = new JsonFilePatchPageDb(path.join(tempDir, "anonymous-method-db.json"));
+    await db.initialize(null);
+    const storage = new FileSystemHtmlStorage(
+      path.join(tempDir, "anonymous-method-drafts")
+    );
+    const app = createApp({ config, db, storage });
+
+    const response = await app.inject({
+      method: "PUT",
+      url: "/api/uploads",
+      headers: { "content-type": "application/json" },
+      payload: `{"html":"${"x".repeat(2 * 1024 * 1024)}`
+    });
+
+    expect(response.statusCode).toBe(401);
+    expect(response.json()).toEqual({
+      ok: false,
+      error: "Missing or invalid API token."
+    });
+
+    await app.close();
+    await db.close();
+  });
+
+  it("keeps unmatched upload-like POST targets authenticated and out of anonymous quota", async () => {
+    const config = { ...testConfig(), allowAnonymousUploads: true };
+    const db = new JsonFilePatchPageDb(path.join(tempDir, "anonymous-route-db.json"));
+    await db.initialize(null);
+    const originalGetPrincipal = db.getAnonymousUploadPrincipal.bind(db);
+    let principalLookups = 0;
+    db.getAnonymousUploadPrincipal = async () => {
+      principalLookups += 1;
+      return originalGetPrincipal();
+    };
+    const storage = new FileSystemHtmlStorage(
+      path.join(tempDir, "anonymous-route-drafts")
+    );
+    const app = createApp({ config, db, storage });
+
+    try {
+      for (const target of uploadLikeApiTargets.slice(0, 5)) {
+        const response = target.rawHttp
+          ? await rawHttpRequest(app, target.url)
+          : await app.inject({
+              method: "POST",
+              url: target.url,
+              payload: {}
+            });
+        expect(response.statusCode, target.label).toBe(401);
+        expect(response.json(), target.label).toEqual({
+          ok: false,
+          error: "Missing or invalid API token."
+        });
+      }
+      expect(principalLookups).toBe(0);
+
+      for (let attempt = 0; attempt < 5; attempt += 1) {
+        const response = await app.inject({
+          method: "POST",
+          url: "/api/uploads",
+          payload: {}
+        });
+        expect(response.statusCode).toBe(400);
+      }
+      expect(principalLookups).toBe(5);
+
+      const limited = await app.inject({
+        method: "POST",
+        url: "/api/uploads",
+        payload: {}
+      });
+      expect(limited.statusCode).toBe(429);
+      expect(principalLookups).toBe(5);
+    } finally {
+      await app.close();
+      await db.close();
+    }
+  });
+
+  it("allows admin credentials alone to moderate anonymous drafts", async () => {
+    const config = { ...testConfig(), allowAnonymousUploads: true };
+    const db = new JsonFilePatchPageDb(path.join(tempDir, "anonymous-moderation-db.json"));
+    await db.initialize("admin-token");
+    const admin = await db.findApiTokenByToken("admin-token");
+    if (!admin) throw new Error("Expected bootstrap authentication.");
+    await db.createApiToken({
+      accountId: admin.accountId,
+      name: "Ordinary token",
+      token: "ordinary-token",
+      scopes: ["upload"]
+    });
+    const storage = new FileSystemHtmlStorage(
+      path.join(tempDir, "anonymous-moderation-drafts")
+    );
+    const app = createApp({ config, db, storage });
+    const createAnonymous = () =>
+      app.inject({
+        method: "POST",
+        url: "/api/uploads",
+        payload: {
+          html: "<!doctype html><html><head><title>Moderate me</title></head><body></body></html>"
+        }
+      });
+
+    try {
+      const disableTarget = await createAnonymous();
+      const disableDraftId = (disableTarget.json() as { draftId: string }).draftId;
+      for (const request of [
+        { method: "GET" as const, url: "/api/me" },
+        { method: "GET" as const, url: "/api/drafts" },
+        {
+          method: "POST" as const,
+          url: `/api/drafts/${disableDraftId}/disable`,
+          payload: { reason: "anonymous attempt" }
+        },
+        { method: "DELETE" as const, url: `/api/drafts/${disableDraftId}` }
+      ]) {
+        const anonymousOperation = await app.inject(request);
+        expect(anonymousOperation.statusCode).toBe(401);
+      }
+
+      const ordinaryDisable = await app.inject({
+        method: "POST",
+        url: `/api/drafts/${disableDraftId}/disable`,
+        headers: { authorization: "Bearer ordinary-token" },
+        payload: { reason: "not an admin" }
+      });
+      expect(ordinaryDisable.statusCode).toBe(404);
+
+      const adminDisable = await app.inject({
+        method: "POST",
+        url: `/api/drafts/${disableDraftId}/disable`,
+        headers: { authorization: "Bearer admin-token" },
+        payload: { reason: "admin policy" }
+      });
+      expect(adminDisable.statusCode).toBe(200);
+
+      const deleteTarget = await createAnonymous();
+      const deleteDraftId = (deleteTarget.json() as { draftId: string }).draftId;
+      const ordinaryDelete = await app.inject({
+        method: "DELETE",
+        url: `/api/drafts/${deleteDraftId}`,
+        headers: { authorization: "Bearer ordinary-token" }
+      });
+      expect(ordinaryDelete.statusCode).toBe(404);
+
+      const adminDelete = await app.inject({
+        method: "DELETE",
+        url: `/api/drafts/${deleteDraftId}`,
+        headers: { authorization: "Bearer admin-token" }
+      });
+      expect(adminDelete.statusCode).toBe(200);
+
+      const foreignDraftId = "zzzzzzzzzzzz";
+      await db.recordUpload({
+        intent: "create",
+        draftId: foreignDraftId,
+        versionId: "ver_foreign_owner",
+        accountId: "acct_foreign",
+        apiTokenId: admin.id,
+        title: "Foreign ordinary draft",
+        objectKey: `drafts/${foreignDraftId}/versions/ver_foreign_owner.html`,
+        contentHash: "sha256:foreign",
+        fileSize: 1,
+        filename: "foreign.html",
+        metadata: {},
+        sourceIp: null,
+        userAgent: "vitest"
+      });
+      const crossAccountAdmin = await app.inject({
+        method: "DELETE",
+        url: `/api/drafts/${foreignDraftId}`,
+        headers: { authorization: "Bearer admin-token" }
+      });
+      expect(crossAccountAdmin.statusCode).toBe(404);
+    } finally {
+      await app.close();
+      await db.close();
+    }
+  });
+
+  it("does not downgrade present bad credentials when anonymous uploads are enabled", async () => {
+    const config = { ...testConfig(), allowAnonymousUploads: true };
     const dbFile = path.join(tempDir, "pre-body-auth-db.json");
     const db = new JsonFilePatchPageDb(dbFile);
     await db.initialize("admin-token");
@@ -186,12 +428,6 @@ describe("PatchPage server", () => {
 
     try {
       const cases = [
-        {
-          label: "missing",
-          authorization: undefined,
-          statusCode: 401,
-          error: "Missing or invalid API token."
-        },
         {
           label: "empty",
           authorization: "",
@@ -249,6 +485,15 @@ describe("PatchPage server", () => {
           error: testCase.error
         });
       }
+
+      const anonymousAfterBadCredentials = await app.inject({
+        method: "POST",
+        url: "/api/uploads",
+        payload: {
+          html: "<!doctype html><html><head><title>Anonymous quota remains</title></head><body></body></html>"
+        }
+      });
+      expect(anonymousAfterBadCredentials.statusCode).toBe(201);
     } finally {
       await app.close();
       await db.close();
@@ -919,6 +1164,91 @@ describe("PatchPage server", () => {
         payload: {}
       });
       expect(reset.statusCode).toBe(400);
+    } finally {
+      await app.close();
+      await db.close();
+    }
+  });
+
+  it("composes protected, anonymous-create, and token upload limits independently", async () => {
+    let now = 1_000;
+    const config = {
+      ...testConfig(),
+      allowAnonymousUploads: true,
+      protectedApiRateLimitPerMinute: 8,
+      authenticatedUploadRateLimitPerMinute: 1,
+      anonymousCreateRateLimitPerMinute: 5
+    };
+    const db = new JsonFilePatchPageDb(path.join(tempDir, "anonymous-limit-db.json"));
+    await db.initialize("upload-token");
+    const storage = new FileSystemHtmlStorage(
+      path.join(tempDir, "anonymous-limit-drafts")
+    );
+    const app = createApp({ config, db, storage, clock: () => now });
+
+    try {
+      for (let attempt = 0; attempt < 5; attempt += 1) {
+        const response = await app.inject({
+          method: "POST",
+          url: "/api/uploads",
+          payload: {}
+        });
+        expect(response.statusCode).toBe(400);
+      }
+
+      const anonymousLimited = await app.inject({
+        method: "POST",
+        url: "/api/uploads",
+        headers: { "content-type": "application/json" },
+        payload: `{"html":"${"x".repeat(2 * 1024 * 1024)}`
+      });
+      expect(anonymousLimited.statusCode).toBe(429);
+      expect(anonymousLimited.headers["retry-after"]).toBe("60");
+
+      const authenticated = await app.inject({
+        method: "POST",
+        url: "/api/uploads",
+        headers: { authorization: "Bearer upload-token" },
+        payload: {
+          html: "<!doctype html><html><head><title>Authenticated quota</title></head><body></body></html>"
+        }
+      });
+      expect(authenticated.statusCode).toBe(201);
+
+      const tokenLimited = await app.inject({
+        method: "POST",
+        url: "/api/uploads",
+        headers: { authorization: "Bearer upload-token" },
+        payload: {}
+      });
+      expect(tokenLimited.statusCode).toBe(429);
+
+      const protectedLimited = await app.inject({
+        method: "GET",
+        url: "/api/me",
+        headers: { authorization: "Bearer upload-token" }
+      });
+      expect(protectedLimited.statusCode).toBe(429);
+
+      now = 61_000;
+      const resetAnonymous = await app.inject({
+        method: "POST",
+        url: "/api/uploads",
+        payload: {
+          html: "<!doctype html><html><head><title>Reset anonymous</title></head><body></body></html>"
+        }
+      });
+      expect(resetAnonymous.statusCode).toBe(201);
+
+      const resetAuthenticated = await app.inject({
+        method: "POST",
+        url: "/api/uploads",
+        headers: { authorization: "Bearer upload-token" },
+        payload: {
+          html: "<!doctype html><html><head><title>Reset token</title></head><body></body></html>"
+        }
+      });
+      expect(resetAuthenticated.statusCode).toBe(201);
     } finally {
       await app.close();
       await db.close();

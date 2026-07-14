@@ -8,7 +8,7 @@ Terraform creates:
 - external platform ingress with insecure HTTP disabled;
 - the Azure Container Registry and the app's managed identity and role assignments;
 - the Blob Storage account and private container, plus the PostgreSQL server/database; and
-- generated application secrets and the Container App environment variables, including `PATCHPAGE_PUBLIC_BASE_URL`, the rate-limit settings, and, when configured, `PATCHPAGE_TRUST_PROXY`.
+- generated application secrets and the Container App environment variables, including `PATCHPAGE_PUBLIC_BASE_URL`, `PATCHPAGE_ALLOW_ANONYMOUS_UPLOADS`, the rate-limit settings, and, when configured, `PATCHPAGE_TRUST_PROXY`.
 
 Terraform does **not** create or manage the remote-state resources, container image build, DNS zone or records, Container App custom hostname, managed certificate, or certificate binding. Those steps are deliberately manual and provider-neutral below. Terraform creates the initial Container App ingress and then ignores later changes to the whole ingress block so an apply cannot overwrite the CLI-managed hostname and certificate binding. Resource postconditions and the live check below fail closed if any ignored security or routing invariant drifts. Any intentional ingress change therefore remains HITL: update the lifecycle rule and restore the manual binding as one coordinated operation.
 
@@ -166,6 +166,7 @@ cp terraform.tfvars.example terraform.tfvars
 - Replace the deliberately invalid `public_base_url` with the deployer's real origin. It must be HTTPS with a public DNS hostname and no credentials, port, path, query, fragment, or trailing slash.
 - Keep `trust_proxy = null` for the initial deployment. This omits `PATCHPAGE_TRUST_PROXY` so forwarded client-address headers remain untrusted. Enable it only after completing [the client-IP HITL verification](#4-verify-and-enable-client-ip-attribution).
 - Keep `max_html_bytes = 524288` unless you intentionally change the maximum accepted HTML artifact size.
+- Keep `allow_anonymous_uploads = false` unless this self-hosted deployment intentionally accepts create-only requests without credentials. Terraform converts the boolean to `PATCHPAGE_ALLOW_ANONYMOUS_UPLOADS`; changing it does not enable anonymous uploads on any maintainer-hosted environment.
 - Keep the rate-limit defaults unless the deployment needs a different local safety envelope: `protected_api_rate_limit_per_minute = 60`, `authenticated_upload_rate_limit_per_minute = 20`, and `anonymous_create_rate_limit_per_minute = 5`. Each value must be an integer from `1` through `10000`; Terraform wires them to the matching `PATCHPAGE_*_RATE_LIMIT_PER_MINUTE` Container App environment variables.
 
 Terraform rejects the maintainer's domains, localhost/private-style names, reserved example names, and common placeholder values. It also rejects unsafe or malformed trusted-proxy values. The first targeted apply still requires a valid deployer-owned origin even though it only creates the registry.
@@ -1062,5 +1063,5 @@ This verification remains an operator responsibility after deploy. Repeat it whe
 - Terraform state contains generated secrets. Keep it in the private Azure state storage account.
 - The Blob container is private; public draft viewing goes through the PatchPage server.
 - The server uses managed identity for Blob access in production.
-- Uploads require API tokens. Anonymous uploads remain disabled.
+- Uploads require API tokens by default. Anonymous creation remains disabled unless this deployment explicitly sets `allow_anonymous_uploads = true`.
 - Keep `trust_proxy = null` until the live forwarding chain has passed the HITL verification above; an incorrect trust rule permits spoofed audit attribution.

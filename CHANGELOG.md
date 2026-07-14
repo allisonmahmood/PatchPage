@@ -13,6 +13,8 @@ All notable changes to PatchPage are documented in this file. The format is base
 - Release automation for the intended supported
   `ghcr.io/allisonmahmood/patchpage-server` image, with immutable version and commit tags,
   a moving `latest` tag, a non-root runtime, and `/data` persistence.
+- Opt-in anonymous draft creation for self-hosted servers and the CLI, disabled by default,
+  create-only, independently rate limited, and backed by a non-authenticating audit principal.
 
 ### Changed
 

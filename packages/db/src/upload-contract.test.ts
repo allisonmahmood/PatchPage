@@ -33,6 +33,88 @@ function describeUploadContract(
   const suite = enabled ? describe : describe.skip;
 
   suite(`${driverName} draft upload contract`, () => {
+    it("initializes a non-authenticating anonymous upload principal idempotently", async () => {
+      const harness = await createHarness();
+      const draftId = newDraftId();
+
+      try {
+        await harness.db.initialize(null);
+        await harness.db.initialize(null);
+        const principal = await harness.db.getAnonymousUploadPrincipal();
+
+        expect(principal).toEqual({
+          accountId: "acct_anonymous",
+          apiTokenId: "tok_anonymous"
+        });
+        for (const unusableCredential of [
+          principal.apiTokenId,
+          principal.accountId,
+          "anonymous"
+        ]) {
+          await expect(
+            harness.db.findApiTokenByToken(unusableCredential)
+          ).resolves.toBeNull();
+        }
+
+        await harness.db.recordUpload(
+          uploadInput("create", draftId, harness.auth, {
+            accountId: principal.accountId,
+            apiTokenId: principal.apiTokenId
+          })
+        );
+        const lookup = await harness.db.findDraftVersion(draftId);
+        expect(lookup.draft?.accountId).toBe(principal.accountId);
+        expect(lookup.version?.createdByApiTokenId).toBe(principal.apiTokenId);
+      } finally {
+        await harness.close();
+      }
+    });
+
+    it("allows only explicitly authorized moderation of anonymous drafts", async () => {
+      const harness = await createHarness();
+      const principal = await harness.db.getAnonymousUploadPrincipal();
+      const disabledDraftId = newDraftId();
+      const deletedDraftId = newDraftId();
+
+      try {
+        for (const draftId of [disabledDraftId, deletedDraftId]) {
+          await harness.db.recordUpload(
+            uploadInput("create", draftId, harness.auth, {
+              accountId: principal.accountId,
+              apiTokenId: principal.apiTokenId
+            })
+          );
+        }
+
+        await expect(
+          harness.db.disableDraft(
+            disabledDraftId,
+            harness.auth.accountId,
+            "ordinary token"
+          )
+        ).resolves.toBe(false);
+        await expect(
+          harness.db.deleteDraft(deletedDraftId, harness.auth.accountId)
+        ).resolves.toBe(false);
+
+        await expect(
+          harness.db.disableDraft(
+            disabledDraftId,
+            harness.auth.accountId,
+            "admin policy",
+            { canModerateAnonymous: true }
+          )
+        ).resolves.toBe(true);
+        await expect(
+          harness.db.deleteDraft(deletedDraftId, harness.auth.accountId, {
+            canModerateAnonymous: true
+          })
+        ).resolves.toBe(true);
+      } finally {
+        await harness.close();
+      }
+    });
+
     it("rejects an update for an unknown draft without creating it", async () => {
       const harness = await createHarness();
       const draftId = newDraftId();

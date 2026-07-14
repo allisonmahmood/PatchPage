@@ -8,7 +8,7 @@ locals {
     NODE_ENV                                             = "production"
     PORT                                                 = "3000"
     PATCHPAGE_PUBLIC_BASE_URL                            = var.public_base_url
-    PATCHPAGE_ALLOW_ANONYMOUS_UPLOADS                    = "false"
+    PATCHPAGE_ALLOW_ANONYMOUS_UPLOADS                    = tostring(var.allow_anonymous_uploads)
     PATCHPAGE_MAX_HTML_BYTES                             = tostring(var.max_html_bytes)
     PATCHPAGE_PROTECTED_API_RATE_LIMIT_PER_MINUTE        = tostring(var.protected_api_rate_limit_per_minute)
     PATCHPAGE_AUTHENTICATED_UPLOAD_RATE_LIMIT_PER_MINUTE = tostring(var.authenticated_upload_rate_limit_per_minute)

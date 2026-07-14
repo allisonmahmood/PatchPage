@@ -1,3 +1,9 @@
+import {
+  ANONYMOUS_INTERNAL_REVOKED_AT,
+  ANONYMOUS_INTERNAL_TOKEN_HASH,
+  ANONYMOUS_UPLOAD_PRINCIPAL
+} from "./internal-principals.js";
+
 export const POSTGRES_SCHEMA_SQL = `
 CREATE TABLE IF NOT EXISTS accounts (
   id TEXT PRIMARY KEY,
@@ -64,4 +70,26 @@ CREATE TABLE IF NOT EXISTS upload_events (
 
 CREATE INDEX IF NOT EXISTS draft_versions_draft_id_idx ON draft_versions(draft_id);
 CREATE INDEX IF NOT EXISTS upload_events_draft_id_idx ON upload_events(draft_id);
+
+INSERT INTO accounts (id, name)
+VALUES ('${ANONYMOUS_UPLOAD_PRINCIPAL.accountId}', 'Anonymous Uploads')
+ON CONFLICT (id) DO UPDATE
+SET name = EXCLUDED.name,
+    updated_at = now();
+
+INSERT INTO api_tokens (id, account_id, name, token_hash, scopes, revoked_at)
+VALUES (
+  '${ANONYMOUS_UPLOAD_PRINCIPAL.apiTokenId}',
+  '${ANONYMOUS_UPLOAD_PRINCIPAL.accountId}',
+  'Anonymous Upload Audit Actor',
+  '${ANONYMOUS_INTERNAL_TOKEN_HASH}',
+  '[]'::jsonb,
+  '${ANONYMOUS_INTERNAL_REVOKED_AT}'::timestamptz
+)
+ON CONFLICT (id) DO UPDATE
+SET account_id = EXCLUDED.account_id,
+    name = EXCLUDED.name,
+    token_hash = EXCLUDED.token_hash,
+    scopes = EXCLUDED.scopes,
+    revoked_at = EXCLUDED.revoked_at;
 `;
