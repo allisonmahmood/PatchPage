@@ -1,6 +1,6 @@
 {
   "name": "patchpage",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Upload static HTML drafts to PatchPage.",
   "type": "module",
   "license": "MIT",
@@ -12,14 +12,28 @@
   },
   "homepage": "https://github.com/allisonmahmood/PatchPage#readme",
   "bugs": "https://github.com/allisonmahmood/PatchPage/issues",
-  "keywords": ["html", "static-html", "drafts", "preview", "publish", "cli", "agents", "agent-skills", "claude"],
+  "keywords": [
+    "html",
+    "static-html",
+    "drafts",
+    "preview",
+    "publish",
+    "cli",
+    "agents",
+    "agent-skills",
+    "claude"
+  ],
   "engines": {
     "node": ">=22"
   },
   "bin": {
     "patchpage": "./dist/index.js"
   },
-  "files": ["dist", "README.md", "skills"],
+  "files": [
+    "dist",
+    "README.md",
+    "skills"
+  ],
   "publishConfig": {
     "provenance": true
   },
