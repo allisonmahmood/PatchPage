@@ -306,6 +306,10 @@ test_deploy_resources() {
           'server_image = "acrpatchpageabc123.azurecr.io/patchpage-server:d761896"' \
           "$image_vars" ||
           fail "deployment wrote an unexpected server image reference"
+        grep -Fqx \
+          'az acr build --registry acrpatchpageabc123 --image patchpage-server:d761896 --file ../../apps/server/Dockerfile ../..' \
+          "$TMP_DIR/deploy-$scenario.log" ||
+          fail "deployment used unexpected ACR build arguments"
         grep -Fqx completed "$TMP_DIR/deploy-$scenario.log" ||
           fail "successful deployment did not complete"
         ;;
