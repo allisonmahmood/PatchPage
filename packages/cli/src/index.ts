@@ -170,8 +170,8 @@ program
         "Anonymous uploads are create-only; --draft requires credentials."
       );
     }
-    const drafts = readDrafts();
-    const knownDraft = drafts.files?.[resolvedFile];
+    const drafts = anonymous ? null : readDrafts();
+    const knownDraft = drafts?.files?.[resolvedFile];
     const draftId = anonymous
       ? null
       : options.new
@@ -217,7 +217,7 @@ program
       throw new CliError(`${body.error || "Upload failed."}${details}${hint}`);
     }
 
-    if (!anonymous) {
+    if (drafts) {
       drafts.files ||= {};
       drafts.files[resolvedFile] = {
         draftId: body.draftId,
@@ -286,11 +286,44 @@ function readUploadAuth(
   if (process.env.PATCHPAGE_API_TOKEN !== undefined) {
     return { apiUrl, apiToken: process.env.PATCHPAGE_API_TOKEN, anonymous: false };
   }
-  const credentials = readJson<Credentials>(CREDENTIALS_PATH, {});
+  const credentials = readUploadCredentials();
   if (credentials.apiToken !== undefined) {
     return { apiUrl, apiToken: credentials.apiToken, anonymous: false };
   }
   return { apiUrl, apiToken: null, anonymous: true };
+}
+
+function readUploadCredentials(): Credentials {
+  let serialized: string;
+  try {
+    serialized = readFileSync(CREDENTIALS_PATH, "utf8");
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return {};
+    throw new CliError(
+      "Stored credentials could not be read. Check permissions or run: patchpage auth set to replace them."
+    );
+  }
+
+  let value: unknown;
+  try {
+    value = JSON.parse(serialized);
+  } catch {
+    throw new CliError(
+      "Stored credentials are invalid. Run: patchpage auth set to replace them."
+    );
+  }
+
+  const apiToken =
+    value && typeof value === "object" && !Array.isArray(value)
+      ? (value as Record<string, unknown>).apiToken
+      : undefined;
+  if (typeof apiToken !== "string" || apiToken.length === 0) {
+    throw new CliError(
+      "Stored credentials are invalid. Run: patchpage auth set to replace them."
+    );
+  }
+
+  return { apiToken };
 }
 
 function defaultHostHint(apiUrl: string): string {

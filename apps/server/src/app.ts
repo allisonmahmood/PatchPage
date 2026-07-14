@@ -373,6 +373,7 @@ function protectedApiPrefixGuard(
       authState.kind === "missing" &&
       allowAnonymousUploads &&
       targetPolicy.anonymousCreate &&
+      !request.is404 &&
       request.method === "POST"
     ) {
       const routingErrorStatus = (request.raw as MarkedIncomingMessage)[
@@ -391,9 +392,6 @@ function protectedApiPrefixGuard(
       }
       request.anonymousUploadPrincipal = await db.getAnonymousUploadPrincipal();
 
-      if (request.is404) {
-        sendApiNotFound(reply);
-      }
       return;
     }
 

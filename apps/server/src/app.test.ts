@@ -244,6 +244,61 @@ describe("PatchPage server", () => {
     await db.close();
   });
 
+  it("keeps unmatched upload-like POST targets authenticated and out of anonymous quota", async () => {
+    const config = { ...testConfig(), allowAnonymousUploads: true };
+    const db = new JsonFilePatchPageDb(path.join(tempDir, "anonymous-route-db.json"));
+    await db.initialize(null);
+    const originalGetPrincipal = db.getAnonymousUploadPrincipal.bind(db);
+    let principalLookups = 0;
+    db.getAnonymousUploadPrincipal = async () => {
+      principalLookups += 1;
+      return originalGetPrincipal();
+    };
+    const storage = new FileSystemHtmlStorage(
+      path.join(tempDir, "anonymous-route-drafts")
+    );
+    const app = createApp({ config, db, storage });
+
+    try {
+      for (const target of uploadLikeApiTargets.slice(0, 5)) {
+        const response = target.rawHttp
+          ? await rawHttpRequest(app, target.url)
+          : await app.inject({
+              method: "POST",
+              url: target.url,
+              payload: {}
+            });
+        expect(response.statusCode, target.label).toBe(401);
+        expect(response.json(), target.label).toEqual({
+          ok: false,
+          error: "Missing or invalid API token."
+        });
+      }
+      expect(principalLookups).toBe(0);
+
+      for (let attempt = 0; attempt < 5; attempt += 1) {
+        const response = await app.inject({
+          method: "POST",
+          url: "/api/uploads",
+          payload: {}
+        });
+        expect(response.statusCode).toBe(400);
+      }
+      expect(principalLookups).toBe(5);
+
+      const limited = await app.inject({
+        method: "POST",
+        url: "/api/uploads",
+        payload: {}
+      });
+      expect(limited.statusCode).toBe(429);
+      expect(principalLookups).toBe(5);
+    } finally {
+      await app.close();
+      await db.close();
+    }
+  });
+
   it("allows admin credentials alone to moderate anonymous drafts", async () => {
     const config = { ...testConfig(), allowAnonymousUploads: true };
     const db = new JsonFilePatchPageDb(path.join(tempDir, "anonymous-moderation-db.json"));

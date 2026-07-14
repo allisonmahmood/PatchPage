@@ -3,6 +3,7 @@ import {
   chmodSync,
   existsSync,
   lstatSync,
+  mkdirSync,
   mkdtempSync,
   readFileSync,
   rmSync,
@@ -539,6 +540,12 @@ describe("patchpage upload", () => {
     const stateDir = makeStateDir();
     const htmlPath = path.join(stateDir, "anonymous-override.html");
     const cachedDraftId = "abcdefghijkl";
+    const draftCachePath = path.join(stateDir, "drafts.json");
+    const draftCacheReadMarker = path.join(stateDir, "draft-cache-read");
+    const cacheReadProbe = {
+      PATCHPAGE_TEST_FS_READ_TARGET: draftCachePath,
+      PATCHPAGE_TEST_FS_READ_MARKER: draftCacheReadMarker
+    };
     writeFileSync(
       htmlPath,
       "<!doctype html><html><head><title>Anonymous override</title></head><body></body></html>"
@@ -558,7 +565,7 @@ describe("patchpage upload", () => {
       }
     };
     writeFileSync(
-      path.join(stateDir, "drafts.json"),
+      draftCachePath,
       `${JSON.stringify(cachedState, null, 2)}\n`
     );
     let authorization: string | undefined;
@@ -593,7 +600,7 @@ describe("patchpage upload", () => {
           "--api-url",
           `http://127.0.0.1:${address.port}`
         ],
-        { PATCHPAGE_API_TOKEN: "environment-token" },
+        { PATCHPAGE_API_TOKEN: "environment-token", ...cacheReadProbe },
         stateDir
       );
       const explicitNewResult = await runCliAsync(
@@ -605,7 +612,7 @@ describe("patchpage upload", () => {
           "--api-url",
           `http://127.0.0.1:${address.port}`
         ],
-        { PATCHPAGE_API_TOKEN: "environment-token" },
+        { PATCHPAGE_API_TOKEN: "environment-token", ...cacheReadProbe },
         stateDir
       );
 
@@ -615,6 +622,7 @@ describe("patchpage upload", () => {
       expect(
         JSON.parse(readFileSync(path.join(stateDir, "drafts.json"), "utf8"))
       ).toEqual(cachedState);
+      expect(existsSync(draftCacheReadMarker)).toBe(false);
     } finally {
       await new Promise<void>((resolve, reject) =>
         server.close((error) => (error ? reject(error) : resolve()))
@@ -771,9 +779,93 @@ describe("patchpage upload", () => {
     }
   });
 
+  it("fails closed on malformed or invalid stored credentials", async () => {
+    let requestCount = 0;
+    const server = createServer((_request, response) => {
+      requestCount += 1;
+      response.statusCode = 201;
+      response.setHeader("Content-Type", "application/json");
+      response.end(
+        JSON.stringify({
+          ok: true,
+          draftId: "mnopqrstuvwx",
+          publicUrl: "http://example.test/d/mnopqrstuvwx",
+          versionNumber: 1,
+          warnings: []
+        })
+      );
+    });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+
+    try {
+      const address = server.address();
+      if (!address || typeof address === "string") throw new Error("Expected a TCP test server");
+      const invalidCredentials = [
+        ["malformed", "not-json\n"],
+        ["null-document", "null\n"],
+        ["missing-token", "{}\n"],
+        ["null-token", '{"apiToken":null}\n'],
+        ["number-token", '{"apiToken":42}\n'],
+        ["empty-token", '{"apiToken":""}\n']
+      ];
+
+      for (const [label, contents] of invalidCredentials) {
+        const stateDir = makeStateDir();
+        const htmlPath = path.join(stateDir, `${label}.html`);
+        writeFileSync(htmlPath, `<!doctype html><title>${label}</title>`);
+        writeFileSync(path.join(stateDir, "credentials.json"), contents);
+
+        const result = await runCliAsync(
+          ["upload", htmlPath, "--api-url", `http://127.0.0.1:${address.port}`],
+          {},
+          stateDir
+        );
+
+        expect(result.status, label).toBe(1);
+        expect(result.stdout, label).toBe("");
+        expect(result.stderr, label).toBe(
+          "Stored credentials are invalid. Run: patchpage auth set to replace them.\n"
+        );
+        expect(existsSync(path.join(stateDir, "drafts.json")), label).toBe(false);
+      }
+
+      const unreadableStateDir = makeStateDir();
+      const unreadableHtmlPath = path.join(unreadableStateDir, "unreadable.html");
+      writeFileSync(unreadableHtmlPath, "<!doctype html><title>Unreadable credentials</title>");
+      mkdirSync(path.join(unreadableStateDir, "credentials.json"));
+      const unreadableResult = await runCliAsync(
+        [
+          "upload",
+          unreadableHtmlPath,
+          "--api-url",
+          `http://127.0.0.1:${address.port}`
+        ],
+        {},
+        unreadableStateDir
+      );
+      expect(unreadableResult.status).toBe(1);
+      expect(unreadableResult.stdout).toBe("");
+      expect(unreadableResult.stderr).toBe(
+        "Stored credentials could not be read. Check permissions or run: patchpage auth set to replace them.\n"
+      );
+      expect(existsSync(path.join(unreadableStateDir, "drafts.json"))).toBe(false);
+      expect(requestCount).toBe(0);
+    } finally {
+      await new Promise<void>((resolve, reject) =>
+        server.close((error) => (error ? reject(error) : resolve()))
+      );
+    }
+  });
+
   it("keeps repeated no-credential uploads create-only without persisting update intent", async () => {
     const stateDir = makeStateDir();
     const htmlPath = path.join(stateDir, "repeat-anonymous.html");
+    const draftCachePath = path.join(stateDir, "drafts.json");
+    const draftCacheReadMarker = path.join(stateDir, "draft-cache-read");
+    const cacheReadProbe = {
+      PATCHPAGE_TEST_FS_READ_TARGET: draftCachePath,
+      PATCHPAGE_TEST_FS_READ_MARKER: draftCacheReadMarker
+    };
     writeFileSync(htmlPath, "<!doctype html><title>Repeat anonymous</title>");
     const authorizations: Array<string | undefined> = [];
     const requestBodies: Array<Record<string, unknown>> = [];
@@ -803,8 +895,8 @@ describe("patchpage upload", () => {
       if (!address || typeof address === "string") throw new Error("Expected a TCP test server");
       const args = ["upload", htmlPath, "--api-url", `http://127.0.0.1:${address.port}`];
 
-      const first = await runCliAsync(args, {}, stateDir);
-      const second = await runCliAsync(args, {}, stateDir);
+      const first = await runCliAsync(args, cacheReadProbe, stateDir);
+      const second = await runCliAsync(args, cacheReadProbe, stateDir);
 
       expect([first.status, second.status]).toEqual([0, 0]);
       expect(authorizations).toEqual([undefined, undefined]);
@@ -815,6 +907,7 @@ describe("patchpage upload", () => {
       expect(first.stdout).toContain("Draft ID: mnopqrstuvwx");
       expect(second.stdout).toContain("Draft ID: yzabcdefghij");
       expect(existsSync(path.join(stateDir, "drafts.json"))).toBe(false);
+      expect(existsSync(draftCacheReadMarker)).toBe(false);
     } finally {
       await new Promise<void>((resolve, reject) =>
         server.close((error) => (error ? reject(error) : resolve()))

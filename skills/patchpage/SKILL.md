@@ -42,14 +42,25 @@ npx patchpage upload ./plan.html
 Behavior:
 
 - The hosted default is `https://post.patchyhq.com`, the maintainer's private instance,
-  which does not offer public token signup.
-- Uploads require a PatchPage API token issued by the server operator. To use PatchPage
-  yourself, deploy your own server and point the CLI at it with `--api-url` or
-  `PATCHPAGE_API_URL`; a self-hosted server mints its own tokens. Self-hosting guide:
+  which does not offer public token signup. Do not assume it accepts anonymous uploads.
+- Self-hosted servers require a PatchPage API token by default. An operator may explicitly
+  enable create-only anonymous uploads with `PATCHPAGE_ALLOW_ANONYMOUS_UPLOADS=true`;
+  point the CLI at that server with `--api-url` or `PATCHPAGE_API_URL`. Self-hosting guide:
   https://github.com/allisonmahmood/PatchPage/blob/main/docs/SELF_HOSTING.md
-- Draft view URLs are public and unlisted by default.
-- Uploading the same local file updates the known draft unless `--new` is passed.
-- CLI state lives under `~/.patchpage`.
+- Upload credential precedence is explicit `--anonymous`, then `PATCHPAGE_API_TOKEN`, then
+  stored credentials. When neither environment nor stored credentials exist, `upload`
+  automatically attempts anonymous creation. Authentication failures never retry anonymously.
+- Authenticated uploads use the per-file cache, so uploading the same local file updates its
+  known draft unless `--new` is passed. Anonymous uploads always create a fresh server-identified
+  draft, ignore cached IDs, and never write results to that cache. Use `--anonymous` to bypass
+  available credentials; do not combine it with update-only `--draft`.
+- Draft view URLs are public and unlisted. CLI state lives under `~/.patchpage`.
+
+To force create-only anonymous mode on an opted-in self-hosted server:
+
+```bash
+npx patchpage upload ./plan.html --anonymous --api-url https://patchpage.example.com
+```
 
 Set credentials with:
 
@@ -110,7 +121,8 @@ Blocked or unsafe:
 
 ## Pitfalls
 
-- Upload tokens gate publishing and ownership. They do not make draft viewers private.
+- Authentication gates ownership and updates; an operator's anonymous opt-in permits creation
+  only. Neither mode makes draft viewers private.
 - Do not publish sensitive or confidential material unless public-link visibility is acceptable.
 - Do not tell the user an API token makes drafts private.
 - Never put an API token in a positional argument. Use the hidden prompt for a person or
