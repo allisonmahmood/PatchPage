@@ -8,6 +8,7 @@
     "build": "turbo run build",
     "dev": "turbo run dev --parallel",
     "test": "turbo run test",
+    "test:packed-cli-e2e": "node scripts/packed-cli-e2e.mjs",
     "test:release-workflow": "node scripts/verify-release-workflow.mjs",
     "test:server-image": "bash scripts/verify-server-image.sh",
     "lint": "turbo run lint",
