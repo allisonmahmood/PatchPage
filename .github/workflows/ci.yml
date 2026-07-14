@@ -36,8 +36,8 @@ jobs:
       fail-fast: false
       matrix:
         # 22 is the minimum supported Node (engines >=22; pnpm 11 also
-        # requires >=22.13). cli-smoke additionally runs the packed artifact
-        # on Node 22 the way end users install it.
+        # requires >=22.13). cli-smoke runs the packed real-server contract
+        # entirely on Node 22 the way end users install it.
         node-version: [22, 24]
     steps:
       - uses: actions/checkout@v4
@@ -78,6 +78,7 @@ jobs:
 
   cli-smoke:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - uses: pnpm/action-setup@v4
@@ -85,74 +86,21 @@ jobs:
           version: 11.5.2
       - uses: actions/setup-node@v4
         with:
-          node-version: 24
+          node-version: 22
           cache: pnpm
       - run: pnpm install --frozen-lockfile
-      - run: pnpm --filter patchpage build
-      - name: Pack tarball and verify contents
-        shell: bash
+      - name: Exercise packed CLI harness lifecycle probes
         run: |
-          set -euo pipefail
-
-          cd packages/cli
-          npm pack --json > "$RUNNER_TEMP/patchpage-pack.json"
-
-          node - "$RUNNER_TEMP/patchpage-pack.json" <<'NODE'
-          const fs = require("node:fs");
-
-          const pack = JSON.parse(fs.readFileSync(process.argv[2], "utf8"))[0];
-          const required = ["dist/index.js", "skills/patchpage/SKILL.md", "LICENSE", "README.md"];
-          const files = new Set(pack.files.map((file) => file.path));
-          const missing = required.filter((file) => !files.has(file));
-
-          if (missing.length > 0) {
-            console.error(`Missing files from npm pack: ${missing.join(", ")}`);
-            console.error("Packed files:");
-            for (const file of [...files].sort()) {
-              console.error(`- ${file}`);
-            }
-            process.exit(1);
-          }
-          NODE
-
-          tarball="$(
-            node - "$RUNNER_TEMP/patchpage-pack.json" <<'NODE'
-          const fs = require("node:fs");
-          const path = require("node:path");
-
-          const pack = JSON.parse(fs.readFileSync(process.argv[2], "utf8"))[0];
-          console.log(path.resolve(process.cwd(), pack.filename));
-          NODE
-          )"
-          echo "TARBALL=$tarball" >> "$GITHUB_ENV"
-          echo "CLI_VERSION=$(node -p "require('./package.json').version")" >> "$GITHUB_ENV"
-      # The published CLI claims engines.node >=22. Verify the packed artifact
-      # on the minimum supported Node the way end users get it: a clean
-      # npm install of the tarball, no pnpm or repo tooling involved.
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 22
-      - name: Install and run tarball on minimum supported Node
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          tmp_dir="$(mktemp -d)"
-          cd "$tmp_dir"
-          npm install "$TARBALL"
-
-          output="$(./node_modules/.bin/patchpage --version)"
-          if [[ "$output" != "$CLI_VERSION" ]]; then
-            echo "::error::Expected patchpage --version to print $CLI_VERSION, got $output"
-            exit 1
-          fi
-
-          if [[ "$output" == "0.0.0-dev" ]]; then
-            echo "::error::Installed patchpage binary reported 0.0.0-dev"
-            exit 1
-          fi
-
-          ./node_modules/.bin/patchpage validate "$GITHUB_WORKSPACE/examples/plan.html"
+          node scripts/packed-cli-e2e.mjs --platform-probes
+          node scripts/packed-cli-e2e.mjs --lifecycle-probes
+          node scripts/packed-cli-e2e.mjs --signal-probes
+      - name: Exercise the packed CLI against an isolated real server
+        env:
+          PATCHPAGE_API_TOKEN: ambient-invalid-token
+          PATCHPAGE_API_URL: http://127.0.0.1:9/ambient-poison
+          PATCHPAGE_MAX_HTML_BYTES: "1"
+          PATCHPAGE_UNKNOWN_AMBIENT_POISON: must-not-leak
+        run: pnpm test:packed-cli-e2e
 
   docker:
     runs-on: ubuntu-latest
