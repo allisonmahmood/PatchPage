@@ -8,9 +8,8 @@ import { gunzipSync } from "node:zlib";
 import { isAlias, isMap, isScalar, isSeq, parseDocument } from "yaml";
 
 const repoRoot = path.resolve(
-  process.env.PATCHPAGE_RELEASE_WORKFLOW_REPO_ROOT ??
-    path.dirname(fileURLToPath(import.meta.url)),
-  process.env.PATCHPAGE_RELEASE_WORKFLOW_REPO_ROOT ? "." : "..",
+  process.env.PATCHPAGE_RELEASE_WORKFLOW_REPO_ROOT ?? path.dirname(fileURLToPath(import.meta.url)),
+  process.env.PATCHPAGE_RELEASE_WORKFLOW_REPO_ROOT ? "." : ".."
 );
 const workflowPath = path.join(repoRoot, ".github/workflows/release.yml");
 const [
@@ -24,24 +23,22 @@ const [
   readmeFile,
   serverImageVerifier,
   dockerSaveValidator,
-  ghcrOciReleaseTool,
-] =
-  await Promise.all([
-    readFile(workflowPath, "utf8"),
-    readFile(path.join(repoRoot, ".github/workflows/reconcile-ghcr.yml"), "utf8"),
-    readFile(path.join(repoRoot, ".github/workflows/ci.yml"), "utf8"),
-    readFile(path.join(repoRoot, "package.json"), "utf8"),
-    readFile(path.join(repoRoot, "pnpm-lock.yaml"), "utf8"),
-    readFile(path.join(repoRoot, ".github/dependabot.yml"), "utf8"),
-    readFile(path.join(repoRoot, "docs/SELF_HOSTING.md"), "utf8"),
-    readFile(path.join(repoRoot, "README.md"), "utf8"),
-    readFile(path.join(repoRoot, "scripts/verify-server-image.sh"), "utf8"),
-    readFile(path.join(repoRoot, "scripts/validate-docker-save-artifact.mjs")),
-    readFile(path.join(repoRoot, "scripts/ghcr-oci-release.mjs")),
-  ]);
+  ghcrOciReleaseTool
+] = await Promise.all([
+  readFile(workflowPath, "utf8"),
+  readFile(path.join(repoRoot, ".github/workflows/reconcile-ghcr.yml"), "utf8"),
+  readFile(path.join(repoRoot, ".github/workflows/ci.yml"), "utf8"),
+  readFile(path.join(repoRoot, "package.json"), "utf8"),
+  readFile(path.join(repoRoot, "pnpm-lock.yaml"), "utf8"),
+  readFile(path.join(repoRoot, ".github/dependabot.yml"), "utf8"),
+  readFile(path.join(repoRoot, "docs/SELF_HOSTING.md"), "utf8"),
+  readFile(path.join(repoRoot, "README.md"), "utf8"),
+  readFile(path.join(repoRoot, "scripts/verify-server-image.sh"), "utf8"),
+  readFile(path.join(repoRoot, "scripts/validate-docker-save-artifact.mjs")),
+  readFile(path.join(repoRoot, "scripts/ghcr-oci-release.mjs"))
+]);
 const workflow = process.env.PATCHPAGE_RELEASE_WORKFLOW_SOURCE ?? workflowFile;
-const reconcileWorkflow =
-  process.env.PATCHPAGE_RECONCILE_WORKFLOW_SOURCE ?? reconcileWorkflowFile;
+const reconcileWorkflow = process.env.PATCHPAGE_RECONCILE_WORKFLOW_SOURCE ?? reconcileWorkflowFile;
 const ciWorkflow = process.env.PATCHPAGE_RELEASE_CI_WORKFLOW_SOURCE ?? ciWorkflowFile;
 const dockerSaveValidatorSource = process.env.PATCHPAGE_DOCKER_SAVE_VALIDATOR_SOURCE;
 const ghcrOciReleaseToolSource = process.env.PATCHPAGE_GHCR_OCI_RELEASE_SOURCE;
@@ -51,8 +48,7 @@ const effectiveDockerSaveValidator = dockerSaveValidatorSource
 const effectiveGhcrOciReleaseTool = ghcrOciReleaseToolSource
   ? Buffer.from(ghcrOciReleaseToolSource)
   : ghcrOciReleaseTool;
-const selfHosting =
-  process.env.PATCHPAGE_RELEASE_SELF_HOSTING_SOURCE ?? selfHostingFile;
+const selfHosting = process.env.PATCHPAGE_RELEASE_SELF_HOSTING_SOURCE ?? selfHostingFile;
 const readme = process.env.PATCHPAGE_RELEASE_README_SOURCE ?? readmeFile;
 const packageJson = JSON.parse(packageSource);
 const failures = [];
@@ -60,16 +56,14 @@ let parsedWorkflow = null;
 let workflowDocument = null;
 let parsedReconcileWorkflow = null;
 let reconcileWorkflowDocument = null;
+let parsedCiWorkflow = null;
+let ciWorkflowDocument = null;
 
 function hasUnsupportedYamlIndirection(node) {
   if (node === null || typeof node !== "object") {
     return false;
   }
-  if (
-    isAlias(node) ||
-    typeof node.anchor === "string" ||
-    typeof node.tag === "string"
-  ) {
+  if (isAlias(node) || typeof node.anchor === "string" || typeof node.tag === "string") {
     return true;
   }
   if (isMap(node)) {
@@ -79,7 +73,7 @@ function hasUnsupportedYamlIndirection(node) {
         typeof pair.key.value !== "string" ||
         pair.key.value === "<<" ||
         hasUnsupportedYamlIndirection(pair.key) ||
-        hasUnsupportedYamlIndirection(pair.value),
+        hasUnsupportedYamlIndirection(pair.value)
     );
   }
   if (isSeq(node)) {
@@ -89,11 +83,7 @@ function hasUnsupportedYamlIndirection(node) {
 }
 
 function isPlainResolvedValue(value) {
-  if (
-    value === null ||
-    typeof value === "string" ||
-    typeof value === "boolean"
-  ) {
+  if (value === null || typeof value === "string" || typeof value === "boolean") {
     return true;
   }
   if (typeof value === "number") {
@@ -116,14 +106,12 @@ try {
     }
   } else if (hasUnsupportedYamlIndirection(document.contents)) {
     failures.push(
-      "release.yml must not use YAML anchors, aliases, merge keys, or non-scalar mapping keys; explicit tags are forbidden",
+      "release.yml must not use YAML anchors, aliases, merge keys, or non-scalar mapping keys; explicit tags are forbidden"
     );
   } else {
     const resolvedWorkflow = document.toJS();
     if (!isPlainResolvedValue(resolvedWorkflow)) {
-      failures.push(
-        "release.yml must resolve only to plain scalar, array, and object values",
-      );
+      failures.push("release.yml must resolve only to plain scalar, array, and object values");
     } else {
       workflowDocument = document;
       parsedWorkflow = resolvedWorkflow;
@@ -131,30 +119,28 @@ try {
   }
 } catch (error) {
   failures.push(
-    `release.yml must be valid YAML with unique map keys: ${error instanceof Error ? error.message : String(error)}`,
+    `release.yml must be valid YAML with unique map keys: ${error instanceof Error ? error.message : String(error)}`
   );
 }
 
 try {
   const document = parseDocument(reconcileWorkflow, {
     keepSourceTokens: true,
-    uniqueKeys: true,
+    uniqueKeys: true
   });
   if (document.errors.length > 0) {
     for (const error of document.errors) {
-      failures.push(
-        `reconcile-ghcr.yml must be valid YAML with unique map keys: ${error.message}`,
-      );
+      failures.push(`reconcile-ghcr.yml must be valid YAML with unique map keys: ${error.message}`);
     }
   } else if (hasUnsupportedYamlIndirection(document.contents)) {
     failures.push(
-      "reconcile-ghcr.yml must not use YAML anchors, aliases, merge keys, or non-scalar mapping keys; explicit tags are forbidden",
+      "reconcile-ghcr.yml must not use YAML anchors, aliases, merge keys, or non-scalar mapping keys; explicit tags are forbidden"
     );
   } else {
     const resolvedWorkflow = document.toJS();
     if (!isPlainResolvedValue(resolvedWorkflow)) {
       failures.push(
-        "reconcile-ghcr.yml must resolve only to plain scalar, array, and object values",
+        "reconcile-ghcr.yml must resolve only to plain scalar, array, and object values"
       );
     } else {
       reconcileWorkflowDocument = document;
@@ -163,7 +149,35 @@ try {
   }
 } catch (error) {
   failures.push(
-    `reconcile-ghcr.yml must be valid YAML with unique map keys: ${error instanceof Error ? error.message : String(error)}`,
+    `reconcile-ghcr.yml must be valid YAML with unique map keys: ${error instanceof Error ? error.message : String(error)}`
+  );
+}
+
+try {
+  const document = parseDocument(ciWorkflow, {
+    keepSourceTokens: true,
+    uniqueKeys: true
+  });
+  if (document.errors.length > 0) {
+    for (const error of document.errors) {
+      failures.push(`ci.yml must be valid YAML with unique map keys: ${error.message}`);
+    }
+  } else if (hasUnsupportedYamlIndirection(document.contents)) {
+    failures.push(
+      "ci.yml must not use YAML anchors, aliases, merge keys, or non-scalar mapping keys; explicit tags are forbidden"
+    );
+  } else {
+    const resolvedWorkflow = document.toJS();
+    if (!isPlainResolvedValue(resolvedWorkflow)) {
+      failures.push("ci.yml must resolve only to plain scalar, array, and object values");
+    } else {
+      ciWorkflowDocument = document;
+      parsedCiWorkflow = resolvedWorkflow;
+    }
+  }
+} catch (error) {
+  failures.push(
+    `ci.yml must be valid YAML with unique map keys: ${error instanceof Error ? error.message : String(error)}`
   );
 }
 
@@ -172,347 +186,347 @@ const exactVersionPattern = /^\d+\.\d+\.\d+$/;
 const reviewedNpm = Object.freeze({
   version: "11.18.0",
   integrity:
-    "sha512-T67M4L5wNm0cZ7EBLErcEkY1SmzEW/WJ+SADBzsFUY1UdAPfFHXFQtZ6SEXiK0+vzXysCvAsepbMaBTwnrAD+w==",
+    "sha512-T67M4L5wNm0cZ7EBLErcEkY1SmzEW/WJ+SADBzsFUY1UdAPfFHXFQtZ6SEXiK0+vzXysCvAsepbMaBTwnrAD+w=="
 });
 const reviewedActions = new Map([
   [
     "actions/checkout",
     {
       version: "v4.3.1",
-      sha: "34e114876b0b11c390a56381ad16ebd13914f8d5",
-    },
+      sha: "34e114876b0b11c390a56381ad16ebd13914f8d5"
+    }
   ],
   [
     "actions/setup-node",
     {
       version: "v4.4.0",
-      sha: "49933ea5288caeca8642d1e84afbd3f7d6820020",
-    },
+      sha: "49933ea5288caeca8642d1e84afbd3f7d6820020"
+    }
   ],
   [
     "pnpm/action-setup",
     {
       version: "v4.3.0",
-      sha: "b906affcce14559ad1aafd4ab0e942779e9f58b1",
-    },
+      sha: "b906affcce14559ad1aafd4ab0e942779e9f58b1"
+    }
   ],
   [
     "actions/upload-artifact",
     {
       version: "v7.0.1",
-      sha: "043fb46d1a93c77aae656e7c1c64a875d1fc6a0a",
-    },
+      sha: "043fb46d1a93c77aae656e7c1c64a875d1fc6a0a"
+    }
   ],
   [
     "actions/download-artifact",
     {
       version: "v8.0.1",
-      sha: "3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c",
-    },
+      sha: "3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c"
+    }
   ],
   [
     "docker/login-action",
     {
       version: "v3.7.0",
-      sha: "c94ce9fb468520275223c153574b00df6fe4bcc9",
-    },
-  ],
+      sha: "c94ce9fb468520275223c153574b00df6fe4bcc9"
+    }
+  ]
 ]);
 const reviewedUploadArtifact = `actions/upload-artifact@${reviewedActions.get("actions/upload-artifact").sha}`;
 const reviewedDownloadArtifact = `actions/download-artifact@${reviewedActions.get("actions/download-artifact").sha}`;
 const expectedVersionProducerRun = [
   "set -euo pipefail",
   "",
-  "version=\"$(node -p \"require('./packages/cli/package.json').version\")\"",
-  "if [[ ! \"$version\" =~ ^(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)$ ]]; then",
-  "  echo \"::error::Release version must be exact stable SemVer, got ${version}\"",
+  'version="$(node -p "require(\'./packages/cli/package.json\').version")"',
+  'if [[ ! "$version" =~ ^(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)$ ]]; then',
+  '  echo "::error::Release version must be exact stable SemVer, got ${version}"',
   "  exit 1",
   "fi",
   "",
-  "expected_ref=\"v${version}\"",
+  'expected_ref="v${version}"',
   "",
-  "if [[ \"$expected_ref\" != \"$GITHUB_REF_NAME\" ]]; then",
-  "  echo \"::error::Tag ${GITHUB_REF_NAME} does not match packages/cli version ${expected_ref}\"",
+  'if [[ "$expected_ref" != "$GITHUB_REF_NAME" ]]; then',
+  '  echo "::error::Tag ${GITHUB_REF_NAME} does not match packages/cli version ${expected_ref}"',
   "  exit 1",
   "fi",
   "",
-  "if ! grep -Fq \"## [${version}]\" CHANGELOG.md; then",
-  "  echo \"::error::CHANGELOG.md is missing a ## [${version}] heading\"",
+  'if ! grep -Fq "## [${version}]" CHANGELOG.md; then',
+  '  echo "::error::CHANGELOG.md is missing a ## [${version}] heading"',
   "  exit 1",
   "fi",
   "",
-  "revision=\"$(git rev-parse HEAD)\"",
-  "if [[ ! \"$revision\" =~ ^[0-9a-f]{40}$ ]]; then",
-  "  echo \"::error::Resolved release revision is not a full commit SHA: ${revision}\"",
+  'revision="$(git rev-parse HEAD)"',
+  'if [[ ! "$revision" =~ ^[0-9a-f]{40}$ ]]; then',
+  '  echo "::error::Resolved release revision is not a full commit SHA: ${revision}"',
   "  exit 1",
   "fi",
   "",
-  "echo \"version=$version\" >> \"$GITHUB_OUTPUT\"",
-  "echo \"revision=$revision\" >> \"$GITHUB_OUTPUT\"",
-  "",
+  'echo "version=$version" >> "$GITHUB_OUTPUT"',
+  'echo "revision=$revision" >> "$GITHUB_OUTPUT"',
+  ""
 ].join("\n");
 const expectedNpmCliProducerRun = [
   "set -euo pipefail",
   "",
-  "if [[ ! \"$EXPECTED_NPM_VERSION\" =~ ^[0-9]+\\.[0-9]+\\.[0-9]+$ ]]; then",
-  "  echo \"::error::Expected an exact npm version, got $EXPECTED_NPM_VERSION\"",
+  'if [[ ! "$EXPECTED_NPM_VERSION" =~ ^[0-9]+\\.[0-9]+\\.[0-9]+$ ]]; then',
+  '  echo "::error::Expected an exact npm version, got $EXPECTED_NPM_VERSION"',
   "  exit 1",
   "fi",
   "",
-  "npm_tarball=\"$RUNNER_TEMP/npm-${EXPECTED_NPM_VERSION}.tgz\"",
-  "npm_cli_dir=\"$RUNNER_TEMP/npm-cli\"",
-  "rm -f \"$npm_tarball\"",
-  "rm -rf \"$npm_cli_dir\"",
+  'npm_tarball="$RUNNER_TEMP/npm-${EXPECTED_NPM_VERSION}.tgz"',
+  'npm_cli_dir="$RUNNER_TEMP/npm-cli"',
+  'rm -f "$npm_tarball"',
+  'rm -rf "$npm_cli_dir"',
   "",
   "curl --fail --silent --show-error \\",
   "  --proto '=https' \\",
   "  --tlsv1.2 \\",
-  "  --output \"$npm_tarball\" \\",
-  "  \"https://registry.npmjs.org/npm/-/npm-${EXPECTED_NPM_VERSION}.tgz\"",
+  '  --output "$npm_tarball" \\',
+  '  "https://registry.npmjs.org/npm/-/npm-${EXPECTED_NPM_VERSION}.tgz"',
   "",
-  "actual_integrity=\"$(",
+  'actual_integrity="$(',
   "  node - \"$npm_tarball\" <<'NODE'",
-  "const { createHash } = require(\"node:crypto\");",
-  "const { readFileSync } = require(\"node:fs\");",
+  'const { createHash } = require("node:crypto");',
+  'const { readFileSync } = require("node:fs");',
   "",
-  "const digest = createHash(\"sha512\")",
+  'const digest = createHash("sha512")',
   "  .update(readFileSync(process.argv[2]))",
-  "  .digest(\"base64\");",
+  '  .digest("base64");',
   "process.stdout.write(`sha512-${digest}`);",
   "NODE",
-  ")\"",
+  ')"',
   "",
-  "if [[ \"$actual_integrity\" != \"$EXPECTED_NPM_INTEGRITY\" ]]; then",
-  "  echo \"::error::npm registry tarball integrity mismatch\"",
+  'if [[ "$actual_integrity" != "$EXPECTED_NPM_INTEGRITY" ]]; then',
+  '  echo "::error::npm registry tarball integrity mismatch"',
   "  exit 1",
   "fi",
   "",
-  "mkdir -p \"$npm_cli_dir\"",
-  "tar -xzf \"$npm_tarball\" -C \"$npm_cli_dir\" --strip-components=1",
+  'mkdir -p "$npm_cli_dir"',
+  'tar -xzf "$npm_tarball" -C "$npm_cli_dir" --strip-components=1',
   "",
-  "actual_version=\"$(node \"$npm_cli_dir/bin/npm-cli.js\" --version)\"",
-  "if [[ \"$actual_version\" != \"$EXPECTED_NPM_VERSION\" ]]; then",
-  "  echo \"::error::Verified npm CLI reported $actual_version, expected $EXPECTED_NPM_VERSION\"",
+  'actual_version="$(node "$npm_cli_dir/bin/npm-cli.js" --version)"',
+  'if [[ "$actual_version" != "$EXPECTED_NPM_VERSION" ]]; then',
+  '  echo "::error::Verified npm CLI reported $actual_version, expected $EXPECTED_NPM_VERSION"',
   "  exit 1",
   "fi",
   "",
-  "echo \"version=$actual_version\" >> \"$GITHUB_OUTPUT\"",
-  "",
+  'echo "version=$actual_version" >> "$GITHUB_OUTPUT"',
+  ""
 ].join("\n");
 const expectedVerifyNpmCliRun = [
   "set -euo pipefail",
   "",
-  "NPM_CLI=\"$RUNNER_TEMP/npm-cli/bin/npm-cli.js\"",
-  "actual_version=\"$(node \"$NPM_CLI\" --version)\"",
-  "if [[ \"$actual_version\" != \"$EXPECTED_NPM_VERSION\" ]]; then",
-  "  echo \"::error::Downloaded npm CLI reported $actual_version, expected $EXPECTED_NPM_VERSION\"",
+  'NPM_CLI="$RUNNER_TEMP/npm-cli/bin/npm-cli.js"',
+  'actual_version="$(node "$NPM_CLI" --version)"',
+  'if [[ "$actual_version" != "$EXPECTED_NPM_VERSION" ]]; then',
+  '  echo "::error::Downloaded npm CLI reported $actual_version, expected $EXPECTED_NPM_VERSION"',
   "  exit 1",
   "fi",
   "",
-  "echo \"NPM_CLI=$NPM_CLI\" >> \"$GITHUB_ENV\"",
-  "",
+  'echo "NPM_CLI=$NPM_CLI" >> "$GITHUB_ENV"',
+  ""
 ].join("\n");
 const expectedPackageProducerRun = [
   "set -euo pipefail",
   "",
-  "package_dir=\"$RUNNER_TEMP/patchpage-package\"",
-  "rm -rf \"$package_dir\"",
-  "mkdir -p \"$package_dir\"",
+  'package_dir="$RUNNER_TEMP/patchpage-package"',
+  'rm -rf "$package_dir"',
+  'mkdir -p "$package_dir"',
   "",
   "cd packages/cli",
-  "node \"$NPM_CLI\" pack \\",
+  'node "$NPM_CLI" pack \\',
   "  --ignore-scripts \\",
   "  --json \\",
-  "  --pack-destination \"$package_dir\" \\",
-  "  > \"$RUNNER_TEMP/patchpage-pack.json\"",
+  '  --pack-destination "$package_dir" \\',
+  '  > "$RUNNER_TEMP/patchpage-pack.json"',
   "",
   "node - \"$RUNNER_TEMP/patchpage-pack.json\" <<'NODE'",
-  "const fs = require(\"node:fs\");",
+  'const fs = require("node:fs");',
   "",
-  "const pack = JSON.parse(fs.readFileSync(process.argv[2], \"utf8\"))[0];",
-  "const required = [\"dist/index.js\", \"skills/patchpage/SKILL.md\", \"LICENSE\", \"README.md\"];",
+  'const pack = JSON.parse(fs.readFileSync(process.argv[2], "utf8"))[0];',
+  'const required = ["dist/index.js", "skills/patchpage/SKILL.md", "LICENSE", "README.md"];',
   "const files = new Set(pack.files.map((file) => file.path));",
   "const missing = required.filter((file) => !files.has(file));",
   "",
   "if (missing.length > 0) {",
-  "  console.error(`Missing files from npm pack: ${missing.join(\", \")}`);",
-  "  console.error(\"Packed files:\");",
-  "  for (const file of [...files].sort()) {",
-  "    console.error(`- ${file}`);",
-  "  }",
+  '  console.error(`Missing reviewed required npm pack files (${missing.length}): ${missing.join(", ")}`);',
   "  process.exit(1);",
   "}",
   "NODE",
   "",
-  "reported_tarball=\"$(",
-  "  node - \"$RUNNER_TEMP/patchpage-pack.json\" \"$package_dir\" <<'NODE'",
-  "const fs = require(\"node:fs\");",
-  "const path = require(\"node:path\");",
+  'reported_tarball="$(',
+  '  node - "$RUNNER_TEMP/patchpage-pack.json" "$package_dir" <<\'NODE\'',
+  'const fs = require("node:fs");',
+  'const path = require("node:path");',
   "",
-  "const pack = JSON.parse(fs.readFileSync(process.argv[2], \"utf8\"))[0];",
-  "console.log(path.resolve(process.argv[3], pack.filename));",
+  'const pack = JSON.parse(fs.readFileSync(process.argv[2], "utf8"))[0];',
+  "process.stdout.write(path.resolve(process.argv[3], pack.filename));",
   "NODE",
-  ")\"",
+  ')"',
   "",
   "mapfile -t tarballs < <(find \"$package_dir\" -maxdepth 1 -type f -name 'patchpage-*.tgz' -print)",
-  "if [[ \"${#tarballs[@]}\" -ne 1 ]]; then",
-  "  echo \"::error::Expected exactly one PatchPage tarball, found ${#tarballs[@]}\"",
+  'if [[ "${#tarballs[@]}" -ne 1 ]]; then',
+  '  echo "::error::Expected exactly one PatchPage tarball, found ${#tarballs[@]}"',
   "  exit 1",
   "fi",
   "",
-  "tarball=\"${tarballs[0]}\"",
-  "if [[ \"$tarball\" != \"$reported_tarball\" ]]; then",
-  "  echo \"::error::npm pack reported $reported_tarball, but found $tarball\"",
+  'tarball="${tarballs[0]}"',
+  'if [[ "$tarball" != "$reported_tarball" ]]; then',
+  '  echo "::error::npm pack reported a different tarball than the sole produced artifact"',
   "  exit 1",
   "fi",
   "",
-  "cli_version=\"$(node -p \"require('./package.json').version\")\"",
-  "unique_tarball=\"$package_dir/patchpage-${cli_version}-run-attempt-${GITHUB_RUN_ATTEMPT}.tgz\"",
-  "mv -- \"$tarball\" \"$unique_tarball\"",
-  "tarball=\"$unique_tarball\"",
+  'cli_version="$(node -p "require(\'./package.json\').version")"',
+  'unique_tarball="$package_dir/patchpage-${cli_version}-run-attempt-${GITHUB_RUN_ATTEMPT}.tgz"',
+  'mv -- "$tarball" "$unique_tarball"',
+  'tarball="$unique_tarball"',
   "",
-  "echo \"TARBALL=$tarball\" >> \"$GITHUB_ENV\"",
-  "echo \"CLI_VERSION=$cli_version\" >> \"$GITHUB_ENV\"",
-  "echo \"tarball-path=$tarball\" >> \"$GITHUB_OUTPUT\"",
-  "echo \"filename=$(basename \"$tarball\")\" >> \"$GITHUB_OUTPUT\"",
-  "echo \"sha256=$(sha256sum \"$tarball\" | awk '{print $1}')\" >> \"$GITHUB_OUTPUT\"",
+  "node ../../scripts/verify-release-privacy.mjs \\",
+  '  --pack-json "$RUNNER_TEMP/patchpage-pack.json" \\',
+  '  --tarball "$tarball"',
   "",
+  'echo "TARBALL=$tarball" >> "$GITHUB_ENV"',
+  'echo "CLI_VERSION=$cli_version" >> "$GITHUB_ENV"',
+  'echo "tarball-path=$tarball" >> "$GITHUB_OUTPUT"',
+  'echo "filename=$(basename "$tarball")" >> "$GITHUB_OUTPUT"',
+  'echo "sha256=$(sha256sum "$tarball" | awk \'{print $1}\')" >> "$GITHUB_OUTPUT"',
+  ""
 ].join("\n");
 const expectedMinimumNodeSmokeRun = [
   "set -euo pipefail",
   "",
-  "tmp_dir=\"$(mktemp -d)\"",
-  "cd \"$tmp_dir\"",
-  "node \"$NPM_CLI\" install --ignore-scripts \"$TARBALL\"",
+  'tmp_dir="$(mktemp -d)"',
+  'cd "$tmp_dir"',
+  'node "$NPM_CLI" install --ignore-scripts "$TARBALL"',
   "",
-  "output=\"$(./node_modules/.bin/patchpage --version)\"",
-  "if [[ \"$output\" != \"$CLI_VERSION\" ]]; then",
-  "  echo \"::error::Expected patchpage --version to print $CLI_VERSION, got $output\"",
+  'output="$(./node_modules/.bin/patchpage --version)"',
+  'if [[ "$output" != "$CLI_VERSION" ]]; then',
+  '  echo "::error::Expected patchpage --version to print $CLI_VERSION, got $output"',
   "  exit 1",
   "fi",
   "",
-  "if [[ \"$output\" == \"0.0.0-dev\" ]]; then",
-  "  echo \"::error::Installed patchpage binary reported 0.0.0-dev\"",
+  'if [[ "$output" == "0.0.0-dev" ]]; then',
+  '  echo "::error::Installed patchpage binary reported 0.0.0-dev"',
   "  exit 1",
   "fi",
   "",
-  "./node_modules/.bin/patchpage validate \"$GITHUB_WORKSPACE/examples/plan.html\"",
+  './node_modules/.bin/patchpage validate "$GITHUB_WORKSPACE/examples/plan.html"',
   "",
-  "actual_sha256=\"$(sha256sum \"$TARBALL\" | awk '{print $1}')\"",
-  "if [[ \"$actual_sha256\" != \"$EXPECTED_TARBALL_SHA256\" ]]; then",
-  "  echo \"::error::The tested tarball changed during the smoke install\"",
+  'actual_sha256="$(sha256sum "$TARBALL" | awk \'{print $1}\')"',
+  'if [[ "$actual_sha256" != "$EXPECTED_TARBALL_SHA256" ]]; then',
+  '  echo "::error::The tested tarball changed during the smoke install"',
   "  exit 1",
   "fi",
-  "",
+  ""
 ].join("\n");
 const expectedPublicationRun = [
   "set -euo pipefail",
   "",
   "shopt -s nullglob",
-  "tarballs=(\"$RUNNER_TEMP/patchpage-package\"/*.tgz)",
-  "if [[ \"${#tarballs[@]}\" -ne 1 ]]; then",
-  "  echo \"::error::Expected exactly one downloaded PatchPage tarball, found ${#tarballs[@]}\"",
+  'tarballs=("$RUNNER_TEMP/patchpage-package"/*.tgz)',
+  'if [[ "${#tarballs[@]}" -ne 1 ]]; then',
+  '  echo "::error::Expected exactly one downloaded PatchPage tarball, found ${#tarballs[@]}"',
   "  exit 1",
   "fi",
   "",
-  "tarball=\"${tarballs[0]}\"",
-  "if [[ \"$(basename \"$tarball\")\" != \"$EXPECTED_FILENAME\" ]]; then",
-  "  echo \"::error::Downloaded tarball name does not match the verified artifact\"",
+  'tarball="${tarballs[0]}"',
+  'if [[ "$(basename "$tarball")" != "$EXPECTED_FILENAME" ]]; then',
+  '  echo "::error::Downloaded tarball name does not match the verified artifact"',
   "  exit 1",
   "fi",
   "",
-  "actual_sha256=\"$(sha256sum \"$tarball\" | awk '{print $1}')\"",
-  "if [[ \"$actual_sha256\" != \"$EXPECTED_SHA256\" ]]; then",
-  "  echo \"::error::Downloaded tarball digest does not match the verified artifact\"",
+  'actual_sha256="$(sha256sum "$tarball" | awk \'{print $1}\')"',
+  'if [[ "$actual_sha256" != "$EXPECTED_SHA256" ]]; then',
+  '  echo "::error::Downloaded tarball digest does not match the verified artifact"',
   "  exit 1",
   "fi",
   "",
   "IFS=$'\\t' read -r package_name package_version < <(",
-  "  tar -xOf \"$tarball\" package/package.json \\",
-  "    | node -e 'const fs = require(\"node:fs\"); const pkg = JSON.parse(fs.readFileSync(0, \"utf8\")); console.log(`${pkg.name}\\t${pkg.version}`)'",
+  '  tar -xOf "$tarball" package/package.json \\',
+  '    | node -e \'const fs = require("node:fs"); const pkg = JSON.parse(fs.readFileSync(0, "utf8")); console.log(`${pkg.name}\\t${pkg.version}`)\'',
   ")",
-  "if [[ \"$package_name\" != \"patchpage\" ]]; then",
-  "  echo \"::error::Downloaded package is named $package_name, expected patchpage\"",
+  'if [[ "$package_name" != "patchpage" ]]; then',
+  '  echo "::error::Downloaded package is named $package_name, expected patchpage"',
   "  exit 1",
   "fi",
-  "if [[ \"$package_version\" != \"$EXPECTED_VERSION\" ]]; then",
-  "  echo \"::error::Downloaded package version $package_version does not match $EXPECTED_VERSION\"",
-  "  exit 1",
-  "fi",
-  "",
-  "npm_cli=\"$RUNNER_TEMP/npm-cli/bin/npm-cli.js\"",
-  "actual_npm_version=\"$(node \"$npm_cli\" --version)\"",
-  "if [[ \"$actual_npm_version\" != \"$EXPECTED_NPM_VERSION\" ]]; then",
-  "  echo \"::error::Downloaded npm CLI reported $actual_npm_version, expected $EXPECTED_NPM_VERSION\"",
+  'if [[ "$package_version" != "$EXPECTED_VERSION" ]]; then',
+  '  echo "::error::Downloaded package version $package_version does not match $EXPECTED_VERSION"',
   "  exit 1",
   "fi",
   "",
-  "registry_metadata=\"$RUNNER_TEMP/npm-registry-metadata.json\"",
-  "curl_error=\"$RUNNER_TEMP/npm-registry-curl.err\"",
-  "registry_url=\"https://registry.npmjs.org/${package_name}/${EXPECTED_VERSION}\"",
-  "if ! http_status=\"$(",
+  'npm_cli="$RUNNER_TEMP/npm-cli/bin/npm-cli.js"',
+  'actual_npm_version="$(node "$npm_cli" --version)"',
+  'if [[ "$actual_npm_version" != "$EXPECTED_NPM_VERSION" ]]; then',
+  '  echo "::error::Downloaded npm CLI reported $actual_npm_version, expected $EXPECTED_NPM_VERSION"',
+  "  exit 1",
+  "fi",
+  "",
+  'registry_metadata="$RUNNER_TEMP/npm-registry-metadata.json"',
+  'curl_error="$RUNNER_TEMP/npm-registry-curl.err"',
+  'registry_url="https://registry.npmjs.org/${package_name}/${EXPECTED_VERSION}"',
+  'if ! http_status="$(',
   "  curl --silent --show-error \\",
   "    --proto '=https' \\",
   "    --tlsv1.2 \\",
-  "    --output \"$registry_metadata\" \\",
+  '    --output "$registry_metadata" \\',
   "    --write-out '%{http_code}' \\",
-  "    \"$registry_url\" \\",
-  "    2>\"$curl_error\"",
-  ")\"; then",
-  "  echo \"::error::Failed to query npm registry for patchpage@${EXPECTED_VERSION}\"",
-  "  cat \"$curl_error\" >&2",
+  '    "$registry_url" \\',
+  '    2>"$curl_error"',
+  ')"; then',
+  '  echo "::error::Failed to query npm registry for patchpage@${EXPECTED_VERSION}"',
+  '  cat "$curl_error" >&2',
   "  exit 1",
   "fi",
   "",
-  "case \"$http_status\" in",
+  'case "$http_status" in',
   "  200)",
-  "    registry_integrity=\"$(",
+  '    registry_integrity="$(',
   "      node - \"$registry_metadata\" <<'NODE'",
-  "const { readFileSync } = require(\"node:fs\");",
+  'const { readFileSync } = require("node:fs");',
   "",
-  "const metadata = JSON.parse(readFileSync(process.argv[2], \"utf8\"));",
+  'const metadata = JSON.parse(readFileSync(process.argv[2], "utf8"));',
   "const integrity = metadata.dist?.integrity;",
-  "if (typeof integrity === \"string\" && integrity.length > 0) {",
+  'if (typeof integrity === "string" && integrity.length > 0) {',
   "  process.stdout.write(integrity);",
   "}",
   "NODE",
-  "    )\"",
-  "    if [[ -z \"$registry_integrity\" ]]; then",
-  "      echo \"::error::npm registry metadata is missing dist.integrity\"",
+  '    )"',
+  '    if [[ -z "$registry_integrity" ]]; then',
+  '      echo "::error::npm registry metadata is missing dist.integrity"',
   "      exit 1",
   "    fi",
   "",
-  "    local_integrity=\"$(",
+  '    local_integrity="$(',
   "      node - \"$tarball\" <<'NODE'",
-  "const { createHash } = require(\"node:crypto\");",
-  "const { readFileSync } = require(\"node:fs\");",
+  'const { createHash } = require("node:crypto");',
+  'const { readFileSync } = require("node:fs");',
   "",
-  "const digest = createHash(\"sha512\")",
+  'const digest = createHash("sha512")',
   "  .update(readFileSync(process.argv[2]))",
-  "  .digest(\"base64\");",
+  '  .digest("base64");',
   "process.stdout.write(`sha512-${digest}`);",
   "NODE",
-  "    )\"",
-  "    if [[ \"$registry_integrity\" != \"$local_integrity\" ]]; then",
-  "      echo \"::error::patchpage@${EXPECTED_VERSION} exists with different integrity\"",
+  '    )"',
+  '    if [[ "$registry_integrity" != "$local_integrity" ]]; then',
+  '      echo "::error::patchpage@${EXPECTED_VERSION} exists with different integrity"',
   "      exit 1",
   "    fi",
   "",
-  "    echo \"patchpage@${EXPECTED_VERSION} already published with matching integrity, skipping\"",
+  '    echo "patchpage@${EXPECTED_VERSION} already published with matching integrity, skipping"',
   "    exit 0",
   "    ;;",
   "  404)",
-  "    echo \"patchpage@${EXPECTED_VERSION} is absent from npm; publishing\"",
+  '    echo "patchpage@${EXPECTED_VERSION} is absent from npm; publishing"',
   "    ;;",
   "  *)",
-  "    echo \"::error::Unexpected npm registry HTTP status: $http_status\"",
+  '    echo "::error::Unexpected npm registry HTTP status: $http_status"',
   "    exit 1",
   "    ;;",
   "esac",
   "",
-  "node \"$npm_cli\" publish \"$tarball\" --ignore-scripts --provenance \\",
+  'node "$npm_cli" publish "$tarball" --ignore-scripts --provenance \\',
   "  --registry=https://registry.npmjs.org",
-  "",
+  ""
 ].join("\n");
 
 function job(name) {
@@ -528,9 +542,7 @@ function jobFrom(source, name, label) {
     return "";
   }
 
-  const end = lines.findIndex(
-    (line, index) => index > start && /^  [a-zA-Z0-9_-]+:$/.test(line),
-  );
+  const end = lines.findIndex((line, index) => index > start && /^  [a-zA-Z0-9_-]+:$/.test(line));
   return lines.slice(start, end === -1 ? undefined : end).join("\n");
 }
 
@@ -606,6 +618,32 @@ function parsedSteps(jobName, selectedJob) {
   return selectedJob.steps;
 }
 
+function parsedCiJob(name) {
+  if (parsedCiWorkflow === null) {
+    return null;
+  }
+
+  const jobs = isMapping(parsedCiWorkflow) ? parsedCiWorkflow.jobs : null;
+  const selectedJob = isMapping(jobs) ? jobs[name] : null;
+  if (!isMapping(selectedJob)) {
+    failures.push(`ci.yml must define ${name} as a parsed job map`);
+    return null;
+  }
+
+  return selectedJob;
+}
+
+function parsedCiSteps(jobName, selectedJob) {
+  if (selectedJob === null) {
+    return [];
+  }
+  if (!Array.isArray(selectedJob.steps) || !selectedJob.steps.every(isMapping)) {
+    failures.push(`ci ${jobName} must define steps as parsed YAML maps`);
+    return [];
+  }
+  return selectedJob.steps;
+}
+
 function uniqueStep(steps, predicate, description) {
   if (parsedWorkflow === null) {
     return null;
@@ -652,7 +690,7 @@ function parsedActionUses(document, source, label) {
         continue;
       }
       const usesPairs = step.items.filter(
-        (pair) => isScalar(pair.key) && pair.key.value === "uses",
+        (pair) => isScalar(pair.key) && pair.key.value === "uses"
       );
       if (usesPairs.length === 0) {
         continue;
@@ -665,21 +703,18 @@ function parsedActionUses(document, source, label) {
       const [usesPair] = usesPairs;
       const valueRange = isScalar(usesPair.value) ? usesPair.value.range : null;
       const valueEnd = Array.isArray(valueRange) ? valueRange[1] : null;
-      const lineEnd =
-        typeof valueEnd === "number" ? source.indexOf("\n", valueEnd) : -1;
+      const lineEnd = typeof valueEnd === "number" ? source.indexOf("\n", valueEnd) : -1;
 
       actions.push({
         comment: isScalar(usesPair.value) ? usesPair.value.comment : null,
         coordinate: isScalar(usesPair.value) ? usesPair.value.value : null,
         inlineSuffix:
           typeof valueEnd === "number"
-            ? source
-                .slice(valueEnd, lineEnd === -1 ? source.length : lineEnd)
-                .replace(/\r$/, "")
+            ? source.slice(valueEnd, lineEnd === -1 ? source.length : lineEnd).replace(/\r$/, "")
             : null,
         jobName,
         label,
-        lineNumber: workflowLineNumber(source, usesPair.key.range?.[0] ?? 0),
+        lineNumber: workflowLineNumber(source, usesPair.key.range?.[0] ?? 0)
       });
     }
   }
@@ -691,7 +726,7 @@ const actionUses = parsedActionUses(workflowDocument, workflow, "release.yml");
 const reconcileActionUses = parsedActionUses(
   reconcileWorkflowDocument,
   reconcileWorkflow,
-  "reconcile-ghcr.yml",
+  "reconcile-ghcr.yml"
 );
 
 function ciJob(name) {
@@ -703,9 +738,7 @@ function ciJob(name) {
     return "";
   }
 
-  const end = lines.findIndex(
-    (line, index) => index > start && /^  [a-zA-Z0-9_-]+:$/.test(line),
-  );
+  const end = lines.findIndex((line, index) => index > start && /^  [a-zA-Z0-9_-]+:$/.test(line));
   return lines.slice(start, end === -1 ? undefined : end).join("\n");
 }
 
@@ -795,11 +828,11 @@ if (parsedReconcileWorkflow !== null && reconcileActionUses.length === 0) {
 
 for (const { comment, coordinate, inlineSuffix, label, lineNumber } of [
   ...actionUses,
-  ...reconcileActionUses,
+  ...reconcileActionUses
 ]) {
   if (typeof coordinate !== "string") {
     failures.push(
-      `${label}:${lineNumber} must pin an Action to a full commit SHA with an inline semver release comment`,
+      `${label}:${lineNumber} must pin an Action to a full commit SHA with an inline semver release comment`
     );
     continue;
   }
@@ -807,7 +840,7 @@ for (const { comment, coordinate, inlineSuffix, label, lineNumber } of [
   const coordinateMatch = coordinate.match(/^([^\s@]+)@([^\s@]+)$/);
   if (!coordinateMatch) {
     failures.push(
-      `${label}:${lineNumber} must pin an Action to a full commit SHA with an inline semver release comment`,
+      `${label}:${lineNumber} must pin an Action to a full commit SHA with an inline semver release comment`
     );
     continue;
   }
@@ -824,7 +857,7 @@ for (const { comment, coordinate, inlineSuffix, label, lineNumber } of [
 
   if (reviewed && reviewed.sha !== reference) {
     failures.push(
-      `${label}:${lineNumber} must use reviewed coordinate ${actionName}@${reviewed.sha} # ${reviewed.version}`,
+      `${label}:${lineNumber} must use reviewed coordinate ${actionName}@${reviewed.sha} # ${reviewed.version}`
     );
   }
 
@@ -834,11 +867,11 @@ for (const { comment, coordinate, inlineSuffix, label, lineNumber } of [
       : null;
   if (commentVersion === null || inlineSuffix !== ` # ${commentVersion}`) {
     failures.push(
-      `${label}:${lineNumber} must pin an Action to a full commit SHA with an inline semver release comment`,
+      `${label}:${lineNumber} must pin an Action to a full commit SHA with an inline semver release comment`
     );
   } else if (reviewed && reviewed.version !== commentVersion) {
     failures.push(
-      `${label}:${lineNumber} must use reviewed coordinate ${actionName}@${reviewed.sha} # ${reviewed.version}`,
+      `${label}:${lineNumber} must use reviewed coordinate ${actionName}@${reviewed.sha} # ${reviewed.version}`
     );
   }
 }
@@ -849,16 +882,15 @@ const expectedActionCounts = new Map([
   ["pnpm/action-setup", 1],
   ["actions/upload-artifact", 3],
   ["actions/download-artifact", 4],
-  ["docker/login-action", 0],
+  ["docker/login-action", 0]
 ]);
 for (const [actionName, expectedCount] of expectedActionCounts) {
   const actualCount = actionUses.filter(
-    ({ coordinate }) =>
-      typeof coordinate === "string" && coordinate.startsWith(`${actionName}@`),
+    ({ coordinate }) => typeof coordinate === "string" && coordinate.startsWith(`${actionName}@`)
   ).length;
   if (actualCount !== expectedCount) {
     failures.push(
-      `release.yml must retain all ${expectedCount} reviewed ${actionName} Action uses`,
+      `release.yml must retain all ${expectedCount} reviewed ${actionName} Action uses`
     );
   }
 }
@@ -869,16 +901,15 @@ const expectedReconcileActionCounts = new Map([
   ["pnpm/action-setup", 0],
   ["actions/upload-artifact", 3],
   ["actions/download-artifact", 3],
-  ["docker/login-action", 0],
+  ["docker/login-action", 0]
 ]);
 for (const [actionName, expectedCount] of expectedReconcileActionCounts) {
   const actualCount = reconcileActionUses.filter(
-    ({ coordinate }) =>
-      typeof coordinate === "string" && coordinate.startsWith(`${actionName}@`),
+    ({ coordinate }) => typeof coordinate === "string" && coordinate.startsWith(`${actionName}@`)
   ).length;
   if (actualCount !== expectedCount) {
     failures.push(
-      `reconcile-ghcr.yml must retain all ${expectedCount} reviewed ${actionName} Action uses`,
+      `reconcile-ghcr.yml must retain all ${expectedCount} reviewed ${actionName} Action uses`
     );
   }
 }
@@ -886,20 +917,20 @@ for (const [actionName, expectedCount] of expectedReconcileActionCounts) {
 const npmVersion = packageJson.devDependencies?.npm;
 if (npmVersion !== reviewedNpm.version) {
   failures.push(
-    `the publishing npm CLI must be the reviewed exact root devDependency ${reviewedNpm.version}`,
+    `the publishing npm CLI must be the reviewed exact root devDependency ${reviewedNpm.version}`
   );
 } else {
   const rootImporter = lockfile.match(/^  \.:\n[\s\S]*?(?=^  \S)/m)?.[0] ?? "";
   const escapedNpmVersion = npmVersion.replaceAll(".", "\\.");
   const lockedNpm = new RegExp(
     `^      npm:\\n        specifier: ${npmVersion.replaceAll(".", "\\.")}\\n        version: ${npmVersion.replaceAll(".", "\\.")}$`,
-    "m",
+    "m"
   );
   const lockedNpmIntegrity = lockfile.match(
     new RegExp(
       `^  npm@${escapedNpmVersion}:\\n    resolution: \\{integrity: (sha512-[^}]+)\\}$`,
-      "m",
-    ),
+      "m"
+    )
   )?.[1];
 
   if (!lockedNpm.test(rootImporter)) {
@@ -907,7 +938,7 @@ if (npmVersion !== reviewedNpm.version) {
   }
   if (lockedNpmIntegrity !== reviewedNpm.integrity) {
     failures.push(
-      `pnpm-lock.yaml must retain the reviewed registry integrity for npm@${npmVersion}`,
+      `pnpm-lock.yaml must retain the reviewed registry integrity for npm@${npmVersion}`
     );
   }
 }
@@ -923,27 +954,21 @@ for (const ecosystem of ["npm", "github-actions"]) {
 }
 
 const releaseConcurrency = workflow.match(
-  /^concurrency:\n  group: ([^\n]+)\n  queue: max\n  cancel-in-progress: false$/m,
+  /^concurrency:\n  group: ([^\n]+)\n  queue: max\n  cancel-in-progress: false$/m
 );
 if (!releaseConcurrency) {
   failures.push(
-    "release.yml must serialize all patchpage-server publishes in one package-wide max queue without canceling running or pending releases; GitHub caps max at 100 pending runs",
+    "release.yml must serialize all patchpage-server publishes in one package-wide max queue without canceling running or pending releases; GitHub caps max at 100 pending runs"
   );
 } else if (releaseConcurrency[1] !== "release-ghcr-patchpage-server") {
   failures.push(
-    "release.yml concurrency group must be the constant package-wide release-ghcr-patchpage-server group, not a ref/version-scoped group",
+    "release.yml concurrency group must be the constant package-wide release-ghcr-patchpage-server group, not a ref/version-scoped group"
   );
 }
 
 if (
   parsedWorkflow !== null &&
-  (!hasExactKeys(parsedWorkflow, [
-    "name",
-    "on",
-    "permissions",
-    "concurrency",
-    "jobs",
-  ]) ||
+  (!hasExactKeys(parsedWorkflow, ["name", "on", "permissions", "concurrency", "jobs"]) ||
     parsedWorkflow.name !== "Release" ||
     !hasExactKeys(parsedWorkflow.on, ["push"]) ||
     !hasExactKeys(parsedWorkflow.on.push, ["tags"]) ||
@@ -952,11 +977,11 @@ if (
     !hasExactMapping(parsedWorkflow.concurrency, {
       group: "release-ghcr-patchpage-server",
       queue: "max",
-      "cancel-in-progress": false,
+      "cancel-in-progress": false
     }))
 ) {
   failures.push(
-    "release.yml root must contain exactly the reviewed trigger, permissions, concurrency, and jobs",
+    "release.yml root must contain exactly the reviewed trigger, permissions, concurrency, and jobs"
   );
 }
 
@@ -977,77 +1002,74 @@ const expectedReleaseJobs = [
   "verify-server-image",
   "docker-ghcr",
   "ghcr-anonymous-smoke",
-  "npx-smoke",
+  "npx-smoke"
 ];
 const reviewedReleaseJobContracts = new Map([
   [
     "guard",
     {
       digest: "0d997fca5709187a66a6096e740de547c974114f580a134dfc5836798048ecb9",
-      permissions: { contents: "read" },
-    },
+      permissions: { contents: "read" }
+    }
   ],
   [
     "prepare-npm",
     {
       digest: "06cad8342bc8f91548af697e797fd95e7ae2d506f4cf94cb9ef1acfe93ae3ad0",
-      permissions: {},
-    },
+      permissions: {}
+    }
   ],
   [
     "verify",
     {
-      digest: "34002413484b34b0da88bec19e43d65b88a99ea2e614fbece4b4c5eb9ebd6439",
-      permissions: { contents: "read" },
-    },
+      digest: "81cd016a69f4cc14c339f5bdbae57ed212219d92b31e93de0ce796eefbe10ea4",
+      permissions: { contents: "read" }
+    }
   ],
   [
     "publish-npm",
     {
       digest: "d9407283578d65ac0b6415ab8730d37bdde1c654d615698e7a2b644a5d545443",
-      permissions: { "id-token": "write" },
-    },
+      permissions: { "id-token": "write" }
+    }
   ],
   [
     "github-release",
     {
       digest: "33a2d1d2592c5d0615da80eab88418df943ecc77d875506e220c3c1c26c013e2",
-      permissions: { contents: "write" },
-    },
+      permissions: { contents: "write" }
+    }
   ],
   [
     "verify-server-image",
     {
       digest: "067125da1d66d43b3bb3e1b45452fcde2a20549ac7c99725b7d3b4f1d1a32469",
-      permissions: { contents: "read" },
-    },
+      permissions: { contents: "read" }
+    }
   ],
   [
     "docker-ghcr",
     {
       digest: "d4e7b62918f5d9150011f384b1514a24a5a637cb617dc69ece3d769b7155ed20",
-      permissions: { packages: "write" },
-    },
+      permissions: { packages: "write" }
+    }
   ],
   [
     "ghcr-anonymous-smoke",
     {
       digest: "24b6be0ef3359d0a1a46e6a76f4d0fd61e6db93924594f7962d1ea91bda99d63",
-      permissions: {},
-    },
+      permissions: {}
+    }
   ],
   [
     "npx-smoke",
     {
       digest: "17cd0764c9612c7446ca10b444d462f9e3aed5309a0799b7c4a52ac257f330b2",
-      permissions: {},
-    },
-  ],
+      permissions: {}
+    }
+  ]
 ]);
-if (
-  parsedWorkflow !== null &&
-  !hasExactKeys(parsedWorkflow.jobs, expectedReleaseJobs)
-) {
+if (parsedWorkflow !== null && !hasExactKeys(parsedWorkflow.jobs, expectedReleaseJobs)) {
   failures.push("release.yml must contain exactly the reviewed release jobs");
 }
 if (parsedWorkflow !== null) {
@@ -1062,7 +1084,7 @@ if (parsedWorkflow !== null) {
       digest !== contract.digest
     ) {
       failures.push(
-        `${jobName} must match the exact reviewed job map, permissions, and ordered steps`,
+        `${jobName} must match the exact reviewed job map, permissions, and ordered steps`
       );
     }
   }
@@ -1076,25 +1098,25 @@ const reviewedReconcileRoot = {
         target: {
           description: "Optional exact stable release tag, for example v1.2.3",
           required: false,
-          type: "string",
+          type: "string"
         },
         "batch-size": {
           description: "Maximum missing or incomplete stable releases to replay",
           required: false,
           default: "3",
-          type: "string",
-        },
-      },
+          type: "string"
+        }
+      }
     },
-    schedule: [{ cron: "17 */6 * * *" }],
+    schedule: [{ cron: "17 */6 * * *" }]
   },
   permissions: {},
   concurrency: {
     group: "release-ghcr-patchpage-server",
     queue: "max",
-    "cancel-in-progress": false,
+    "cancel-in-progress": false
   },
-  jobs: null,
+  jobs: null
 };
 if (
   parsedReconcileWorkflow !== null &&
@@ -1102,7 +1124,7 @@ if (
     JSON.stringify(reviewedReconcileRoot)
 ) {
   failures.push(
-    "reconcile-ghcr.yml root must contain exactly the reviewed triggers, permissions, concurrency, and jobs",
+    "reconcile-ghcr.yml root must contain exactly the reviewed triggers, permissions, concurrency, and jobs"
   );
 }
 
@@ -1112,51 +1134,51 @@ const expectedReconcileJobs = [
   "publish-ghcr",
   "reconcile-latest",
   "bind-publish-results",
-  "ghcr-anonymous-acceptance",
+  "ghcr-anonymous-acceptance"
 ];
 const reviewedReconcileJobContracts = new Map([
   [
     "inspect",
     {
       digest: "831898fb0c8a5b70132ce818898c247cabc9f5199fc387ab47b4e9a88ed5ce41",
-      permissions: { contents: "read", packages: "read" },
-    },
+      permissions: { contents: "read", packages: "read" }
+    }
   ],
   [
     "rebuild",
     {
       digest: "ec539fabecbc0eabdd0807d2be89941492d8e4fa49fa61ddcb7492ee3a7cd891",
-      permissions: { contents: "read" },
-    },
+      permissions: { contents: "read" }
+    }
   ],
   [
     "publish-ghcr",
     {
       digest: "23a606d3857b15b976ce5c7741fda0cd714836fe8b392ab5a318a0bca4699e91",
-      permissions: { actions: "read", packages: "write" },
-    },
+      permissions: { actions: "read", packages: "write" }
+    }
   ],
   [
     "reconcile-latest",
     {
       digest: "c8adfe1de7a9dda6fc626bd6d64b771ef1237ba57415e87cb229825f49667c18",
-      permissions: { packages: "write" },
-    },
+      permissions: { packages: "write" }
+    }
   ],
   [
     "bind-publish-results",
     {
       digest: "6b3dfd61bb2338e0ee62030893e92eb3631d95ace341e7d0997966194f89b956",
-      permissions: { actions: "read" },
-    },
+      permissions: { actions: "read" }
+    }
   ],
   [
     "ghcr-anonymous-acceptance",
     {
       digest: "94c89f3c826ae9744e7d122069254b988dcf56f4aa3d63f2397ad0871ec9db8f",
-      permissions: {},
-    },
-  ],
+      permissions: {}
+    }
+  ]
 ]);
 if (
   parsedReconcileWorkflow !== null &&
@@ -1176,7 +1198,7 @@ if (parsedReconcileWorkflow !== null) {
       digest !== contract.digest
     ) {
       failures.push(
-        `reconcile-ghcr ${jobName} must match the exact reviewed job map, permissions, and ordered steps`,
+        `reconcile-ghcr ${jobName} must match the exact reviewed job map, permissions, and ordered steps`
       );
     }
   }
@@ -1188,90 +1210,92 @@ const publishSteps = parsedSteps("publish-npm", parsedPublishJob);
 const guardCheckoutStep = uniqueStep(
   guardSteps,
   (step) => step.uses === `actions/checkout@${reviewedActions.get("actions/checkout").sha}`,
-  "the guard checkout step",
+  "the guard checkout step"
 );
 const versionProducerStep = uniqueStep(
   guardSteps,
   (step) => step.id === "version",
-  "the guard version producer step",
+  "the guard version producer step"
 );
 const npmCliUploadStep = uniqueStep(
   prepareNpmSteps,
   (step) => step.name === "Upload the reviewed npm CLI",
-  "the Upload the reviewed npm CLI step",
+  "the Upload the reviewed npm CLI step"
 );
 const npmCliProducerIdStep = uniqueStep(
   prepareNpmSteps,
   (step) => step.id === "npm-cli",
-  "the reviewed npm CLI producer step",
+  "the reviewed npm CLI producer step"
 );
 const npmCliProducerNameStep = uniqueStep(
   prepareNpmSteps,
   (step) => step.name === "Fetch and verify the reviewed npm CLI",
-  "the Fetch and verify the reviewed npm CLI step",
+  "the Fetch and verify the reviewed npm CLI step"
 );
 const serverImageJob = job("verify-server-image");
 const dockerJob = job("docker-ghcr");
 const anonymousImageJob = job("ghcr-anonymous-smoke");
+const ciLintJob = ciJob("lint");
 const ciDockerJob = ciJob("docker");
+const parsedCiLintJob = parsedCiJob("lint");
+const ciLintSteps = parsedCiSteps("lint", parsedCiLintJob);
 
 const npmCliUploadIdStep = uniqueStep(
   prepareNpmSteps,
   (step) => step.id === "npm-cli-artifact",
-  "the npm-cli-artifact producer step",
+  "the npm-cli-artifact producer step"
 );
 const packageMetadataStep = uniqueStep(
   verifySteps,
   (step) => step.id === "package",
-  "the package metadata producer step",
+  "the package metadata producer step"
 );
 const packageMetadataNameStep = uniqueStep(
   verifySteps,
   (step) => step.name === "Pack exactly one release tarball and verify contents",
-  "the Pack exactly one release tarball and verify contents step",
+  "the Pack exactly one release tarball and verify contents step"
 );
 const verifyNpmCliStep = uniqueStep(
   verifySteps,
   (step) => step.name === "Verify the isolated npm CLI",
-  "the Verify the isolated npm CLI step",
+  "the Verify the isolated npm CLI step"
 );
 const verifyNpmCliDownloadStep = uniqueStep(
   verifySteps,
   (step) => step.name === "Download the isolated npm CLI",
-  "the Download the isolated npm CLI step",
+  "the Download the isolated npm CLI step"
 );
 const smokeInstallStep = uniqueStep(
   verifySteps,
   (step) => step.name === "Install and run tarball on minimum supported Node",
-  "the minimum-Node tarball smoke step",
+  "the minimum-Node tarball smoke step"
 );
 const smokeInstallIndex = verifySteps.indexOf(smokeInstallStep);
-const minimumNodeSetupStep =
-  smokeInstallIndex > 0 ? verifySteps[smokeInstallIndex - 1] : null;
+const minimumNodeSetupStep = smokeInstallIndex > 0 ? verifySteps[smokeInstallIndex - 1] : null;
 const packageUploadStep = uniqueStep(
   verifySteps,
   (step) => step.name === "Upload the exact tested tarball",
-  "the Upload the exact tested tarball step",
+  "the Upload the exact tested tarball step"
 );
 const packageUploadIdStep = uniqueStep(
   verifySteps,
   (step) => step.id === "package-artifact",
-  "the package-artifact producer step",
+  "the package-artifact producer step"
 );
 const packageDownloadStep = uniqueStep(
   publishSteps,
   (step) => step.name === "Download the exact tested tarball",
-  "the Download the exact tested tarball step",
+  "the Download the exact tested tarball step"
 );
 const npmCliDownloadStep = uniqueStep(
   publishSteps,
   (step) => step.name === "Download the pinned publishing CLI",
-  "the Download the pinned publishing CLI step",
+  "the Download the pinned publishing CLI step"
 );
 const publicationStep = uniqueStep(
   publishSteps,
   (step) => step.name === "Publish the verified tarball to npm",
-  "the Publish the verified tarball to npm step",
+  "the Publish the verified tarball to npm step"
 );
 const publicationRun = typeof publicationStep?.run === "string" ? publicationStep.run : "";
 const prepareSetupNodeStep = prepareNpmSteps[0] ?? null;
@@ -1284,7 +1308,7 @@ if (
   parsedWorkflow !== null &&
   !hasExactMapping(parsedGuardJob?.outputs, {
     version: "${{ steps.version.outputs.version }}",
-    revision: "${{ steps.version.outputs.revision }}",
+    revision: "${{ steps.version.outputs.revision }}"
   })
 ) {
   failures.push("guard outputs must bind exactly to the version producer");
@@ -1302,9 +1326,7 @@ if (
     versionProducerStep.run !== expectedVersionProducerRun ||
     guardSteps.indexOf(versionProducerStep) !== 1)
 ) {
-  failures.push(
-    "guard must check out the repository before running the exact version producer",
-  );
+  failures.push("guard must check out the repository before running the exact version producer");
 }
 
 if (
@@ -1321,7 +1343,7 @@ if (
     prepareSetupNodeStep.uses !==
       `actions/setup-node@${reviewedActions.get("actions/setup-node").sha}` ||
     !hasExactMapping(prepareSetupNodeStep.with, {
-      "node-version": reviewedNodeVersion,
+      "node-version": reviewedNodeVersion
     }))
 ) {
   failures.push("prepare-npm must contain exactly the reviewed job map and ordered steps");
@@ -1331,7 +1353,7 @@ if (
   parsedWorkflow !== null &&
   !hasExactMapping(parsedPrepareNpmJob?.outputs, {
     "npm-version": "${{ steps.npm-cli.outputs.version }}",
-    "npm-cli-artifact-id": "${{ steps.npm-cli-artifact.outputs.artifact-id }}",
+    "npm-cli-artifact-id": "${{ steps.npm-cli-artifact.outputs.artifact-id }}"
   })
 ) {
   failures.push("prepare-npm outputs must bind the exact reviewed npm CLI producers");
@@ -1345,14 +1367,13 @@ if (
     npmCliProducerIdStep.shell !== "bash" ||
     !hasExactMapping(npmCliProducerIdStep.env, {
       EXPECTED_NPM_VERSION: reviewedNpm.version,
-      EXPECTED_NPM_INTEGRITY: reviewedNpm.integrity,
+      EXPECTED_NPM_INTEGRITY: reviewedNpm.integrity
     }) ||
     npmCliProducerIdStep.run !== expectedNpmCliProducerRun ||
-    prepareNpmSteps.indexOf(npmCliProducerIdStep) >=
-      prepareNpmSteps.indexOf(npmCliUploadStep))
+    prepareNpmSteps.indexOf(npmCliProducerIdStep) >= prepareNpmSteps.indexOf(npmCliUploadStep))
 ) {
   failures.push(
-    "prepare-npm must fetch, verify, and output the exact reviewed npm CLI before upload",
+    "prepare-npm must fetch, verify, and output the exact reviewed npm CLI before upload"
   );
 }
 
@@ -1367,7 +1388,7 @@ if (
       path: "${{ runner.temp }}/npm-cli",
       "if-no-files-found": "error",
       "retention-days": 1,
-      "include-hidden-files": true,
+      "include-hidden-files": true
     }))
 ) {
   failures.push("prepare-npm must produce the exact isolated npm CLI artifact");
@@ -1376,13 +1397,7 @@ if (
 if (
   parsedWorkflow !== null &&
   (parsedVerifyJob === null ||
-    !hasExactKeys(parsedVerifyJob, [
-      "needs",
-      "runs-on",
-      "permissions",
-      "outputs",
-      "steps",
-    ]) ||
+    !hasExactKeys(parsedVerifyJob, ["needs", "runs-on", "permissions", "outputs", "steps"]) ||
     !hasExactArray(parsedVerifyJob.needs, ["guard", "prepare-npm"]) ||
     parsedVerifyJob["runs-on"] !== "ubuntu-latest" ||
     !hasExactMapping(parsedVerifyJob.permissions, { contents: "read" }) ||
@@ -1391,8 +1406,7 @@ if (
     verifySteps[1] !== verifyPnpmSetupStep ||
     verifySteps[2] !== verifySetupNodeStep ||
     !hasExactKeys(verifyCheckoutStep, ["uses"]) ||
-    verifyCheckoutStep.uses !==
-      `actions/checkout@${reviewedActions.get("actions/checkout").sha}` ||
+    verifyCheckoutStep.uses !== `actions/checkout@${reviewedActions.get("actions/checkout").sha}` ||
     !hasExactKeys(verifyPnpmSetupStep, ["uses", "with"]) ||
     verifyPnpmSetupStep.uses !==
       `pnpm/action-setup@${reviewedActions.get("pnpm/action-setup").sha}` ||
@@ -1402,7 +1416,7 @@ if (
       `actions/setup-node@${reviewedActions.get("actions/setup-node").sha}` ||
     !hasExactMapping(verifySetupNodeStep.with, {
       "node-version": reviewedNodeVersion,
-      cache: "pnpm",
+      cache: "pnpm"
     }) ||
     !isExactRunStep(verifySteps[3], "pnpm install --frozen-lockfile") ||
     !isExactRunStep(verifySteps[4], "pnpm lint") ||
@@ -1414,7 +1428,7 @@ if (
     verifyNpmCliDownloadStep.uses !== reviewedDownloadArtifact ||
     !hasExactMapping(verifyNpmCliDownloadStep.with, {
       "artifact-ids": "${{ needs.prepare-npm.outputs.npm-cli-artifact-id }}",
-      path: "${{ runner.temp }}/npm-cli",
+      path: "${{ runner.temp }}/npm-cli"
     }) ||
     verifySteps[9] !== verifyNpmCliStep ||
     verifySteps[10] !== packageMetadataStep ||
@@ -1423,7 +1437,7 @@ if (
     verifySteps[13] !== packageUploadStep)
 ) {
   failures.push(
-    "verify must contain exactly the reviewed job map and ordered build and smoke steps",
+    "verify must contain exactly the reviewed job map and ordered build and smoke steps"
   );
 }
 
@@ -1432,7 +1446,7 @@ if (
   (!hasExactMapping(parsedVerifyJob?.outputs, {
     "tarball-filename": "${{ steps.package.outputs.filename }}",
     "tarball-sha256": "${{ steps.package.outputs.sha256 }}",
-    "package-artifact-id": "${{ steps.package-artifact.outputs.artifact-id }}",
+    "package-artifact-id": "${{ steps.package-artifact.outputs.artifact-id }}"
   }) ||
     packageMetadataStep === null ||
     packageMetadataStep !== packageMetadataNameStep ||
@@ -1442,9 +1456,7 @@ if (
     packageMetadataStep.shell !== "bash" ||
     packageMetadataStep.run !== expectedPackageProducerRun)
 ) {
-  failures.push(
-    "verify outputs must bind to the exact package and artifact producers",
-  );
+  failures.push("verify outputs must bind to the exact package and artifact producers");
 }
 
 if (
@@ -1457,7 +1469,7 @@ if (
       path: "${{ steps.package.outputs.tarball-path }}",
       "if-no-files-found": "error",
       "retention-days": 1,
-      archive: false,
+      archive: false
     }))
 ) {
   failures.push("verify must upload exactly the active single raw tarball input");
@@ -1469,7 +1481,7 @@ if (
     !hasExactKeys(verifyNpmCliStep, ["name", "shell", "env", "run"]) ||
     verifyNpmCliStep.shell !== "bash" ||
     !hasExactMapping(verifyNpmCliStep.env, {
-      EXPECTED_NPM_VERSION: "${{ needs.prepare-npm.outputs.npm-version }}",
+      EXPECTED_NPM_VERSION: "${{ needs.prepare-npm.outputs.npm-version }}"
     }) ||
     verifyNpmCliStep.run !== expectedVerifyNpmCliRun)
 ) {
@@ -1484,17 +1496,17 @@ if (
     minimumNodeSetupStep.uses !==
       `actions/setup-node@${reviewedActions.get("actions/setup-node").sha}` ||
     !hasExactMapping(minimumNodeSetupStep.with, {
-      "node-version": 22,
+      "node-version": 22
     }) ||
     !hasExactKeys(smokeInstallStep, ["name", "shell", "env", "run"]) ||
     smokeInstallStep.shell !== "bash" ||
     !hasExactMapping(smokeInstallStep.env, {
-      EXPECTED_TARBALL_SHA256: "${{ steps.package.outputs.sha256 }}",
+      EXPECTED_TARBALL_SHA256: "${{ steps.package.outputs.sha256 }}"
     }) ||
     smokeInstallStep.run !== expectedMinimumNodeSmokeRun)
 ) {
   failures.push(
-    "verify must run the exact tarball smoke contract on the minimum supported Node 22",
+    "verify must run the exact tarball smoke contract on the minimum supported Node 22"
   );
 }
 
@@ -1509,19 +1521,19 @@ if (
     verifySteps.indexOf(smokeInstallStep) >= verifySteps.indexOf(packageUploadStep))
 ) {
   failures.push(
-    "verify must validate the isolated npm CLI, produce the package, smoke-test it, then upload it",
+    "verify must validate the isolated npm CLI, produce the package, smoke-test it, then upload it"
   );
 }
 
 const expectedVerifyWorkflowCommandReferences = [
   {
     line: 'echo "NPM_CLI=$NPM_CLI" >> "$GITHUB_ENV"',
-    step: verifyNpmCliStep,
+    step: verifyNpmCliStep
   },
   ...expectedPackageProducerRun
     .split("\n")
     .filter((line) => line.includes("GITHUB_ENV") || line.includes("GITHUB_OUTPUT"))
-    .map((line) => ({ line, step: packageMetadataStep })),
+    .map((line) => ({ line, step: packageMetadataStep }))
 ];
 const verifyWorkflowCommandReferences = verifySteps.flatMap((step) =>
   typeof step.run === "string"
@@ -1529,20 +1541,19 @@ const verifyWorkflowCommandReferences = verifySteps.flatMap((step) =>
         .split("\n")
         .filter((line) => line.includes("GITHUB_ENV") || line.includes("GITHUB_OUTPUT"))
         .map((line) => ({ line, step }))
-    : [],
+    : []
 );
 if (
   parsedWorkflow !== null &&
-  (verifyWorkflowCommandReferences.length !==
-    expectedVerifyWorkflowCommandReferences.length ||
+  (verifyWorkflowCommandReferences.length !== expectedVerifyWorkflowCommandReferences.length ||
     verifyWorkflowCommandReferences.some(
       (reference, index) =>
         reference.step !== expectedVerifyWorkflowCommandReferences[index].step ||
-        reference.line !== expectedVerifyWorkflowCommandReferences[index].line,
+        reference.line !== expectedVerifyWorkflowCommandReferences[index].line
     ))
 ) {
   failures.push(
-    "verify may write GITHUB_ENV and GITHUB_OUTPUT only at the reviewed producer lines",
+    "verify may write GITHUB_ENV and GITHUB_OUTPUT only at the reviewed producer lines"
   );
 }
 
@@ -1562,17 +1573,16 @@ if (
     publishSetupNodeStep.uses !==
       `actions/setup-node@${reviewedActions.get("actions/setup-node").sha}` ||
     !hasExactMapping(publishSetupNodeStep.with, {
-      "node-version": reviewedNodeVersion,
+      "node-version": reviewedNodeVersion
     }))
 ) {
   failures.push(
-    "publish-npm must contain exactly the reviewed privileged job map and ordered publication steps",
+    "publish-npm must contain exactly the reviewed privileged job map and ordered publication steps"
   );
 }
 
 const publishDownloadSteps = publishSteps.filter(
-  (step) =>
-    typeof step.uses === "string" && step.uses.startsWith("actions/download-artifact@"),
+  (step) => typeof step.uses === "string" && step.uses.startsWith("actions/download-artifact@")
 );
 if (parsedWorkflow !== null && publishDownloadSteps.length !== 2) {
   failures.push("publish-npm must contain exactly two download-artifact steps");
@@ -1586,7 +1596,7 @@ if (
     !hasExactMapping(packageDownloadStep.with, {
       "artifact-ids": "${{ needs.verify.outputs.package-artifact-id }}",
       path: "${{ runner.temp }}/patchpage-package",
-      "skip-decompress": true,
+      "skip-decompress": true
     }))
 ) {
   failures.push("publish-npm must download the exact raw package artifact by ID");
@@ -1599,7 +1609,7 @@ if (
     npmCliDownloadStep.uses !== reviewedDownloadArtifact ||
     !hasExactMapping(npmCliDownloadStep.with, {
       "artifact-ids": "${{ needs.prepare-npm.outputs.npm-cli-artifact-id }}",
-      path: "${{ runner.temp }}/npm-cli",
+      path: "${{ runner.temp }}/npm-cli"
     }))
 ) {
   failures.push("publish-npm must normally decompress the exact isolated npm CLI artifact");
@@ -1616,7 +1626,7 @@ if (
     publishSteps.indexOf(npmCliDownloadStep) >= publicationStepIndex)
 ) {
   failures.push(
-    "the publication step must contain exactly name, shell, env, and the reviewed run after both isolated downloads",
+    "the publication step must contain exactly name, shell, env, and the reviewed run after both isolated downloads"
   );
 }
 
@@ -1626,7 +1636,7 @@ if (
     EXPECTED_FILENAME: "${{ needs.verify.outputs.tarball-filename }}",
     EXPECTED_NPM_VERSION: "${{ needs.prepare-npm.outputs.npm-version }}",
     EXPECTED_SHA256: "${{ needs.verify.outputs.tarball-sha256 }}",
-    EXPECTED_VERSION: "${{ needs.guard.outputs.version }}",
+    EXPECTED_VERSION: "${{ needs.guard.outputs.version }}"
   })
 ) {
   failures.push("the publication step must bind the exact verified filename, digest, versions");
@@ -1646,22 +1656,17 @@ if (prepareNpmJob) {
     "npm install",
     "npm exec",
     "npx ",
-    "pnpm ",
+    "pnpm "
   ]) {
     if (prepareNpmJob.includes(forbidden)) {
       failures.push(`prepare-npm must not contain ${forbidden}`);
     }
   }
 
-  const allowedPrepareActions = new Set([
-    "actions/setup-node",
-    "actions/upload-artifact",
-  ]);
+  const allowedPrepareActions = new Set(["actions/setup-node", "actions/upload-artifact"]);
   const prepareActions = actionUses
     .filter(({ jobName }) => jobName === "prepare-npm")
-    .map(({ coordinate }) =>
-      typeof coordinate === "string" ? coordinate.split("@")[0] : null,
-    );
+    .map(({ coordinate }) => (typeof coordinate === "string" ? coordinate.split("@")[0] : null));
   for (const action of prepareActions) {
     if (!allowedPrepareActions.has(action)) {
       failures.push(`prepare-npm must not execute the ${action} Action`);
@@ -1680,29 +1685,25 @@ if (prepareNpmJob) {
     !prepareNpmJob.includes(`EXPECTED_NPM_INTEGRITY: ${reviewedNpm.integrity}`)
   ) {
     failures.push(
-      "prepare-npm must bind its fetched npm version and integrity to the reviewed metadata",
+      "prepare-npm must bind its fetched npm version and integrity to the reviewed metadata"
     );
   }
 
   const prepareNodeVersions = [
     ...prepareNpmJob.matchAll(
-      /uses: actions\/setup-node@[^\n]+\n\s+with:\n\s+node-version:\s+([^\s#]+)/g,
-    ),
+      /uses: actions\/setup-node@[^\n]+\n\s+with:\n\s+node-version:\s+([^\s#]+)/g
+    )
   ].map((match) => match[1]);
   if (
     prepareNodeVersions.length !== 1 ||
     !exactVersionPattern.test(prepareNodeVersions[0]) ||
     prepareNodeVersions[0] !== reviewedNodeVersion
   ) {
-    failures.push(
-      `prepare-npm must use the reviewed exact Node runtime ${reviewedNodeVersion}`,
-    );
+    failures.push(`prepare-npm must use the reviewed exact Node runtime ${reviewedNodeVersion}`);
   }
 
   if (
-    !prepareNpmJob.includes(
-      'https://registry.npmjs.org/npm/-/npm-${EXPECTED_NPM_VERSION}.tgz',
-    ) ||
+    !prepareNpmJob.includes("https://registry.npmjs.org/npm/-/npm-${EXPECTED_NPM_VERSION}.tgz") ||
     !prepareNpmJob.includes("curl --fail --silent --show-error") ||
     !prepareNpmJob.includes("--proto '=https'") ||
     !prepareNpmJob.includes("--tlsv1.2")
@@ -1711,18 +1712,14 @@ if (prepareNpmJob) {
   }
 
   const sriCalculation = prepareNpmJob.indexOf('createHash("sha512")');
-  const sriComparison = prepareNpmJob.indexOf(
-    '"$actual_integrity" != "$EXPECTED_NPM_INTEGRITY"',
-  );
+  const sriComparison = prepareNpmJob.indexOf('"$actual_integrity" != "$EXPECTED_NPM_INTEGRITY"');
   const extraction = prepareNpmJob.indexOf("tar -xzf");
-  const cliExecution = prepareNpmJob.indexOf(
-    'node "$npm_cli_dir/bin/npm-cli.js" --version',
-  );
+  const cliExecution = prepareNpmJob.indexOf('node "$npm_cli_dir/bin/npm-cli.js" --version');
   const cliVersionComparison = prepareNpmJob.indexOf(
-    '"$actual_version" != "$EXPECTED_NPM_VERSION"',
+    '"$actual_version" != "$EXPECTED_NPM_VERSION"'
   );
   const cliVersionOutput = prepareNpmJob.indexOf(
-    'echo "version=$actual_version" >> "$GITHUB_OUTPUT"',
+    'echo "version=$actual_version" >> "$GITHUB_OUTPUT"'
   );
   const artifactUpload = prepareNpmJob.indexOf("uses: actions/upload-artifact@");
   if (
@@ -1734,25 +1731,19 @@ if (prepareNpmJob) {
     extraction <= sriComparison ||
     cliExecution <= extraction ||
     cliVersionComparison <= cliExecution ||
-    !prepareNpmJob
-      .slice(cliVersionComparison, cliVersionOutput)
-      .includes("exit 1") ||
+    !prepareNpmJob.slice(cliVersionComparison, cliVersionOutput).includes("exit 1") ||
     cliVersionOutput <= cliVersionComparison ||
     artifactUpload <= cliVersionOutput
   ) {
-    failures.push(
-      "prepare-npm must verify the reviewed SRI before extracting or executing npm",
-    );
+    failures.push("prepare-npm must verify the reviewed SRI before extracting or executing npm");
   }
 
   if (
     !prepareNpmJob.includes(
-      "npm-cli-artifact-id: ${{ steps.npm-cli-artifact.outputs.artifact-id }}",
+      "npm-cli-artifact-id: ${{ steps.npm-cli-artifact.outputs.artifact-id }}"
     ) ||
     !prepareNpmJob.includes("npm-version: ${{ steps.npm-cli.outputs.version }}") ||
-    !prepareNpmJob.includes(
-      "name: npm-publishing-cli-${{ github.run_attempt }}",
-    ) ||
+    !prepareNpmJob.includes("name: npm-publishing-cli-${{ github.run_attempt }}") ||
     !prepareNpmJob.includes("uses: actions/upload-artifact@")
   ) {
     failures.push("prepare-npm must expose its immutable npm CLI artifact ID and version");
@@ -1761,8 +1752,8 @@ if (prepareNpmJob) {
 
 const publishNodeVersions = [
   ...publishJob.matchAll(
-    /uses: actions\/setup-node@[^\n]+\n\s+with:\n\s+node-version:\s+([^\s#]+)/g,
-  ),
+    /uses: actions\/setup-node@[^\n]+\n\s+with:\n\s+node-version:\s+([^\s#]+)/g
+  )
 ].map((match) => match[1]);
 
 if (
@@ -1770,9 +1761,7 @@ if (
   !exactVersionPattern.test(publishNodeVersions[0]) ||
   publishNodeVersions[0] !== reviewedNodeVersion
 ) {
-  failures.push(
-    `publish-npm must use the reviewed exact Node runtime ${reviewedNodeVersion}`,
-  );
+  failures.push(`publish-npm must use the reviewed exact Node runtime ${reviewedNodeVersion}`);
 }
 
 if (!/permissions:\n      contents: read\n    outputs:/.test(verifyJob)) {
@@ -1803,99 +1792,156 @@ if (!publishJob.includes("uses: actions/download-artifact@")) {
   failures.push("publish-npm must download the verified publication bundle");
 }
 
-if (
-  !verifyJob.includes(
-    "package-artifact-id: ${{ steps.package-artifact.outputs.artifact-id }}",
-  )
-) {
+if (!verifyJob.includes("package-artifact-id: ${{ steps.package-artifact.outputs.artifact-id }}")) {
   failures.push("verify must expose the immutable package artifact ID");
 }
-if (
-  !publishJob.includes(
-    "artifact-ids: ${{ needs.verify.outputs.package-artifact-id }}",
-  )
-) {
+if (!publishJob.includes("artifact-ids: ${{ needs.verify.outputs.package-artifact-id }}")) {
   failures.push("publish-npm must download the exact package artifact ID from verify");
 }
 
 const originalTarballDiscovery = verifyJob.indexOf("mapfile -t tarballs");
-const originalTarballCountGuard = verifyJob.indexOf(
-  'if [[ "${#tarballs[@]}" -ne 1 ]]; then',
-);
+const originalTarballCountGuard = verifyJob.indexOf('if [[ "${#tarballs[@]}" -ne 1 ]]; then');
 const originalTarballAssignment = verifyJob.indexOf('tarball="${tarballs[0]}"');
-const reportedTarballGuard = verifyJob.indexOf(
-  'if [[ "$tarball" != "$reported_tarball" ]]; then',
-);
+const reportedTarballGuard = verifyJob.indexOf('if [[ "$tarball" != "$reported_tarball" ]]; then');
 const uniqueTarballName = verifyJob.indexOf(
-  'unique_tarball="$package_dir/patchpage-${cli_version}-run-attempt-${GITHUB_RUN_ATTEMPT}.tgz"',
+  'unique_tarball="$package_dir/patchpage-${cli_version}-run-attempt-${GITHUB_RUN_ATTEMPT}.tgz"'
 );
 const uniqueTarballMove = verifyJob.indexOf('mv -- "$tarball" "$unique_tarball"');
 const uniqueTarballAssignment = verifyJob.indexOf('tarball="$unique_tarball"');
-const tarballEnvironmentOutput = verifyJob.indexOf(
-  'echo "TARBALL=$tarball" >> "$GITHUB_ENV"',
+const releasePrivacyGate = verifyJob.indexOf("node ../../scripts/verify-release-privacy.mjs \\");
+const releasePrivacyPackJson = verifyJob.indexOf(
+  '  --pack-json "$RUNNER_TEMP/patchpage-pack.json" \\',
+  releasePrivacyGate
 );
-const tarballPathOutput = verifyJob.indexOf(
-  'echo "tarball-path=$tarball" >> "$GITHUB_OUTPUT"',
-);
+const releasePrivacyTarball = verifyJob.indexOf('  --tarball "$tarball"', releasePrivacyGate);
+const tarballEnvironmentOutput = verifyJob.indexOf('echo "TARBALL=$tarball" >> "$GITHUB_ENV"');
+const tarballPathOutput = verifyJob.indexOf('echo "tarball-path=$tarball" >> "$GITHUB_OUTPUT"');
 const tarballFilenameOutput = verifyJob.indexOf(
-  'echo "filename=$(basename "$tarball")" >> "$GITHUB_OUTPUT"',
+  'echo "filename=$(basename "$tarball")" >> "$GITHUB_OUTPUT"'
 );
-const tarballDigestOutput = verifyJob.indexOf(
-  'echo "sha256=$(sha256sum "$tarball"',
-);
-const smokeInstall = verifyJob.indexOf(
-  'node "$NPM_CLI" install --ignore-scripts "$TARBALL"',
-);
+const tarballDigestOutput = verifyJob.indexOf('echo "sha256=$(sha256sum "$tarball"');
+const smokeInstall = verifyJob.indexOf('node "$NPM_CLI" install --ignore-scripts "$TARBALL"');
 const smokeDigestGuard = verifyJob.indexOf(
-  'if [[ "$actual_sha256" != "$EXPECTED_TARBALL_SHA256" ]]; then',
+  'if [[ "$actual_sha256" != "$EXPECTED_TARBALL_SHA256" ]]; then'
 );
 const packageUpload = verifyJob.indexOf("id: package-artifact");
-const rawTarballDiscovery = publishJob.indexOf(
-  'tarballs=("$RUNNER_TEMP/patchpage-package"/*.tgz)',
-);
-const rawTarballCountGuard = publishJob.indexOf(
-  'if [[ "${#tarballs[@]}" -ne 1 ]]; then',
-);
+const rawTarballDiscovery = publishJob.indexOf('tarballs=("$RUNNER_TEMP/patchpage-package"/*.tgz)');
+const rawTarballCountGuard = publishJob.indexOf('if [[ "${#tarballs[@]}" -ne 1 ]]; then');
 const rawTarballAssignment = publishJob.indexOf('tarball="${tarballs[0]}"');
 const rawBasenameGuard = publishJob.indexOf(
-  'if [[ "$(basename "$tarball")" != "$EXPECTED_FILENAME" ]]; then',
+  'if [[ "$(basename "$tarball")" != "$EXPECTED_FILENAME" ]]; then'
 );
-const rawDigestCalculation = publishJob.indexOf(
-  'actual_sha256="$(sha256sum "$tarball"',
-);
-const rawDigestGuard = publishJob.indexOf(
-  'if [[ "$actual_sha256" != "$EXPECTED_SHA256" ]]; then',
-);
-const packageMetadataRead = publishJob.indexOf(
-  'tar -xOf "$tarball" package/package.json',
-);
+const rawDigestCalculation = publishJob.indexOf('actual_sha256="$(sha256sum "$tarball"');
+const rawDigestGuard = publishJob.indexOf('if [[ "$actual_sha256" != "$EXPECTED_SHA256" ]]; then');
+const packageMetadataRead = publishJob.indexOf('tar -xOf "$tarball" package/package.json');
 const publishTarCommands = publishJob.match(/^\s+tar\s+/gm) ?? [];
 const publishUnzipCommands = publishJob.match(/^\s+unzip(?:\s|$)/gm) ?? [];
+const releasePrivacyGateMessage =
+  "verify must run the release privacy gate against the exact pack JSON and renamed tarball before smoke and upload";
+const reviewedPrivacyGateLines = [
+  "node ../../scripts/verify-release-privacy.mjs \\",
+  '  --pack-json "$RUNNER_TEMP/patchpage-pack.json" \\',
+  '  --tarball "$tarball"'
+];
+const packageProducerRun =
+  typeof packageMetadataStep?.run === "string" ? packageMetadataStep.run : "";
+const packageProducerRunLines = packageProducerRun.split(/\r?\n/);
+const packagePrivacyMentions = packageProducerRunLines.filter((line) =>
+  line.includes("verify-release-privacy.mjs")
+);
+const packagePrivacyGateStarts = [];
+for (
+  let index = 0;
+  index <= packageProducerRunLines.length - reviewedPrivacyGateLines.length;
+  index += 1
+) {
+  if (
+    reviewedPrivacyGateLines.every(
+      (line, offset) => packageProducerRunLines[index + offset] === line
+    )
+  ) {
+    packagePrivacyGateStarts.push(index);
+  }
+}
+const packageTarballBindingLine = packageProducerRunLines.lastIndexOf('tarball="$unique_tarball"');
+const packageFirstOutputLine = Math.min(
+  ...[
+    'echo "TARBALL=$tarball" >> "$GITHUB_ENV"',
+    'echo "CLI_VERSION=$cli_version" >> "$GITHUB_ENV"',
+    'echo "tarball-path=$tarball" >> "$GITHUB_OUTPUT"',
+    'echo "filename=$(basename "$tarball")" >> "$GITHUB_OUTPUT"'
+  ]
+    .map((line) => packageProducerRunLines.indexOf(line))
+    .filter((index) => index !== -1)
+);
+const packagePrivacyGateStart = packagePrivacyGateStarts[0] ?? -1;
+const packagePrivacyGateEnd =
+  packagePrivacyGateStart === -1
+    ? -1
+    : packagePrivacyGateStart + reviewedPrivacyGateLines.length - 1;
+const preGatePackageRun = packageProducerRunLines
+  .slice(0, packagePrivacyGateStart === -1 ? undefined : packagePrivacyGateStart)
+  .join("\n");
+const preGatePackPathLoggingMessage =
+  "package producer must not log npm pack file paths before the privacy gate";
+if (
+  /console\.(?:error|log|warn)\s*\([^\n]*(?:pack\.files|file\.path|\[\.\.\.files\]|\$\{file\})/.test(
+    preGatePackageRun
+  ) ||
+  /(?:echo|printf)[^\n]*(?:\$reported_tarball|\$tarball)/.test(preGatePackageRun)
+) {
+  failures.push(preGatePackPathLoggingMessage);
+}
+
+if (
+  parsedVerifyJob === null ||
+  Object.hasOwn(parsedVerifyJob, "if") ||
+  Object.hasOwn(parsedVerifyJob, "continue-on-error") ||
+  packageMetadataStep === null ||
+  Object.hasOwn(packageMetadataStep, "if") ||
+  Object.hasOwn(packageMetadataStep, "continue-on-error") ||
+  packagePrivacyMentions.length !== 1 ||
+  packagePrivacyGateStarts.length !== 1 ||
+  packageTarballBindingLine === -1 ||
+  packagePrivacyGateStart <= packageTarballBindingLine ||
+  !Number.isFinite(packageFirstOutputLine) ||
+  packageFirstOutputLine <= packagePrivacyGateEnd ||
+  releasePrivacyGate === -1 ||
+  releasePrivacyGate <= uniqueTarballAssignment ||
+  releasePrivacyPackJson <= releasePrivacyGate ||
+  releasePrivacyTarball <= releasePrivacyPackJson ||
+  smokeInstall <= releasePrivacyTarball ||
+  packageUpload <= releasePrivacyTarball
+) {
+  failures.push(releasePrivacyGateMessage);
+}
 
 if (
   originalTarballDiscovery === -1 ||
   originalTarballCountGuard <= originalTarballDiscovery ||
   originalTarballAssignment <= originalTarballCountGuard ||
-  !verifyJob
-    .slice(originalTarballCountGuard, originalTarballAssignment)
-    .includes("exit 1") ||
+  !verifyJob.slice(originalTarballCountGuard, originalTarballAssignment).includes("exit 1") ||
   reportedTarballGuard <= originalTarballAssignment ||
   uniqueTarballName <= reportedTarballGuard ||
   uniqueTarballMove <= uniqueTarballName ||
   uniqueTarballAssignment <= uniqueTarballMove ||
+  releasePrivacyGate <= uniqueTarballAssignment ||
+  releasePrivacyPackJson <= releasePrivacyGate ||
+  releasePrivacyTarball <= releasePrivacyPackJson ||
   tarballEnvironmentOutput <= uniqueTarballAssignment ||
+  tarballEnvironmentOutput <= releasePrivacyTarball ||
   tarballPathOutput <= uniqueTarballAssignment ||
+  tarballPathOutput <= releasePrivacyTarball ||
   tarballFilenameOutput <= uniqueTarballAssignment ||
   tarballDigestOutput <= uniqueTarballAssignment ||
+  tarballDigestOutput <= releasePrivacyTarball ||
   smokeInstall <= tarballDigestOutput ||
   smokeDigestGuard <= smokeInstall ||
   packageUpload <= smokeDigestGuard ||
   rawTarballDiscovery === -1 ||
   rawTarballCountGuard <= rawTarballDiscovery ||
   rawTarballAssignment <= rawTarballCountGuard ||
-  !publishJob
-    .slice(rawTarballCountGuard, rawTarballAssignment)
-    .includes("exit 1") ||
+  !publishJob.slice(rawTarballCountGuard, rawTarballAssignment).includes("exit 1") ||
   rawBasenameGuard <= rawTarballAssignment ||
   rawDigestCalculation <= rawBasenameGuard ||
   !publishJob.slice(rawBasenameGuard, rawDigestCalculation).includes("exit 1") ||
@@ -1906,26 +1952,22 @@ if (
   publishUnzipCommands.length !== 0
 ) {
   failures.push(
-    "the package artifact must cross into publish-npm as one run-isolated raw tarball and pass basename and digest checks before metadata is read",
+    "the package artifact must cross into publish-npm as one run-isolated raw tarball and pass basename and digest checks before metadata is read"
   );
 }
 
 if (
-  !publishJob.includes(
-    "artifact-ids: ${{ needs.prepare-npm.outputs.npm-cli-artifact-id }}",
-  ) ||
-  !publishJob.includes(
-    "EXPECTED_NPM_VERSION: ${{ needs.prepare-npm.outputs.npm-version }}",
-  )
+  !publishJob.includes("artifact-ids: ${{ needs.prepare-npm.outputs.npm-cli-artifact-id }}") ||
+  !publishJob.includes("EXPECTED_NPM_VERSION: ${{ needs.prepare-npm.outputs.npm-version }}")
 ) {
   failures.push(
-    "publish-npm must download the npm CLI artifact and version directly from prepare-npm",
+    "publish-npm must download the npm CLI artifact and version directly from prepare-npm"
   );
 }
 
 for (const forbidden of [
   "needs.verify.outputs.npm-cli-artifact-id",
-  "needs.verify.outputs.npm-version",
+  "needs.verify.outputs.npm-version"
 ]) {
   if (publishJob.includes(forbidden)) {
     failures.push(`publish-npm must not source the npm CLI through verify via ${forbidden}`);
@@ -1933,9 +1975,7 @@ for (const forbidden of [
 }
 
 if (
-  !verifyJob.includes(
-    "artifact-ids: ${{ needs.prepare-npm.outputs.npm-cli-artifact-id }}",
-  ) ||
+  !verifyJob.includes("artifact-ids: ${{ needs.prepare-npm.outputs.npm-cli-artifact-id }}") ||
   !verifyJob.includes("uses: actions/download-artifact@")
 ) {
   failures.push("verify must download the exact npm CLI artifact from prepare-npm");
@@ -1946,7 +1986,7 @@ for (const forbidden of [
   "node_modules/npm",
   "cp -RL",
   "npm-cli-artifact-id: ${{ steps.",
-  "Upload the pinned publishing CLI",
+  "Upload the pinned publishing CLI"
 ]) {
   if (verifyJob.includes(forbidden)) {
     failures.push(`verify must not stage or upload npm via ${forbidden}`);
@@ -1954,21 +1994,17 @@ for (const forbidden of [
 }
 
 const npmCliDownload = verifyJob.indexOf(
-  "artifact-ids: ${{ needs.prepare-npm.outputs.npm-cli-artifact-id }}",
+  "artifact-ids: ${{ needs.prepare-npm.outputs.npm-cli-artifact-id }}"
 );
 const npmPack = verifyJob.indexOf('node "$NPM_CLI" pack');
-const npmInstall = verifyJob.indexOf(
-  'node "$NPM_CLI" install --ignore-scripts "$TARBALL"',
-);
-const packagedCliExecution = verifyJob.indexOf(
-  "./node_modules/.bin/patchpage --version",
-);
+const npmInstall = verifyJob.indexOf('node "$NPM_CLI" install --ignore-scripts "$TARBALL"');
+const packagedCliExecution = verifyJob.indexOf("./node_modules/.bin/patchpage --version");
 const projectExecutionMarkers = [
   "pnpm install --frozen-lockfile",
   "pnpm lint",
   "pnpm typecheck",
   "pnpm test",
-  "pnpm --filter patchpage build",
+  "pnpm --filter patchpage build"
 ];
 if (
   projectExecutionMarkers.some((marker) => {
@@ -1981,14 +2017,12 @@ if (
   packagedCliExecution <= npmInstall
 ) {
   failures.push(
-    "verify must finish project execution before using the isolated npm CLI to pack and install",
+    "verify must finish project execution before using the isolated npm CLI to pack and install"
   );
 }
 
 if (
-  !verifyJob.includes(
-    "EXPECTED_NPM_VERSION: ${{ needs.prepare-npm.outputs.npm-version }}",
-  ) ||
+  !verifyJob.includes("EXPECTED_NPM_VERSION: ${{ needs.prepare-npm.outputs.npm-version }}") ||
   !verifyJob.includes('NPM_CLI="$RUNNER_TEMP/npm-cli/bin/npm-cli.js"') ||
   !verifyJob.includes('node "$NPM_CLI" --version')
 ) {
@@ -2001,7 +2035,7 @@ for (const forbidden of [
   "GITHUB_WORKSPACE",
   "node_modules/.bin",
   "prepack",
-  "prepublishOnly",
+  "prepublishOnly"
 ]) {
   if (publishJob.includes(forbidden)) {
     failures.push(`publish-npm must not contain ${forbidden}`);
@@ -2009,9 +2043,7 @@ for (const forbidden of [
 }
 
 const allowedPublishActions = new Set(["actions/setup-node", "actions/download-artifact"]);
-for (const { coordinate } of actionUses.filter(
-  ({ jobName }) => jobName === "publish-npm",
-)) {
+for (const { coordinate } of actionUses.filter(({ jobName }) => jobName === "publish-npm")) {
   const action = typeof coordinate === "string" ? coordinate.split("@")[0] : null;
   if (!allowedPublishActions.has(action)) {
     failures.push(`publish-npm must not execute the ${String(action)} Action`);
@@ -2045,16 +2077,12 @@ if (!/node "\$NPM_CLI" install --ignore-scripts "\$TARBALL"/.test(verifyJob)) {
   failures.push("verify must smoke-install the same tarball with the pinned npm CLI");
 }
 
-const npmPublishCommands =
-  publishJob.match(/^[ \t]+node "\$npm_cli" publish\b/gm) ?? [];
+const npmPublishCommands = publishJob.match(/^[ \t]+node "\$npm_cli" publish\b/gm) ?? [];
 const exactProductionPublish =
   /^[ \t]+node "\$npm_cli" publish "\$tarball" --ignore-scripts --provenance(?:[ \t]+--registry=https:\/\/registry\.npmjs\.org|[ \t]+\\\n[ \t]+--registry=https:\/\/registry\.npmjs\.org)[ \t]*$/m;
-if (
-  npmPublishCommands.length !== 1 ||
-  !exactProductionPublish.test(publishJob)
-) {
+if (npmPublishCommands.length !== 1 || !exactProductionPublish.test(publishJob)) {
   failures.push(
-    "publish-npm must use the exact reviewed npm publish command and production registry",
+    "publish-npm must use the exact reviewed npm publish command and production registry"
   );
 }
 
@@ -2063,12 +2091,7 @@ if (serverImageJob) {
     failures.push("verify-server-image must depend only on the release guard");
   }
 
-  if (
-    !sameEntries(
-      jobPermissions(serverImageJob),
-      new Map([["contents", "read"]]),
-    )
-  ) {
+  if (!sameEntries(jobPermissions(serverImageJob), new Map([["contents", "read"]]))) {
     failures.push("verify-server-image must receive only repository read access");
   }
 
@@ -2077,22 +2100,16 @@ if (serverImageJob) {
     !serverImageJob.includes("image-tar-sha256: ${{ steps.image.outputs.sha256 }}") ||
     !serverImageJob.includes("image-id: ${{ steps.image.outputs.image-id }}") ||
     !serverImageJob.includes("config-id: ${{ steps.image.outputs.config-id }}") ||
-    !serverImageJob.includes(
-      "image-artifact-id: ${{ steps.image-artifact.outputs.artifact-id }}",
-    )
+    !serverImageJob.includes("image-artifact-id: ${{ steps.image-artifact.outputs.artifact-id }}")
   ) {
     failures.push(
-      "verify-server-image must expose filename, SHA-256, image/config ID, and artifact ID outputs",
+      "verify-server-image must expose filename, SHA-256, image/config ID, and artifact ID outputs"
     );
   }
 
   if (
-    !/^\s+VERSION\s*:\s*\$\{\{\s*needs\.guard\.outputs\.version\s*\}\}\s*$/m.test(
-      serverImageJob,
-    ) ||
-    !/^\s+REVISION\s*:\s*\$\{\{\s*needs\.guard\.outputs\.revision\s*\}\}\s*$/m.test(
-      serverImageJob,
-    )
+    !/^\s+VERSION\s*:\s*\$\{\{\s*needs\.guard\.outputs\.version\s*\}\}\s*$/m.test(serverImageJob) ||
+    !/^\s+REVISION\s*:\s*\$\{\{\s*needs\.guard\.outputs\.revision\s*\}\}\s*$/m.test(serverImageJob)
   ) {
     failures.push("verify-server-image must bind image metadata to guard outputs");
   }
@@ -2105,22 +2122,20 @@ if (serverImageJob) {
     !serverImageJob.includes('scripts/verify-server-image.sh "$image" "$VERSION" "$REVISION"') ||
     !serverImageJob.includes('docker save "$image" --output "$tar_path"') ||
     !serverImageJob.includes('sha256sum "$tar_path"') ||
-    !serverImageJob.includes('patchpage-server-${VERSION}-${REVISION}-${GITHUB_RUN_ATTEMPT}.tar')
+    !serverImageJob.includes("patchpage-server-${VERSION}-${REVISION}-${GITHUB_RUN_ATTEMPT}.tar")
   ) {
     failures.push(
-      "verify-server-image must build, behaviorally verify, and save the exact metadata-bound image tar",
+      "verify-server-image must build, behaviorally verify, and save the exact metadata-bound image tar"
     );
   }
 
   const build = serverImageJob.indexOf("docker build");
-  const builtImageId = serverImageJob.search(
-    /built_image_id\s*=\s*"\$\(docker image inspect/,
-  );
+  const builtImageId = serverImageJob.search(/built_image_id\s*=\s*"\$\(docker image inspect/);
   const verifyImage = serverImageJob.indexOf(
-    'scripts/verify-server-image.sh "$image" "$VERSION" "$REVISION"',
+    'scripts/verify-server-image.sh "$image" "$VERSION" "$REVISION"'
   );
   const verifiedImageId = serverImageJob.search(
-    /verified_image_id\s*=\s*"\$\(docker image inspect/,
+    /verified_image_id\s*=\s*"\$\(docker image inspect/
   );
   const saveImage = serverImageJob.indexOf('docker save "$image" --output "$tar_path"');
   const uploadImage = serverImageJob.indexOf("uses: actions/upload-artifact@");
@@ -2137,7 +2152,7 @@ if (serverImageJob) {
     !serverImageJob.includes("if-no-files-found: error")
   ) {
     failures.push(
-      "verify-server-image must upload a run-attempt-isolated raw tar only after verification",
+      "verify-server-image must upload a run-attempt-isolated raw tar only after verification"
     );
   }
 
@@ -2148,7 +2163,7 @@ if (serverImageJob) {
     "docker push",
     "packages:",
     "GITHUB_TOKEN",
-    "github.token",
+    "github.token"
   ]) {
     if (serverImageJob.includes(forbidden)) {
       failures.push(`verify-server-image must not contain ${forbidden}`);
@@ -2166,12 +2181,8 @@ if (dockerJob) {
   }
 
   if (
-    !dockerJob.includes(
-      "manifest-digest: ${{ steps.publish-image.outputs.manifest-digest }}",
-    ) ||
-    !dockerJob.includes(
-      "config-digest: ${{ steps.publish-image.outputs.config-digest }}",
-    )
+    !dockerJob.includes("manifest-digest: ${{ steps.publish-image.outputs.manifest-digest }}") ||
+    !dockerJob.includes("config-digest: ${{ steps.publish-image.outputs.config-digest }}")
   ) {
     failures.push("docker-ghcr must expose the verified GHCR manifest and config digests");
   }
@@ -2192,7 +2203,7 @@ if (dockerJob) {
     "GITHUB_WORKSPACE",
     "contents:",
     "If-Match",
-    "If-None-Match",
+    "If-None-Match"
   ]) {
     if (dockerJob.includes(forbidden)) {
       failures.push(`docker-ghcr publisher must not contain ${forbidden}`);
@@ -2204,7 +2215,7 @@ if (dockerJob) {
 
   if (
     !dockerJob.includes(
-      "artifact-ids: ${{ needs.verify-server-image.outputs.image-artifact-id }}",
+      "artifact-ids: ${{ needs.verify-server-image.outputs.image-artifact-id }}"
     ) ||
     !dockerJob.includes("skip-decompress: true")
   ) {
@@ -2213,15 +2224,13 @@ if (dockerJob) {
 
   const validatorSource = decodedEmbeddedSource(
     dockerJob,
-    "PATCHPAGE_VALIDATE_DOCKER_SAVE_ARTIFACT",
+    "PATCHPAGE_VALIDATE_DOCKER_SAVE_ARTIFACT"
   );
   const ociSource = decodedEmbeddedSource(dockerJob, "PATCHPAGE_GHCR_OCI_RELEASE");
   const validatorSha = sha256Hex(effectiveDockerSaveValidator);
   const ociSha = sha256Hex(effectiveGhcrOciReleaseTool);
   if (!validatorSource || !validatorSource.equals(effectiveDockerSaveValidator)) {
-    failures.push(
-      "docker-ghcr must embed the tested docker-save validator source byte-for-byte",
-    );
+    failures.push("docker-ghcr must embed the tested docker-save validator source byte-for-byte");
   }
   if (!ociSource || !ociSource.equals(effectiveGhcrOciReleaseTool)) {
     failures.push("docker-ghcr must embed the tested OCI release tool source byte-for-byte");
@@ -2236,11 +2245,11 @@ if (dockerJob) {
   }
 
   const downloadImage = dockerJob.indexOf(
-    "artifact-ids: ${{ needs.verify-server-image.outputs.image-artifact-id }}",
+    "artifact-ids: ${{ needs.verify-server-image.outputs.image-artifact-id }}"
   );
   const installTools = dockerJob.indexOf("Install reviewed checkout-free release tools");
   const validateArtifact = dockerJob.indexOf(
-    "Validate and load the verified server image artifact before registry auth",
+    "Validate and load the verified server image artifact before registry auth"
   );
   const validatorCall = dockerJob.indexOf('node "$VALIDATE_DOCKER_SAVE_ARTIFACT"');
   const loadImage = dockerJob.indexOf('docker load --input "$tar_path"');
@@ -2249,8 +2258,12 @@ if (dockerJob) {
   const publishImage = dockerJob.indexOf("id: publish-image");
   const publishRelease = dockerJob.indexOf('node "$GHCR_OCI_RELEASE" publish-release');
   const reconcileLatest = dockerJob.indexOf('node "$GHCR_OCI_RELEASE" reconcile-latest');
-  const configDigestOutput = dockerJob.indexOf('echo "config-digest=$config_digest" >> "$GITHUB_OUTPUT"');
-  const manifestDigestOutput = dockerJob.indexOf('echo "manifest-digest=$manifest_digest" >> "$GITHUB_OUTPUT"');
+  const configDigestOutput = dockerJob.indexOf(
+    'echo "config-digest=$config_digest" >> "$GITHUB_OUTPUT"'
+  );
+  const manifestDigestOutput = dockerJob.indexOf(
+    'echo "manifest-digest=$manifest_digest" >> "$GITHUB_OUTPUT"'
+  );
   if (
     downloadImage === -1 ||
     installTools <= downloadImage ||
@@ -2266,7 +2279,7 @@ if (dockerJob) {
     manifestDigestOutput <= configDigestOutput
   ) {
     failures.push(
-      "docker-ghcr must install reviewed tools, validate the raw tar before docker load, then publish and reconcile through OCI state",
+      "docker-ghcr must install reviewed tools, validate the raw tar before docker load, then publish and reconcile through OCI state"
     );
   }
 
@@ -2280,7 +2293,7 @@ if (dockerJob) {
     !dockerJob.includes('echo "image-tar=$tar_path" >> "$GITHUB_OUTPUT"')
   ) {
     failures.push(
-      "docker-ghcr must pass filename, artifact digest, expected RepoTag, and config ID into the tar validator",
+      "docker-ghcr must pass filename, artifact digest, expected RepoTag, and config ID into the tar validator"
     );
   }
 
@@ -2298,7 +2311,7 @@ if (dockerJob) {
     !dockerJob.includes("const state = JSON.parse(process.argv[1])")
   ) {
     failures.push(
-      "docker-ghcr must publish the validated tar through the reviewed OCI release tool with exact release identity",
+      "docker-ghcr must publish the validated tar through the reviewed OCI release tool with exact release identity"
     );
   }
 
@@ -2311,7 +2324,9 @@ if (dockerJob) {
     !effectiveGhcrOciReleaseTool.includes("/tags/list?n=100") ||
     !effectiveGhcrOciReleaseTool.includes("repository:${this.name}:${this.scopeActions}") ||
     !effectiveGhcrOciReleaseTool.includes("FIRST_PACKAGE_REPOSITORY") ||
-    !effectiveGhcrOciReleaseTool.includes("return error.code === expectedCode && detailMatchesTarget(error.detail, target);") ||
+    !effectiveGhcrOciReleaseTool.includes(
+      "return error.code === expectedCode && detailMatchesTarget(error.detail, target);"
+    ) ||
     !effectiveGhcrOciReleaseTool.includes("registry bearer realm changed origin") ||
     !effectiveGhcrOciReleaseTool.includes("blob upload Location changed registry origin") ||
     !effectiveGhcrOciReleaseTool.includes("response.status !== 201") ||
@@ -2327,7 +2342,9 @@ if (dockerJob) {
     !effectiveGhcrOciReleaseTool.includes("expectedBytes: configSize") ||
     effectiveGhcrOciReleaseTool.includes("arrayBuffer()") ||
     !effectiveGhcrOciReleaseTool.includes("authenticateLatestCandidate") ||
-    !effectiveGhcrOciReleaseTool.includes("post-write latest and re-enumerated highest complete release") ||
+    !effectiveGhcrOciReleaseTool.includes(
+      "post-write latest and re-enumerated highest complete release"
+    ) ||
     !effectiveGhcrOciReleaseTool.includes("post-write release pair and canonical image") ||
     !effectiveGhcrOciReleaseTool.includes("publishRelease") ||
     !effectiveGhcrOciReleaseTool.includes("putManifest") ||
@@ -2335,14 +2352,18 @@ if (dockerJob) {
     effectiveGhcrOciReleaseTool.includes("If-None-Match")
   ) {
     failures.push(
-      "ghcr-oci-release.mjs must implement exact digest-bound OCI reads, paginated highest-complete selection, latest authentication, and unconditional manifest PUTs without CAS claims",
+      "ghcr-oci-release.mjs must implement exact digest-bound OCI reads, paginated highest-complete selection, latest authentication, and unconditional manifest PUTs without CAS claims"
     );
   }
 
   if (
     !effectiveDockerSaveValidator.includes("validateDockerSaveTar") ||
-    !effectiveDockerSaveValidator.includes("if (descriptor?.mediaType !== OCI_MANIFEST_MEDIA_TYPE)") ||
-    !effectiveDockerSaveValidator.includes("if (ociManifest?.mediaType !== OCI_MANIFEST_MEDIA_TYPE)") ||
+    !effectiveDockerSaveValidator.includes(
+      "if (descriptor?.mediaType !== OCI_MANIFEST_MEDIA_TYPE)"
+    ) ||
+    !effectiveDockerSaveValidator.includes(
+      "if (ociManifest?.mediaType !== OCI_MANIFEST_MEDIA_TYPE)"
+    ) ||
     !effectiveDockerSaveValidator.includes("createGunzip") ||
     !effectiveDockerSaveValidator.includes("createZstdDecompress") ||
     !effectiveDockerSaveValidator.includes("MAX_UNCOMPRESSED_LAYER_BYTES") ||
@@ -2360,11 +2381,9 @@ if (dockerJob) {
     !effectiveDockerSaveValidator.includes("if (!allowedKeys.has(key))") ||
     !effectiveDockerSaveValidator.includes("has an invalid container_config") ||
     !effectiveDockerSaveValidator.includes(
-      'for (const key of ["config", "architecture", "variant"])',
+      'for (const key of ["config", "architecture", "variant"])'
     ) ||
-    !effectiveDockerSaveValidator.includes(
-      "if (!isLeaf && hasOwn(node.legacy, key))",
-    ) ||
+    !effectiveDockerSaveValidator.includes("if (!isLeaf && hasOwn(node.legacy, key))") ||
     !effectiveDockerSaveValidator.includes(
       `    const stableRuntimeFields = [
       "User",
@@ -2379,65 +2398,49 @@ if (dockerJob) {
       "StopSignal",
       "Shell",
       "OnBuild",
-    ];`,
+    ];`
     ) ||
     !effectiveDockerSaveValidator.includes(
-      "!isDeepStrictEqual(leafRuntimeConfig[key], ociRuntimeConfig[key])",
+      "!isDeepStrictEqual(leafRuntimeConfig[key], ociRuntimeConfig[key])"
     ) ||
     !effectiveDockerSaveValidator.includes("if (node.legacy.os !== config.os)") ||
     !effectiveDockerSaveValidator.includes(
-      "if (hasOwn(leaf.legacy, key) && leaf.legacy[key] !== config[key])",
+      "if (hasOwn(leaf.legacy, key) && leaf.legacy[key] !== config[key])"
     ) ||
     !effectiveDockerSaveValidator.includes(
-      "legacy config graph must contain exactly one parentless root",
+      "legacy config graph must contain exactly one parentless root"
     ) ||
     !effectiveDockerSaveValidator.includes(
-      "if (repositoryTags[tag] !== expectedRepositoryLayer)",
+      "if (repositoryTags[tag] !== expectedRepositoryLayer)"
     ) ||
     !effectiveDockerSaveValidator.includes("repositories must contain exactly") ||
     !effectiveDockerSaveValidator.includes("unreferenced or unexpected file")
   ) {
     failures.push(
-      "validate-docker-save-artifact.mjs must retain the structural docker-save graph validator",
+      "validate-docker-save-artifact.mjs must retain the structural docker-save graph validator"
     );
   }
 }
 
 const reconcileInspectJob = jobFrom(reconcileWorkflow, "inspect", "reconcile-ghcr.yml");
 const reconcileRebuildJob = jobFrom(reconcileWorkflow, "rebuild", "reconcile-ghcr.yml");
-const reconcilePublishJob = jobFrom(
-  reconcileWorkflow,
-  "publish-ghcr",
-  "reconcile-ghcr.yml",
-);
-const reconcileLatestJob = jobFrom(
-  reconcileWorkflow,
-  "reconcile-latest",
-  "reconcile-ghcr.yml",
-);
-const reconcileBindJob = jobFrom(
-  reconcileWorkflow,
-  "bind-publish-results",
-  "reconcile-ghcr.yml",
-);
+const reconcilePublishJob = jobFrom(reconcileWorkflow, "publish-ghcr", "reconcile-ghcr.yml");
+const reconcileLatestJob = jobFrom(reconcileWorkflow, "reconcile-latest", "reconcile-ghcr.yml");
+const reconcileBindJob = jobFrom(reconcileWorkflow, "bind-publish-results", "reconcile-ghcr.yml");
 const reconcileAnonymousJob = jobFrom(
   reconcileWorkflow,
   "ghcr-anonymous-acceptance",
-  "reconcile-ghcr.yml",
+  "reconcile-ghcr.yml"
 );
 
-
-
 if (
-  !/^on:\n  workflow_dispatch:[\s\S]*\n  schedule:\n    - cron: /m.test(
-    reconcileWorkflow,
-  ) ||
+  !/^on:\n  workflow_dispatch:[\s\S]*\n  schedule:\n    - cron: /m.test(reconcileWorkflow) ||
   !/^concurrency:\n  group: release-ghcr-patchpage-server\n  queue: max\n  cancel-in-progress: false$/m.test(
-    reconcileWorkflow,
+    reconcileWorkflow
   )
 ) {
   failures.push(
-    "reconcile-ghcr.yml must be scheduled/manual and reuse the package-wide max queue, capped by GitHub at 100 pending runs",
+    "reconcile-ghcr.yml must be scheduled/manual and reuse the package-wide max queue, capped by GitHub at 100 pending runs"
   );
 }
 
@@ -2447,8 +2450,8 @@ if (reconcileInspectJob) {
       jobPermissions(reconcileInspectJob),
       new Map([
         ["contents", "read"],
-        ["packages", "read"],
-      ]),
+        ["packages", "read"]
+      ])
     ) ||
     !reconcileInspectJob.includes("gh api --paginate") ||
     !reconcileInspectJob.includes("git fetch --force --tags --prune --prune-tags") ||
@@ -2461,19 +2464,15 @@ if (reconcileInspectJob) {
     !reconcileInspectJob.includes(".filter((tag) => isSupportedImageRelease(tag.slice(1)))") ||
     !reconcileInspectJob.includes("predates first supported image release") ||
     !reconcileInspectJob.includes("const rows = tags.map((tag) => {") ||
-    !reconcileInspectJob.includes(
-      'if [[ -z "$INPUT_TARGET" || "$tag" == "$INPUT_TARGET" ]]',
-    ) ||
+    !reconcileInspectJob.includes('if [[ -z "$INPUT_TARGET" || "$tag" == "$INPUT_TARGET" ]]') ||
     reconcileInspectJob.includes("const selected =") ||
     reconcileInspectJob.includes("tags.slice(") ||
     reconcileInspectJob.split('split(".").map(BigInt)').length - 1 !== 2 ||
     !reconcileInspectJob.includes("snapshot: ${{ steps.plan.outputs.snapshot }}") ||
-    !reconcileInspectJob.includes(
-      "complete-count: ${{ steps.plan.outputs.complete-count }}",
-    ) ||
+    !reconcileInspectJob.includes("complete-count: ${{ steps.plan.outputs.complete-count }}") ||
     !reconcileInspectJob.includes("reconcile-snapshot.json") ||
     !reconcileInspectJob.includes("complete inspect state digests are invalid") ||
-    !reconcileInspectJob.includes('if (( needed_count < INPUT_BATCH_SIZE ))') ||
+    !reconcileInspectJob.includes("if (( needed_count < INPUT_BATCH_SIZE ))") ||
     !reconcileInspectJob.includes("needed_count=$((needed_count + 1))") ||
     reconcileInspectJob.includes("needed_count >= INPUT_BATCH_SIZE") ||
     reconcileInspectJob.includes("break") ||
@@ -2485,7 +2484,7 @@ if (reconcileInspectJob) {
     !reconcileInspectJob.includes("incomplete")
   ) {
     failures.push(
-      "reconcile inspect must paginate stable GitHub tags, verify fetch completeness, inspect GHCR, and choose a bounded missing/incomplete batch",
+      "reconcile inspect must paginate stable GitHub tags, verify fetch completeness, inspect GHCR, and choose a bounded missing/incomplete batch"
     );
   }
 }
@@ -2493,12 +2492,10 @@ if (reconcileInspectJob) {
 if (reconcileRebuildJob) {
   const buildImage = reconcileRebuildJob.indexOf("docker build");
   const verifyImage = reconcileRebuildJob.indexOf(
-    'scripts/verify-server-image.sh "$image" "$VERSION" "$REVISION"',
+    'scripts/verify-server-image.sh "$image" "$VERSION" "$REVISION"'
   );
   const saveImage = reconcileRebuildJob.indexOf('docker save "$image" --output "$tar_path"');
-  const validateTar = reconcileRebuildJob.indexOf(
-    'node scripts/validate-docker-save-artifact.mjs',
-  );
+  const validateTar = reconcileRebuildJob.indexOf("node scripts/validate-docker-save-artifact.mjs");
   const uploadImage = reconcileRebuildJob.indexOf("Upload exact replay server image raw tar");
   if (
     !sameEntries(jobPermissions(reconcileRebuildJob), new Map([["contents", "read"]])) ||
@@ -2517,15 +2514,15 @@ if (reconcileRebuildJob) {
     !reconcileRebuildJob.includes("archive: false") ||
     !reconcileRebuildJob.includes("artifactId") ||
     !reconcileRebuildJob.includes(
-      'cat > "$RUNNER_TEMP/reconcile-handoff-${{ matrix.version }}.json"',
+      'cat > "$RUNNER_TEMP/reconcile-handoff-${{ matrix.version }}.json"'
     ) ||
     !reconcileRebuildJob.includes(
-      "path: ${{ runner.temp }}/reconcile-handoff-${{ matrix.version }}.json",
+      "path: ${{ runner.temp }}/reconcile-handoff-${{ matrix.version }}.json"
     ) ||
     !reconcileRebuildJob.includes("overwrite: true") ||
     reconcileRebuildJob.split("retention-days: 30").length - 1 !== 2 ||
     reconcileRebuildJob.includes(
-      "reconcile-handoff-${{ matrix.version }}-${{ github.run_attempt }}.json",
+      "reconcile-handoff-${{ matrix.version }}-${{ github.run_attempt }}.json"
     ) ||
     reconcileRebuildJob.includes("          name: reconcile-handoff-") ||
     reconcileRebuildJob.includes("docker login") ||
@@ -2533,7 +2530,7 @@ if (reconcileRebuildJob) {
     reconcileRebuildJob.includes("npm publish")
   ) {
     failures.push(
-      "reconcile rebuild must use current reviewed verifiers on an exact detached historical source worktree before handing off a raw image artifact",
+      "reconcile rebuild must use current reviewed verifiers on an exact detached historical source worktree before handing off a raw image artifact"
     );
   }
 }
@@ -2541,39 +2538,39 @@ if (reconcileRebuildJob) {
 if (reconcilePublishJob) {
   const validatorSource = decodedEmbeddedSource(
     reconcilePublishJob,
-    "PATCHPAGE_VALIDATE_DOCKER_SAVE_ARTIFACT",
+    "PATCHPAGE_VALIDATE_DOCKER_SAVE_ARTIFACT"
   );
   const ociSource = decodedEmbeddedSource(reconcilePublishJob, "PATCHPAGE_GHCR_OCI_RELEASE");
   if (!validatorSource || !validatorSource.equals(effectiveDockerSaveValidator)) {
     failures.push(
-      "reconcile publisher must embed the tested docker-save validator source byte-for-byte",
+      "reconcile publisher must embed the tested docker-save validator source byte-for-byte"
     );
   }
   if (!ociSource || !ociSource.equals(effectiveGhcrOciReleaseTool)) {
-    failures.push("reconcile publisher must embed the tested OCI release tool source byte-for-byte");
+    failures.push(
+      "reconcile publisher must embed the tested OCI release tool source byte-for-byte"
+    );
   }
   if (
     !sameEntries(
       jobPermissions(reconcilePublishJob),
       new Map([
         ["actions", "read"],
-        ["packages", "write"],
-      ]),
+        ["packages", "write"]
+      ])
     ) ||
     !reconcilePublishJob.includes("max-parallel: 1") ||
     !reconcilePublishJob.includes("actions/download-artifact@") ||
     !reconcilePublishJob.includes("Resolve replay handoff artifact ID") ||
     !reconcilePublishJob.includes("Expected exactly one replay handoff artifact named") ||
-    !reconcilePublishJob.includes(
-      'handoff_name="reconcile-handoff-${{ matrix.version }}.json"',
-    ) ||
-    !reconcilePublishJob.includes(
-      '"reconcile-handoff-${{ matrix.version }}.json"',
-    ) ||
+    !reconcilePublishJob.includes('handoff_name="reconcile-handoff-${{ matrix.version }}.json"') ||
+    !reconcilePublishJob.includes('"reconcile-handoff-${{ matrix.version }}.json"') ||
     reconcilePublishJob.includes(
-      "reconcile-handoff-${{ matrix.version }}-${{ github.run_attempt }}.json",
+      "reconcile-handoff-${{ matrix.version }}-${{ github.run_attempt }}.json"
     ) ||
-    !reconcilePublishJob.includes("artifact-ids: ${{ steps.handoff-artifact.outputs.artifact-id }}") ||
+    !reconcilePublishJob.includes(
+      "artifact-ids: ${{ steps.handoff-artifact.outputs.artifact-id }}"
+    ) ||
     !reconcilePublishJob.includes("handoff directory must contain exactly one entry") ||
     !reconcilePublishJob.includes("handoff file must be a regular non-link file") ||
     !reconcilePublishJob.includes("handoff JSON must be canonical") ||
@@ -2581,19 +2578,16 @@ if (reconcilePublishJob) {
     !reconcilePublishJob.includes("const entries = fs.readdirSync(directory);") ||
     !reconcilePublishJob.includes("if (entries.length !== 1)") ||
     !reconcilePublishJob.includes("handoffStat.nlink !== 1") ||
-    !reconcilePublishJob.includes(
-      "JSON.stringify(Object.keys(value)) !== JSON.stringify(keys)",
-    ) ||
-    !reconcilePublishJob.includes('raw !== `${JSON.stringify(value)}\\n`') ||
+    !reconcilePublishJob.includes("JSON.stringify(Object.keys(value)) !== JSON.stringify(keys)") ||
+    !reconcilePublishJob.includes("raw !== `${JSON.stringify(value)}\\n`") ||
     !reconcilePublishJob.includes("imageFilenamePattern") ||
-    !reconcilePublishJob.includes(
-      "handoff image filename is invalid for the release identity",
-    ) ||
+    !reconcilePublishJob.includes("handoff image filename is invalid for the release identity") ||
     !reconcilePublishJob.includes("handoff configId does not match imageId") ||
     !reconcilePublishJob.includes("artifact-ids: ${{ steps.handoff.outputs.image-artifact-id }}") ||
     !reconcilePublishJob.includes("Validate and load replay image before registry auth") ||
     !reconcilePublishJob.includes("Publish replay image to GHCR") ||
-    reconcilePublishJob.split("\n").filter((line) => line === "          skip-decompress: true").length < 2 ||
+    reconcilePublishJob.split("\n").filter((line) => line === "          skip-decompress: true")
+      .length < 2 ||
     reconcilePublishJob.includes("actions/artifacts/${artifact_id}/zip") ||
     reconcilePublishJob.includes("unzip ") ||
     !reconcilePublishJob.includes('node "$VALIDATE_DOCKER_SAVE_ARTIFACT"') ||
@@ -2601,10 +2595,10 @@ if (reconcilePublishJob) {
     !reconcilePublishJob.includes('node "$GHCR_OCI_RELEASE" publish-release') ||
     !reconcilePublishJob.includes("Upload immutable replay publication result") ||
     !reconcilePublishJob.includes(
-      'result_path="$RUNNER_TEMP/reconcile-publish-result-${version}-${revision}.json"',
+      'result_path="$RUNNER_TEMP/reconcile-publish-result-${version}-${revision}.json"'
     ) ||
     !reconcilePublishJob.includes(
-      "const bound = { version, revision, manifestDigest: value.manifestDigest, configDigest: value.configDigest };",
+      "const bound = { version, revision, manifestDigest: value.manifestDigest, configDigest: value.configDigest };"
     ) ||
     !reconcilePublishJob.includes("actions/upload-artifact@") ||
     !reconcilePublishJob.includes("path: ${{ steps.publish-image.outputs.result-path }}") ||
@@ -2620,28 +2614,26 @@ if (reconcilePublishJob) {
     reconcilePublishJob.includes("docker login")
   ) {
     failures.push(
-      "reconcile publisher must be checkout-free packages:write only, validate exact raw artifacts, and publish only GHCR through the reviewed OCI tool",
+      "reconcile publisher must be checkout-free packages:write only, validate exact raw artifacts, and publish only GHCR through the reviewed OCI tool"
     );
   }
 }
 if (reconcileLatestJob) {
   const validatorSource = decodedEmbeddedSource(
     reconcileLatestJob,
-    "PATCHPAGE_RECONCILE_LATEST_VALIDATOR",
+    "PATCHPAGE_RECONCILE_LATEST_VALIDATOR"
   );
   const ociSource = decodedEmbeddedSource(
     reconcileLatestJob,
-    "PATCHPAGE_RECONCILE_LATEST_OCI_RELEASE",
+    "PATCHPAGE_RECONCILE_LATEST_OCI_RELEASE"
   );
   if (!validatorSource || !validatorSource.equals(effectiveDockerSaveValidator)) {
     failures.push(
-      "reconcile latest must embed the tested docker-save validator dependency byte-for-byte",
+      "reconcile latest must embed the tested docker-save validator dependency byte-for-byte"
     );
   }
   if (!ociSource || !ociSource.equals(effectiveGhcrOciReleaseTool)) {
-    failures.push(
-      "reconcile latest must embed the tested OCI release tool source byte-for-byte",
-    );
+    failures.push("reconcile latest must embed the tested OCI release tool source byte-for-byte");
   }
   if (
     !sameEntries(jobPermissions(reconcileLatestJob), new Map([["packages", "write"]])) ||
@@ -2653,7 +2645,7 @@ if (reconcileLatestJob) {
     !reconcileLatestJob.includes("needs.inspect.outputs.complete-count != '0'") ||
     !reconcileLatestJob.includes("Embedded docker-save validator source hash mismatch") ||
     !reconcileLatestJob.includes(
-      'chmod 500 "$tools_dir/validate-docker-save-artifact.mjs" "$tools_dir/ghcr-oci-release.mjs"',
+      'chmod 500 "$tools_dir/validate-docker-save-artifact.mjs" "$tools_dir/ghcr-oci-release.mjs"'
     ) ||
     !reconcileLatestJob.includes("Embedded OCI release tool source hash mismatch") ||
     !reconcileLatestJob.includes('node "$GHCR_OCI_RELEASE" reconcile-latest') ||
@@ -2664,7 +2656,7 @@ if (reconcileLatestJob) {
     reconcileLatestJob.includes("docker ")
   ) {
     failures.push(
-      "reconcile latest must run checkout-free after replay or for an already-complete supported release, but skip the pre-support empty schedule",
+      "reconcile latest must run checkout-free after replay or for an already-complete supported release, but skip the pre-support empty schedule"
     );
   }
 }
@@ -2682,18 +2674,14 @@ if (reconcileBindJob) {
     !reconcileBindJob.includes("REPAIR_MATRIX: ${{ needs.inspect.outputs.matrix }}") ||
     !reconcileBindJob.includes("RELEASE_SNAPSHOT: ${{ needs.inspect.outputs.snapshot }}") ||
     !reconcileBindJob.includes("gh api --paginate") ||
-    !reconcileBindJob.includes(
-      "/actions/runs/${GITHUB_RUN_ID}/artifacts?per_page=100",
-    ) ||
+    !reconcileBindJob.includes("/actions/runs/${GITHUB_RUN_ID}/artifacts?per_page=100") ||
     !reconcileBindJob.includes(".created_at") ||
     !reconcileBindJob.includes('row.status === "complete"') ||
     !reconcileBindJob.includes('source: "snapshot"') ||
     !reconcileBindJob.includes('source: "artifact"') ||
+    !reconcileBindJob.includes('!["missing", "incomplete"].includes(snapshotRow.status)') ||
     !reconcileBindJob.includes(
-      '!["missing", "incomplete"].includes(snapshotRow.status)',
-    ) ||
-    !reconcileBindJob.includes(
-      ".filter((artifact) => artifact.name === name && !artifact.expired)",
+      ".filter((artifact) => artifact.name === name && !artifact.expired)"
     ) ||
     !reconcileBindJob.includes("right.created - left.created") ||
     !reconcileBindJob.includes("BigInt(right.id) > BigInt(left.id)") ||
@@ -2706,16 +2694,15 @@ if (reconcileBindJob) {
     reconcileBindJob.includes("matches.length !== 1")
   ) {
     failures.push(
-      "reconcile result binder must accept every complete snapshot row, select the newest exact per-row publication artifact after successful repair, and ignore unrelated stale run artifacts",
+      "reconcile result binder must accept every complete snapshot row, select the newest exact per-row publication artifact after successful repair, and ignore unrelated stale run artifacts"
     );
   }
 }
 
 async function verifyReconcileBinderBehavior() {
-  const run =
-    parsedReconcileWorkflow?.jobs?.["bind-publish-results"]?.steps?.find(
-      (step) => step.id === "bind",
-    )?.run;
+  const run = parsedReconcileWorkflow?.jobs?.["bind-publish-results"]?.steps?.find(
+    (step) => step.id === "bind"
+  )?.run;
   const marker =
     'node - "$RELEASE_SNAPSHOT" "$REPAIR_MATRIX" "$REPAIR_COUNT" "$artifacts" <<\'NODE\'\n';
   const scriptStart = typeof run === "string" ? run.indexOf(marker) + marker.length : -1;
@@ -2737,7 +2724,7 @@ async function verifyReconcileBinderBehavior() {
     revision: revisionA,
     status: "complete",
     manifestDigest: manifestA,
-    configDigest: configA,
+    configDigest: configA
   };
   const completeC = {
     tag: "v1.2.0",
@@ -2745,7 +2732,7 @@ async function verifyReconcileBinderBehavior() {
     revision: revisionC,
     status: "complete",
     manifestDigest: manifestC,
-    configDigest: configC,
+    configDigest: configC
   };
   const snapshotBinding = (row) => ({
     tag: row.tag,
@@ -2754,19 +2741,19 @@ async function verifyReconcileBinderBehavior() {
     source: "snapshot",
     artifactId: "",
     manifestDigest: row.manifestDigest,
-    configDigest: row.configDigest,
+    configDigest: row.configDigest
   });
   const repairedB = {
     tag: "v1.1.0",
     version: "1.1.0",
-    revision: revisionB,
+    revision: revisionB
   };
   const artifactBindingB = {
     ...repairedB,
     source: "artifact",
     artifactId: "99",
     manifestDigest: "",
-    configDigest: "",
+    configDigest: ""
   };
   const artifactNameB = `reconcile-publish-result-1.1.0-${revisionB}.json`;
   const artifactNameC = `reconcile-publish-result-1.2.0-${revisionC}.json`;
@@ -2776,22 +2763,19 @@ async function verifyReconcileBinderBehavior() {
       snapshot: [completeA, completeC],
       repairMatrix: { include: [] },
       artifacts: "",
-      expected: { include: [snapshotBinding(completeA), snapshotBinding(completeC)] },
+      expected: { include: [snapshotBinding(completeA), snapshotBinding(completeC)] }
     },
     {
       name: "next run retains a successful sibling and binds the repaired row",
-      snapshot: [
-        completeA,
-        { ...repairedB, status: "missing" },
-      ],
+      snapshot: [completeA, { ...repairedB, status: "missing" }],
       repairMatrix: { include: [repairedB] },
       artifacts: [
         `42\t${artifactNameB}\tfalse\t2026-07-14T01:00:00Z`,
         `99\t${artifactNameB}\tfalse\t2026-07-14T02:00:00Z`,
         `100\treconcile-publish-result-unrelated.json\tfalse\t2026-07-14T03:00:00Z`,
-        `101\t${artifactNameB}\ttrue\t2026-07-14T04:00:00Z`,
+        `101\t${artifactNameB}\ttrue\t2026-07-14T04:00:00Z`
       ].join("\n"),
-      expected: { include: [snapshotBinding(completeA), artifactBindingB] },
+      expected: { include: [snapshotBinding(completeA), artifactBindingB] }
     },
     {
       name: "smaller rerun matrix ignores stale prior-attempt artifacts",
@@ -2802,23 +2786,23 @@ async function verifyReconcileBinderBehavior() {
           tag: "v1.2.0",
           version: "1.2.0",
           revision: revisionC,
-          status: "missing",
-        },
+          status: "missing"
+        }
       ],
       repairMatrix: { include: [repairedB] },
       artifacts: [
         `99\t${artifactNameB}\tfalse\t2026-07-14T02:00:00Z`,
-        `77\t${artifactNameC}\tfalse\t2026-07-13T23:00:00Z`,
+        `77\t${artifactNameC}\tfalse\t2026-07-13T23:00:00Z`
       ].join("\n"),
-      expected: { include: [snapshotBinding(completeA), artifactBindingB] },
+      expected: { include: [snapshotBinding(completeA), artifactBindingB] }
     },
     {
       name: "pre-support empty schedule produces no acceptance rows",
       snapshot: [],
       repairMatrix: { include: [] },
       artifacts: "",
-      expected: { include: [] },
-    },
+      expected: { include: [] }
+    }
   ];
 
   const directory = await mkdtemp(path.join(tmpdir(), "patchpage-reconcile-binder-"));
@@ -2834,13 +2818,13 @@ async function verifyReconcileBinderBehavior() {
           JSON.stringify(fixture.snapshot),
           JSON.stringify(fixture.repairMatrix),
           String(fixture.repairMatrix.include.length),
-          artifactPath,
+          artifactPath
         ],
         {
           cwd: repoRoot,
           encoding: "utf8",
-          input: run.slice(scriptStart, scriptEnd),
-        },
+          input: run.slice(scriptStart, scriptEnd)
+        }
       );
       let actual;
       try {
@@ -2850,7 +2834,7 @@ async function verifyReconcileBinderBehavior() {
       }
       if (result.status !== 0 || JSON.stringify(actual) !== JSON.stringify(fixture.expected)) {
         fixtureFailures.push(
-          `reconcile result binder behavioral fixture failed: ${fixture.name}; ${result.stderr.trim() || result.stdout.trim() || `exit ${result.status}`}`,
+          `reconcile result binder behavioral fixture failed: ${fixture.name}; ${result.stderr.trim() || result.stdout.trim() || `exit ${result.status}`}`
         );
       }
     }
@@ -2874,47 +2858,37 @@ if (reconcileAnonymousJob) {
     !reconcileAnonymousJob.includes("needs.reconcile-latest.result == 'success'") ||
     !reconcileAnonymousJob.includes("needs.bind-publish-results.result == 'success'") ||
     !reconcileAnonymousJob.includes(
-      "matrix: ${{ fromJson(needs.bind-publish-results.outputs.matrix) }}",
+      "matrix: ${{ fromJson(needs.bind-publish-results.outputs.matrix) }}"
     ) ||
     !reconcileAnonymousJob.includes("Download exact immutable publication result") ||
     !reconcileAnonymousJob.includes("if: matrix.source == 'artifact'") ||
     !reconcileAnonymousJob.includes("artifact-ids: ${{ matrix.artifactId }}") ||
     !reconcileAnonymousJob.includes("skip-decompress: true") ||
-    !reconcileAnonymousJob.includes(
-      "Resolve the exact snapshot or publication result binding",
-    ) ||
+    !reconcileAnonymousJob.includes("Resolve the exact snapshot or publication result binding") ||
     !reconcileAnonymousJob.includes('if (source === "snapshot")') ||
     !reconcileAnonymousJob.includes('} else if (source === "artifact")') ||
     !reconcileAnonymousJob.includes(
-      "snapshot acceptance must not consume a publication artifact",
+      "snapshot acceptance must not consume a publication artifact"
     ) ||
     !reconcileAnonymousJob.includes(
-      "publication result directory must contain exactly the expected file",
+      "publication result directory must contain exactly the expected file"
     ) ||
-    !reconcileAnonymousJob.includes(
-      "publication result must be a regular non-link file",
-    ) ||
+    !reconcileAnonymousJob.includes("publication result must be a regular non-link file") ||
     !reconcileAnonymousJob.includes("publication result JSON must be canonical") ||
+    !reconcileAnonymousJob.includes("publication result identity does not match the matrix") ||
     !reconcileAnonymousJob.includes(
-      "publication result identity does not match the matrix",
+      "EXPECTED_MANIFEST_DIGEST: ${{ steps.bound-result.outputs.manifest-digest }}"
     ) ||
     !reconcileAnonymousJob.includes(
-      "EXPECTED_MANIFEST_DIGEST: ${{ steps.bound-result.outputs.manifest-digest }}",
-    ) ||
-    !reconcileAnonymousJob.includes(
-      "EXPECTED_CONFIG_DIGEST: ${{ steps.bound-result.outputs.config-digest }}",
+      "EXPECTED_CONFIG_DIGEST: ${{ steps.bound-result.outputs.config-digest }}"
     ) ||
     semverPull === -1 ||
     revisionPull <= semverPull ||
     digestPull <= revisionPull ||
     boot <= digestPull ||
     reconcileAnonymousJob.split("require_bound_image").length - 1 < 4 ||
-    !reconcileAnonymousJob.includes(
-      'actual_digest" == "$EXPECTED_MANIFEST_DIGEST"',
-    ) ||
-    !reconcileAnonymousJob.includes(
-      'actual_config" == "$EXPECTED_CONFIG_DIGEST"',
-    ) ||
+    !reconcileAnonymousJob.includes('actual_digest" == "$EXPECTED_MANIFEST_DIGEST"') ||
+    !reconcileAnonymousJob.includes('actual_config" == "$EXPECTED_CONFIG_DIGEST"') ||
     !reconcileAnonymousJob.includes("trap cleanup EXIT") ||
     !reconcileAnonymousJob.includes("DOCKER_CONFIG") ||
     !reconcileAnonymousJob.includes("/healthz") ||
@@ -2930,30 +2904,24 @@ if (reconcileAnonymousJob) {
     reconcileAnonymousJob.includes("npm ")
   ) {
     failures.push(
-      "anonymous reconciliation acceptance must consume either the exact complete-release snapshot or the newest exact publisher artifact ID, bind semver/full-SHA/config without credentials, and boot only its digest",
+      "anonymous reconciliation acceptance must consume either the exact complete-release snapshot or the newest exact publisher artifact ID, bind semver/full-SHA/config without credentials, and boot only its digest"
     );
   }
 }
 
-
-
 if (ciDockerJob) {
   if (
     !/^\s+VERSION\s*:\s*0\.0\.0-ci\s*$/m.test(ciDockerJob) ||
-    !/^\s+REVISION\s*:\s*"0000000000000000000000000000000000000000"\s*$/m.test(
-      ciDockerJob,
-    )
+    !/^\s+REVISION\s*:\s*"0000000000000000000000000000000000000000"\s*$/m.test(ciDockerJob)
   ) {
     failures.push("CI must use deterministic string image version and quoted revision metadata");
   }
 
   const build = ciDockerJob.indexOf("docker build");
   const saveImage = ciDockerJob.indexOf('docker save "$image"');
-  const validateSavedImage = ciDockerJob.indexOf(
-    "node scripts/validate-docker-save-artifact.mjs",
-  );
+  const validateSavedImage = ciDockerJob.indexOf("node scripts/validate-docker-save-artifact.mjs");
   const verifyImage = ciDockerJob.search(
-    /scripts\/verify-server-image\.sh\s+"\$image"\s+"\$VERSION"\s+"\$REVISION"/,
+    /scripts\/verify-server-image\.sh\s+"\$image"\s+"\$VERSION"\s+"\$REVISION"/
   );
   const buildCommand = ciDockerJob.slice(build, verifyImage);
   if (
@@ -2977,7 +2945,7 @@ if (ciDockerJob) {
     "docker login",
     "docker pull",
     "docker push",
-    "ghcr.io/allisonmahmood/patchpage-server",
+    "ghcr.io/allisonmahmood/patchpage-server"
   ]) {
     if (ciDockerJob.includes(forbidden)) {
       failures.push(`CI's local image contract must not contain ${forbidden}`);
@@ -2991,20 +2959,60 @@ if (packageJson.scripts?.["test:server-image"] !== "bash scripts/verify-server-i
 if (packageJson.scripts?.["test:ghcr-oci"] !== "node scripts/ghcr-oci-release.test.mjs") {
   failures.push("package.json must expose the focused GHCR OCI mock suite");
 }
-if (packageJson.scripts?.["test:docker-save"] !== "node scripts/validate-docker-save-artifact.test.mjs") {
+if (
+  packageJson.scripts?.["test:docker-save"] !==
+  "node scripts/validate-docker-save-artifact.test.mjs"
+) {
   failures.push("package.json must expose the focused docker-save validator fixture suite");
 }
 if (
-  !ciWorkflow.includes("pnpm test:release-workflow") ||
-  !ciWorkflow.includes("pnpm test:ghcr-oci") ||
-  !ciWorkflow.includes("pnpm test:docker-save")
+  packageJson.scripts?.["test:release-privacy"] !==
+  "node --test scripts/verify-release-privacy.test.mjs"
 ) {
-  failures.push("CI lint job must always run release verifier, GHCR OCI mocks, and docker-save fixtures");
+  failures.push("package.json must expose the focused release privacy fixture suite");
+}
+const ciReleaseWorkflowTest = ciLintSteps.findIndex((step) =>
+  isExactRunStep(step, "pnpm test:release-workflow")
+);
+const ciReleasePrivacyRuns = ciLintSteps.filter(
+  (step) => typeof step.run === "string" && step.run.includes("pnpm test:release-privacy")
+);
+const ciReleasePrivacyExact = ciReleasePrivacyRuns.filter((step) =>
+  isExactRunStep(step, "pnpm test:release-privacy")
+);
+const ciReleasePrivacyTest = ciLintSteps.findIndex((step) =>
+  isExactRunStep(step, "pnpm test:release-privacy")
+);
+const ciGhcrOciTest = ciLintSteps.findIndex((step) => isExactRunStep(step, "pnpm test:ghcr-oci"));
+const ciDockerSaveTest = ciLintSteps.findIndex((step) =>
+  isExactRunStep(step, "pnpm test:docker-save")
+);
+if (
+  parsedCiWorkflow === null ||
+  parsedCiLintJob === null ||
+  Object.hasOwn(parsedCiWorkflow, "defaults") ||
+  Object.hasOwn(parsedCiWorkflow, "env") ||
+  Object.hasOwn(parsedCiLintJob, "defaults") ||
+  Object.hasOwn(parsedCiLintJob, "env") ||
+  Object.hasOwn(parsedCiLintJob, "if") ||
+  Object.hasOwn(parsedCiLintJob, "continue-on-error") ||
+  ciReleaseWorkflowTest === -1 ||
+  ciReleasePrivacyRuns.length !== 1 ||
+  ciReleasePrivacyExact.length !== 1 ||
+  ciReleasePrivacyTest <= ciReleaseWorkflowTest ||
+  ciGhcrOciTest <= ciReleasePrivacyTest ||
+  ciDockerSaveTest <= ciGhcrOciTest
+) {
+  failures.push(
+    "CI lint job must run exactly one unconditional run-only release privacy fixture step in order"
+  );
 }
 
 if (
   !serverImageVerifier.includes('[[ ! "$expected_revision" =~ ^[0-9a-f]{40}$ ]]') ||
-  !serverImageVerifier.includes("Expected revision must be a quoted 40-character lowercase hex string")
+  !serverImageVerifier.includes(
+    "Expected revision must be a quoted 40-character lowercase hex string"
+  )
 ) {
   failures.push("verify-server-image.sh must reject coerced or non-40-hex revisions");
 }
@@ -3018,7 +3026,7 @@ for (const required of [
   supportedImage,
   "patchpage-data:/data",
   "PATCHPAGE_DB_FILE=/data/patchpage-db.json",
-  "PATCHPAGE_STORAGE_DIR=/data/drafts",
+  "PATCHPAGE_STORAGE_DIR=/data/drafts"
 ]) {
   if (!selfHosting.includes(required)) {
     failures.push(`self-hosting docs must document ${required}`);
@@ -3032,11 +3040,13 @@ if (
   !/full\s+commit\s+SHA[^\n]*intended not to move/i.test(selfHosting) ||
   !/immutable deployment pin[^\n]*manifest digest/i.test(selfHosting)
 ) {
-  failures.push("self-hosting docs must distinguish intended fixed tags from immutable digest pins");
+  failures.push(
+    "self-hosting docs must distinguish intended fixed tags from immutable digest pins"
+  );
 }
 if (!/stable semver[^\n]*prerelease/i.test(selfHosting)) {
   failures.push(
-    "self-hosting docs must document the stable-only release policy and prerelease rejection",
+    "self-hosting docs must document the stable-only release policy and prerelease rejection"
   );
 }
 if (!/(?:moving[^\n]*`latest`|`latest`[^\n]*(?:follows|moves))/i.test(selfHosting)) {
@@ -3046,14 +3056,14 @@ if (
   !/newer `latest`[^\n]*manifest digest[^\n]*config[^\n]*paired release tags/i.test(selfHosting)
 ) {
   failures.push(
-    "self-hosting docs must explain how a newer latest tag is authenticated before it is retained",
+    "self-hosting docs must explain how a newer latest tag is authenticated before it is retained"
   );
 }
 for (const required of [
   "GHCR Public visibility",
   "does not change package visibility",
   "anonymous GHCR smoke",
-  "issue #17",
+  "issue #17"
 ]) {
   if (!selfHosting.includes(required)) {
     failures.push(`self-hosting docs must document the first-package visibility gate: ${required}`);
@@ -3064,7 +3074,9 @@ if (
   !readme.includes("anonymous GHCR smoke") ||
   !readme.includes("not a claim that the first package is already public")
 ) {
-  failures.push("README must describe the GHCR public-visibility gate without claiming live availability");
+  failures.push(
+    "README must describe the GHCR public-visibility gate without claiming live availability"
+  );
 }
 
 if (anonymousImageJob) {
@@ -3090,7 +3102,7 @@ if (anonymousImageJob) {
     "GITHUB_REF_NAME",
     ":latest",
     "packages:",
-    "actions/download-artifact",
+    "actions/download-artifact"
   ]) {
     if (anonymousImageJob.includes(forbidden)) {
       failures.push(`ghcr-anonymous-smoke must not contain ${forbidden}`);
@@ -3099,20 +3111,18 @@ if (anonymousImageJob) {
 
   const tagPull = anonymousImageJob.indexOf('pull_anonymously "$tag_image"');
   const digestPull = anonymousImageJob.indexOf('pull_anonymously "$digest_image"');
-  const boot = anonymousImageJob.indexOf('docker run -d');
+  const boot = anonymousImageJob.indexOf("docker run -d");
   const portInspect = anonymousImageJob.indexOf("docker container inspect");
   const healthRequest = anonymousImageJob.search(
-    /body\s*=\s*"\$\(curl\s+-fsS\s+"http:\/\/127\.0\.0\.1:\$\{host_port\}\/healthz"[^\n]*\)"/,
+    /body\s*=\s*"\$\(curl\s+-fsS\s+"http:\/\/127\.0\.0\.1:\$\{host_port\}\/healthz"[^\n]*\)"/
   );
-  const exactHealth = anonymousImageJob.search(
-    /\[\[\s*"\$body"\s*==\s*'\{"ok":true\}'\s*\]\]/,
-  );
+  const exactHealth = anonymousImageJob.search(/\[\[\s*"\$body"\s*==\s*'\{"ok":true\}'\s*\]\]/);
   if (
     !anonymousImageJob.includes(
-      "EXPECTED_DIGEST: ${{ needs.docker-ghcr.outputs.manifest-digest }}",
+      "EXPECTED_DIGEST: ${{ needs.docker-ghcr.outputs.manifest-digest }}"
     ) ||
     !anonymousImageJob.includes(
-      "EXPECTED_CONFIG_ID: ${{ needs.docker-ghcr.outputs.config-digest }}",
+      "EXPECTED_CONFIG_ID: ${{ needs.docker-ghcr.outputs.config-digest }}"
     ) ||
     !anonymousImageJob.includes("VERSION: ${{ needs.guard.outputs.version }}") ||
     !anonymousImageJob.includes('tag_image="${ghcr_image}:${VERSION}"') ||
@@ -3127,20 +3137,18 @@ if (anonymousImageJob) {
     !anonymousImageJob.includes('actual_config" == "$EXPECTED_CONFIG_ID"')
   ) {
     failures.push(
-      "ghcr-anonymous-smoke must bind the semver tag and exact digest to the publisher manifest and verified config before boot",
+      "ghcr-anonymous-smoke must bind the semver tag and exact digest to the publisher manifest and verified config before boot"
     );
   }
 
   if (healthRequest <= boot || exactHealth <= healthRequest) {
-    failures.push(
-      "ghcr-anonymous-smoke must obtain and require the exact live /healthz response",
-    );
+    failures.push("ghcr-anonymous-smoke must obtain and require the exact live /healthz response");
   }
 
   if (
     !/docker_config\s*=\s*"\$\(mktemp -d\)"/.test(anonymousImageJob) ||
     !/export\s+DOCKER_CONFIG\s*=\s*"\$docker_config"/.test(anonymousImageJob) ||
-    !anonymousImageJob.includes('printf \'{"auths":{}}\\n\'') ||
+    !anonymousImageJob.includes("printf '{\"auths\":{}}\\n'") ||
     !anonymousImageJob.includes("-p 127.0.0.1::3000") ||
     !anonymousImageJob.includes("Docker did not publish the server port")
   ) {
@@ -3161,19 +3169,19 @@ async function runMutationChecks() {
     '          if [[ "$package_name" != "patchpage" ]]; then',
     '            echo "::error::Downloaded package is named $package_name, expected patchpage"',
     "            exit 1",
-    "          fi",
+    "          fi"
   ].join("\n");
   const basenameGuard = [
     '          if [[ "$(basename "$tarball")" != "$EXPECTED_FILENAME" ]]; then',
     '            echo "::error::Downloaded tarball name does not match the verified artifact"',
     "            exit 1",
-    "          fi",
+    "          fi"
   ].join("\n");
   const shaGuard = [
     '          if [[ "$actual_sha256" != "$EXPECTED_SHA256" ]]; then',
     '            echo "::error::Downloaded tarball digest does not match the verified artifact"',
     "            exit 1",
-    "          fi",
+    "          fi"
   ].join("\n");
   const publicationContractFailure =
     /publication step must contain exactly name, shell, env, and the reviewed run/;
@@ -3192,12 +3200,12 @@ async function runMutationChecks() {
               "        run: |",
               "          docker build .",
               '          scripts/verify-server-image.sh "$image" "$VERSION" "$REVISION"',
-              "      - name: Publish or accept the release tag pair with exact OCI state, then reconcile latest",
-            ].join("\n"),
-          ),
+              "      - name: Publish or accept the release tag pair with exact OCI state, then reconcile latest"
+            ].join("\n")
+          )
         },
         expected:
-          /docker-ghcr publisher must not contain (?:docker build|scripts\/verify-server-image\.sh)/,
+          /docker-ghcr publisher must not contain (?:docker build|scripts\/verify-server-image\.sh)/
       },
       {
         name: "reject stable SemVer validation deferred beyond the release guard",
@@ -3209,13 +3217,12 @@ async function runMutationChecks() {
               '            echo "::error::Release version must be exact stable SemVer, got ${version}"',
               "            exit 1",
               "          fi",
-              "",
+              ""
             ].join("\n"),
-            "",
-          ),
+            ""
+          )
         },
-        expected:
-          /guard must check out the repository before running the exact version producer/,
+        expected: /guard must check out the repository before running the exact version producer/
       },
       {
         name: "reject image artifact selected by name instead of immutable ID",
@@ -3223,10 +3230,10 @@ async function runMutationChecks() {
           PATCHPAGE_RELEASE_WORKFLOW_SOURCE: replaceOnce(
             workflow,
             "artifact-ids: ${{ needs.verify-server-image.outputs.image-artifact-id }}",
-            "name: patchpage-server-image-${{ github.run_attempt }}",
-          ),
+            "name: patchpage-server-image-${{ github.run_attempt }}"
+          )
         },
-        expected: /docker-ghcr must download the exact raw image artifact ID/,
+        expected: /docker-ghcr must download the exact raw image artifact ID/
       },
       {
         name: "reject validator moved after docker load",
@@ -3236,14 +3243,14 @@ async function runMutationChecks() {
             '          docker load --input "$tar_path"',
             [
               '          docker load --input "$tar_path"',
-              '          node "$VALIDATE_DOCKER_SAVE_ARTIFACT" --artifact-dir "$RUNNER_TEMP/server-image" --expected-filename "$EXPECTED_FILENAME" --expected-sha256 "$EXPECTED_SHA256" --expected-repo-tag "$expected_local_tag" --expected-config-id "$EXPECTED_IMAGE_ID"',
-            ].join("\n"),
+              '          node "$VALIDATE_DOCKER_SAVE_ARTIFACT" --artifact-dir "$RUNNER_TEMP/server-image" --expected-filename "$EXPECTED_FILENAME" --expected-sha256 "$EXPECTED_SHA256" --expected-repo-tag "$expected_local_tag" --expected-config-id "$EXPECTED_IMAGE_ID"'
+            ].join("\n")
           ).replace(
             /\n          node "\$VALIDATE_DOCKER_SAVE_ARTIFACT" \\\n            --artifact-dir "\$RUNNER_TEMP\/server-image" \\\n            --expected-filename "\$EXPECTED_FILENAME" \\\n            --expected-sha256 "\$EXPECTED_SHA256" \\\n            --expected-repo-tag "\$expected_local_tag" \\\n            --expected-config-id "\$EXPECTED_IMAGE_ID"\n/,
-            "\n",
-          ),
+            "\n"
+          )
         },
-        expected: /validate the raw tar before docker load/,
+        expected: /validate the raw tar before docker load/
       },
       {
         name: "reject missing embedded validator hash check",
@@ -3251,10 +3258,10 @@ async function runMutationChecks() {
           PATCHPAGE_RELEASE_WORKFLOW_SOURCE: replaceOnce(
             workflow,
             "Embedded docker-save validator source hash mismatch",
-            "validator hash check removed",
-          ),
+            "validator hash check removed"
+          )
         },
-        expected: /docker-ghcr must hash-check both embedded release tools before use/,
+        expected: /docker-ghcr must hash-check both embedded release tools before use/
       },
       {
         name: "reject missing OCI publish command",
@@ -3262,10 +3269,11 @@ async function runMutationChecks() {
           PATCHPAGE_RELEASE_WORKFLOW_SOURCE: replaceOnce(
             workflow,
             'node "$GHCR_OCI_RELEASE" publish-release',
-            'node "$GHCR_OCI_RELEASE" select-latest',
-          ),
+            'node "$GHCR_OCI_RELEASE" select-latest'
+          )
         },
-        expected: /publish and reconcile through OCI state|publish the validated tar through the reviewed OCI release tool/,
+        expected:
+          /publish and reconcile through OCI state|publish the validated tar through the reviewed OCI release tool/
       },
       {
         name: "reject missing latest reconciliation",
@@ -3273,10 +3281,10 @@ async function runMutationChecks() {
           PATCHPAGE_RELEASE_WORKFLOW_SOURCE: replaceOnce(
             workflow,
             'node "$GHCR_OCI_RELEASE" reconcile-latest',
-            'node "$GHCR_OCI_RELEASE" select-latest',
-          ),
+            'node "$GHCR_OCI_RELEASE" select-latest'
+          )
         },
-        expected: /publish and reconcile through OCI state/,
+        expected: /publish and reconcile through OCI state/
       },
       {
         name: "reject adding Docker login to publisher",
@@ -3290,24 +3298,20 @@ async function runMutationChecks() {
               "          registry: ghcr.io",
               "          username: ${{ github.repository_owner }}",
               "          password: ${{ github.token }}",
-              "      - name: Validate and load the verified server image artifact before registry auth",
-            ].join("\n"),
-          ),
+              "      - name: Validate and load the verified server image artifact before registry auth"
+            ].join("\n")
+          )
         },
         expected:
-          /docker-ghcr publisher must not contain uses: docker\/login-action@|release\.yml must retain all 0 reviewed docker\/login-action Action uses/,
+          /docker-ghcr publisher must not contain uses: docker\/login-action@|release\.yml must retain all 0 reviewed docker\/login-action Action uses/
       },
       {
         name: "reject numeric queue syntax",
         env: {
-          PATCHPAGE_RELEASE_WORKFLOW_SOURCE: replaceOnce(
-            workflow,
-            "  queue: max",
-            "  queue: 100",
-          ),
+          PATCHPAGE_RELEASE_WORKFLOW_SOURCE: replaceOnce(workflow, "  queue: max", "  queue: 100")
         },
         expected:
-          /release\.yml must serialize all patchpage-server publishes in one package-wide max queue/,
+          /release\.yml must serialize all patchpage-server publishes in one package-wide max queue/
       },
       {
         name: "reject missing release concurrency",
@@ -3319,12 +3323,12 @@ async function runMutationChecks() {
               "  group: release-ghcr-patchpage-server",
               "  queue: max",
               "  cancel-in-progress: false",
-              "",
+              ""
             ].join("\n"),
-            "",
-          ),
+            ""
+          )
         },
-        expected: /release\.yml must serialize all patchpage-server publishes/,
+        expected: /release\.yml must serialize all patchpage-server publishes/
       },
       {
         name: "reject removed GHCR digest output",
@@ -3332,10 +3336,10 @@ async function runMutationChecks() {
           PATCHPAGE_RELEASE_WORKFLOW_SOURCE: replaceOnce(
             workflow,
             "manifest-digest: ${{ steps.publish-image.outputs.manifest-digest }}",
-            "manifest-digest-removed: true",
-          ),
+            "manifest-digest-removed: true"
+          )
         },
-        expected: /docker-ghcr must expose the verified GHCR manifest and config digests/,
+        expected: /docker-ghcr must expose the verified GHCR manifest and config digests/
       },
       {
         name: "reject removed GHCR config digest output",
@@ -3343,10 +3347,10 @@ async function runMutationChecks() {
           PATCHPAGE_RELEASE_WORKFLOW_SOURCE: replaceOnce(
             workflow,
             "config-digest: ${{ steps.publish-image.outputs.config-digest }}",
-            "config-digest-removed: true",
-          ),
+            "config-digest-removed: true"
+          )
         },
-        expected: /docker-ghcr must expose the verified GHCR manifest and config digests/,
+        expected: /docker-ghcr must expose the verified GHCR manifest and config digests/
       },
       {
         name: "reject release smoke skipping the anonymous semver pull",
@@ -3354,10 +3358,10 @@ async function runMutationChecks() {
           PATCHPAGE_RELEASE_WORKFLOW_SOURCE: replaceOnce(
             workflow,
             '          pull_anonymously "$tag_image"',
-            '          echo "skipped anonymous semver pull"',
-          ),
+            '          echo "skipped anonymous semver pull"'
+          )
         },
-        expected: /ghcr-anonymous-smoke must bind the semver tag and exact digest/,
+        expected: /ghcr-anonymous-smoke must bind the semver tag and exact digest/
       },
       {
         name: "reject release smoke semver retarget acceptance",
@@ -3365,10 +3369,10 @@ async function runMutationChecks() {
           PATCHPAGE_RELEASE_WORKFLOW_SOURCE: replaceOnce(
             workflow,
             'actual_digest" == "$EXPECTED_DIGEST"',
-            '-n "$actual_digest"',
-          ),
+            '-n "$actual_digest"'
+          )
         },
-        expected: /ghcr-anonymous-smoke must bind the semver tag and exact digest/,
+        expected: /ghcr-anonymous-smoke must bind the semver tag and exact digest/
       },
       {
         name: "reject release smoke config substitution",
@@ -3376,10 +3380,10 @@ async function runMutationChecks() {
           PATCHPAGE_RELEASE_WORKFLOW_SOURCE: replaceOnce(
             workflow,
             'actual_config" == "$EXPECTED_CONFIG_ID"',
-            '-n "$actual_config"',
-          ),
+            '-n "$actual_config"'
+          )
         },
-        expected: /ghcr-anonymous-smoke must bind the semver tag and exact digest/,
+        expected: /ghcr-anonymous-smoke must bind the semver tag and exact digest/
       },
       {
         name: "reject reconcile single queue",
@@ -3387,10 +3391,11 @@ async function runMutationChecks() {
           PATCHPAGE_RECONCILE_WORKFLOW_SOURCE: replaceOnce(
             reconcileWorkflow,
             "  queue: max",
-            "  queue: 1",
-          ),
+            "  queue: 1"
+          )
         },
-        expected: /reconcile-ghcr\.yml must be scheduled\/manual and reuse the package-wide max queue/,
+        expected:
+          /reconcile-ghcr\.yml must be scheduled\/manual and reuse the package-wide max queue/
       },
       {
         name: "reject reconcile slicing before inspection",
@@ -3398,10 +3403,10 @@ async function runMutationChecks() {
           PATCHPAGE_RECONCILE_WORKFLOW_SOURCE: replaceOnce(
             reconcileWorkflow,
             "const rows = tags.map((tag) => {",
-            "const rows = tags.slice(0, 1).map((tag) => {",
-          ),
+            "const rows = tags.slice(0, 1).map((tag) => {"
+          )
         },
-        expected: /reconcile inspect must paginate stable GitHub tags/,
+        expected: /reconcile inspect must paginate stable GitHub tags/
       },
       {
         name: "reject precision-losing reconciler semver ordering",
@@ -3409,10 +3414,11 @@ async function runMutationChecks() {
           PATCHPAGE_RECONCILE_WORKFLOW_SOURCE: replaceOnce(
             reconcileWorkflow,
             'split(".").map(BigInt)',
-            'split(".").map(Number)',
-          ),
+            'split(".").map(Number)'
+          )
         },
-        expected: /reconcile inspect must paginate stable GitHub tags|reconcile-ghcr inspect must match the exact reviewed job map/,
+        expected:
+          /reconcile inspect must paginate stable GitHub tags|reconcile-ghcr inspect must match the exact reviewed job map/
       },
       {
         name: "reject reconciling legacy image tags",
@@ -3420,10 +3426,10 @@ async function runMutationChecks() {
           PATCHPAGE_RECONCILE_WORKFLOW_SOURCE: replaceOnce(
             reconcileWorkflow,
             ".filter((tag) => isSupportedImageRelease(tag.slice(1)))",
-            ".filter(() => true)",
-          ),
+            ".filter(() => true)"
+          )
         },
-        expected: /reconcile inspect must paginate stable GitHub tags/,
+        expected: /reconcile inspect must paginate stable GitHub tags/
       },
       {
         name: "reject lowering the first supported image release",
@@ -3431,10 +3437,10 @@ async function runMutationChecks() {
           PATCHPAGE_GHCR_OCI_RELEASE_SOURCE: replaceOnce(
             effectiveGhcrOciReleaseTool.toString("utf8"),
             'const MINIMUM_SUPPORTED_IMAGE_VERSION = "0.1.1"',
-            'const MINIMUM_SUPPORTED_IMAGE_VERSION = "0.1.0"',
-          ),
+            'const MINIMUM_SUPPORTED_IMAGE_VERSION = "0.1.0"'
+          )
         },
-        expected: /ghcr-oci-release\.mjs must implement exact digest-bound OCI reads/,
+        expected: /ghcr-oci-release\.mjs must implement exact digest-bound OCI reads/
       },
       {
         name: "reject bypassing the reviewed remote config size ceiling",
@@ -3442,10 +3448,10 @@ async function runMutationChecks() {
           PATCHPAGE_GHCR_OCI_RELEASE_SOURCE: replaceOnce(
             effectiveGhcrOciReleaseTool.toString("utf8"),
             "if (configSize > MAX_CONFIG_BYTES) {",
-            "if (false) {",
-          ),
+            "if (false) {"
+          )
         },
-        expected: /ghcr-oci-release\.mjs must implement exact digest-bound OCI reads/,
+        expected: /ghcr-oci-release\.mjs must implement exact digest-bound OCI reads/
       },
       {
         name: "reject reading a config without its exact descriptor size",
@@ -3453,10 +3459,10 @@ async function runMutationChecks() {
           PATCHPAGE_GHCR_OCI_RELEASE_SOURCE: replaceOnce(
             effectiveGhcrOciReleaseTool.toString("utf8"),
             "expectedBytes: configSize",
-            "expectedBytes: null",
-          ),
+            "expectedBytes: null"
+          )
         },
-        expected: /ghcr-oci-release\.mjs must implement exact digest-bound OCI reads/,
+        expected: /ghcr-oci-release\.mjs must implement exact digest-bound OCI reads/
       },
       {
         name: "reject bypassing the streaming registry body reader",
@@ -3464,10 +3470,10 @@ async function runMutationChecks() {
           PATCHPAGE_GHCR_OCI_RELEASE_SOURCE: replaceOnce(
             effectiveGhcrOciReleaseTool.toString("utf8"),
             "response.body?.getReader()",
-            "null",
-          ),
+            "null"
+          )
         },
-        expected: /ghcr-oci-release\.mjs must implement exact digest-bound OCI reads/,
+        expected: /ghcr-oci-release\.mjs must implement exact digest-bound OCI reads/
       },
       {
         name: "reject comparing config diff IDs to compressed descriptors",
@@ -3475,10 +3481,11 @@ async function runMutationChecks() {
           PATCHPAGE_DOCKER_SAVE_VALIDATOR_SOURCE: replaceOnce(
             effectiveDockerSaveValidator.toString("utf8"),
             "await uncompressedLayerDigest",
-            "await Promise.resolve",
-          ),
+            "await Promise.resolve"
+          )
         },
-        expected: /validate-docker-save-artifact\.mjs must retain the structural docker-save graph validator/,
+        expected:
+          /validate-docker-save-artifact\.mjs must retain the structural docker-save graph validator/
       },
       {
         name: "reject weakening the compressed layer expansion ceiling",
@@ -3486,10 +3493,11 @@ async function runMutationChecks() {
           PATCHPAGE_DOCKER_SAVE_VALIDATOR_SOURCE: replaceOnce(
             effectiveDockerSaveValidator.toString("utf8"),
             "const MAX_LAYER_EXPANSION_RATIO = 200",
-            "const MAX_LAYER_EXPANSION_RATIO = Number.MAX_SAFE_INTEGER",
-          ),
+            "const MAX_LAYER_EXPANSION_RATIO = Number.MAX_SAFE_INTEGER"
+          )
         },
-        expected: /validate-docker-save-artifact\.mjs must retain the structural docker-save graph validator/,
+        expected:
+          /validate-docker-save-artifact\.mjs must retain the structural docker-save graph validator/
       },
       {
         name: "reject accepting the wrong number of Moby legacy nodes",
@@ -3497,10 +3505,11 @@ async function runMutationChecks() {
           PATCHPAGE_DOCKER_SAVE_VALIDATOR_SOURCE: replaceOnce(
             effectiveDockerSaveValidator.toString("utf8"),
             "if (nodes.length !== diffIds.length)",
-            "if (false)",
-          ),
+            "if (false)"
+          )
         },
-        expected: /validate-docker-save-artifact\.mjs must retain the structural docker-save graph validator/,
+        expected:
+          /validate-docker-save-artifact\.mjs must retain the structural docker-save graph validator/
       },
       {
         name: "reject accepting ambiguous Moby legacy roots",
@@ -3508,10 +3517,11 @@ async function runMutationChecks() {
           PATCHPAGE_DOCKER_SAVE_VALIDATOR_SOURCE: replaceOnce(
             effectiveDockerSaveValidator.toString("utf8"),
             "if (roots.length !== 1)",
-            "if (false)",
-          ),
+            "if (false)"
+          )
         },
-        expected: /validate-docker-save-artifact\.mjs must retain the structural docker-save graph validator/,
+        expected:
+          /validate-docker-save-artifact\.mjs must retain the structural docker-save graph validator/
       },
       {
         name: "reject repositories detached from the final uncompressed diff ID",
@@ -3519,10 +3529,11 @@ async function runMutationChecks() {
           PATCHPAGE_DOCKER_SAVE_VALIDATOR_SOURCE: replaceOnce(
             effectiveDockerSaveValidator.toString("utf8"),
             "if (repositoryTags[tag] !== expectedRepositoryLayer)",
-            "if (false)",
-          ),
+            "if (false)"
+          )
         },
-        expected: /validate-docker-save-artifact\.mjs must retain the structural docker-save graph validator/,
+        expected:
+          /validate-docker-save-artifact\.mjs must retain the structural docker-save graph validator/
       },
       {
         name: "reject allowing unexpected Moby V1 metadata keys",
@@ -3530,10 +3541,11 @@ async function runMutationChecks() {
           PATCHPAGE_DOCKER_SAVE_VALIDATOR_SOURCE: replaceOnce(
             effectiveDockerSaveValidator.toString("utf8"),
             "if (!allowedKeys.has(key))",
-            "if (false)",
-          ),
+            "if (false)"
+          )
         },
-        expected: /validate-docker-save-artifact\.mjs must retain the structural docker-save graph validator/,
+        expected:
+          /validate-docker-save-artifact\.mjs must retain the structural docker-save graph validator/
       },
       {
         name: "reject accepting forked Moby legacy graphs",
@@ -3541,10 +3553,11 @@ async function runMutationChecks() {
           PATCHPAGE_DOCKER_SAVE_VALIDATOR_SOURCE: replaceOnce(
             effectiveDockerSaveValidator.toString("utf8"),
             "if (children.has(node.parent))",
-            "if (false)",
-          ),
+            "if (false)"
+          )
         },
-        expected: /validate-docker-save-artifact\.mjs must retain the structural docker-save graph validator/,
+        expected:
+          /validate-docker-save-artifact\.mjs must retain the structural docker-save graph validator/
       },
       {
         name: "reject runtime config fields on non-leaf Moby nodes",
@@ -3552,10 +3565,11 @@ async function runMutationChecks() {
           PATCHPAGE_DOCKER_SAVE_VALIDATOR_SOURCE: replaceOnce(
             effectiveDockerSaveValidator.toString("utf8"),
             "if (!isLeaf && hasOwn(node.legacy, key))",
-            "if (false)",
-          ),
+            "if (false)"
+          )
         },
-        expected: /validate-docker-save-artifact\.mjs must retain the structural docker-save graph validator/,
+        expected:
+          /validate-docker-save-artifact\.mjs must retain the structural docker-save graph validator/
       },
       {
         name: "reject dropping a stable leaf runtime projection",
@@ -3563,10 +3577,11 @@ async function runMutationChecks() {
           PATCHPAGE_DOCKER_SAVE_VALIDATOR_SOURCE: replaceOnce(
             effectiveDockerSaveValidator.toString("utf8"),
             '      "Labels",\n',
-            "",
-          ),
+            ""
+          )
         },
-        expected: /validate-docker-save-artifact\.mjs must retain the structural docker-save graph validator/,
+        expected:
+          /validate-docker-save-artifact\.mjs must retain the structural docker-save graph validator/
       },
       {
         name: "reject leaf runtime projections detached from the OCI config",
@@ -3574,10 +3589,11 @@ async function runMutationChecks() {
           PATCHPAGE_DOCKER_SAVE_VALIDATOR_SOURCE: replaceOnce(
             effectiveDockerSaveValidator.toString("utf8"),
             "!isDeepStrictEqual(leafRuntimeConfig[key], ociRuntimeConfig[key])",
-            "false",
-          ),
+            "false"
+          )
         },
-        expected: /validate-docker-save-artifact\.mjs must retain the structural docker-save graph validator/,
+        expected:
+          /validate-docker-save-artifact\.mjs must retain the structural docker-save graph validator/
       },
       {
         name: "reject Moby node operating systems detached from the OCI config",
@@ -3585,10 +3601,11 @@ async function runMutationChecks() {
           PATCHPAGE_DOCKER_SAVE_VALIDATOR_SOURCE: replaceOnce(
             effectiveDockerSaveValidator.toString("utf8"),
             "if (node.legacy.os !== config.os)",
-            "if (false)",
-          ),
+            "if (false)"
+          )
         },
-        expected: /validate-docker-save-artifact\.mjs must retain the structural docker-save graph validator/,
+        expected:
+          /validate-docker-save-artifact\.mjs must retain the structural docker-save graph validator/
       },
       {
         name: "reject leaf platform fields detached from the OCI config",
@@ -3596,10 +3613,11 @@ async function runMutationChecks() {
           PATCHPAGE_DOCKER_SAVE_VALIDATOR_SOURCE: replaceOnce(
             effectiveDockerSaveValidator.toString("utf8"),
             "if (hasOwn(leaf.legacy, key) && leaf.legacy[key] !== config[key])",
-            "if (false)",
-          ),
+            "if (false)"
+          )
         },
-        expected: /validate-docker-save-artifact\.mjs must retain the structural docker-save graph validator/,
+        expected:
+          /validate-docker-save-artifact\.mjs must retain the structural docker-save graph validator/
       },
       {
         name: "reject CI skipping validation of the actual docker-save output",
@@ -3607,10 +3625,178 @@ async function runMutationChecks() {
           PATCHPAGE_RELEASE_CI_WORKFLOW_SOURCE: replaceOnce(
             ciWorkflow,
             "node scripts/validate-docker-save-artifact.mjs",
-            "echo skipped-docker-save-validation",
-          ),
+            "echo skipped-docker-save-validation"
+          )
         },
-        expected: /CI must run the behavioral contract on its one metadata-bound image build/,
+        expected: /CI must run the behavioral contract on its one metadata-bound image build/
+      },
+      {
+        name: "reject CI skipping release privacy fixtures",
+        env: {
+          PATCHPAGE_RELEASE_CI_WORKFLOW_SOURCE: replaceOnce(
+            ciWorkflow,
+            "- run: pnpm test:release-privacy",
+            "- run: echo skipped-release-privacy"
+          )
+        },
+        expected:
+          /CI lint job must run exactly one unconditional run-only release privacy fixture step in order/
+      },
+      {
+        name: "reject CI lint job continue-on-error",
+        env: {
+          PATCHPAGE_RELEASE_CI_WORKFLOW_SOURCE: replaceOnce(
+            ciWorkflow,
+            "  lint:\n    runs-on: ubuntu-latest",
+            "  lint:\n    continue-on-error: true\n    runs-on: ubuntu-latest"
+          )
+        },
+        expected:
+          /CI lint job must run exactly one unconditional run-only release privacy fixture step in order/
+      },
+      {
+        name: "reject CI lint job conditional",
+        env: {
+          PATCHPAGE_RELEASE_CI_WORKFLOW_SOURCE: replaceOnce(
+            ciWorkflow,
+            "  lint:\n    runs-on: ubuntu-latest",
+            "  lint:\n    if: always()\n    runs-on: ubuntu-latest"
+          )
+        },
+        expected:
+          /CI lint job must run exactly one unconditional run-only release privacy fixture step in order/
+      },
+      {
+        name: "reject CI workflow run-shell defaults",
+        env: {
+          PATCHPAGE_RELEASE_CI_WORKFLOW_SOURCE: replaceOnce(
+            ciWorkflow,
+            "permissions:\n  contents: read",
+            'defaults:\n  run:\n    shell: "bash {0} || true"\n\npermissions:\n  contents: read'
+          )
+        },
+        expected:
+          /CI lint job must run exactly one unconditional run-only release privacy fixture step in order/
+      },
+      {
+        name: "reject CI lint job run-shell defaults",
+        env: {
+          PATCHPAGE_RELEASE_CI_WORKFLOW_SOURCE: replaceOnce(
+            ciWorkflow,
+            "  lint:\n    runs-on: ubuntu-latest",
+            '  lint:\n    defaults:\n      run:\n        shell: "bash {0} || true"\n    runs-on: ubuntu-latest'
+          )
+        },
+        expected:
+          /CI lint job must run exactly one unconditional run-only release privacy fixture step in order/
+      },
+      {
+        name: "reject CI workflow ambient mutation-skip environment",
+        env: {
+          PATCHPAGE_RELEASE_CI_WORKFLOW_SOURCE: replaceOnce(
+            ciWorkflow,
+            "permissions:\n  contents: read",
+            'env:\n  PATCHPAGE_RELEASE_WORKFLOW_SKIP_MUTATION_CHECKS: "1"\n\npermissions:\n  contents: read'
+          )
+        },
+        expected:
+          /CI lint job must run exactly one unconditional run-only release privacy fixture step in order/
+      },
+      {
+        name: "reject CI lint job ambient mutation-skip environment",
+        env: {
+          PATCHPAGE_RELEASE_CI_WORKFLOW_SOURCE: replaceOnce(
+            ciWorkflow,
+            "  lint:\n    runs-on: ubuntu-latest",
+            '  lint:\n    env:\n      PATCHPAGE_RELEASE_WORKFLOW_SKIP_MUTATION_CHECKS: "1"\n    runs-on: ubuntu-latest'
+          )
+        },
+        expected:
+          /CI lint job must run exactly one unconditional run-only release privacy fixture step in order/
+      },
+      {
+        name: "reject CI release privacy suffix",
+        env: {
+          PATCHPAGE_RELEASE_CI_WORKFLOW_SOURCE: replaceOnce(
+            ciWorkflow,
+            "- run: pnpm test:release-privacy",
+            '- run: "pnpm test:release-privacy || true"'
+          )
+        },
+        expected:
+          /CI lint job must run exactly one unconditional run-only release privacy fixture step in order/
+      },
+      {
+        name: "reject CI release privacy comment suffix",
+        env: {
+          PATCHPAGE_RELEASE_CI_WORKFLOW_SOURCE: replaceOnce(
+            ciWorkflow,
+            "- run: pnpm test:release-privacy",
+            '- run: "pnpm test:release-privacy # comment"'
+          )
+        },
+        expected:
+          /CI lint job must run exactly one unconditional run-only release privacy fixture step in order/
+      },
+      {
+        name: "reject CI release privacy shell key",
+        env: {
+          PATCHPAGE_RELEASE_CI_WORKFLOW_SOURCE: replaceOnce(
+            ciWorkflow,
+            "- run: pnpm test:release-privacy",
+            "- run: pnpm test:release-privacy\n        shell: bash"
+          )
+        },
+        expected:
+          /CI lint job must run exactly one unconditional run-only release privacy fixture step in order/
+      },
+      {
+        name: "reject CI release privacy continue-on-error",
+        env: {
+          PATCHPAGE_RELEASE_CI_WORKFLOW_SOURCE: replaceOnce(
+            ciWorkflow,
+            "- run: pnpm test:release-privacy",
+            "- run: pnpm test:release-privacy\n        continue-on-error: true"
+          )
+        },
+        expected:
+          /CI lint job must run exactly one unconditional run-only release privacy fixture step in order/
+      },
+      {
+        name: "reject CI release privacy conditional",
+        env: {
+          PATCHPAGE_RELEASE_CI_WORKFLOW_SOURCE: replaceOnce(
+            ciWorkflow,
+            "- run: pnpm test:release-privacy",
+            "- if: always()\n        run: pnpm test:release-privacy"
+          )
+        },
+        expected:
+          /CI lint job must run exactly one unconditional run-only release privacy fixture step in order/
+      },
+      {
+        name: "reject CI duplicate near-match release privacy fixtures",
+        env: {
+          PATCHPAGE_RELEASE_CI_WORKFLOW_SOURCE: replaceOnce(
+            ciWorkflow,
+            "- run: pnpm test:release-privacy",
+            '- run: pnpm test:release-privacy\n      - run: "pnpm test:release-privacy || true"'
+          )
+        },
+        expected:
+          /CI lint job must run exactly one unconditional run-only release privacy fixture step in order/
+      },
+      {
+        name: "reject CI duplicate release privacy fixtures",
+        env: {
+          PATCHPAGE_RELEASE_CI_WORKFLOW_SOURCE: replaceOnce(
+            ciWorkflow,
+            "- run: pnpm test:release-privacy",
+            "- run: pnpm test:release-privacy\n      - run: pnpm test:release-privacy"
+          )
+        },
+        expected:
+          /CI lint job must run exactly one unconditional run-only release privacy fixture step in order/
       },
       {
         name: "reject stopping inspection after the bounded repair batch",
@@ -3618,10 +3804,10 @@ async function runMutationChecks() {
           PATCHPAGE_RECONCILE_WORKFLOW_SOURCE: replaceOnce(
             reconcileWorkflow,
             "                  needed_count=$((needed_count + 1))\n                fi",
-            "                  needed_count=$((needed_count + 1))\n                  break\n                fi",
-          ),
+            "                  needed_count=$((needed_count + 1))\n                  break\n                fi"
+          )
         },
-        expected: /reconcile inspect must paginate stable GitHub tags/,
+        expected: /reconcile inspect must paginate stable GitHub tags/
       },
       {
         name: "reject latest reconciliation for a pre-support empty schedule",
@@ -3629,10 +3815,10 @@ async function runMutationChecks() {
           PATCHPAGE_RECONCILE_WORKFLOW_SOURCE: replaceOnce(
             reconcileWorkflow,
             "      needs.inspect.outputs.complete-count != '0'))",
-            "      true))",
-          ),
+            "      true))"
+          )
         },
-        expected: /reconcile latest must run checkout-free/,
+        expected: /reconcile latest must run checkout-free/
       },
       {
         name: "reject skipping zero-repair result binding and anonymous acceptance",
@@ -3640,10 +3826,10 @@ async function runMutationChecks() {
           PATCHPAGE_RECONCILE_WORKFLOW_SOURCE: replaceOnce(
             reconcileWorkflow,
             "  bind-publish-results:\n    if: >-\n      always() &&",
-            "  bind-publish-results:\n    if: >-\n      needs.inspect.outputs.count != '0' &&",
-          ),
+            "  bind-publish-results:\n    if: >-\n      needs.inspect.outputs.count != '0' &&"
+          )
         },
-        expected: /reconcile result binder must accept every complete snapshot row/,
+        expected: /reconcile result binder must accept every complete snapshot row/
       },
       {
         name: "reject result binding after an aggregate publisher failure",
@@ -3655,18 +3841,18 @@ async function runMutationChecks() {
               "    if: >-",
               "      always() &&",
               "      needs.inspect.result == 'success' &&",
-              "      (needs.publish-ghcr.result == 'success' ||",
+              "      (needs.publish-ghcr.result == 'success' ||"
             ].join("\n"),
             [
               "  bind-publish-results:",
               "    if: >-",
               "      always() &&",
               "      needs.inspect.result == 'success' &&",
-              "      (needs.publish-ghcr.result == 'failure' ||",
-            ].join("\n"),
-          ),
+              "      (needs.publish-ghcr.result == 'failure' ||"
+            ].join("\n")
+          )
         },
-        expected: /reconcile result binder must accept every complete snapshot row/,
+        expected: /reconcile result binder must accept every complete snapshot row/
       },
       {
         name: "reject dropping a prior successful row from the inspect snapshot",
@@ -3674,10 +3860,10 @@ async function runMutationChecks() {
           PATCHPAGE_RECONCILE_WORKFLOW_SOURCE: replaceOnce(
             reconcileWorkflow,
             '                source: "snapshot",',
-            '                source: "disabled-snapshot",',
-          ),
+            '                source: "disabled-snapshot",'
+          )
         },
-        expected: /reconcile result binder must accept every complete snapshot row/,
+        expected: /reconcile result binder must accept every complete snapshot row/
       },
       {
         name: "reject selecting an unrelated stale publication result artifact",
@@ -3685,10 +3871,10 @@ async function runMutationChecks() {
           PATCHPAGE_RECONCILE_WORKFLOW_SOURCE: replaceOnce(
             reconcileWorkflow,
             ".filter((artifact) => artifact.name === name && !artifact.expired)",
-            '.filter((artifact) => artifact.name.startsWith("reconcile-publish-result-") && !artifact.expired)',
-          ),
+            '.filter((artifact) => artifact.name.startsWith("reconcile-publish-result-") && !artifact.expired)'
+          )
         },
-        expected: /reconcile result binder must accept every complete snapshot row/,
+        expected: /reconcile result binder must accept every complete snapshot row/
       },
       {
         name: "reject selecting an older exact publication result artifact",
@@ -3696,10 +3882,10 @@ async function runMutationChecks() {
           PATCHPAGE_RECONCILE_WORKFLOW_SOURCE: replaceOnce(
             reconcileWorkflow,
             "artifactId: matches[0].id",
-            "artifactId: matches.at(-1).id",
-          ),
+            "artifactId: matches.at(-1).id"
+          )
         },
-        expected: /reconcile result binder must accept every complete snapshot row/,
+        expected: /reconcile result binder must accept every complete snapshot row/
       },
       {
         name: "reject anonymous acceptance bypass for complete snapshot rows",
@@ -3707,10 +3893,10 @@ async function runMutationChecks() {
           PATCHPAGE_RECONCILE_WORKFLOW_SOURCE: replaceOnce(
             reconcileWorkflow,
             'if (source === "snapshot")',
-            'if (source === "disabled-snapshot")',
-          ),
+            'if (source === "disabled-snapshot")'
+          )
         },
-        expected: /anonymous reconciliation acceptance must consume either/,
+        expected: /anonymous reconciliation acceptance must consume either/
       },
       {
         name: "reject anonymous publication result selected by mutable name",
@@ -3718,10 +3904,10 @@ async function runMutationChecks() {
           PATCHPAGE_RECONCILE_WORKFLOW_SOURCE: replaceOnce(
             reconcileWorkflow,
             "artifact-ids: ${{ matrix.artifactId }}",
-            "name: reconcile-publish-result-${{ matrix.version }}-${{ matrix.revision }}.json",
-          ),
+            "name: reconcile-publish-result-${{ matrix.version }}-${{ matrix.revision }}.json"
+          )
         },
-        expected: /anonymous reconciliation acceptance must consume either/,
+        expected: /anonymous reconciliation acceptance must consume either/
       },
       {
         name: "reject credentials in anonymous reconciliation acceptance",
@@ -3731,17 +3917,17 @@ async function runMutationChecks() {
             [
               "      - name: Pull both bound release tags anonymously, then boot the exact digest",
               "        shell: bash",
-              "        env:",
+              "        env:"
             ].join("\n"),
             [
               "      - name: Pull both bound release tags anonymously, then boot the exact digest",
               "        shell: bash",
               "        env:",
-              "          GITHUB_TOKEN: ${{ github.token }}",
-            ].join("\n"),
-          ),
+              "          GITHUB_TOKEN: ${{ github.token }}"
+            ].join("\n")
+          )
         },
-        expected: /anonymous reconciliation acceptance must consume either/,
+        expected: /anonymous reconciliation acceptance must consume either/
       },
       {
         name: "reject missing anonymous reconciliation semver pull",
@@ -3749,10 +3935,10 @@ async function runMutationChecks() {
           PATCHPAGE_RECONCILE_WORKFLOW_SOURCE: replaceOnce(
             reconcileWorkflow,
             '          pull_anonymously "$semver_image"',
-            '          echo "skipped anonymous semver pull"',
-          ),
+            '          echo "skipped anonymous semver pull"'
+          )
         },
-        expected: /anonymous reconciliation acceptance must consume either/,
+        expected: /anonymous reconciliation acceptance must consume either/
       },
       {
         name: "reject missing anonymous reconciliation full-SHA pull",
@@ -3760,10 +3946,10 @@ async function runMutationChecks() {
           PATCHPAGE_RECONCILE_WORKFLOW_SOURCE: replaceOnce(
             reconcileWorkflow,
             '          pull_anonymously "$revision_image"',
-            '          echo "skipped anonymous revision pull"',
-          ),
+            '          echo "skipped anonymous revision pull"'
+          )
         },
-        expected: /anonymous reconciliation acceptance must consume either/,
+        expected: /anonymous reconciliation acceptance must consume either/
       },
       {
         name: "reject anonymous reconciliation tag retarget race",
@@ -3771,10 +3957,10 @@ async function runMutationChecks() {
           PATCHPAGE_RECONCILE_WORKFLOW_SOURCE: replaceOnce(
             reconcileWorkflow,
             'actual_digest" == "$EXPECTED_MANIFEST_DIGEST"',
-            '-n "$actual_digest"',
-          ),
+            '-n "$actual_digest"'
+          )
         },
-        expected: /anonymous reconciliation acceptance must consume either/,
+        expected: /anonymous reconciliation acceptance must consume either/
       },
       {
         name: "reject anonymous reconciliation config substitution",
@@ -3782,10 +3968,10 @@ async function runMutationChecks() {
           PATCHPAGE_RECONCILE_WORKFLOW_SOURCE: replaceOnce(
             reconcileWorkflow,
             'actual_config" == "$EXPECTED_CONFIG_DIGEST"',
-            '-n "$actual_config"',
-          ),
+            '-n "$actual_config"'
+          )
         },
-        expected: /anonymous reconciliation acceptance must consume either/,
+        expected: /anonymous reconciliation acceptance must consume either/
       },
       {
         name: "reject mutable registry reselection in anonymous reconciliation",
@@ -3795,11 +3981,11 @@ async function runMutationChecks() {
             '          pull_anonymously "$semver_image"',
             [
               '          node "$GHCR_OCI_RELEASE" inspect-release',
-              '          pull_anonymously "$semver_image"',
-            ].join("\n"),
-          ),
+              '          pull_anonymously "$semver_image"'
+            ].join("\n")
+          )
         },
-        expected: /anonymous reconciliation acceptance must consume either/,
+        expected: /anonymous reconciliation acceptance must consume either/
       },
       {
         name: "reject inexact anonymous reconciliation health",
@@ -3807,10 +3993,10 @@ async function runMutationChecks() {
           PATCHPAGE_RECONCILE_WORKFLOW_SOURCE: replaceOnce(
             reconcileWorkflow,
             `            if [[ "$body" == '{"ok":true}' ]]; then`,
-            '            if [[ -n "$body" ]]; then',
-          ),
+            '            if [[ -n "$body" ]]; then'
+          )
         },
-        expected: /anonymous reconciliation acceptance must consume either/,
+        expected: /anonymous reconciliation acceptance must consume either/
       },
       {
         name: "reject reconcile handoff selected by artifact name",
@@ -3818,10 +4004,10 @@ async function runMutationChecks() {
           PATCHPAGE_RECONCILE_WORKFLOW_SOURCE: replaceOnce(
             reconcileWorkflow,
             "          artifact-ids: ${{ steps.handoff-artifact.outputs.artifact-id }}",
-            "          name: reconcile-handoff-${{ matrix.version }}-${{ github.run_attempt }}",
-          ),
+            "          name: reconcile-handoff-${{ matrix.version }}-${{ github.run_attempt }}"
+          )
         },
-        expected: /reconcile publisher must be checkout-free packages:write only/,
+        expected: /reconcile publisher must be checkout-free packages:write only/
       },
       {
         name: "reject reconcile zip wrapper extraction",
@@ -3832,13 +4018,13 @@ async function runMutationChecks() {
             [
               "      - name: Extract image artifact wrapper",
               "        run: |",
-              "          gh api \"/repos/${GITHUB_REPOSITORY}/actions/artifacts/${artifact_id}/zip\" --output \"$RUNNER_TEMP/raw-artifact.zip\"",
-              "          unzip -q \"$RUNNER_TEMP/raw-artifact.zip\" -d \"$RUNNER_TEMP/server-image\"",
-              "      - name: Validate and load replay image before registry auth",
-            ].join("\n"),
-          ),
+              '          gh api "/repos/${GITHUB_REPOSITORY}/actions/artifacts/${artifact_id}/zip" --output "$RUNNER_TEMP/raw-artifact.zip"',
+              '          unzip -q "$RUNNER_TEMP/raw-artifact.zip" -d "$RUNNER_TEMP/server-image"',
+              "      - name: Validate and load replay image before registry auth"
+            ].join("\n")
+          )
         },
-        expected: /reconcile publisher must be checkout-free packages:write only/,
+        expected: /reconcile publisher must be checkout-free packages:write only/
       },
       {
         name: "reject mutable reconciler Action coordinate",
@@ -3846,10 +4032,10 @@ async function runMutationChecks() {
           PATCHPAGE_RECONCILE_WORKFLOW_SOURCE: replaceOnce(
             reconcileWorkflow,
             "uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1",
-            "uses: actions/checkout@main # v4.3.1",
-          ),
+            "uses: actions/checkout@main # v4.3.1"
+          )
         },
-        expected: /reconcile-ghcr\.yml:\d+ must pin actions\/checkout to a full commit SHA/,
+        expected: /reconcile-ghcr\.yml:\d+ must pin actions\/checkout to a full commit SHA/
       },
       {
         name: "reject reconciler YAML anchor",
@@ -3857,10 +4043,10 @@ async function runMutationChecks() {
           PATCHPAGE_RECONCILE_WORKFLOW_SOURCE: replaceOnce(
             reconcileWorkflow,
             "permissions: {}",
-            "permissions: &shared {}",
-          ),
+            "permissions: &shared {}"
+          )
         },
-        expected: /reconcile-ghcr\.yml must not use YAML anchors/,
+        expected: /reconcile-ghcr\.yml must not use YAML anchors/
       },
       {
         name: "reject reconciler custom YAML tag",
@@ -3868,10 +4054,10 @@ async function runMutationChecks() {
           PATCHPAGE_RECONCILE_WORKFLOW_SOURCE: replaceOnce(
             reconcileWorkflow,
             "permissions: {}",
-            "permissions: !!omap []",
-          ),
+            "permissions: !!omap []"
+          )
         },
-        expected: /reconcile-ghcr\.yml must not use YAML anchors.*explicit tags are forbidden/,
+        expected: /reconcile-ghcr\.yml must not use YAML anchors.*explicit tags are forbidden/
       },
       {
         name: "reject reconciler duplicate root key",
@@ -3879,10 +4065,10 @@ async function runMutationChecks() {
           PATCHPAGE_RECONCILE_WORKFLOW_SOURCE: replaceOnce(
             reconcileWorkflow,
             "permissions: {}\n\nconcurrency:",
-            "permissions: {}\npermissions: {}\n\nconcurrency:",
-          ),
+            "permissions: {}\npermissions: {}\n\nconcurrency:"
+          )
         },
-        expected: /reconcile-ghcr\.yml must be valid YAML with unique map keys/,
+        expected: /reconcile-ghcr\.yml must be valid YAML with unique map keys/
       },
       {
         name: "reject reconciler root environment",
@@ -3890,10 +4076,10 @@ async function runMutationChecks() {
           PATCHPAGE_RECONCILE_WORKFLOW_SOURCE: replaceOnce(
             reconcileWorkflow,
             "\njobs:\n",
-            "\nenv:\n  NODE_OPTIONS: attacker\n\njobs:\n",
-          ),
+            "\nenv:\n  NODE_OPTIONS: attacker\n\njobs:\n"
+          )
         },
-        expected: /reconcile-ghcr\.yml root must contain exactly the reviewed triggers/,
+        expected: /reconcile-ghcr\.yml root must contain exactly the reviewed triggers/
       },
       {
         name: "reject privileged run added to reconciler publisher",
@@ -3901,10 +4087,10 @@ async function runMutationChecks() {
           PATCHPAGE_RECONCILE_WORKFLOW_SOURCE: replaceOnce(
             reconcileWorkflow,
             "      - name: Resolve replay handoff artifact ID",
-            "      - name: Attacker package step\n        run: echo attacker\n      - name: Resolve replay handoff artifact ID",
-          ),
+            "      - name: Attacker package step\n        run: echo attacker\n      - name: Resolve replay handoff artifact ID"
+          )
         },
-        expected: /reconcile-ghcr publish-ghcr must match the exact reviewed job map/,
+        expected: /reconcile-ghcr publish-ghcr must match the exact reviewed job map/
       },
       {
         name: "reject reconciler publisher permission elevation",
@@ -3912,10 +4098,10 @@ async function runMutationChecks() {
           PATCHPAGE_RECONCILE_WORKFLOW_SOURCE: replaceOnce(
             reconcileWorkflow,
             "    permissions:\n      actions: read\n      packages: write",
-            "    permissions:\n      actions: read\n      packages: write\n      id-token: write",
-          ),
+            "    permissions:\n      actions: read\n      packages: write\n      id-token: write"
+          )
         },
-        expected: /reconcile-ghcr publish-ghcr must match the exact reviewed job map/,
+        expected: /reconcile-ghcr publish-ghcr must match the exact reviewed job map/
       },
       {
         name: "reject missing explicit first-package probe in release publisher",
@@ -3923,10 +4109,10 @@ async function runMutationChecks() {
           PATCHPAGE_RELEASE_WORKFLOW_SOURCE: replaceOnce(
             workflow,
             "--allow-first-package true",
-            "--first-package-probe-disabled true",
-          ),
+            "--first-package-probe-disabled true"
+          )
         },
-        expected: /docker-ghcr must publish the validated tar through the reviewed OCI release tool/,
+        expected: /docker-ghcr must publish the validated tar through the reviewed OCI release tool/
       },
       {
         name: "reject historical checkout replacing detached source worktree",
@@ -3934,10 +4120,10 @@ async function runMutationChecks() {
           PATCHPAGE_RECONCILE_WORKFLOW_SOURCE: replaceOnce(
             reconcileWorkflow,
             'git worktree add --detach "$source_dir" "$REVISION"',
-            'git checkout "$TAG"',
-          ),
+            'git checkout "$TAG"'
+          )
         },
-        expected: /reconcile rebuild must use current reviewed verifiers/,
+        expected: /reconcile rebuild must use current reviewed verifiers/
       },
       {
         name: "reject unvalidated reconciliation rebuild tar",
@@ -3945,10 +4131,10 @@ async function runMutationChecks() {
           PATCHPAGE_RECONCILE_WORKFLOW_SOURCE: replaceOnce(
             reconcileWorkflow,
             "node scripts/validate-docker-save-artifact.mjs",
-            "echo skipped-current-docker-save-validator",
-          ),
+            "echo skipped-current-docker-save-validator"
+          )
         },
-        expected: /reconcile rebuild must use current reviewed verifiers/,
+        expected: /reconcile rebuild must use current reviewed verifiers/
       },
       {
         name: "reject configured name for unarchived reconciliation handoff",
@@ -3956,10 +4142,10 @@ async function runMutationChecks() {
           PATCHPAGE_RECONCILE_WORKFLOW_SOURCE: replaceOnce(
             reconcileWorkflow,
             "          path: ${{ runner.temp }}/reconcile-handoff-${{ matrix.version }}.json",
-            "          name: reconcile-handoff-${{ matrix.version }}\n          path: ${{ runner.temp }}/reconcile-handoff-${{ matrix.version }}.json",
-          ),
+            "          name: reconcile-handoff-${{ matrix.version }}\n          path: ${{ runner.temp }}/reconcile-handoff-${{ matrix.version }}.json"
+          )
         },
-        expected: /reconcile rebuild must use current reviewed verifiers/,
+        expected: /reconcile rebuild must use current reviewed verifiers/
       },
       {
         name: "reject attempt-scoped reconciliation handoff lookup",
@@ -3967,10 +4153,10 @@ async function runMutationChecks() {
           PATCHPAGE_RECONCILE_WORKFLOW_SOURCE: replaceOnce(
             reconcileWorkflow,
             'handoff_name="reconcile-handoff-${{ matrix.version }}.json"',
-            'handoff_name="reconcile-handoff-${{ matrix.version }}-${{ github.run_attempt }}.json"',
-          ),
+            'handoff_name="reconcile-handoff-${{ matrix.version }}-${{ github.run_attempt }}.json"'
+          )
         },
-        expected: /reconcile publisher must be checkout-free packages:write only/,
+        expected: /reconcile publisher must be checkout-free packages:write only/
       },
       {
         name: "reject reconciliation handoff extra-entry bypass",
@@ -3978,10 +4164,10 @@ async function runMutationChecks() {
           PATCHPAGE_RECONCILE_WORKFLOW_SOURCE: replaceOnce(
             reconcileWorkflow,
             "if (entries.length !== 1)",
-            "if (entries.length < 1)",
-          ),
+            "if (entries.length < 1)"
+          )
         },
-        expected: /reconcile publisher must be checkout-free packages:write only/,
+        expected: /reconcile publisher must be checkout-free packages:write only/
       },
       {
         name: "reject CAS header claims in publisher",
@@ -3991,11 +4177,11 @@ async function runMutationChecks() {
             'node "$GHCR_OCI_RELEASE" publish-release',
             [
               'curl -H "If-Match: ${EXPECTED_IMAGE_ID}" https://ghcr.io/v2/',
-              'node "$GHCR_OCI_RELEASE" publish-release',
-            ].join("\n"),
-          ),
+              'node "$GHCR_OCI_RELEASE" publish-release'
+            ].join("\n")
+          )
         },
-        expected: /docker-ghcr publisher must not contain If-Match/,
+        expected: /docker-ghcr publisher must not contain If-Match/
       },
       {
         name: "reject missing exact OCI error target binding",
@@ -4003,10 +4189,10 @@ async function runMutationChecks() {
           PATCHPAGE_GHCR_OCI_RELEASE_SOURCE: replaceOnce(
             effectiveGhcrOciReleaseTool.toString("utf8"),
             "return error.code === expectedCode && detailMatchesTarget(error.detail, target);",
-            "return error.code === expectedCode;",
-          ),
+            "return error.code === expectedCode;"
+          )
         },
-        expected: /ghcr-oci-release\.mjs must implement exact digest-bound OCI reads/,
+        expected: /ghcr-oci-release\.mjs must implement exact digest-bound OCI reads/
       },
       {
         name: "reject accepting a non-OCI registry manifest",
@@ -4014,10 +4200,10 @@ async function runMutationChecks() {
           PATCHPAGE_GHCR_OCI_RELEASE_SOURCE: replaceOnce(
             effectiveGhcrOciReleaseTool.toString("utf8"),
             "if (responseMediaType !== OCI_MANIFEST_MEDIA_TYPE)",
-            "if (!responseMediaType)",
-          ),
+            "if (!responseMediaType)"
+          )
         },
-        expected: /ghcr-oci-release\.mjs must implement exact digest-bound OCI reads/,
+        expected: /ghcr-oci-release\.mjs must implement exact digest-bound OCI reads/
       },
       {
         name: "reject accepting a non-OCI Docker-save manifest",
@@ -4025,10 +4211,11 @@ async function runMutationChecks() {
           PATCHPAGE_DOCKER_SAVE_VALIDATOR_SOURCE: replaceOnce(
             effectiveDockerSaveValidator.toString("utf8"),
             "if (descriptor?.mediaType !== OCI_MANIFEST_MEDIA_TYPE)",
-            "if (!descriptor?.mediaType)",
-          ),
+            "if (!descriptor?.mediaType)"
+          )
         },
-        expected: /validate-docker-save-artifact\.mjs must retain the structural docker-save graph validator/,
+        expected:
+          /validate-docker-save-artifact\.mjs must retain the structural docker-save graph validator/
       },
       {
         name: "reject precision-losing OCI semver ordering",
@@ -4036,10 +4223,10 @@ async function runMutationChecks() {
           PATCHPAGE_GHCR_OCI_RELEASE_SOURCE: replaceOnce(
             effectiveGhcrOciReleaseTool.toString("utf8"),
             "leftMatch.slice(1).map(BigInt)",
-            "leftMatch.slice(1).map(Number)",
-          ),
+            "leftMatch.slice(1).map(Number)"
+          )
         },
-        expected: /ghcr-oci-release\.mjs must implement exact digest-bound OCI reads/,
+        expected: /ghcr-oci-release\.mjs must implement exact digest-bound OCI reads/
       },
       {
         name: "reject missing manifest PUT status binding",
@@ -4047,10 +4234,10 @@ async function runMutationChecks() {
           PATCHPAGE_GHCR_OCI_RELEASE_SOURCE: replaceOnce(
             effectiveGhcrOciReleaseTool.toString("utf8"),
             "response.status !== 201",
-            "!response.ok",
-          ),
+            "!response.ok"
+          )
         },
-        expected: /ghcr-oci-release\.mjs must implement exact digest-bound OCI reads/,
+        expected: /ghcr-oci-release\.mjs must implement exact digest-bound OCI reads/
       },
       {
         name: "reject bypassing latest final reinspection",
@@ -4058,10 +4245,10 @@ async function runMutationChecks() {
           PATCHPAGE_GHCR_OCI_RELEASE_SOURCE: replaceOnce(
             effectiveGhcrOciReleaseTool.toString("utf8"),
             "post-write latest and re-enumerated highest complete release",
-            "post-write latest",
-          ),
+            "post-write latest"
+          )
         },
-        expected: /ghcr-oci-release\.mjs must implement exact digest-bound OCI reads/,
+        expected: /ghcr-oci-release\.mjs must implement exact digest-bound OCI reads/
       },
       {
         name: "reject bypassing release-pair final reinspection",
@@ -4069,10 +4256,10 @@ async function runMutationChecks() {
           PATCHPAGE_GHCR_OCI_RELEASE_SOURCE: replaceOnce(
             effectiveGhcrOciReleaseTool.toString("utf8"),
             "post-write release pair and canonical image",
-            "post-write release pair",
-          ),
+            "post-write release pair"
+          )
         },
-        expected: /ghcr-oci-release\.mjs must implement exact digest-bound OCI reads/,
+        expected: /ghcr-oci-release\.mjs must implement exact digest-bound OCI reads/
       },
       {
         name: "reject unquoted CI revision",
@@ -4080,10 +4267,10 @@ async function runMutationChecks() {
           PATCHPAGE_RELEASE_CI_WORKFLOW_SOURCE: replaceOnce(
             ciWorkflow,
             'REVISION: "0000000000000000000000000000000000000000"',
-            "REVISION: 0000000000000000000000000000000000000000",
-          ),
+            "REVISION: 0000000000000000000000000000000000000000"
+          )
         },
-        expected: /CI must use deterministic string image version and quoted revision metadata/,
+        expected: /CI must use deterministic string image version and quoted revision metadata/
       },
       {
         name: "reject identity guard after false AND continuation",
@@ -4091,10 +4278,10 @@ async function runMutationChecks() {
           PATCHPAGE_RELEASE_WORKFLOW_SOURCE: replaceOnce(
             workflow,
             packageNameGuard,
-            `          false &&\n${packageNameGuard}`,
-          ),
+            `          false &&\n${packageNameGuard}`
+          )
         },
-        expected: publicationContractFailure,
+        expected: publicationContractFailure
       },
       {
         name: "reject identity guard after backslash OR continuation",
@@ -4102,10 +4289,10 @@ async function runMutationChecks() {
           PATCHPAGE_RELEASE_WORKFLOW_SOURCE: replaceOnce(
             workflow,
             packageNameGuard,
-            `          true \\\n            ||\n${packageNameGuard}`,
-          ),
+            `          true \\\n            ||\n${packageNameGuard}`
+          )
         },
-        expected: publicationContractFailure,
+        expected: publicationContractFailure
       },
       {
         name: "reject identity guard after pipeline continuation",
@@ -4113,10 +4300,10 @@ async function runMutationChecks() {
           PATCHPAGE_RELEASE_WORKFLOW_SOURCE: replaceOnce(
             workflow,
             packageNameGuard,
-            `          true |\n${packageNameGuard}`,
-          ),
+            `          true |\n${packageNameGuard}`
+          )
         },
-        expected: publicationContractFailure,
+        expected: publicationContractFailure
       },
       {
         name: "reject identity guard rendered as multiline quoted text",
@@ -4124,10 +4311,10 @@ async function runMutationChecks() {
           PATCHPAGE_RELEASE_WORKFLOW_SOURCE: replaceOnce(
             workflow,
             packageNameGuard,
-            `          : '\n${packageNameGuard}\n          '`,
-          ),
+            `          : '\n${packageNameGuard}\n          '`
+          )
         },
-        expected: publicationContractFailure,
+        expected: publicationContractFailure
       },
       {
         name: "reject identity guard rendered as escaped heredoc data",
@@ -4135,10 +4322,10 @@ async function runMutationChecks() {
           PATCHPAGE_RELEASE_WORKFLOW_SOURCE: replaceOnce(
             workflow,
             packageNameGuard,
-            `          cat <<\\EOF\n${packageNameGuard}\n          EOF`,
-          ),
+            `          cat <<\\EOF\n${packageNameGuard}\n          EOF`
+          )
         },
-        expected: publicationContractFailure,
+        expected: publicationContractFailure
       },
       {
         name: "reject identity guard rendered as multiple-heredoc data",
@@ -4151,11 +4338,11 @@ async function runMutationChecks() {
               "          harmless",
               "          FIRST",
               packageNameGuard,
-              "          SECOND",
-            ].join("\n"),
-          ),
+              "          SECOND"
+            ].join("\n")
+          )
         },
-        expected: publicationContractFailure,
+        expected: publicationContractFailure
       },
       {
         name: "reject identity guard nested in split-line case",
@@ -4169,11 +4356,11 @@ async function runMutationChecks() {
               "            never)",
               packageNameGuard,
               "              ;;",
-              "          esac",
-            ].join("\n"),
-          ),
+              "          esac"
+            ].join("\n")
+          )
         },
-        expected: publicationContractFailure,
+        expected: publicationContractFailure
       },
       {
         name: "reject basename guard nested under false",
@@ -4181,10 +4368,10 @@ async function runMutationChecks() {
           PATCHPAGE_RELEASE_WORKFLOW_SOURCE: replaceOnce(
             workflow,
             basenameGuard,
-            `          if false; then\n${basenameGuard}\n          fi`,
-          ),
+            `          if false; then\n${basenameGuard}\n          fi`
+          )
         },
-        expected: publicationContractFailure,
+        expected: publicationContractFailure
       },
       {
         name: "reject digest guard nested under false",
@@ -4192,10 +4379,10 @@ async function runMutationChecks() {
           PATCHPAGE_RELEASE_WORKFLOW_SOURCE: replaceOnce(
             workflow,
             shaGuard,
-            `          if false; then\n${shaGuard}\n          fi`,
-          ),
+            `          if false; then\n${shaGuard}\n          fi`
+          )
         },
-        expected: publicationContractFailure,
+        expected: publicationContractFailure
       },
       {
         name: "reject package name reassignment",
@@ -4203,10 +4390,10 @@ async function runMutationChecks() {
           PATCHPAGE_RELEASE_WORKFLOW_SOURCE: replaceOnce(
             workflow,
             packageNameGuard,
-            `          package_name="patchpage"\n${packageNameGuard}`,
-          ),
+            `          package_name="patchpage"\n${packageNameGuard}`
+          )
         },
-        expected: publicationContractFailure,
+        expected: publicationContractFailure
       },
       {
         name: "reject package version reassignment",
@@ -4214,10 +4401,10 @@ async function runMutationChecks() {
           PATCHPAGE_RELEASE_WORKFLOW_SOURCE: replaceOnce(
             workflow,
             '          if [[ "$package_version" != "$EXPECTED_VERSION" ]]; then',
-            '          package_version="$EXPECTED_VERSION"\n          if [[ "$package_version" != "$EXPECTED_VERSION" ]]; then',
-          ),
+            '          package_version="$EXPECTED_VERSION"\n          if [[ "$package_version" != "$EXPECTED_VERSION" ]]; then'
+          )
         },
-        expected: publicationContractFailure,
+        expected: publicationContractFailure
       },
       {
         name: "reject expected filename reassignment",
@@ -4225,10 +4412,10 @@ async function runMutationChecks() {
           PATCHPAGE_RELEASE_WORKFLOW_SOURCE: replaceOnce(
             workflow,
             basenameGuard,
-            `          EXPECTED_FILENAME="$(basename "$tarball")"\n${basenameGuard}`,
-          ),
+            `          EXPECTED_FILENAME="$(basename "$tarball")"\n${basenameGuard}`
+          )
         },
-        expected: publicationContractFailure,
+        expected: publicationContractFailure
       },
       {
         name: "reject expected digest reassignment",
@@ -4236,10 +4423,10 @@ async function runMutationChecks() {
           PATCHPAGE_RELEASE_WORKFLOW_SOURCE: replaceOnce(
             workflow,
             shaGuard,
-            `          EXPECTED_SHA256="$actual_sha256"\n${shaGuard}`,
-          ),
+            `          EXPECTED_SHA256="$actual_sha256"\n${shaGuard}`
+          )
         },
-        expected: publicationContractFailure,
+        expected: publicationContractFailure
       },
       {
         name: "reject expected package version reassignment",
@@ -4247,10 +4434,10 @@ async function runMutationChecks() {
           PATCHPAGE_RELEASE_WORKFLOW_SOURCE: replaceOnce(
             workflow,
             '          if [[ "$package_version" != "$EXPECTED_VERSION" ]]; then',
-            '          EXPECTED_VERSION="$package_version"\n          if [[ "$package_version" != "$EXPECTED_VERSION" ]]; then',
-          ),
+            '          EXPECTED_VERSION="$package_version"\n          if [[ "$package_version" != "$EXPECTED_VERSION" ]]; then'
+          )
         },
-        expected: publicationContractFailure,
+        expected: publicationContractFailure
       },
       {
         name: "reject expected npm version reassignment",
@@ -4258,10 +4445,10 @@ async function runMutationChecks() {
           PATCHPAGE_RELEASE_WORKFLOW_SOURCE: replaceOnce(
             workflow,
             '          if [[ "$actual_npm_version" != "$EXPECTED_NPM_VERSION" ]]; then',
-            '          EXPECTED_NPM_VERSION="$actual_npm_version"\n          if [[ "$actual_npm_version" != "$EXPECTED_NPM_VERSION" ]]; then',
-          ),
+            '          EXPECTED_NPM_VERSION="$actual_npm_version"\n          if [[ "$actual_npm_version" != "$EXPECTED_NPM_VERSION" ]]; then'
+          )
         },
-        expected: publicationContractFailure,
+        expected: publicationContractFailure
       },
       {
         name: "reject disabled publication step",
@@ -4269,10 +4456,10 @@ async function runMutationChecks() {
           PATCHPAGE_RELEASE_WORKFLOW_SOURCE: replaceOnce(
             workflow,
             "      - name: Publish the verified tarball to npm\n        shell: bash",
-            "      - name: Publish the verified tarball to npm\n        if: false\n        shell: bash",
-          ),
+            "      - name: Publish the verified tarball to npm\n        if: false\n        shell: bash"
+          )
         },
-        expected: publicationContractFailure,
+        expected: publicationContractFailure
       },
       {
         name: "reject continue-on-error publication step",
@@ -4280,10 +4467,10 @@ async function runMutationChecks() {
           PATCHPAGE_RELEASE_WORKFLOW_SOURCE: replaceOnce(
             workflow,
             "      - name: Publish the verified tarball to npm\n        shell: bash",
-            "      - name: Publish the verified tarball to npm\n        continue-on-error: true\n        shell: bash",
-          ),
+            "      - name: Publish the verified tarball to npm\n        continue-on-error: true\n        shell: bash"
+          )
         },
-        expected: publicationContractFailure,
+        expected: publicationContractFailure
       },
       {
         name: "reject extra publication step keys",
@@ -4291,10 +4478,10 @@ async function runMutationChecks() {
           PATCHPAGE_RELEASE_WORKFLOW_SOURCE: replaceOnce(
             workflow,
             "      - name: Publish the verified tarball to npm\n        shell: bash",
-            "      - name: Publish the verified tarball to npm\n        timeout-minutes: 1\n        shell: bash",
-          ),
+            "      - name: Publish the verified tarball to npm\n        timeout-minutes: 1\n        shell: bash"
+          )
         },
-        expected: publicationContractFailure,
+        expected: publicationContractFailure
       },
       {
         name: "reject unreviewed Action behind quoted uses key",
@@ -4302,26 +4489,22 @@ async function runMutationChecks() {
           PATCHPAGE_RELEASE_WORKFLOW_SOURCE: replaceOnce(
             workflow,
             "      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1\n      - id: version",
-            '      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1\n      - "uses": attacker/action@main # v1.0.0\n      - id: version',
-          ),
+            '      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1\n      - "uses": attacker/action@main # v1.0.0\n      - id: version'
+          )
         },
-        expected: /uses unreviewed Action attacker\/action/,
+        expected: /uses unreviewed Action attacker\/action/
       },
       {
         name: "reject unreviewed Action behind alias mapping key",
         env: {
           PATCHPAGE_RELEASE_WORKFLOW_SOURCE: replaceOnce(
-            replaceOnce(
-              workflow,
-              "name: Release\n",
-              "name: Release\nx-uses-key: &uses_key uses\n",
-            ),
+            replaceOnce(workflow, "name: Release\n", "name: Release\nx-uses-key: &uses_key uses\n"),
             "      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1\n      - id: version",
-            "      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1\n      - *uses_key : attacker/action@main # v1.0.0\n      - id: version",
-          ),
+            "      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1\n      - *uses_key : attacker/action@main # v1.0.0\n      - id: version"
+          )
         },
         expected:
-          /release\.yml must not use YAML anchors, aliases, merge keys, or non-scalar mapping keys/,
+          /release\.yml must not use YAML anchors, aliases, merge keys, or non-scalar mapping keys/
       },
       {
         name: "reject unreviewed Action behind alias value",
@@ -4330,14 +4513,14 @@ async function runMutationChecks() {
             replaceOnce(
               workflow,
               "name: Release\n",
-              "name: Release\nx-attacker-action: &attacker_action attacker/action@main\n",
+              "name: Release\nx-attacker-action: &attacker_action attacker/action@main\n"
             ),
             "      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1\n      - id: version",
-            "      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1\n      - uses: *attacker_action # v1.0.0\n      - id: version",
-          ),
+            "      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1\n      - uses: *attacker_action # v1.0.0\n      - id: version"
+          )
         },
         expected:
-          /release\.yml must not use YAML anchors, aliases, merge keys, or non-scalar mapping keys/,
+          /release\.yml must not use YAML anchors, aliases, merge keys, or non-scalar mapping keys/
       },
       {
         name: "reject unreviewed Action behind merged step",
@@ -4346,14 +4529,14 @@ async function runMutationChecks() {
             replaceOnce(
               workflow,
               "name: Release\n",
-              "name: Release\nx-attacker-step: &attacker_step\n  uses: attacker/action@main\n",
+              "name: Release\nx-attacker-step: &attacker_step\n  uses: attacker/action@main\n"
             ),
             "      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1\n      - id: version",
-            "      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1\n      - <<: *attacker_step\n      - id: version",
-          ),
+            "      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1\n      - <<: *attacker_step\n      - id: version"
+          )
         },
         expected:
-          /release\.yml must not use YAML anchors, aliases, merge keys, or non-scalar mapping keys/,
+          /release\.yml must not use YAML anchors, aliases, merge keys, or non-scalar mapping keys/
       },
       {
         name: "reject guard output producer rebind",
@@ -4361,10 +4544,10 @@ async function runMutationChecks() {
           PATCHPAGE_RELEASE_WORKFLOW_SOURCE: replaceOnce(
             workflow,
             "      version: ${{ steps.version.outputs.version }}",
-            "      version: ${{ steps.attacker.outputs.version }}",
-          ),
+            "      version: ${{ steps.attacker.outputs.version }}"
+          )
         },
-        expected: /guard outputs must bind exactly to the version producer/,
+        expected: /guard outputs must bind exactly to the version producer/
       },
       {
         name: "reject guard producer ID rebind",
@@ -4372,10 +4555,10 @@ async function runMutationChecks() {
           PATCHPAGE_RELEASE_WORKFLOW_SOURCE: replaceOnce(
             workflow,
             "      - id: version",
-            "      - id: attacker",
-          ),
+            "      - id: attacker"
+          )
         },
-        expected: /guard version producer step must exist exactly once/,
+        expected: /guard version producer step must exist exactly once/
       },
       {
         name: "reject guard producer run changes",
@@ -4383,10 +4566,10 @@ async function runMutationChecks() {
           PATCHPAGE_RELEASE_WORKFLOW_SOURCE: replaceOnce(
             workflow,
             '          echo "revision=$revision" >> "$GITHUB_OUTPUT"',
-            '          echo "revision=$revision" >> "$GITHUB_OUTPUT"\n          : changed',
-          ),
+            '          echo "revision=$revision" >> "$GITHUB_OUTPUT"\n          : changed'
+          )
         },
-        expected: /guard must check out the repository before running the exact version producer/,
+        expected: /guard must check out the repository before running the exact version producer/
       },
       {
         name: "reject package filename output rebind",
@@ -4394,10 +4577,10 @@ async function runMutationChecks() {
           PATCHPAGE_RELEASE_WORKFLOW_SOURCE: replaceOnce(
             workflow,
             "      tarball-filename: ${{ steps.package.outputs.filename }}",
-            "      tarball-filename: ${{ steps.attacker.outputs.filename }}",
-          ),
+            "      tarball-filename: ${{ steps.attacker.outputs.filename }}"
+          )
         },
-        expected: /verify outputs must bind to the exact package and artifact producers/,
+        expected: /verify outputs must bind to the exact package and artifact producers/
       },
       {
         name: "reject package digest output rebind",
@@ -4405,10 +4588,10 @@ async function runMutationChecks() {
           PATCHPAGE_RELEASE_WORKFLOW_SOURCE: replaceOnce(
             workflow,
             "      tarball-sha256: ${{ steps.package.outputs.sha256 }}",
-            "      tarball-sha256: ${{ steps.attacker.outputs.sha256 }}",
-          ),
+            "      tarball-sha256: ${{ steps.attacker.outputs.sha256 }}"
+          )
         },
-        expected: /verify outputs must bind to the exact package and artifact producers/,
+        expected: /verify outputs must bind to the exact package and artifact producers/
       },
       {
         name: "reject package producer run changes",
@@ -4416,10 +4599,132 @@ async function runMutationChecks() {
           PATCHPAGE_RELEASE_WORKFLOW_SOURCE: replaceOnce(
             workflow,
             '          echo "sha256=$(sha256sum "$tarball" | awk \'{print $1}\')" >> "$GITHUB_OUTPUT"',
-            '          echo "sha256=$(sha256sum "$tarball" | awk \'{print $1}\')" >> "$GITHUB_OUTPUT"\n          : changed',
-          ),
+            '          echo "sha256=$(sha256sum "$tarball" | awk \'{print $1}\')" >> "$GITHUB_OUTPUT"\n          : changed'
+          )
         },
-        expected: /verify outputs must bind to the exact package and artifact producers/,
+        expected: /verify outputs must bind to the exact package and artifact producers/
+      },
+      {
+        name: "reject pre-gate npm pack path logging",
+        env: {
+          PATCHPAGE_RELEASE_WORKFLOW_SOURCE: replaceOnce(
+            workflow,
+            '            console.error(`Missing reviewed required npm pack files (${missing.length}): ${missing.join(", ")}`);',
+            [
+              '            console.error(`Missing reviewed required npm pack files (${missing.length}): ${missing.join(", ")}`);',
+              '            console.error(pack.files.map((file) => file.path).join("\\n"));'
+            ].join("\n")
+          )
+        },
+        expected: /package producer must not log npm pack file paths before the privacy gate/
+      },
+      {
+        name: "reject release privacy gate removal",
+        env: {
+          PATCHPAGE_RELEASE_WORKFLOW_SOURCE: replaceOnce(
+            workflow,
+            '          node ../../scripts/verify-release-privacy.mjs \\\n            --pack-json "$RUNNER_TEMP/patchpage-pack.json" \\\n            --tarball "$tarball"',
+            "          : privacy gate disabled"
+          )
+        },
+        expected:
+          /verify must run the release privacy gate against the exact pack JSON and renamed tarball before smoke and upload/
+      },
+      {
+        name: "reject release privacy gate before renamed tarball binding",
+        env: {
+          PATCHPAGE_RELEASE_WORKFLOW_SOURCE: replaceOnce(
+            workflow,
+            '          mv -- "$tarball" "$unique_tarball"\n          tarball="$unique_tarball"\n\n          node ../../scripts/verify-release-privacy.mjs \\\n            --pack-json "$RUNNER_TEMP/patchpage-pack.json" \\\n            --tarball "$tarball"',
+            '          mv -- "$tarball" "$unique_tarball"\n          node ../../scripts/verify-release-privacy.mjs \\\n            --pack-json "$RUNNER_TEMP/patchpage-pack.json" \\\n            --tarball "$tarball"\n          tarball="$unique_tarball"'
+          )
+        },
+        expected:
+          /verify must run the release privacy gate against the exact pack JSON and renamed tarball before smoke and upload/
+      },
+      {
+        name: "reject release privacy gate tarball rebind",
+        env: {
+          PATCHPAGE_RELEASE_WORKFLOW_SOURCE: replaceOnce(
+            workflow,
+            '            --tarball "$tarball"',
+            '            --tarball "$reported_tarball"'
+          )
+        },
+        expected:
+          /verify must run the release privacy gate against the exact pack JSON and renamed tarball before smoke and upload/
+      },
+      {
+        name: "reject release privacy gate suffix",
+        env: {
+          PATCHPAGE_RELEASE_WORKFLOW_SOURCE: replaceOnce(
+            workflow,
+            "          node ../../scripts/verify-release-privacy.mjs \\",
+            "          node ../../scripts/verify-release-privacy.mjs \\ || true"
+          )
+        },
+        expected:
+          /verify must run the release privacy gate against the exact pack JSON and renamed tarball before smoke and upload/
+      },
+      {
+        name: "reject release privacy gate commented duplicate",
+        env: {
+          PATCHPAGE_RELEASE_WORKFLOW_SOURCE: replaceOnce(
+            workflow,
+            "          node ../../scripts/verify-release-privacy.mjs \\",
+            "          # node ../../scripts/verify-release-privacy.mjs \\\n          node ../../scripts/verify-release-privacy.mjs \\"
+          )
+        },
+        expected:
+          /verify must run the release privacy gate against the exact pack JSON and renamed tarball before smoke and upload/
+      },
+      {
+        name: "reject release privacy gate step continue-on-error",
+        env: {
+          PATCHPAGE_RELEASE_WORKFLOW_SOURCE: replaceOnce(
+            workflow,
+            "      - name: Pack exactly one release tarball and verify contents\n        id: package\n        shell: bash\n        run: |",
+            "      - name: Pack exactly one release tarball and verify contents\n        id: package\n        shell: bash\n        continue-on-error: true\n        run: |"
+          )
+        },
+        expected:
+          /verify must run the release privacy gate against the exact pack JSON and renamed tarball before smoke and upload/
+      },
+      {
+        name: "reject verify job continue-on-error around release privacy gate",
+        env: {
+          PATCHPAGE_RELEASE_WORKFLOW_SOURCE: replaceOnce(
+            workflow,
+            "  verify:\n    needs: [guard, prepare-npm]\n    runs-on: ubuntu-latest",
+            "  verify:\n    needs: [guard, prepare-npm]\n    continue-on-error: true\n    runs-on: ubuntu-latest"
+          )
+        },
+        expected:
+          /verify must run the release privacy gate against the exact pack JSON and renamed tarball before smoke and upload/
+      },
+      {
+        name: "reject verify job conditional around release privacy gate",
+        env: {
+          PATCHPAGE_RELEASE_WORKFLOW_SOURCE: replaceOnce(
+            workflow,
+            "  verify:\n    needs: [guard, prepare-npm]\n    runs-on: ubuntu-latest",
+            "  verify:\n    needs: [guard, prepare-npm]\n    if: always()\n    runs-on: ubuntu-latest"
+          )
+        },
+        expected:
+          /verify must run the release privacy gate against the exact pack JSON and renamed tarball before smoke and upload/
+      },
+      {
+        name: "reject release privacy gate conditional wrapper",
+        env: {
+          PATCHPAGE_RELEASE_WORKFLOW_SOURCE: replaceOnce(
+            workflow,
+            "          node ../../scripts/verify-release-privacy.mjs \\",
+            "          if node ../../scripts/verify-release-privacy.mjs \\"
+          )
+        },
+        expected:
+          /verify must run the release privacy gate against the exact pack JSON and renamed tarball before smoke and upload/
       },
       {
         name: "reject later GITHUB_ENV writes",
@@ -4427,10 +4732,11 @@ async function runMutationChecks() {
           PATCHPAGE_RELEASE_WORKFLOW_SOURCE: replaceOnce(
             workflow,
             "      - name: Upload the exact tested tarball",
-            '      - name: Rebind package environment\n        shell: bash\n        run: echo "TARBALL=/tmp/attacker.tgz" >> "$GITHUB_ENV"\n      - name: Upload the exact tested tarball',
-          ),
+            '      - name: Rebind package environment\n        shell: bash\n        run: echo "TARBALL=/tmp/attacker.tgz" >> "$GITHUB_ENV"\n      - name: Upload the exact tested tarball'
+          )
         },
-        expected: /verify may write GITHUB_ENV and GITHUB_OUTPUT only at the reviewed producer lines/,
+        expected:
+          /verify may write GITHUB_ENV and GITHUB_OUTPUT only at the reviewed producer lines/
       },
       {
         name: "reject later GITHUB_OUTPUT writes",
@@ -4438,10 +4744,11 @@ async function runMutationChecks() {
           PATCHPAGE_RELEASE_WORKFLOW_SOURCE: replaceOnce(
             workflow,
             "      - name: Upload the exact tested tarball",
-            '      - name: Add later output\n        id: later\n        shell: bash\n        run: echo "sha256=attacker" >> "$GITHUB_OUTPUT"\n      - name: Upload the exact tested tarball',
-          ),
+            '      - name: Add later output\n        id: later\n        shell: bash\n        run: echo "sha256=attacker" >> "$GITHUB_OUTPUT"\n      - name: Upload the exact tested tarball'
+          )
         },
-        expected: /verify may write GITHUB_ENV and GITHUB_OUTPUT only at the reviewed producer lines/,
+        expected:
+          /verify may write GITHUB_ENV and GITHUB_OUTPUT only at the reviewed producer lines/
       },
       {
         name: "reject later GITHUB_ENV redirection",
@@ -4449,10 +4756,11 @@ async function runMutationChecks() {
           PATCHPAGE_RELEASE_WORKFLOW_SOURCE: replaceOnce(
             workflow,
             "      - name: Upload the exact tested tarball",
-            '      - name: Redirect package environment\n        shell: bash\n        run: printf "%s\\n" "TARBALL=/tmp/attacker.tgz" > "${GITHUB_ENV}"\n      - name: Upload the exact tested tarball',
-          ),
+            '      - name: Redirect package environment\n        shell: bash\n        run: printf "%s\\n" "TARBALL=/tmp/attacker.tgz" > "${GITHUB_ENV}"\n      - name: Upload the exact tested tarball'
+          )
         },
-        expected: /verify may write GITHUB_ENV and GITHUB_OUTPUT only at the reviewed producer lines/,
+        expected:
+          /verify may write GITHUB_ENV and GITHUB_OUTPUT only at the reviewed producer lines/
       },
       {
         name: "reject later GITHUB_OUTPUT redirection",
@@ -4460,10 +4768,11 @@ async function runMutationChecks() {
           PATCHPAGE_RELEASE_WORKFLOW_SOURCE: replaceOnce(
             workflow,
             "      - name: Upload the exact tested tarball",
-            '      - name: Redirect later output\n        id: later\n        shell: bash\n        run: printf "%s\\n" "sha256=attacker" > "${GITHUB_OUTPUT}"\n      - name: Upload the exact tested tarball',
-          ),
+            '      - name: Redirect later output\n        id: later\n        shell: bash\n        run: printf "%s\\n" "sha256=attacker" > "${GITHUB_OUTPUT}"\n      - name: Upload the exact tested tarball'
+          )
         },
-        expected: /verify may write GITHUB_ENV and GITHUB_OUTPUT only at the reviewed producer lines/,
+        expected:
+          /verify may write GITHUB_ENV and GITHUB_OUTPUT only at the reviewed producer lines/
       },
       {
         name: "reject top-level jobs alias override",
@@ -4481,12 +4790,12 @@ async function runMutationChecks() {
               "      id-token: write",
               "    steps:",
               "      - run: echo attacker",
-              "jobs:",
-            ].join("\n") + "\n",
-          ),
+              "jobs:"
+            ].join("\n") + "\n"
+          )
         },
         expected:
-          /release\.yml must not use YAML anchors, aliases, merge keys, or non-scalar mapping keys/,
+          /release\.yml must not use YAML anchors, aliases, merge keys, or non-scalar mapping keys/
       },
       {
         name: "reject unexpected privileged release job",
@@ -4503,11 +4812,11 @@ async function runMutationChecks() {
               "      packages: write",
               "    steps:",
               "      - run: echo attacker",
-              "  guard:",
-            ].join("\n") + "\n",
-          ),
+              "  guard:"
+            ].join("\n") + "\n"
+          )
         },
-        expected: /release\.yml must contain exactly the reviewed release jobs/,
+        expected: /release\.yml must contain exactly the reviewed release jobs/
       },
       {
         name: "reject npm CLI replacement after producer output",
@@ -4515,11 +4824,11 @@ async function runMutationChecks() {
           PATCHPAGE_RELEASE_WORKFLOW_SOURCE: replaceOnce(
             workflow,
             '          echo "version=$actual_version" >> "$GITHUB_OUTPUT"',
-            '          echo "version=$actual_version" >> "$GITHUB_OUTPUT"\n          printf "%s\\n" "#!/usr/bin/env node" "console.log(\\"$EXPECTED_NPM_VERSION\\")" > "$npm_cli_dir/bin/npm-cli.js"',
-          ),
+            '          echo "version=$actual_version" >> "$GITHUB_OUTPUT"\n          printf "%s\\n" "#!/usr/bin/env node" "console.log(\\"$EXPECTED_NPM_VERSION\\")" > "$npm_cli_dir/bin/npm-cli.js"'
+          )
         },
         expected:
-          /prepare-npm must fetch, verify, and output the exact reviewed npm CLI before upload/,
+          /prepare-npm must fetch, verify, and output the exact reviewed npm CLI before upload/
       },
       {
         name: "reject executable step between npm CLI producer and upload",
@@ -4527,10 +4836,10 @@ async function runMutationChecks() {
           PATCHPAGE_RELEASE_WORKFLOW_SOURCE: replaceOnce(
             workflow,
             "      - name: Upload the reviewed npm CLI",
-            '      - name: Replace reviewed npm CLI\n        shell: bash\n        run: echo attacker > "$RUNNER_TEMP/npm-cli/bin/npm-cli.js"\n      - name: Upload the reviewed npm CLI',
-          ),
+            '      - name: Replace reviewed npm CLI\n        shell: bash\n        run: echo attacker > "$RUNNER_TEMP/npm-cli/bin/npm-cli.js"\n      - name: Upload the reviewed npm CLI'
+          )
         },
-        expected: /prepare-npm must contain exactly the reviewed job map and ordered steps/,
+        expected: /prepare-npm must contain exactly the reviewed job map and ordered steps/
       },
       {
         name: "reject npm CLI replacement after verify-side version check",
@@ -4538,10 +4847,10 @@ async function runMutationChecks() {
           PATCHPAGE_RELEASE_WORKFLOW_SOURCE: replaceOnce(
             workflow,
             '          echo "NPM_CLI=$NPM_CLI" >> "$GITHUB_ENV"',
-            '          echo "NPM_CLI=$NPM_CLI" >> "$GITHUB_ENV"\n          echo attacker > "$NPM_CLI"',
-          ),
+            '          echo "NPM_CLI=$NPM_CLI" >> "$GITHUB_ENV"\n          echo attacker > "$NPM_CLI"'
+          )
         },
-        expected: /verify must bind and validate the exact isolated npm CLI/,
+        expected: /verify must bind and validate the exact isolated npm CLI/
       },
       {
         name: "reject disabled minimum-Node smoke step",
@@ -4549,10 +4858,11 @@ async function runMutationChecks() {
           PATCHPAGE_RELEASE_WORKFLOW_SOURCE: replaceOnce(
             workflow,
             "      - name: Install and run tarball on minimum supported Node\n        shell: bash",
-            "      - name: Install and run tarball on minimum supported Node\n        if: false\n        shell: bash",
-          ),
+            "      - name: Install and run tarball on minimum supported Node\n        if: false\n        shell: bash"
+          )
         },
-        expected: /verify must run the exact tarball smoke contract on the minimum supported Node 22/,
+        expected:
+          /verify must run the exact tarball smoke contract on the minimum supported Node 22/
       },
       {
         name: "reject continue-on-error minimum-Node smoke step",
@@ -4560,10 +4870,11 @@ async function runMutationChecks() {
           PATCHPAGE_RELEASE_WORKFLOW_SOURCE: replaceOnce(
             workflow,
             "      - name: Install and run tarball on minimum supported Node\n        shell: bash",
-            "      - name: Install and run tarball on minimum supported Node\n        continue-on-error: true\n        shell: bash",
-          ),
+            "      - name: Install and run tarball on minimum supported Node\n        continue-on-error: true\n        shell: bash"
+          )
         },
-        expected: /verify must run the exact tarball smoke contract on the minimum supported Node 22/,
+        expected:
+          /verify must run the exact tarball smoke contract on the minimum supported Node 22/
       },
       {
         name: "reject changed minimum supported Node",
@@ -4571,10 +4882,11 @@ async function runMutationChecks() {
           PATCHPAGE_RELEASE_WORKFLOW_SOURCE: replaceOnce(
             workflow,
             "          node-version: 22\n      - name: Install and run tarball on minimum supported Node",
-            "          node-version: 23\n      - name: Install and run tarball on minimum supported Node",
-          ),
+            "          node-version: 23\n      - name: Install and run tarball on minimum supported Node"
+          )
         },
-        expected: /verify must run the exact tarball smoke contract on the minimum supported Node 22/,
+        expected:
+          /verify must run the exact tarball smoke contract on the minimum supported Node 22/
       },
       {
         name: "reject minimum-Node smoke run changes",
@@ -4582,10 +4894,11 @@ async function runMutationChecks() {
           PATCHPAGE_RELEASE_WORKFLOW_SOURCE: replaceOnce(
             workflow,
             "      - name: Install and run tarball on minimum supported Node\n        shell: bash\n        env:\n          EXPECTED_TARBALL_SHA256: ${{ steps.package.outputs.sha256 }}\n        run: |\n          set -euo pipefail",
-            "      - name: Install and run tarball on minimum supported Node\n        shell: bash\n        env:\n          EXPECTED_TARBALL_SHA256: ${{ steps.package.outputs.sha256 }}\n        run: |\n          set -euo pipefail\n          : changed",
-          ),
+            "      - name: Install and run tarball on minimum supported Node\n        shell: bash\n        env:\n          EXPECTED_TARBALL_SHA256: ${{ steps.package.outputs.sha256 }}\n        run: |\n          set -euo pipefail\n          : changed"
+          )
         },
-        expected: /verify must run the exact tarball smoke contract on the minimum supported Node 22/,
+        expected:
+          /verify must run the exact tarball smoke contract on the minimum supported Node 22/
       },
       {
         name: "reject minimum-Node smoke environment rebind",
@@ -4593,10 +4906,11 @@ async function runMutationChecks() {
           PATCHPAGE_RELEASE_WORKFLOW_SOURCE: replaceOnce(
             workflow,
             "          EXPECTED_TARBALL_SHA256: ${{ steps.package.outputs.sha256 }}",
-            "          EXPECTED_TARBALL_SHA256: attacker",
-          ),
+            "          EXPECTED_TARBALL_SHA256: attacker"
+          )
         },
-        expected: /verify must run the exact tarball smoke contract on the minimum supported Node 22/,
+        expected:
+          /verify must run the exact tarball smoke contract on the minimum supported Node 22/
       },
       {
         name: "reject extra minimum-Node smoke key",
@@ -4604,10 +4918,11 @@ async function runMutationChecks() {
           PATCHPAGE_RELEASE_WORKFLOW_SOURCE: replaceOnce(
             workflow,
             "      - name: Install and run tarball on minimum supported Node\n        shell: bash",
-            "      - name: Install and run tarball on minimum supported Node\n        timeout-minutes: 1\n        shell: bash",
-          ),
+            "      - name: Install and run tarball on minimum supported Node\n        timeout-minutes: 1\n        shell: bash"
+          )
         },
-        expected: /verify must run the exact tarball smoke contract on the minimum supported Node 22/,
+        expected:
+          /verify must run the exact tarball smoke contract on the minimum supported Node 22/
       },
       {
         name: "reject dist rewrite before package producer",
@@ -4615,11 +4930,11 @@ async function runMutationChecks() {
           PATCHPAGE_RELEASE_WORKFLOW_SOURCE: replaceOnce(
             workflow,
             "      - name: Pack exactly one release tarball and verify contents",
-            '      - name: Rewrite built CLI\n        shell: bash\n        run: echo attacker > packages/cli/dist/index.js\n      - name: Pack exactly one release tarball and verify contents',
-          ),
+            "      - name: Rewrite built CLI\n        shell: bash\n        run: echo attacker > packages/cli/dist/index.js\n      - name: Pack exactly one release tarball and verify contents"
+          )
         },
         expected:
-          /verify must contain exactly the reviewed job map and ordered build and smoke steps/,
+          /verify must contain exactly the reviewed job map and ordered build and smoke steps/
       },
       {
         name: "reject executable step between publication downloads and publish",
@@ -4627,11 +4942,11 @@ async function runMutationChecks() {
           PATCHPAGE_RELEASE_WORKFLOW_SOURCE: replaceOnce(
             workflow,
             "      - name: Publish the verified tarball to npm",
-            '      - name: Replace publishing CLI\n        shell: bash\n        run: echo attacker > "$RUNNER_TEMP/npm-cli/bin/npm-cli.js"\n      - name: Publish the verified tarball to npm',
-          ),
+            '      - name: Replace publishing CLI\n        shell: bash\n        run: echo attacker > "$RUNNER_TEMP/npm-cli/bin/npm-cli.js"\n      - name: Publish the verified tarball to npm'
+          )
         },
         expected:
-          /publish-npm must contain exactly the reviewed privileged job map and ordered publication steps/,
+          /publish-npm must contain exactly the reviewed privileged job map and ordered publication steps/
       },
       {
         name: "reject executable step after publication",
@@ -4639,11 +4954,11 @@ async function runMutationChecks() {
           PATCHPAGE_RELEASE_WORKFLOW_SOURCE: replaceOnce(
             workflow,
             "\n  github-release:",
-            '\n      - name: Run after npm publication\n        shell: bash\n        run: echo attacker\n\n  github-release:',
-          ),
+            "\n      - name: Run after npm publication\n        shell: bash\n        run: echo attacker\n\n  github-release:"
+          )
         },
         expected:
-          /publish-npm must contain exactly the reviewed privileged job map and ordered publication steps/,
+          /publish-npm must contain exactly the reviewed privileged job map and ordered publication steps/
       },
       {
         name: "reject prepare-npm container",
@@ -4651,10 +4966,10 @@ async function runMutationChecks() {
           PATCHPAGE_RELEASE_WORKFLOW_SOURCE: replaceOnce(
             workflow,
             "  prepare-npm:\n    runs-on: ubuntu-latest",
-            "  prepare-npm:\n    runs-on: ubuntu-latest\n    container: attacker/image:latest",
-          ),
+            "  prepare-npm:\n    runs-on: ubuntu-latest\n    container: attacker/image:latest"
+          )
         },
-        expected: /prepare-npm must contain exactly the reviewed job map and ordered steps/,
+        expected: /prepare-npm must contain exactly the reviewed job map and ordered steps/
       },
       {
         name: "reject verify container",
@@ -4662,11 +4977,11 @@ async function runMutationChecks() {
           PATCHPAGE_RELEASE_WORKFLOW_SOURCE: replaceOnce(
             workflow,
             "  verify:\n    needs: [guard, prepare-npm]\n    runs-on: ubuntu-latest",
-            "  verify:\n    needs: [guard, prepare-npm]\n    runs-on: ubuntu-latest\n    container: attacker/image:latest",
-          ),
+            "  verify:\n    needs: [guard, prepare-npm]\n    runs-on: ubuntu-latest\n    container: attacker/image:latest"
+          )
         },
         expected:
-          /verify must contain exactly the reviewed job map and ordered build and smoke steps/,
+          /verify must contain exactly the reviewed job map and ordered build and smoke steps/
       },
       {
         name: "reject publish-npm container",
@@ -4674,11 +4989,11 @@ async function runMutationChecks() {
           PATCHPAGE_RELEASE_WORKFLOW_SOURCE: replaceOnce(
             workflow,
             "  publish-npm:\n    needs: [guard, prepare-npm, verify]\n    runs-on: ubuntu-latest",
-            "  publish-npm:\n    needs: [guard, prepare-npm, verify]\n    runs-on: ubuntu-latest\n    container: attacker/image:latest",
-          ),
+            "  publish-npm:\n    needs: [guard, prepare-npm, verify]\n    runs-on: ubuntu-latest\n    container: attacker/image:latest"
+          )
         },
         expected:
-          /publish-npm must contain exactly the reviewed privileged job map and ordered publication steps/,
+          /publish-npm must contain exactly the reviewed privileged job map and ordered publication steps/
       },
       {
         name: "reject publish-npm services",
@@ -4686,11 +5001,11 @@ async function runMutationChecks() {
           PATCHPAGE_RELEASE_WORKFLOW_SOURCE: replaceOnce(
             workflow,
             "  publish-npm:\n    needs: [guard, prepare-npm, verify]\n    runs-on: ubuntu-latest",
-            "  publish-npm:\n    needs: [guard, prepare-npm, verify]\n    runs-on: ubuntu-latest\n    services:\n      attacker:\n        image: attacker/image:latest",
-          ),
+            "  publish-npm:\n    needs: [guard, prepare-npm, verify]\n    runs-on: ubuntu-latest\n    services:\n      attacker:\n        image: attacker/image:latest"
+          )
         },
         expected:
-          /publish-npm must contain exactly the reviewed privileged job map and ordered publication steps/,
+          /publish-npm must contain exactly the reviewed privileged job map and ordered publication steps/
       },
       {
         name: "reject conditional publish-npm job",
@@ -4698,11 +5013,11 @@ async function runMutationChecks() {
           PATCHPAGE_RELEASE_WORKFLOW_SOURCE: replaceOnce(
             workflow,
             "  publish-npm:\n    needs: [guard, prepare-npm, verify]",
-            "  publish-npm:\n    needs: [guard, prepare-npm, verify]\n    if: false",
-          ),
+            "  publish-npm:\n    needs: [guard, prepare-npm, verify]\n    if: false"
+          )
         },
         expected:
-          /publish-npm must contain exactly the reviewed privileged job map and ordered publication steps/,
+          /publish-npm must contain exactly the reviewed privileged job map and ordered publication steps/
       },
       {
         name: "reject publish-npm strategy",
@@ -4710,11 +5025,11 @@ async function runMutationChecks() {
           PATCHPAGE_RELEASE_WORKFLOW_SOURCE: replaceOnce(
             workflow,
             "  publish-npm:\n    needs: [guard, prepare-npm, verify]\n    runs-on: ubuntu-latest",
-            "  publish-npm:\n    needs: [guard, prepare-npm, verify]\n    runs-on: ubuntu-latest\n    strategy:\n      matrix:\n        attacker: [true]",
-          ),
+            "  publish-npm:\n    needs: [guard, prepare-npm, verify]\n    runs-on: ubuntu-latest\n    strategy:\n      matrix:\n        attacker: [true]"
+          )
         },
         expected:
-          /publish-npm must contain exactly the reviewed privileged job map and ordered publication steps/,
+          /publish-npm must contain exactly the reviewed privileged job map and ordered publication steps/
       },
       {
         name: "reject publish-npm job environment",
@@ -4722,11 +5037,11 @@ async function runMutationChecks() {
           PATCHPAGE_RELEASE_WORKFLOW_SOURCE: replaceOnce(
             workflow,
             "  publish-npm:\n    needs: [guard, prepare-npm, verify]\n    runs-on: ubuntu-latest",
-            "  publish-npm:\n    needs: [guard, prepare-npm, verify]\n    runs-on: ubuntu-latest\n    env:\n      NODE_OPTIONS: attacker",
-          ),
+            "  publish-npm:\n    needs: [guard, prepare-npm, verify]\n    runs-on: ubuntu-latest\n    env:\n      NODE_OPTIONS: attacker"
+          )
         },
         expected:
-          /publish-npm must contain exactly the reviewed privileged job map and ordered publication steps/,
+          /publish-npm must contain exactly the reviewed privileged job map and ordered publication steps/
       },
       {
         name: "reject privileged run added to github-release",
@@ -4734,11 +5049,11 @@ async function runMutationChecks() {
           PATCHPAGE_RELEASE_WORKFLOW_SOURCE: replaceOnce(
             workflow,
             "      - name: Create GitHub release",
-            '      - name: Attacker release step\n        shell: bash\n        run: echo attacker\n      - name: Create GitHub release',
-          ),
+            "      - name: Attacker release step\n        shell: bash\n        run: echo attacker\n      - name: Create GitHub release"
+          )
         },
         expected:
-          /github-release must match the exact reviewed job map, permissions, and ordered steps/,
+          /github-release must match the exact reviewed job map, permissions, and ordered steps/
       },
       {
         name: "reject github-release permission elevation",
@@ -4746,11 +5061,11 @@ async function runMutationChecks() {
           PATCHPAGE_RELEASE_WORKFLOW_SOURCE: replaceOnce(
             workflow,
             "  github-release:\n    needs: publish-npm\n    runs-on: ubuntu-latest\n    permissions:\n      contents: write",
-            '  github-release:\n    needs: publish-npm\n    runs-on: ubuntu-latest\n    permissions:\n      contents: write\n      "id-token": write\n      packages: write',
-          ),
+            '  github-release:\n    needs: publish-npm\n    runs-on: ubuntu-latest\n    permissions:\n      contents: write\n      "id-token": write\n      packages: write'
+          )
         },
         expected:
-          /github-release must match the exact reviewed job map, permissions, and ordered steps/,
+          /github-release must match the exact reviewed job map, permissions, and ordered steps/
       },
       {
         name: "reject github-release container",
@@ -4758,11 +5073,11 @@ async function runMutationChecks() {
           PATCHPAGE_RELEASE_WORKFLOW_SOURCE: replaceOnce(
             workflow,
             "  github-release:\n    needs: publish-npm\n    runs-on: ubuntu-latest",
-            "  github-release:\n    needs: publish-npm\n    runs-on: ubuntu-latest\n    container: attacker/image:latest",
-          ),
+            "  github-release:\n    needs: publish-npm\n    runs-on: ubuntu-latest\n    container: attacker/image:latest"
+          )
         },
         expected:
-          /github-release must match the exact reviewed job map, permissions, and ordered steps/,
+          /github-release must match the exact reviewed job map, permissions, and ordered steps/
       },
       {
         name: "reject github-release services",
@@ -4770,11 +5085,11 @@ async function runMutationChecks() {
           PATCHPAGE_RELEASE_WORKFLOW_SOURCE: replaceOnce(
             workflow,
             "  github-release:\n    needs: publish-npm\n    runs-on: ubuntu-latest",
-            "  github-release:\n    needs: publish-npm\n    runs-on: ubuntu-latest\n    services:\n      attacker:\n        image: attacker/image:latest",
-          ),
+            "  github-release:\n    needs: publish-npm\n    runs-on: ubuntu-latest\n    services:\n      attacker:\n        image: attacker/image:latest"
+          )
         },
         expected:
-          /github-release must match the exact reviewed job map, permissions, and ordered steps/,
+          /github-release must match the exact reviewed job map, permissions, and ordered steps/
       },
       {
         name: "reject privileged run added to docker-ghcr",
@@ -4782,11 +5097,11 @@ async function runMutationChecks() {
           PATCHPAGE_RELEASE_WORKFLOW_SOURCE: replaceOnce(
             workflow,
             "      - name: Download the immutable verified server image artifact",
-            '      - name: Attacker package step\n        shell: bash\n        run: echo attacker\n      - name: Download the immutable verified server image artifact',
-          ),
+            "      - name: Attacker package step\n        shell: bash\n        run: echo attacker\n      - name: Download the immutable verified server image artifact"
+          )
         },
         expected:
-          /docker-ghcr must match the exact reviewed job map, permissions, and ordered steps/,
+          /docker-ghcr must match the exact reviewed job map, permissions, and ordered steps/
       },
       {
         name: "reject docker-ghcr quoted permission elevation",
@@ -4794,11 +5109,11 @@ async function runMutationChecks() {
           PATCHPAGE_RELEASE_WORKFLOW_SOURCE: replaceOnce(
             workflow,
             "  docker-ghcr:\n    name: Publish verified server image to GHCR (no checkout)\n    needs: [guard, publish-npm, verify-server-image]\n    runs-on: ubuntu-latest\n    permissions:\n      packages: write",
-            '  docker-ghcr:\n    name: Publish verified server image to GHCR (no checkout)\n    needs: [guard, publish-npm, verify-server-image]\n    runs-on: ubuntu-latest\n    permissions:\n      packages: write\n      "id-token": write',
-          ),
+            '  docker-ghcr:\n    name: Publish verified server image to GHCR (no checkout)\n    needs: [guard, publish-npm, verify-server-image]\n    runs-on: ubuntu-latest\n    permissions:\n      packages: write\n      "id-token": write'
+          )
         },
         expected:
-          /docker-ghcr must match the exact reviewed job map, permissions, and ordered steps/,
+          /docker-ghcr must match the exact reviewed job map, permissions, and ordered steps/
       },
       {
         name: "reject docker-ghcr container",
@@ -4806,11 +5121,11 @@ async function runMutationChecks() {
           PATCHPAGE_RELEASE_WORKFLOW_SOURCE: replaceOnce(
             workflow,
             "  docker-ghcr:\n    name: Publish verified server image to GHCR (no checkout)\n    needs: [guard, publish-npm, verify-server-image]\n    runs-on: ubuntu-latest",
-            "  docker-ghcr:\n    name: Publish verified server image to GHCR (no checkout)\n    needs: [guard, publish-npm, verify-server-image]\n    runs-on: ubuntu-latest\n    container: attacker/image:latest",
-          ),
+            "  docker-ghcr:\n    name: Publish verified server image to GHCR (no checkout)\n    needs: [guard, publish-npm, verify-server-image]\n    runs-on: ubuntu-latest\n    container: attacker/image:latest"
+          )
         },
         expected:
-          /docker-ghcr must match the exact reviewed job map, permissions, and ordered steps/,
+          /docker-ghcr must match the exact reviewed job map, permissions, and ordered steps/
       },
       {
         name: "reject docker-ghcr services",
@@ -4818,11 +5133,11 @@ async function runMutationChecks() {
           PATCHPAGE_RELEASE_WORKFLOW_SOURCE: replaceOnce(
             workflow,
             "  docker-ghcr:\n    name: Publish verified server image to GHCR (no checkout)\n    needs: [guard, publish-npm, verify-server-image]\n    runs-on: ubuntu-latest",
-            "  docker-ghcr:\n    name: Publish verified server image to GHCR (no checkout)\n    needs: [guard, publish-npm, verify-server-image]\n    runs-on: ubuntu-latest\n    services:\n      attacker:\n        image: attacker/image:latest",
-          ),
+            "  docker-ghcr:\n    name: Publish verified server image to GHCR (no checkout)\n    needs: [guard, publish-npm, verify-server-image]\n    runs-on: ubuntu-latest\n    services:\n      attacker:\n        image: attacker/image:latest"
+          )
         },
         expected:
-          /docker-ghcr must match the exact reviewed job map, permissions, and ordered steps/,
+          /docker-ghcr must match the exact reviewed job map, permissions, and ordered steps/
       },
       {
         name: "reject verify-server-image quoted permission elevation",
@@ -4830,11 +5145,11 @@ async function runMutationChecks() {
           PATCHPAGE_RELEASE_WORKFLOW_SOURCE: replaceOnce(
             workflow,
             "  verify-server-image:\n    name: Build and verify server image without registry credentials\n    needs: guard\n    runs-on: ubuntu-latest\n    permissions:\n      contents: read",
-            '  verify-server-image:\n    name: Build and verify server image without registry credentials\n    needs: guard\n    runs-on: ubuntu-latest\n    permissions:\n      contents: read\n      "id-token": write',
-          ),
+            '  verify-server-image:\n    name: Build and verify server image without registry credentials\n    needs: guard\n    runs-on: ubuntu-latest\n    permissions:\n      contents: read\n      "id-token": write'
+          )
         },
         expected:
-          /verify-server-image must match the exact reviewed job map, permissions, and ordered steps/,
+          /verify-server-image must match the exact reviewed job map, permissions, and ordered steps/
       },
       {
         name: "reject guard permission elevation",
@@ -4842,11 +5157,10 @@ async function runMutationChecks() {
           PATCHPAGE_RELEASE_WORKFLOW_SOURCE: replaceOnce(
             workflow,
             "  guard:\n    runs-on: ubuntu-latest\n    permissions:\n      contents: read",
-            "  guard:\n    runs-on: ubuntu-latest\n    permissions:\n      contents: read\n      id-token: write",
-          ),
+            "  guard:\n    runs-on: ubuntu-latest\n    permissions:\n      contents: read\n      id-token: write"
+          )
         },
-        expected:
-          /guard must match the exact reviewed job map, permissions, and ordered steps/,
+        expected: /guard must match the exact reviewed job map, permissions, and ordered steps/
       },
       {
         name: "reject anonymous smoke permission elevation",
@@ -4854,11 +5168,11 @@ async function runMutationChecks() {
           PATCHPAGE_RELEASE_WORKFLOW_SOURCE: replaceOnce(
             workflow,
             "  ghcr-anonymous-smoke:\n    name: Anonymous GHCR public-visibility gate (manual visibility required)\n    needs: [guard, docker-ghcr]\n    runs-on: ubuntu-latest\n    permissions: {}",
-            "  ghcr-anonymous-smoke:\n    name: Anonymous GHCR public-visibility gate (manual visibility required)\n    needs: [guard, docker-ghcr]\n    runs-on: ubuntu-latest\n    permissions:\n      id-token: write",
-          ),
+            "  ghcr-anonymous-smoke:\n    name: Anonymous GHCR public-visibility gate (manual visibility required)\n    needs: [guard, docker-ghcr]\n    runs-on: ubuntu-latest\n    permissions:\n      id-token: write"
+          )
         },
         expected:
-          /ghcr-anonymous-smoke must match the exact reviewed job map, permissions, and ordered steps/,
+          /ghcr-anonymous-smoke must match the exact reviewed job map, permissions, and ordered steps/
       },
       {
         name: "reject npx smoke permission elevation",
@@ -4866,11 +5180,10 @@ async function runMutationChecks() {
           PATCHPAGE_RELEASE_WORKFLOW_SOURCE: replaceOnce(
             workflow,
             "  npx-smoke:\n    needs: publish-npm\n    runs-on: ubuntu-latest\n    permissions: {}",
-            "  npx-smoke:\n    needs: publish-npm\n    runs-on: ubuntu-latest\n    permissions:\n      id-token: write",
-          ),
+            "  npx-smoke:\n    needs: publish-npm\n    runs-on: ubuntu-latest\n    permissions:\n      id-token: write"
+          )
         },
-        expected:
-          /npx-smoke must match the exact reviewed job map, permissions, and ordered steps/,
+        expected: /npx-smoke must match the exact reviewed job map, permissions, and ordered steps/
       },
       {
         name: "reject top-level NODE_OPTIONS environment",
@@ -4878,11 +5191,11 @@ async function runMutationChecks() {
           PATCHPAGE_RELEASE_WORKFLOW_SOURCE: replaceOnce(
             workflow,
             "permissions: {}\n\nconcurrency:",
-            "permissions: {}\nenv:\n  NODE_OPTIONS: --require=/tmp/attacker.cjs\n\nconcurrency:",
-          ),
+            "permissions: {}\nenv:\n  NODE_OPTIONS: --require=/tmp/attacker.cjs\n\nconcurrency:"
+          )
         },
         expected:
-          /release\.yml root must contain exactly the reviewed trigger, permissions, concurrency, and jobs/,
+          /release\.yml root must contain exactly the reviewed trigger, permissions, concurrency, and jobs/
       },
       {
         name: "reject top-level run defaults",
@@ -4890,11 +5203,11 @@ async function runMutationChecks() {
           PATCHPAGE_RELEASE_WORKFLOW_SOURCE: replaceOnce(
             workflow,
             "permissions: {}\n\nconcurrency:",
-            "permissions: {}\ndefaults:\n  run:\n    shell: bash -c attacker\n    working-directory: /tmp\n\nconcurrency:",
-          ),
+            "permissions: {}\ndefaults:\n  run:\n    shell: bash -c attacker\n    working-directory: /tmp\n\nconcurrency:"
+          )
         },
         expected:
-          /release\.yml root must contain exactly the reviewed trigger, permissions, concurrency, and jobs/,
+          /release\.yml root must contain exactly the reviewed trigger, permissions, concurrency, and jobs/
       },
       {
         name: "reject ordered-map permissions",
@@ -4902,10 +5215,10 @@ async function runMutationChecks() {
           PATCHPAGE_RELEASE_WORKFLOW_SOURCE: replaceOnce(
             workflow,
             "  ghcr-anonymous-smoke:\n    name: Anonymous GHCR public-visibility gate (manual visibility required)\n    needs: [guard, docker-ghcr]\n    runs-on: ubuntu-latest\n    permissions: {}",
-            '  ghcr-anonymous-smoke:\n    name: Anonymous GHCR public-visibility gate (manual visibility required)\n    needs: [guard, docker-ghcr]\n    runs-on: ubuntu-latest\n    permissions: !!omap [ { "id-token": write } ]',
-          ),
+            '  ghcr-anonymous-smoke:\n    name: Anonymous GHCR public-visibility gate (manual visibility required)\n    needs: [guard, docker-ghcr]\n    runs-on: ubuntu-latest\n    permissions: !!omap [ { "id-token": write } ]'
+          )
         },
-        expected: /explicit tags are forbidden/,
+        expected: /explicit tags are forbidden/
       },
       {
         name: "reject pairs root permissions",
@@ -4913,10 +5226,10 @@ async function runMutationChecks() {
           PATCHPAGE_RELEASE_WORKFLOW_SOURCE: replaceOnce(
             workflow,
             "permissions: {}\n\nconcurrency:",
-            "permissions: !!pairs [ { id-token: write } ]\n\nconcurrency:",
-          ),
+            "permissions: !!pairs [ { id-token: write } ]\n\nconcurrency:"
+          )
         },
-        expected: /explicit tags are forbidden/,
+        expected: /explicit tags are forbidden/
       },
       {
         name: "reject set permissions",
@@ -4924,10 +5237,10 @@ async function runMutationChecks() {
           PATCHPAGE_RELEASE_WORKFLOW_SOURCE: replaceOnce(
             workflow,
             "  npx-smoke:\n    needs: publish-npm\n    runs-on: ubuntu-latest\n    permissions: {}",
-            "  npx-smoke:\n    needs: publish-npm\n    runs-on: ubuntu-latest\n    permissions: !!set { id-token: null }",
-          ),
+            "  npx-smoke:\n    needs: publish-npm\n    runs-on: ubuntu-latest\n    permissions: !!set { id-token: null }"
+          )
         },
-        expected: /explicit tags are forbidden/,
+        expected: /explicit tags are forbidden/
       },
       {
         name: "reject custom tag on root map",
@@ -4935,10 +5248,10 @@ async function runMutationChecks() {
           PATCHPAGE_RELEASE_WORKFLOW_SOURCE: replaceOnce(
             workflow,
             "name: Release",
-            "--- !attacker\nname: Release",
-          ),
+            "--- !attacker\nname: Release"
+          )
         },
-        expected: /explicit tags are forbidden/,
+        expected: /explicit tags are forbidden/
       },
       {
         name: "reject custom tag on job map",
@@ -4946,10 +5259,10 @@ async function runMutationChecks() {
           PATCHPAGE_RELEASE_WORKFLOW_SOURCE: replaceOnce(
             workflow,
             "  github-release:\n",
-            "  github-release: !attacker\n",
-          ),
+            "  github-release: !attacker\n"
+          )
         },
-        expected: /explicit tags are forbidden/,
+        expected: /explicit tags are forbidden/
       },
       {
         name: "reject custom tag on step map",
@@ -4957,11 +5270,11 @@ async function runMutationChecks() {
           PATCHPAGE_RELEASE_WORKFLOW_SOURCE: replaceOnce(
             workflow,
             "  github-release:\n    needs: publish-npm\n    runs-on: ubuntu-latest\n    permissions:\n      contents: write\n    steps:\n      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1",
-            "  github-release:\n    needs: publish-npm\n    runs-on: ubuntu-latest\n    permissions:\n      contents: write\n    steps:\n      - !attacker\n        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1",
-          ),
+            "  github-release:\n    needs: publish-npm\n    runs-on: ubuntu-latest\n    permissions:\n      contents: write\n    steps:\n      - !attacker\n        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1"
+          )
         },
-        expected: /explicit tags are forbidden/,
-      },
+        expected: /explicit tags are forbidden/
+      }
     ];
   } catch (error) {
     mutationFailures.push(error.message);
@@ -4975,8 +5288,8 @@ async function runMutationChecks() {
       env: {
         ...process.env,
         ...check.env,
-        PATCHPAGE_RELEASE_WORKFLOW_SKIP_MUTATION_CHECKS: "1",
-      },
+        PATCHPAGE_RELEASE_WORKFLOW_SKIP_MUTATION_CHECKS: "1"
+      }
     });
     const output = `${result.stdout ?? ""}\n${result.stderr ?? ""}`;
     if (result.status === 0) {
@@ -4985,7 +5298,7 @@ async function runMutationChecks() {
     }
     if (!check.expected.test(output)) {
       mutationFailures.push(
-        `${check.name}: expected failure was not reported; saw ${output.trim()}`,
+        `${check.name}: expected failure was not reported; saw ${output.trim()}`
       );
     }
   }
@@ -5010,7 +5323,7 @@ if (failures.length > 0) {
     process.exitCode = 1;
   } else {
     console.log(
-      `Verified ${actionUses.length + reconcileActionUses.length} pinned Actions, npm@${npmVersion}, exact release image identity, reconciliation rerun fixtures, anonymous GHCR gate, and mutation checks.`,
+      `Verified ${actionUses.length + reconcileActionUses.length} pinned Actions, npm@${npmVersion}, exact release image identity, reconciliation rerun fixtures, anonymous GHCR gate, and mutation checks.`
     );
   }
 }
