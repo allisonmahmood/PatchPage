@@ -880,13 +880,20 @@ if ! SMOKE_TMP_DIR="$(mktemp -d)"; then
   printf 'Could not create a temporary directory for the deployed smoke.\n' >&2
   exit 1
 fi
-trap 'rm -rf "$SMOKE_TMP_DIR"' EXIT HUP INT TERM
+AUTH_HEADER_FILE=''
 SMOKE_MARKER="PATCHPAGE_AZURE_SMOKE_${SMOKE_TMP_DIR##*/}"
+
+smoke_cleanup() {
+  unset BOOTSTRAP_API_TOKEN
+  rm -rf "$SMOKE_TMP_DIR"
+}
+trap 'smoke_cleanup' 0
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 smoke_fail() {
   printf '%s\n' "$1" >&2
-  unset BOOTSTRAP_API_TOKEN
-  rm -rf "$SMOKE_TMP_DIR"
   exit 1
 }
 
@@ -900,8 +907,8 @@ if ! HTTP_STATUS="$(
 )"; then
   smoke_fail 'The HTTP health request failed.'
 fi
-if test "$HTTP_STATUS" != "308"; then
-  smoke_fail "Expected HTTP status 308, received HTTP $HTTP_STATUS."
+if test "$HTTP_STATUS" != "301"; then
+  smoke_fail "Expected HTTP status 301, received HTTP $HTTP_STATUS."
 fi
 if ! HTTP_LOCATION="$(
   awk '
@@ -949,6 +956,13 @@ fi
 if test -z "$BOOTSTRAP_API_TOKEN"; then
   smoke_fail 'Terraform returned an empty bootstrap API token.'
 fi
+AUTH_HEADER_FILE="$SMOKE_TMP_DIR/upload.headers"
+if ! (umask 077 && printf 'Authorization: Bearer %s\n' \
+  "$BOOTSTRAP_API_TOKEN" > "$AUTH_HEADER_FILE") ||
+   ! chmod 600 "$AUTH_HEADER_FILE"; then
+  smoke_fail 'Could not create the protected upload authorization header.'
+fi
+unset BOOTSTRAP_API_TOKEN
 if ! UPLOAD_PAYLOAD="$(
   jq -cn --arg marker "$SMOKE_MARKER" \
     '{
@@ -969,7 +983,7 @@ if ! UPLOAD_STATUS="$(
     --output "$SMOKE_TMP_DIR/upload.json" \
     --write-out '%{http_code}' \
     --request POST \
-    --header "Authorization: Bearer $BOOTSTRAP_API_TOKEN" \
+    --header "@$AUTH_HEADER_FILE" \
     --header "Content-Type: application/json" \
     --data "$UPLOAD_PAYLOAD" \
     "$PUBLIC_BASE_URL/api/uploads"
@@ -1009,9 +1023,6 @@ if ! grep -Fq -- "$SMOKE_MARKER" "$SMOKE_TMP_DIR/draft.html"; then
 fi
 
 printf '%s\n' "$DRAFT_URL"
-unset BOOTSTRAP_API_TOKEN
-unset SMOKE_MARKER UPLOAD_PAYLOAD
-rm -rf "$SMOKE_TMP_DIR"
 )
 ```
 

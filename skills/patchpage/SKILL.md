@@ -34,9 +34,28 @@ that requires viewer authentication.
 
 PatchPage uploads one safe static HTML document and returns a public, unlisted review URL.
 
+Requires Node.js 22 or newer.
+
+Set `PATCHPAGE_SETUP_TOKEN` in a secret environment variable before running the authenticated
+workflow:
+
 ```bash
-npx patchpage validate ./plan.html
-npx patchpage upload ./plan.html
+(
+  set +x
+  set -eu
+  PATCHPAGE_API_URL='https://patchpage.example.com'
+  export PATCHPAGE_API_URL
+  unset PATCHPAGE_API_TOKEN
+  unset TOKEN
+  : "${PATCHPAGE_SETUP_TOKEN:?Set PATCHPAGE_SETUP_TOKEN to a PatchPage API token}"
+  ARTIFACT_PATH='./plan.html'
+
+  printf '%s' "$PATCHPAGE_SETUP_TOKEN" | npx --yes patchpage auth set --token-stdin --api-url "$PATCHPAGE_API_URL"
+  unset PATCHPAGE_SETUP_TOKEN
+  npx --yes patchpage whoami &&
+    npx --yes patchpage validate "$ARTIFACT_PATH" &&
+    npx --yes patchpage upload "$ARTIFACT_PATH"
+)
 ```
 
 Behavior:
@@ -59,13 +78,13 @@ Behavior:
 To force create-only anonymous mode on an opted-in self-hosted server:
 
 ```bash
-npx patchpage upload ./plan.html --anonymous --api-url https://patchpage.example.com
+npx --yes patchpage upload './plan.html' --anonymous --api-url 'https://patchpage.example.com'
 ```
 
 Set credentials with:
 
 ```bash
-npx patchpage auth set
+npx --yes patchpage auth set
 ```
 
 The default flow requires a terminal and reads the token from a non-echoing prompt.
@@ -73,14 +92,12 @@ The default flow requires a terminal and reads the token from a non-echoing prom
 For a self-hosted server:
 
 ```bash
-npx patchpage auth set --api-url https://patchpage.example.com
+npx --yes patchpage auth set --api-url 'https://patchpage.example.com'
 ```
 
-Automation must select redirected input explicitly and keep the token in a secret variable:
-
-```bash
-printf '%s' "$TOKEN" | npx patchpage auth set --token-stdin --api-url https://patchpage.example.com
-```
+For automated publishing, use the scoped workflow above. Do not shorten it: pin the intended
+origin, clear inherited credential overrides, store the setup token through stdin, verify it
+with `whoami`, and only then validate and upload.
 
 ## HTML Safety Rules
 
@@ -115,8 +132,9 @@ Blocked or unsafe:
    and builder-to-builder copy.
 3. For a restrained technical report, use clear sections, tables, and diagrams where they
    clarify the work.
-4. Validate with `npx patchpage validate /path/to/file.html`.
-5. Upload with `npx patchpage upload /path/to/file.html` when the user wants a link.
+4. For authenticated publishing, use the scoped workflow above so the intended origin and
+   stored credential are verified with `whoami`.
+5. Upload only after both `whoami` and validation succeed.
 6. Return the URL and state that draft URLs are public/unlisted.
 
 ## Pitfalls

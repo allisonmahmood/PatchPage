@@ -72,6 +72,7 @@ jobs:
           node-version: 24
           cache: pnpm
       - run: pnpm install --frozen-lockfile
+      - run: pnpm test:public-surfaces
       - run: pnpm test:release-workflow
       - run: pnpm test:ghcr-oci
       - run: pnpm test:docker-save

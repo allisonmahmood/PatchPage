@@ -1,7 +1,17 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
-import { access, appendFile, mkdtemp, mkdir, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import {
+  access,
+  appendFile,
+  mkdtemp,
+  mkdir,
+  readFile,
+  readdir,
+  realpath,
+  rm,
+  writeFile
+} from "node:fs/promises";
 import { createServer as createHttpServer } from "node:http";
 import { createConnection, createServer } from "node:net";
 import os from "node:os";
@@ -135,12 +145,19 @@ try {
     throw new Error("timeout-owned-temp-root probe unexpectedly completed");
   }
 
-  const packDir = path.join(tempRoot, "pack");
-  const consumerDir = path.join(tempRoot, "consumer");
-  const serverStateDir = path.join(tempRoot, "server-state");
+  const packDir = path.join(tempRoot, "packed artifacts");
+  const consumerDir = path.join(tempRoot, "clean consumer");
+  const serverStateDir = path.join(tempRoot, "server state");
   const metadataPath = path.join(serverStateDir, "metadata.json");
   const objectDir = path.join(serverStateDir, "objects");
-  const cliStateDir = path.join(tempRoot, "cli-state-authenticated");
+  const cliStateDir = path.join(tempRoot, "cli state authenticated");
+  assertSpacedPath("packed artifact directory", packDir);
+  assertSpacedPath("clean consumer directory", consumerDir);
+  assertSpacedPath("server state directory", serverStateDir);
+  assertSpacedPath("CLI state directory", cliStateDir);
+  console.log(
+    `[packed-cli-e2e] spaced paths: consumer=${JSON.stringify(consumerDir)} artifact=${JSON.stringify(packDir)} state=${JSON.stringify(cliStateDir)}`
+  );
   await checkedCall(() =>
     Promise.all([mkdir(packDir), mkdir(consumerDir), mkdir(serverStateDir), mkdir(cliStateDir)])
   );
@@ -272,23 +289,55 @@ try {
   assert.match(whoami.stdout, /^API token: Bootstrap API Token \(tok_bootstrap\)$/m);
   assert.match(whoami.stdout, /^Scopes: admin, upload$/m);
 
-  const fixturePath = path.join(consumerDir, "packed-contract.html");
+  const fixturePath = path.join(consumerDir, "review artifact.html");
+  const fixtureArgument = "./review artifact.html";
+  assertSpacedPath("HTML artifact path", fixturePath);
+  console.log(`[packed-cli-e2e] spaced HTML artifact path: ${JSON.stringify(fixturePath)}`);
   const firstHtml = validHtml("Packed contract v1", "packed-contract-version-one");
   const secondHtml = validHtml("Packed contract v2", "packed-contract-version-two");
   const newHtml = validHtml("Packed contract new draft", "packed-contract-new-draft");
 
   console.log("[packed-cli-e2e] exercising authenticated create, cached update, and --new");
   await checkedCall(() => writeFile(fixturePath, firstHtml, "utf8"));
+  const publicShellSequence = decodePackedCliWorkflow(
+    await checkedCall(() =>
+      readFile(path.join(consumerDir, "node_modules/patchpage/README.md"), "utf8")
+    )
+  );
+  const hostileInheritedApiToken = "hostile-inherited-api-token";
+  const hostileInheritedToken = "hostile-inherited-token";
+  console.log("[packed-cli-e2e] exercising shipped commands under inherited POSIX sh xtrace");
   const first = parseUpload(
-    await runCli(cliPath, ["upload", fixturePath], { cwd: consumerDir, env: cliEnv })
+    await runPublicPosixSh(publicShellSequence, {
+      cwd: consumerDir,
+      env: {
+        ...cliEnv,
+        PATH: [path.dirname(cliPath), cliEnv.PATH].filter(Boolean).join(path.delimiter),
+        PATCHPAGE_API_URL: "https://hostile.invalid",
+        PATCHPAGE_API_TOKEN: hostileInheritedApiToken,
+        TOKEN: hostileInheritedToken,
+        PATCHPAGE_SETUP_URL: publicBaseUrl,
+        PATCHPAGE_SETUP_TOKEN: bootstrapToken
+      },
+      sensitiveValues: [bootstrapToken, hostileInheritedApiToken, hostileInheritedToken]
+    })
   );
   assert.equal(first.label, "Uploaded draft");
   assert.equal(first.versionNumber, 1);
   assert.equal(first.publicUrl, `${publicBaseUrl}/d/${first.draftId}`);
+  const fixtureCachePath = await checkedCall(() => realpath(fixturePath));
+  const shellDraftCache = JSON.parse(
+    await checkedCall(() => readFile(path.join(cliStateDir, "drafts.json"), "utf8"))
+  );
+  assert.deepEqual(
+    Object.keys(shellDraftCache.files ?? {}),
+    [fixtureCachePath],
+    "quoted POSIX sh upload must cache the resolved spaced artifact path"
+  );
 
   await checkedCall(() => writeFile(fixturePath, secondHtml, "utf8"));
   const second = parseUpload(
-    await runCli(cliPath, ["upload", fixturePath], { cwd: consumerDir, env: cliEnv })
+    await runCli(cliPath, ["upload", fixtureArgument], { cwd: consumerDir, env: cliEnv })
   );
   assert.equal(second.label, "Updated draft");
   assert.equal(second.draftId, first.draftId);
@@ -296,7 +345,7 @@ try {
 
   await checkedCall(() => writeFile(fixturePath, newHtml, "utf8"));
   const fresh = parseUpload(
-    await runCli(cliPath, ["upload", fixturePath, "--new"], {
+    await runCli(cliPath, ["upload", fixtureArgument, "--new"], {
       cwd: consumerDir,
       env: cliEnv
     })
@@ -340,13 +389,13 @@ try {
   console.log("[packed-cli-e2e] proving unsafe HTML and bad credentials cannot mutate state");
   const unsafeHtml =
     '<!doctype html><html><head><title>Unsafe</title></head><body><script>alert("no")</script></body></html>';
-  const unsafeValidationStateDir = path.join(tempRoot, "cli-state-unsafe-validation");
+  const unsafeValidationStateDir = path.join(tempRoot, "cli state unsafe validation");
   await checkedCall(() => mkdir(unsafeValidationStateDir));
   assert.deepEqual(await snapshotTree(unsafeValidationStateDir), []);
   await checkedCall(() => writeFile(fixturePath, unsafeHtml, "utf8"));
   await assertCliFailureNoMutation({
     cliPath,
-    args: ["upload", fixturePath],
+    args: ["upload", fixtureArgument],
     cwd: consumerDir,
     env: environment({
       PATCHPAGE_STATE_DIR: unsafeValidationStateDir,
@@ -365,7 +414,7 @@ try {
   );
   await assertCliFailureNoMutation({
     cliPath,
-    args: ["upload", fixturePath],
+    args: ["upload", fixtureArgument],
     cwd: consumerDir,
     env: { ...cliEnv, PATCHPAGE_API_TOKEN: "invalid-env-credential" },
     cliStateDir,
@@ -375,7 +424,7 @@ try {
     stderr: /Missing or invalid API token\./
   });
 
-  const invalidStoredStateDir = path.join(tempRoot, "cli-state-invalid-stored");
+  const invalidStoredStateDir = path.join(tempRoot, "cli state invalid stored");
   await checkedCall(() => mkdir(invalidStoredStateDir));
   const invalidStoredToken = "invalid-stored-credential";
   await runCli(cliPath, ["auth", "set", "--token-stdin", "--api-url", publicBaseUrl], {
@@ -390,7 +439,7 @@ try {
   ]);
   await assertCliFailureNoMutation({
     cliPath,
-    args: ["upload", fixturePath],
+    args: ["upload", fixtureArgument],
     cwd: consumerDir,
     env: invalidStoredEnv,
     cliStateDir: invalidStoredStateDir,
@@ -401,7 +450,7 @@ try {
   });
 
   console.log("[packed-cli-e2e] exercising automatic and explicit anonymous creation");
-  const anonymousStateDir = path.join(tempRoot, "cli-state-anonymous");
+  const anonymousStateDir = path.join(tempRoot, "cli state anonymous");
   await checkedCall(() => mkdir(anonymousStateDir));
   const anonymousEnv = environment({ PATCHPAGE_STATE_DIR: anonymousStateDir }, [
     "PATCHPAGE_API_TOKEN",
@@ -410,13 +459,13 @@ try {
   const anonymousHtml = validHtml("Anonymous same path", "anonymous-same-path");
   await checkedCall(() => writeFile(fixturePath, anonymousHtml, "utf8"));
   const automaticAnonymousOne = parseUpload(
-    await runCli(cliPath, ["upload", fixturePath, "--api-url", publicBaseUrl], {
+    await runCli(cliPath, ["upload", fixtureArgument, "--api-url", publicBaseUrl], {
       cwd: consumerDir,
       env: anonymousEnv
     })
   );
   const automaticAnonymousTwo = parseUpload(
-    await runCli(cliPath, ["upload", fixturePath, "--api-url", publicBaseUrl], {
+    await runCli(cliPath, ["upload", fixtureArgument, "--api-url", publicBaseUrl], {
       cwd: consumerDir,
       env: anonymousEnv
     })
@@ -435,7 +484,7 @@ try {
   );
   await checkedCall(() => writeFile(fixturePath, explicitAnonymousHtml, "utf8"));
   const explicitAnonymous = parseUpload(
-    await runCli(cliPath, ["upload", fixturePath, "--anonymous"], {
+    await runCli(cliPath, ["upload", fixtureArgument, "--anonymous"], {
       cwd: consumerDir,
       env: { ...cliEnv, PATCHPAGE_API_TOKEN: bootstrapToken }
     })
@@ -465,7 +514,7 @@ try {
   );
   await checkedCall(() => writeFile(fixturePath, envPrecedenceHtml, "utf8"));
   const envPrecedence = parseUpload(
-    await runCli(cliPath, ["upload", fixturePath], {
+    await runCli(cliPath, ["upload", fixtureArgument], {
       cwd: consumerDir,
       env: { ...invalidStoredEnv, PATCHPAGE_API_TOKEN: bootstrapToken }
     })
@@ -497,6 +546,9 @@ try {
   });
   assert.equal((await snapshotTree(objectDir)).length, 7);
 
+  console.log(
+    "[packed-cli-e2e] PASS: spaced consumer/artifact/state paths and quoted POSIX sh commands"
+  );
   console.log("[packed-cli-e2e] PASS: complete packed CLI real-server contract");
 } catch (error) {
   if (!(error instanceof ProbeComplete)) mainFailure = error;
@@ -2321,6 +2373,68 @@ function hasExactLine(output, expectedLine) {
 
 function formatServerDiagnostics(stdout, stderr) {
   return `\nserver stdout:\n${redactSensitive(stdout, [bootstrapToken]) || "<empty>"}\nserver stderr:\n${redactSensitive(stderr, [bootstrapToken]) || "<empty>"}`;
+}
+
+function assertSpacedPath(label, candidatePath) {
+  assert.ok(candidatePath.includes(" "), `${label} must intentionally contain a space`);
+}
+
+function decodePackedCliWorkflow(readme) {
+  const startMarker = "<!-- patchpage-packed-cli-e2e:start -->";
+  const endMarker = "<!-- patchpage-packed-cli-e2e:end -->";
+  assert.equal(
+    readme.split(startMarker).length - 1,
+    1,
+    "packed CLI README must contain one workflow start marker"
+  );
+  assert.equal(
+    readme.split(endMarker).length - 1,
+    1,
+    "packed CLI README must contain one workflow end marker"
+  );
+
+  const start = readme.indexOf(startMarker) + startMarker.length;
+  const end = readme.indexOf(endMarker, start);
+  assert.ok(end > start, "packed CLI README workflow markers must be ordered");
+  const marked = readme.slice(start, end);
+  const fence = marked.match(/^\s*```sh[^\S\r\n]*\r?\n([\s\S]*?)\r?\n```\s*$/);
+  assert.ok(fence, "packed CLI README workflow marker must wrap exactly one sh fence");
+  const workflow = fence[1].replaceAll("\r\n", "\n");
+  const npxCount = [...workflow.matchAll(/\bnpx\b/g)].length;
+  const noninteractiveNpxCount = [...workflow.matchAll(/\bnpx\s+--yes\s+patchpage\b/g)].length;
+  assert.ok(npxCount > 0, "packed CLI README workflow must invoke npx");
+  assert.equal(
+    noninteractiveNpxCount,
+    npxCount,
+    "packed CLI README workflow must use npx --yes patchpage for every invocation"
+  );
+  assert.doesNotMatch(workflow, /\bnpx\s+patchpage\b/, "packed CLI workflow must reject bare npx");
+  return workflow;
+}
+
+async function runPublicPosixSh(commandText, options) {
+  const sensitiveValues = options.sensitiveValues ?? [];
+  const shellArgs = ["-eux", "-c", commandText];
+  const environmentValues = new Set(Object.values(options.env ?? {}));
+  assert.ok(sensitiveValues.length > 0, "public shell credential coverage requires a secret");
+  for (const sensitiveValue of sensitiveValues) {
+    assert.ok(
+      environmentValues.has(sensitiveValue),
+      "public shell credentials must be passed through the child environment"
+    );
+    assert.ok(
+      shellArgs.every((argument) => !argument.includes(sensitiveValue)),
+      "public shell credentials must never appear in sh argv"
+    );
+  }
+
+  const result = await run("sh", shellArgs, { ...options, sensitiveValues });
+  const output = `${result.stdout}${result.stderr}`;
+  assert.ok(
+    sensitiveValues.every((sensitiveValue) => !output.includes(sensitiveValue)),
+    "sensitive value leaked in public shell output"
+  );
+  return result;
 }
 
 async function runCli(cliPath, args, options) {
