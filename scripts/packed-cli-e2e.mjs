@@ -2084,7 +2084,20 @@ async function startServer({ publicBaseUrl, metadataPath, objectDir, serverEntry
       });
     } catch (error) {
       if (!isEaddrInUseServerStartupError(error) || attempt === maxAttempts) throw error;
-      await waitForClose(serverProcess).catch(() => undefined);
+      const failedServerProcess = serverProcess;
+      await waitForClose(failedServerProcess).catch(() => undefined);
+      assert.equal(
+        activeChildren.has(failedServerProcess),
+        false,
+        "failed server attempt remained in the active child registry"
+      );
+      if (Number.isInteger(failedServerProcess.pid)) {
+        assert.equal(
+          trackedProcessGroups.has(failedServerProcess.pid),
+          false,
+          "failed server attempt left a reusable process group tracked"
+        );
+      }
       portReservation = await reserveLoopbackPort();
       nextPublicBaseUrl = `http://127.0.0.1:${portReservation.port}`;
       console.log(
@@ -2155,12 +2168,10 @@ async function startServerAttempt({ publicBaseUrl, metadataPath, objectDir, serv
     stdio: ["ignore", "pipe", "pipe"],
     shell: false
   });
-  const serverLifecycle = observeSpawnedChild(serverProcess);
+  const serverLifecycle = registerSpawnedChild(serverProcess);
   serverLifecycle.errorPromise.catch((error) => {
     serverProcessFailure = error;
   });
-  activeChildren.add(serverProcess);
-  trackProcessGroup(serverProcess);
   const serverRecord = {
     type: "server",
     pid: serverProcess.pid,
@@ -2179,10 +2190,6 @@ async function startServerAttempt({ publicBaseUrl, metadataPath, objectDir, serv
   serverProcess.stderr.on("data", (chunk) => {
     childStderr += chunk;
     serverStderr += chunk;
-  });
-  serverProcess.once("close", () => {
-    activeChildren.delete(serverProcess);
-    releaseTrackedProcessGroupIfEmpty(serverProcess);
   });
   try {
     await waitForServerReadyStdout({
