@@ -75,6 +75,7 @@ jobs:
       - run: pnpm test:public-surfaces
       - run: pnpm test:release-workflow
       - run: pnpm test:release-privacy
+      - run: pnpm test:exact-npm-publisher
       - run: pnpm test:ghcr-oci
       - run: pnpm test:docker-save
       - run: pnpm lint

@@ -23,7 +23,8 @@ const [
   readmeFile,
   serverImageVerifier,
   dockerSaveValidator,
-  ghcrOciReleaseTool
+  ghcrOciReleaseTool,
+  exactNpmPublisherFile
 ] = await Promise.all([
   readFile(workflowPath, "utf8"),
   readFile(path.join(repoRoot, ".github/workflows/reconcile-ghcr.yml"), "utf8"),
@@ -35,13 +36,15 @@ const [
   readFile(path.join(repoRoot, "README.md"), "utf8"),
   readFile(path.join(repoRoot, "scripts/verify-server-image.sh"), "utf8"),
   readFile(path.join(repoRoot, "scripts/validate-docker-save-artifact.mjs")),
-  readFile(path.join(repoRoot, "scripts/ghcr-oci-release.mjs"))
+  readFile(path.join(repoRoot, "scripts/ghcr-oci-release.mjs")),
+  readFile(path.join(repoRoot, "scripts/publish-exact-npm-artifact.mjs"), "utf8")
 ]);
 const workflow = process.env.PATCHPAGE_RELEASE_WORKFLOW_SOURCE ?? workflowFile;
 const reconcileWorkflow = process.env.PATCHPAGE_RECONCILE_WORKFLOW_SOURCE ?? reconcileWorkflowFile;
 const ciWorkflow = process.env.PATCHPAGE_RELEASE_CI_WORKFLOW_SOURCE ?? ciWorkflowFile;
 const dockerSaveValidatorSource = process.env.PATCHPAGE_DOCKER_SAVE_VALIDATOR_SOURCE;
 const ghcrOciReleaseToolSource = process.env.PATCHPAGE_GHCR_OCI_RELEASE_SOURCE;
+const exactNpmPublisher = process.env.PATCHPAGE_EXACT_NPM_PUBLISHER_SOURCE ?? exactNpmPublisherFile;
 const effectiveDockerSaveValidator = dockerSaveValidatorSource
   ? Buffer.from(dockerSaveValidatorSource)
   : dockerSaveValidator;
@@ -419,113 +422,74 @@ const expectedMinimumNodeSmokeRun = [
   "fi",
   ""
 ].join("\n");
+const expectedPublisherPreparationRun = [
+  "set -euo pipefail",
+  "",
+  'publisher="$GITHUB_WORKSPACE/scripts/publish-exact-npm-artifact.mjs"',
+  'if [[ ! -f "$publisher" || -L "$publisher" ]]; then',
+  '  echo "::error::The exact npm publisher source is unavailable"',
+  "  exit 1",
+  "fi",
+  "",
+  'echo "path=$publisher" >> "$GITHUB_OUTPUT"',
+  'echo "sha256=$(sha256sum "$publisher" | awk \'{print $1}\')" >> "$GITHUB_OUTPUT"',
+  ""
+].join("\n");
 const expectedPublicationRun = [
   "set -euo pipefail",
   "",
   "shopt -s nullglob",
   'tarballs=("$RUNNER_TEMP/patchpage-package"/*.tgz)',
   'if [[ "${#tarballs[@]}" -ne 1 ]]; then',
-  '  echo "::error::Expected exactly one downloaded PatchPage tarball, found ${#tarballs[@]}"',
+  '  echo "::error::The exact npm tarball artifact is unavailable"',
   "  exit 1",
   "fi",
   "",
   'tarball="${tarballs[0]}"',
   'if [[ "$(basename "$tarball")" != "$EXPECTED_FILENAME" ]]; then',
-  '  echo "::error::Downloaded tarball name does not match the verified artifact"',
+  '  echo "::error::The npm tarball artifact name is invalid"',
   "  exit 1",
   "fi",
   "",
   'actual_sha256="$(sha256sum "$tarball" | awk \'{print $1}\')"',
   'if [[ "$actual_sha256" != "$EXPECTED_SHA256" ]]; then',
-  '  echo "::error::Downloaded tarball digest does not match the verified artifact"',
+  '  echo "::error::The npm tarball artifact digest is invalid"',
   "  exit 1",
   "fi",
   "",
-  "IFS=$'\\t' read -r package_name package_version < <(",
-  '  tar -xOf "$tarball" package/package.json \\',
-  '    | node -e \'const fs = require("node:fs"); const pkg = JSON.parse(fs.readFileSync(0, "utf8")); console.log(`${pkg.name}\\t${pkg.version}`)\'',
-  ")",
-  'if [[ "$package_name" != "patchpage" ]]; then',
-  '  echo "::error::Downloaded package is named $package_name, expected patchpage"',
-  "  exit 1",
-  "fi",
-  'if [[ "$package_version" != "$EXPECTED_VERSION" ]]; then',
-  '  echo "::error::Downloaded package version $package_version does not match $EXPECTED_VERSION"',
+  'publisher_scripts=("$RUNNER_TEMP/npm-publisher"/*.mjs)',
+  'if [[ "${#publisher_scripts[@]}" -ne 1 ]]; then',
+  '  echo "::error::The exact npm publisher artifact is unavailable"',
   "  exit 1",
   "fi",
   "",
-  'npm_cli="$RUNNER_TEMP/npm-cli/bin/npm-cli.js"',
-  'actual_npm_version="$(node "$npm_cli" --version)"',
+  'publisher="${publisher_scripts[0]}"',
+  'if [[ "$(basename "$publisher")" != "publish-exact-npm-artifact.mjs" ]]; then',
+  '  echo "::error::The exact npm publisher artifact name is invalid"',
+  "  exit 1",
+  "fi",
+  "",
+  'actual_publisher_sha256="$(sha256sum "$publisher" | awk \'{print $1}\')"',
+  'if [[ "$actual_publisher_sha256" != "$EXPECTED_PUBLISHER_SHA256" ]]; then',
+  '  echo "::error::The exact npm publisher artifact digest is invalid"',
+  "  exit 1",
+  "fi",
+  "",
+  'npm_cli_dir="$RUNNER_TEMP/npm-cli"',
+  'actual_npm_version="$(node "$npm_cli_dir/bin/npm-cli.js" --version)"',
   'if [[ "$actual_npm_version" != "$EXPECTED_NPM_VERSION" ]]; then',
-  '  echo "::error::Downloaded npm CLI reported $actual_npm_version, expected $EXPECTED_NPM_VERSION"',
+  '  echo "::error::The pinned npm CLI artifact version is invalid"',
   "  exit 1",
   "fi",
   "",
-  'registry_metadata="$RUNNER_TEMP/npm-registry-metadata.json"',
-  'curl_error="$RUNNER_TEMP/npm-registry-curl.err"',
-  'registry_url="https://registry.npmjs.org/${package_name}/${EXPECTED_VERSION}"',
-  'if ! http_status="$(',
-  "  curl --silent --show-error \\",
-  "    --proto '=https' \\",
-  "    --tlsv1.2 \\",
-  '    --output "$registry_metadata" \\',
-  "    --write-out '%{http_code}' \\",
-  '    "$registry_url" \\',
-  '    2>"$curl_error"',
-  ')"; then',
-  '  echo "::error::Failed to query npm registry for patchpage@${EXPECTED_VERSION}"',
-  '  cat "$curl_error" >&2',
-  "  exit 1",
-  "fi",
-  "",
-  'case "$http_status" in',
-  "  200)",
-  '    registry_integrity="$(',
-  "      node - \"$registry_metadata\" <<'NODE'",
-  'const { readFileSync } = require("node:fs");',
-  "",
-  'const metadata = JSON.parse(readFileSync(process.argv[2], "utf8"));',
-  "const integrity = metadata.dist?.integrity;",
-  'if (typeof integrity === "string" && integrity.length > 0) {',
-  "  process.stdout.write(integrity);",
-  "}",
-  "NODE",
-  '    )"',
-  '    if [[ -z "$registry_integrity" ]]; then',
-  '      echo "::error::npm registry metadata is missing dist.integrity"',
-  "      exit 1",
-  "    fi",
-  "",
-  '    local_integrity="$(',
-  "      node - \"$tarball\" <<'NODE'",
-  'const { createHash } = require("node:crypto");',
-  'const { readFileSync } = require("node:fs");',
-  "",
-  'const digest = createHash("sha512")',
-  "  .update(readFileSync(process.argv[2]))",
-  '  .digest("base64");',
-  "process.stdout.write(`sha512-${digest}`);",
-  "NODE",
-  '    )"',
-  '    if [[ "$registry_integrity" != "$local_integrity" ]]; then',
-  '      echo "::error::patchpage@${EXPECTED_VERSION} exists with different integrity"',
-  "      exit 1",
-  "    fi",
-  "",
-  '    echo "patchpage@${EXPECTED_VERSION} already published with matching integrity, skipping"',
-  "    exit 0",
-  "    ;;",
-  "  404)",
-  '    echo "patchpage@${EXPECTED_VERSION} is absent from npm; publishing"',
-  "    ;;",
-  "  *)",
-  '    echo "::error::Unexpected npm registry HTTP status: $http_status"',
-  "    exit 1",
-  "    ;;",
-  "esac",
-  "",
-  'node "$npm_cli" publish "$tarball" --ignore-scripts --provenance \\',
-  "  --registry=https://registry.npmjs.org",
+  'node "$publisher" \\',
+  '  --tarball "$tarball" \\',
+  '  --expected-filename "$EXPECTED_FILENAME" \\',
+  '  --expected-sha256 "$EXPECTED_SHA256" \\',
+  "  --expected-name patchpage \\",
+  '  --expected-version "$EXPECTED_VERSION" \\',
+  '  --expected-npm-version "$EXPECTED_NPM_VERSION" \\',
+  '  --npm-cli-dir "$npm_cli_dir"',
   ""
 ].join("\n");
 
@@ -880,8 +844,8 @@ const expectedActionCounts = new Map([
   ["actions/checkout", 4],
   ["actions/setup-node", 5],
   ["pnpm/action-setup", 1],
-  ["actions/upload-artifact", 3],
-  ["actions/download-artifact", 4],
+  ["actions/upload-artifact", 4],
+  ["actions/download-artifact", 5],
   ["docker/login-action", 0]
 ]);
 for (const [actionName, expectedCount] of expectedActionCounts) {
@@ -1022,14 +986,14 @@ const reviewedReleaseJobContracts = new Map([
   [
     "verify",
     {
-      digest: "81cd016a69f4cc14c339f5bdbae57ed212219d92b31e93de0ce796eefbe10ea4",
+      digest: "433b56b691f3e5012b774f22f32239bba7676789b533e8564001e19018cfba49",
       permissions: { contents: "read" }
     }
   ],
   [
     "publish-npm",
     {
-      digest: "d9407283578d65ac0b6415ab8730d37bdde1c654d615698e7a2b644a5d545443",
+      digest: "755fbbb2513b203689a265b4864deab012849f73efdcf469d12442409e3b62b5",
       permissions: { "id-token": "write" }
     }
   ],
@@ -1282,6 +1246,21 @@ const packageUploadIdStep = uniqueStep(
   (step) => step.id === "package-artifact",
   "the package-artifact producer step"
 );
+const publisherPreparationStep = uniqueStep(
+  verifySteps,
+  (step) => step.name === "Prepare the exact npm publisher",
+  "the Prepare the exact npm publisher step"
+);
+const publisherUploadStep = uniqueStep(
+  verifySteps,
+  (step) => step.name === "Upload the exact npm publisher",
+  "the Upload the exact npm publisher step"
+);
+const publisherUploadIdStep = uniqueStep(
+  verifySteps,
+  (step) => step.id === "publisher-artifact",
+  "the publisher-artifact producer step"
+);
 const packageDownloadStep = uniqueStep(
   publishSteps,
   (step) => step.name === "Download the exact tested tarball",
@@ -1292,6 +1271,11 @@ const npmCliDownloadStep = uniqueStep(
   (step) => step.name === "Download the pinned publishing CLI",
   "the Download the pinned publishing CLI step"
 );
+const publisherDownloadStep = uniqueStep(
+  publishSteps,
+  (step) => step.name === "Download the exact npm publisher",
+  "the Download the exact npm publisher step"
+);
 const publicationStep = uniqueStep(
   publishSteps,
   (step) => step.name === "Publish the verified tarball to npm",
@@ -1300,8 +1284,8 @@ const publicationStep = uniqueStep(
 const publicationRun = typeof publicationStep?.run === "string" ? publicationStep.run : "";
 const prepareSetupNodeStep = prepareNpmSteps[0] ?? null;
 const verifyCheckoutStep = verifySteps[0] ?? null;
-const verifyPnpmSetupStep = verifySteps[1] ?? null;
-const verifySetupNodeStep = verifySteps[2] ?? null;
+const verifyPnpmSetupStep = verifySteps[3] ?? null;
+const verifySetupNodeStep = verifySteps[4] ?? null;
 const publishSetupNodeStep = publishSteps[0] ?? null;
 
 if (
@@ -1401,10 +1385,12 @@ if (
     !hasExactArray(parsedVerifyJob.needs, ["guard", "prepare-npm"]) ||
     parsedVerifyJob["runs-on"] !== "ubuntu-latest" ||
     !hasExactMapping(parsedVerifyJob.permissions, { contents: "read" }) ||
-    verifySteps.length !== 14 ||
+    verifySteps.length !== 16 ||
     verifySteps[0] !== verifyCheckoutStep ||
-    verifySteps[1] !== verifyPnpmSetupStep ||
-    verifySteps[2] !== verifySetupNodeStep ||
+    verifySteps[1] !== publisherPreparationStep ||
+    verifySteps[2] !== publisherUploadStep ||
+    verifySteps[3] !== verifyPnpmSetupStep ||
+    verifySteps[4] !== verifySetupNodeStep ||
     !hasExactKeys(verifyCheckoutStep, ["uses"]) ||
     verifyCheckoutStep.uses !== `actions/checkout@${reviewedActions.get("actions/checkout").sha}` ||
     !hasExactKeys(verifyPnpmSetupStep, ["uses", "with"]) ||
@@ -1418,23 +1404,23 @@ if (
       "node-version": reviewedNodeVersion,
       cache: "pnpm"
     }) ||
-    !isExactRunStep(verifySteps[3], "pnpm install --frozen-lockfile") ||
-    !isExactRunStep(verifySteps[4], "pnpm lint") ||
-    !isExactRunStep(verifySteps[5], "pnpm typecheck") ||
-    !isExactRunStep(verifySteps[6], "pnpm test") ||
-    !isExactRunStep(verifySteps[7], "pnpm --filter patchpage build") ||
-    verifySteps[8] !== verifyNpmCliDownloadStep ||
+    !isExactRunStep(verifySteps[5], "pnpm install --frozen-lockfile") ||
+    !isExactRunStep(verifySteps[6], "pnpm lint") ||
+    !isExactRunStep(verifySteps[7], "pnpm typecheck") ||
+    !isExactRunStep(verifySteps[8], "pnpm test") ||
+    !isExactRunStep(verifySteps[9], "pnpm --filter patchpage build") ||
+    verifySteps[10] !== verifyNpmCliDownloadStep ||
     !hasExactKeys(verifyNpmCliDownloadStep, ["name", "uses", "with"]) ||
     verifyNpmCliDownloadStep.uses !== reviewedDownloadArtifact ||
     !hasExactMapping(verifyNpmCliDownloadStep.with, {
       "artifact-ids": "${{ needs.prepare-npm.outputs.npm-cli-artifact-id }}",
       path: "${{ runner.temp }}/npm-cli"
     }) ||
-    verifySteps[9] !== verifyNpmCliStep ||
-    verifySteps[10] !== packageMetadataStep ||
-    verifySteps[11] !== minimumNodeSetupStep ||
-    verifySteps[12] !== smokeInstallStep ||
-    verifySteps[13] !== packageUploadStep)
+    verifySteps[11] !== verifyNpmCliStep ||
+    verifySteps[12] !== packageMetadataStep ||
+    verifySteps[13] !== minimumNodeSetupStep ||
+    verifySteps[14] !== smokeInstallStep ||
+    verifySteps[15] !== packageUploadStep)
 ) {
   failures.push(
     "verify must contain exactly the reviewed job map and ordered build and smoke steps"
@@ -1446,7 +1432,9 @@ if (
   (!hasExactMapping(parsedVerifyJob?.outputs, {
     "tarball-filename": "${{ steps.package.outputs.filename }}",
     "tarball-sha256": "${{ steps.package.outputs.sha256 }}",
-    "package-artifact-id": "${{ steps.package-artifact.outputs.artifact-id }}"
+    "package-artifact-id": "${{ steps.package-artifact.outputs.artifact-id }}",
+    "publisher-sha256": "${{ steps.publisher.outputs.sha256 }}",
+    "publisher-artifact-id": "${{ steps.publisher-artifact.outputs.artifact-id }}"
   }) ||
     packageMetadataStep === null ||
     packageMetadataStep !== packageMetadataNameStep ||
@@ -1473,6 +1461,30 @@ if (
     }))
 ) {
   failures.push("verify must upload exactly the active single raw tarball input");
+}
+
+if (
+  parsedWorkflow !== null &&
+  (publisherPreparationStep === null ||
+    !hasExactKeys(publisherPreparationStep, ["name", "id", "shell", "run"]) ||
+    publisherPreparationStep.id !== "publisher" ||
+    publisherPreparationStep.shell !== "bash" ||
+    publisherPreparationStep.run !== expectedPublisherPreparationRun ||
+    publisherUploadStep === null ||
+    publisherUploadStep !== publisherUploadIdStep ||
+    !hasExactKeys(publisherUploadStep, ["name", "id", "uses", "with"]) ||
+    publisherUploadStep.uses !== reviewedUploadArtifact ||
+    !hasExactMapping(publisherUploadStep.with, {
+      path: "${{ steps.publisher.outputs.path }}",
+      "if-no-files-found": "error",
+      "retention-days": 1,
+      archive: false
+    }) ||
+    verifySteps.indexOf(verifyCheckoutStep) >= verifySteps.indexOf(publisherPreparationStep) ||
+    verifySteps.indexOf(publisherPreparationStep) >= verifySteps.indexOf(publisherUploadStep) ||
+    verifySteps.indexOf(publisherUploadStep) >= verifySteps.indexOf(verifyPnpmSetupStep))
+) {
+  failures.push("verify must hash and upload the exact raw npm publisher as a separate artifact");
 }
 
 if (
@@ -1526,6 +1538,10 @@ if (
 }
 
 const expectedVerifyWorkflowCommandReferences = [
+  ...expectedPublisherPreparationRun
+    .split("\n")
+    .filter((line) => line.includes("GITHUB_ENV") || line.includes("GITHUB_OUTPUT"))
+    .map((line) => ({ line, step: publisherPreparationStep })),
   {
     line: 'echo "NPM_CLI=$NPM_CLI" >> "$GITHUB_ENV"',
     step: verifyNpmCliStep
@@ -1564,11 +1580,12 @@ if (
     !hasExactArray(parsedPublishJob.needs, ["guard", "prepare-npm", "verify"]) ||
     parsedPublishJob["runs-on"] !== "ubuntu-latest" ||
     !hasExactMapping(parsedPublishJob.permissions, { "id-token": "write" }) ||
-    publishSteps.length !== 4 ||
+    publishSteps.length !== 5 ||
     publishSteps[0] !== publishSetupNodeStep ||
     publishSteps[1] !== packageDownloadStep ||
     publishSteps[2] !== npmCliDownloadStep ||
-    publishSteps[3] !== publicationStep ||
+    publishSteps[3] !== publisherDownloadStep ||
+    publishSteps[4] !== publicationStep ||
     !hasExactKeys(publishSetupNodeStep, ["uses", "with"]) ||
     publishSetupNodeStep.uses !==
       `actions/setup-node@${reviewedActions.get("actions/setup-node").sha}` ||
@@ -1584,8 +1601,8 @@ if (
 const publishDownloadSteps = publishSteps.filter(
   (step) => typeof step.uses === "string" && step.uses.startsWith("actions/download-artifact@")
 );
-if (parsedWorkflow !== null && publishDownloadSteps.length !== 2) {
-  failures.push("publish-npm must contain exactly two download-artifact steps");
+if (parsedWorkflow !== null && publishDownloadSteps.length !== 3) {
+  failures.push("publish-npm must contain exactly three download-artifact steps");
 }
 
 if (
@@ -1615,6 +1632,20 @@ if (
   failures.push("publish-npm must normally decompress the exact isolated npm CLI artifact");
 }
 
+if (
+  parsedWorkflow !== null &&
+  (publisherDownloadStep === null ||
+    !hasExactKeys(publisherDownloadStep, ["name", "uses", "with"]) ||
+    publisherDownloadStep.uses !== reviewedDownloadArtifact ||
+    !hasExactMapping(publisherDownloadStep.with, {
+      "artifact-ids": "${{ needs.verify.outputs.publisher-artifact-id }}",
+      path: "${{ runner.temp }}/npm-publisher",
+      "skip-decompress": true
+    }))
+) {
+  failures.push("publish-npm must download the exact raw npm publisher artifact by ID");
+}
+
 const publicationStepIndex = publishSteps.indexOf(publicationStep);
 if (
   parsedWorkflow !== null &&
@@ -1623,10 +1654,11 @@ if (
     publicationStep.shell !== "bash" ||
     publicationRun !== expectedPublicationRun ||
     publishSteps.indexOf(packageDownloadStep) >= publicationStepIndex ||
-    publishSteps.indexOf(npmCliDownloadStep) >= publicationStepIndex)
+    publishSteps.indexOf(npmCliDownloadStep) >= publicationStepIndex ||
+    publishSteps.indexOf(publisherDownloadStep) >= publicationStepIndex)
 ) {
   failures.push(
-    "the publication step must contain exactly name, shell, env, and the reviewed run after both isolated downloads"
+    "the publication step must contain the reviewed exact-publisher run after all isolated downloads"
   );
 }
 
@@ -1635,6 +1667,7 @@ if (
   !hasExactMapping(publicationStep?.env, {
     EXPECTED_FILENAME: "${{ needs.verify.outputs.tarball-filename }}",
     EXPECTED_NPM_VERSION: "${{ needs.prepare-npm.outputs.npm-version }}",
+    EXPECTED_PUBLISHER_SHA256: "${{ needs.verify.outputs.publisher-sha256 }}",
     EXPECTED_SHA256: "${{ needs.verify.outputs.tarball-sha256 }}",
     EXPECTED_VERSION: "${{ needs.guard.outputs.version }}"
   })
@@ -1798,6 +1831,15 @@ if (!verifyJob.includes("package-artifact-id: ${{ steps.package-artifact.outputs
 if (!publishJob.includes("artifact-ids: ${{ needs.verify.outputs.package-artifact-id }}")) {
   failures.push("publish-npm must download the exact package artifact ID from verify");
 }
+if (
+  !verifyJob.includes(
+    "publisher-artifact-id: ${{ steps.publisher-artifact.outputs.artifact-id }}"
+  ) ||
+  !verifyJob.includes("publisher-sha256: ${{ steps.publisher.outputs.sha256 }}") ||
+  !publishJob.includes("artifact-ids: ${{ needs.verify.outputs.publisher-artifact-id }}")
+) {
+  failures.push("the exact npm publisher must cross jobs as a digest-bound raw artifact by ID");
+}
 
 const originalTarballDiscovery = verifyJob.indexOf("mapfile -t tarballs");
 const originalTarballCountGuard = verifyJob.indexOf('if [[ "${#tarballs[@]}" -ne 1 ]]; then');
@@ -1833,7 +1875,10 @@ const rawBasenameGuard = publishJob.indexOf(
 );
 const rawDigestCalculation = publishJob.indexOf('actual_sha256="$(sha256sum "$tarball"');
 const rawDigestGuard = publishJob.indexOf('if [[ "$actual_sha256" != "$EXPECTED_SHA256" ]]; then');
-const packageMetadataRead = publishJob.indexOf('tar -xOf "$tarball" package/package.json');
+const publisherDigestGuard = publishJob.indexOf(
+  'if [[ "$actual_publisher_sha256" != "$EXPECTED_PUBLISHER_SHA256" ]]; then'
+);
+const publisherInvocation = publishJob.indexOf('node "$publisher" \\');
 const publishTarCommands = publishJob.match(/^\s+tar\s+/gm) ?? [];
 const publishUnzipCommands = publishJob.match(/^\s+unzip(?:\s|$)/gm) ?? [];
 const releasePrivacyGateMessage =
@@ -1946,13 +1991,13 @@ if (
   rawDigestCalculation <= rawBasenameGuard ||
   !publishJob.slice(rawBasenameGuard, rawDigestCalculation).includes("exit 1") ||
   rawDigestGuard <= rawDigestCalculation ||
-  packageMetadataRead <= rawDigestGuard ||
-  !publishJob.slice(rawDigestGuard, packageMetadataRead).includes("exit 1") ||
-  publishTarCommands.length !== 1 ||
+  publisherDigestGuard <= rawDigestGuard ||
+  publisherInvocation <= publisherDigestGuard ||
+  publishTarCommands.length !== 0 ||
   publishUnzipCommands.length !== 0
 ) {
   failures.push(
-    "the package artifact must cross into publish-npm as one run-isolated raw tarball and pass basename and digest checks before metadata is read"
+    "the exact raw tarball and publisher must pass basename and digest checks before the publisher invocation"
   );
 }
 
@@ -2054,11 +2099,15 @@ if (/^\s+(?:npm|pnpm|npx)\s+/m.test(publishJob)) {
   failures.push("publish-npm must not invoke a package manager outside the staged npm CLI");
 }
 
-const allowedNpmCommands = new Set(["--version", "publish"]);
-for (const match of publishJob.matchAll(/node\s+"\$npm_cli"\s+([A-Za-z-]+)/g)) {
-  if (!allowedNpmCommands.has(match[1])) {
-    failures.push(`publish-npm must not run npm ${match[1]}`);
-  }
+if (/node\s+["']?[^\n]*npm-cli\.js["']?\s+publish\b|\bnpm\s+publish\b/.test(publishJob)) {
+  failures.push("publish-npm must not directly publish a tarball or directory with npm");
+}
+if (
+  /^\s+(?:npm|pnpm)\s+(?:pack|publish)\b|(?:^|\s)cd\s+(?:packages\/cli|\$GITHUB_WORKSPACE)/m.test(
+    publishJob
+  )
+) {
+  failures.push("publish-npm must not repack or use a relative-path publishing workaround");
 }
 
 if (publishJob.includes('node "$npm_cli" view')) {
@@ -2077,13 +2126,14 @@ if (!/node "\$NPM_CLI" install --ignore-scripts "\$TARBALL"/.test(verifyJob)) {
   failures.push("verify must smoke-install the same tarball with the pinned npm CLI");
 }
 
-const npmPublishCommands = publishJob.match(/^[ \t]+node "\$npm_cli" publish\b/gm) ?? [];
-const exactProductionPublish =
-  /^[ \t]+node "\$npm_cli" publish "\$tarball" --ignore-scripts --provenance(?:[ \t]+--registry=https:\/\/registry\.npmjs\.org|[ \t]+\\\n[ \t]+--registry=https:\/\/registry\.npmjs\.org)[ \t]*$/m;
-if (npmPublishCommands.length !== 1 || !exactProductionPublish.test(publishJob)) {
-  failures.push(
-    "publish-npm must use the exact reviewed npm publish command and production registry"
-  );
+const exactPublisherInvocations = publishJob.match(/^[ \t]+node "\$publisher" \\$/gm) ?? [];
+if (
+  exactPublisherInvocations.length !== 1 ||
+  !publishJob.includes('  --tarball "$tarball" \\') ||
+  !publishJob.includes('  --expected-sha256 "$EXPECTED_SHA256" \\') ||
+  !publishJob.includes('  --npm-cli-dir "$npm_cli_dir"')
+) {
+  failures.push("publish-npm must invoke the reviewed exact-artifact publisher once");
 }
 
 if (serverImageJob) {
@@ -2953,6 +3003,42 @@ if (ciDockerJob) {
   }
 }
 
+const requiredExactPublisherMarkers = [
+  'createRequire(path.join(npmCliDir, "package.json"))',
+  'requireFromNpm("./node_modules/pacote")',
+  'requireFromNpm("./lib/utils/oidc.js")',
+  'requireFromNpm("./node_modules/libnpmpublish")',
+  'key.startsWith("_")',
+  "AbortSignal.timeout(REGISTRY_REQUEST_TIMEOUT_MS)",
+  "await enforceLatestTagHighWaterMark(",
+  'defaultTag: "latest"',
+  'sha(tarball, "sha256", "hex") !== options["expected-sha256"]',
+  'manifest.name !== options["expected-name"]',
+  'manifest.version !== options["expected-version"]',
+  "containsForbiddenMetadata(manifest)",
+  "await verifiedRegistryState(runtime.fetch ?? globalThis.fetch, expected)",
+  "for (let attempt = 0; attempt < POSTPUBLISH_MAX_ATTEMPTS; attempt += 1)",
+  "validateRegistryManifest(result.metadata, expected)",
+  "if (!hasProvenance(metadata)) fail",
+  "await modules.publish(manifest, tarball, opts)",
+  'typeof opts[key] !== "string"'
+];
+for (const marker of requiredExactPublisherMarkers) {
+  if (!exactNpmPublisher.includes(marker)) {
+    failures.push(
+      "the exact npm publisher must retain artifact, OIDC, metadata, and provenance validation"
+    );
+    break;
+  }
+}
+if (
+  /(?:console\.(?:log|error|warn)|process\.(?:stdout|stderr)\.write)[^\n]*(?:tarballPath|metadata|token|secretValue)/.test(
+    exactNpmPublisher
+  )
+) {
+  failures.push("the exact npm publisher diagnostics must remain category-only");
+}
+
 if (packageJson.scripts?.["test:server-image"] !== "bash scripts/verify-server-image.sh") {
   failures.push("package.json must expose the focused server image contract verifier");
 }
@@ -2971,6 +3057,12 @@ if (
 ) {
   failures.push("package.json must expose the focused release privacy fixture suite");
 }
+if (
+  packageJson.scripts?.["test:exact-npm-publisher"] !==
+  "node --test scripts/publish-exact-npm-artifact.test.mjs"
+) {
+  failures.push("package.json must expose the focused exact npm publisher suite");
+}
 const ciReleaseWorkflowTest = ciLintSteps.findIndex((step) =>
   isExactRunStep(step, "pnpm test:release-workflow")
 );
@@ -2982,6 +3074,15 @@ const ciReleasePrivacyExact = ciReleasePrivacyRuns.filter((step) =>
 );
 const ciReleasePrivacyTest = ciLintSteps.findIndex((step) =>
   isExactRunStep(step, "pnpm test:release-privacy")
+);
+const ciExactPublisherRuns = ciLintSteps.filter(
+  (step) => typeof step.run === "string" && step.run.includes("pnpm test:exact-npm-publisher")
+);
+const ciExactPublisherExact = ciExactPublisherRuns.filter((step) =>
+  isExactRunStep(step, "pnpm test:exact-npm-publisher")
+);
+const ciExactPublisherTest = ciLintSteps.findIndex((step) =>
+  isExactRunStep(step, "pnpm test:exact-npm-publisher")
 );
 const ciGhcrOciTest = ciLintSteps.findIndex((step) => isExactRunStep(step, "pnpm test:ghcr-oci"));
 const ciDockerSaveTest = ciLintSteps.findIndex((step) =>
@@ -3000,7 +3101,10 @@ if (
   ciReleasePrivacyRuns.length !== 1 ||
   ciReleasePrivacyExact.length !== 1 ||
   ciReleasePrivacyTest <= ciReleaseWorkflowTest ||
-  ciGhcrOciTest <= ciReleasePrivacyTest ||
+  ciExactPublisherRuns.length !== 1 ||
+  ciExactPublisherExact.length !== 1 ||
+  ciExactPublisherTest <= ciReleasePrivacyTest ||
+  ciGhcrOciTest <= ciExactPublisherTest ||
   ciDockerSaveTest <= ciGhcrOciTest
 ) {
   failures.push(
@@ -3165,26 +3269,21 @@ function replaceOnce(source, search, replacement) {
 
 async function runMutationChecks() {
   const mutationFailures = [];
-  const packageNameGuard = [
-    '          if [[ "$package_name" != "patchpage" ]]; then',
-    '            echo "::error::Downloaded package is named $package_name, expected patchpage"',
-    "            exit 1",
-    "          fi"
-  ].join("\n");
+  const packageNameGuard = "            --expected-name patchpage \\";
   const basenameGuard = [
     '          if [[ "$(basename "$tarball")" != "$EXPECTED_FILENAME" ]]; then',
-    '            echo "::error::Downloaded tarball name does not match the verified artifact"',
+    '            echo "::error::The npm tarball artifact name is invalid"',
     "            exit 1",
     "          fi"
   ].join("\n");
   const shaGuard = [
     '          if [[ "$actual_sha256" != "$EXPECTED_SHA256" ]]; then',
-    '            echo "::error::Downloaded tarball digest does not match the verified artifact"',
+    '            echo "::error::The npm tarball artifact digest is invalid"',
     "            exit 1",
     "          fi"
   ].join("\n");
   const publicationContractFailure =
-    /publication step must contain exactly name, shell, env, and the reviewed run/;
+    /publication step must contain the reviewed exact-publisher run/;
   let checks;
   try {
     checks = [
@@ -4390,7 +4489,7 @@ async function runMutationChecks() {
           PATCHPAGE_RELEASE_WORKFLOW_SOURCE: replaceOnce(
             workflow,
             packageNameGuard,
-            `          package_name="patchpage"\n${packageNameGuard}`
+            `          expected_name="patchpage"\n${packageNameGuard}`
           )
         },
         expected: publicationContractFailure
@@ -4400,8 +4499,8 @@ async function runMutationChecks() {
         env: {
           PATCHPAGE_RELEASE_WORKFLOW_SOURCE: replaceOnce(
             workflow,
-            '          if [[ "$package_version" != "$EXPECTED_VERSION" ]]; then',
-            '          package_version="$EXPECTED_VERSION"\n          if [[ "$package_version" != "$EXPECTED_VERSION" ]]; then'
+            '            --expected-version "$EXPECTED_VERSION" \\',
+            '            --expected-version "$EXPECTED_VERSION" || true \\'
           )
         },
         expected: publicationContractFailure
@@ -4433,8 +4532,8 @@ async function runMutationChecks() {
         env: {
           PATCHPAGE_RELEASE_WORKFLOW_SOURCE: replaceOnce(
             workflow,
-            '          if [[ "$package_version" != "$EXPECTED_VERSION" ]]; then',
-            '          EXPECTED_VERSION="$package_version"\n          if [[ "$package_version" != "$EXPECTED_VERSION" ]]; then'
+            '            --expected-version "$EXPECTED_VERSION" \\',
+            '            --expected-version "$EXPECTED_VERSION" || false \\'
           )
         },
         expected: publicationContractFailure
@@ -5263,6 +5362,177 @@ async function runMutationChecks() {
           )
         },
         expected: /explicit tags are forbidden/
+      },
+      {
+        name: "reject direct npm tarball publishing",
+        env: {
+          PATCHPAGE_RELEASE_WORKFLOW_SOURCE: replaceOnce(
+            workflow,
+            '          node "$publisher" \\',
+            '          node "$npm_cli_dir/bin/npm-cli.js" publish "$tarball" \\'
+          )
+        },
+        expected: /must not directly publish a tarball or directory with npm/
+      },
+      {
+        name: "reject relative tarball publishing workaround",
+        env: {
+          PATCHPAGE_RELEASE_WORKFLOW_SOURCE: replaceOnce(
+            workflow,
+            '            --tarball "$tarball" \\',
+            '            --tarball "./patchpage.tgz" \\'
+          )
+        },
+        expected: publicationContractFailure
+      },
+      {
+        name: "reject directory repacking in npm publisher",
+        env: {
+          PATCHPAGE_RELEASE_WORKFLOW_SOURCE: replaceOnce(
+            workflow,
+            '          node "$publisher" \\',
+            '          cd "$RUNNER_TEMP/repack" && npm publish . \\'
+          )
+        },
+        expected:
+          /must not (?:directly publish a tarball or directory with npm|repack or use a relative-path publishing workaround)/
+      },
+      {
+        name: "reject repository checkout in npm publisher",
+        env: {
+          PATCHPAGE_RELEASE_WORKFLOW_SOURCE: replaceOnce(
+            workflow,
+            "      - name: Download the exact tested tarball",
+            "      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1\n      - name: Download the exact tested tarball"
+          )
+        },
+        expected:
+          /publish-npm must contain exactly the reviewed privileged job map and ordered publication steps/
+      },
+      {
+        name: "reject exact publisher artifact omission",
+        env: {
+          PATCHPAGE_RELEASE_WORKFLOW_SOURCE: replaceOnce(
+            workflow,
+            [
+              "      - name: Download the exact npm publisher",
+              "        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1",
+              "        with:",
+              "          artifact-ids: ${{ needs.verify.outputs.publisher-artifact-id }}",
+              "          path: ${{ runner.temp }}/npm-publisher",
+              "          skip-decompress: true",
+              ""
+            ].join("\n"),
+            ""
+          )
+        },
+        expected:
+          /exact npm publisher step must exist exactly once|must contain exactly the reviewed privileged job map/
+      },
+      {
+        name: "reject exact publisher artifact substitution",
+        env: {
+          PATCHPAGE_RELEASE_WORKFLOW_SOURCE: replaceOnce(
+            workflow,
+            "          artifact-ids: ${{ needs.verify.outputs.publisher-artifact-id }}",
+            "          artifact-ids: ${{ needs.verify.outputs.package-artifact-id }}"
+          )
+        },
+        expected: /must download the exact raw npm publisher artifact by ID/
+      },
+      {
+        name: "reject exact publisher digest bypass",
+        env: {
+          PATCHPAGE_RELEASE_WORKFLOW_SOURCE: replaceOnce(
+            workflow,
+            '          if [[ "$actual_publisher_sha256" != "$EXPECTED_PUBLISHER_SHA256" ]]; then',
+            '          EXPECTED_PUBLISHER_SHA256="$actual_publisher_sha256"\n          if [[ "$actual_publisher_sha256" != "$EXPECTED_PUBLISHER_SHA256" ]]; then'
+          )
+        },
+        expected: publicationContractFailure
+      },
+      {
+        name: "reject sensitive exact publisher diagnostics",
+        env: {
+          PATCHPAGE_EXACT_NPM_PUBLISHER_SOURCE: replaceOnce(
+            exactNpmPublisher,
+            "async function main() {",
+            'async function main() {\n  console.error("metadata");'
+          )
+        },
+        expected: /exact npm publisher diagnostics must remain category-only/
+      },
+      {
+        name: "reject missing final registry metadata validation",
+        env: {
+          PATCHPAGE_EXACT_NPM_PUBLISHER_SOURCE: replaceOnce(
+            exactNpmPublisher,
+            "  if (result.status === 200) validateRegistryManifest(result.metadata, expected);",
+            "  if (result.status === 200) void result.metadata;"
+          )
+        },
+        expected:
+          /exact npm publisher must retain artifact, OIDC, metadata, and provenance validation/
+      },
+      {
+        name: "reject missing registry provenance validation",
+        env: {
+          PATCHPAGE_EXACT_NPM_PUBLISHER_SOURCE: replaceOnce(
+            exactNpmPublisher,
+            '  if (!hasProvenance(metadata)) fail("registry-provenance");',
+            "  void metadata.dist;"
+          )
+        },
+        expected:
+          /exact npm publisher must retain artifact, OIDC, metadata, and provenance validation/
+      },
+      {
+        name: "reject missing registry request timeout",
+        env: {
+          PATCHPAGE_EXACT_NPM_PUBLISHER_SOURCE: replaceOnce(
+            exactNpmPublisher,
+            "signal: AbortSignal.timeout(REGISTRY_REQUEST_TIMEOUT_MS)",
+            "signal: undefined"
+          )
+        },
+        expected:
+          /exact npm publisher must retain artifact, OIDC, metadata, and provenance validation/
+      },
+      {
+        name: "reject missing latest tag high-water guard",
+        env: {
+          PATCHPAGE_EXACT_NPM_PUBLISHER_SOURCE: replaceOnce(
+            exactNpmPublisher,
+            "  await enforceLatestTagHighWaterMark(",
+            "  await Promise.resolve("
+          )
+        },
+        expected:
+          /exact npm publisher must retain artifact, OIDC, metadata, and provenance validation/
+      },
+      {
+        name: "reject unbounded postpublish polling substitution",
+        env: {
+          PATCHPAGE_EXACT_NPM_PUBLISHER_SOURCE: replaceOnce(
+            exactNpmPublisher,
+            "  for (let attempt = 0; attempt < POSTPUBLISH_MAX_ATTEMPTS; attempt += 1) {",
+            "  for (let attempt = 0; ; attempt += 1) {"
+          )
+        },
+        expected:
+          /exact npm publisher must retain artifact, OIDC, metadata, and provenance validation/
+      },
+      {
+        name: "reject exact publisher CI omission",
+        env: {
+          PATCHPAGE_RELEASE_CI_WORKFLOW_SOURCE: replaceOnce(
+            ciWorkflow,
+            "      - run: pnpm test:exact-npm-publisher\n",
+            ""
+          )
+        },
+        expected:
+          /CI lint job must run exactly one unconditional run-only release privacy fixture step in order/
       },
       {
         name: "reject custom tag on step map",
