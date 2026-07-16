@@ -136,8 +136,32 @@ jobs:
       tarball-filename: ${{ steps.package.outputs.filename }}
       tarball-sha256: ${{ steps.package.outputs.sha256 }}
       package-artifact-id: ${{ steps.package-artifact.outputs.artifact-id }}
+      publisher-sha256: ${{ steps.publisher.outputs.sha256 }}
+      publisher-artifact-id: ${{ steps.publisher-artifact.outputs.artifact-id }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - name: Prepare the exact npm publisher
+        id: publisher
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          publisher="$GITHUB_WORKSPACE/scripts/publish-exact-npm-artifact.mjs"
+          if [[ ! -f "$publisher" || -L "$publisher" ]]; then
+            echo "::error::The exact npm publisher source is unavailable"
+            exit 1
+          fi
+
+          echo "path=$publisher" >> "$GITHUB_OUTPUT"
+          echo "sha256=$(sha256sum "$publisher" | awk '{print $1}')" >> "$GITHUB_OUTPUT"
+      - name: Upload the exact npm publisher
+        id: publisher-artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          path: ${{ steps.publisher.outputs.path }}
+          if-no-files-found: error
+          retention-days: 1
+          archive: false
       - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4.3.0
         with:
           version: 11.5.2
@@ -302,11 +326,18 @@ jobs:
         with:
           artifact-ids: ${{ needs.prepare-npm.outputs.npm-cli-artifact-id }}
           path: ${{ runner.temp }}/npm-cli
+      - name: Download the exact npm publisher
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          artifact-ids: ${{ needs.verify.outputs.publisher-artifact-id }}
+          path: ${{ runner.temp }}/npm-publisher
+          skip-decompress: true
       - name: Publish the verified tarball to npm
         shell: bash
         env:
           EXPECTED_FILENAME: ${{ needs.verify.outputs.tarball-filename }}
           EXPECTED_NPM_VERSION: ${{ needs.prepare-npm.outputs.npm-version }}
+          EXPECTED_PUBLISHER_SHA256: ${{ needs.verify.outputs.publisher-sha256 }}
           EXPECTED_SHA256: ${{ needs.verify.outputs.tarball-sha256 }}
           EXPECTED_VERSION: ${{ needs.guard.outputs.version }}
         run: |
@@ -315,107 +346,55 @@ jobs:
           shopt -s nullglob
           tarballs=("$RUNNER_TEMP/patchpage-package"/*.tgz)
           if [[ "${#tarballs[@]}" -ne 1 ]]; then
-            echo "::error::Expected exactly one downloaded PatchPage tarball, found ${#tarballs[@]}"
+            echo "::error::The exact npm tarball artifact is unavailable"
             exit 1
           fi
 
           tarball="${tarballs[0]}"
           if [[ "$(basename "$tarball")" != "$EXPECTED_FILENAME" ]]; then
-            echo "::error::Downloaded tarball name does not match the verified artifact"
+            echo "::error::The npm tarball artifact name is invalid"
             exit 1
           fi
 
           actual_sha256="$(sha256sum "$tarball" | awk '{print $1}')"
           if [[ "$actual_sha256" != "$EXPECTED_SHA256" ]]; then
-            echo "::error::Downloaded tarball digest does not match the verified artifact"
+            echo "::error::The npm tarball artifact digest is invalid"
             exit 1
           fi
 
-          IFS=$'\t' read -r package_name package_version < <(
-            tar -xOf "$tarball" package/package.json \
-              | node -e 'const fs = require("node:fs"); const pkg = JSON.parse(fs.readFileSync(0, "utf8")); console.log(`${pkg.name}\t${pkg.version}`)'
-          )
-          if [[ "$package_name" != "patchpage" ]]; then
-            echo "::error::Downloaded package is named $package_name, expected patchpage"
-            exit 1
-          fi
-          if [[ "$package_version" != "$EXPECTED_VERSION" ]]; then
-            echo "::error::Downloaded package version $package_version does not match $EXPECTED_VERSION"
+          publisher_scripts=("$RUNNER_TEMP/npm-publisher"/*.mjs)
+          if [[ "${#publisher_scripts[@]}" -ne 1 ]]; then
+            echo "::error::The exact npm publisher artifact is unavailable"
             exit 1
           fi
 
-          npm_cli="$RUNNER_TEMP/npm-cli/bin/npm-cli.js"
-          actual_npm_version="$(node "$npm_cli" --version)"
+          publisher="${publisher_scripts[0]}"
+          if [[ "$(basename "$publisher")" != "publish-exact-npm-artifact.mjs" ]]; then
+            echo "::error::The exact npm publisher artifact name is invalid"
+            exit 1
+          fi
+
+          actual_publisher_sha256="$(sha256sum "$publisher" | awk '{print $1}')"
+          if [[ "$actual_publisher_sha256" != "$EXPECTED_PUBLISHER_SHA256" ]]; then
+            echo "::error::The exact npm publisher artifact digest is invalid"
+            exit 1
+          fi
+
+          npm_cli_dir="$RUNNER_TEMP/npm-cli"
+          actual_npm_version="$(node "$npm_cli_dir/bin/npm-cli.js" --version)"
           if [[ "$actual_npm_version" != "$EXPECTED_NPM_VERSION" ]]; then
-            echo "::error::Downloaded npm CLI reported $actual_npm_version, expected $EXPECTED_NPM_VERSION"
+            echo "::error::The pinned npm CLI artifact version is invalid"
             exit 1
           fi
 
-          registry_metadata="$RUNNER_TEMP/npm-registry-metadata.json"
-          curl_error="$RUNNER_TEMP/npm-registry-curl.err"
-          registry_url="https://registry.npmjs.org/${package_name}/${EXPECTED_VERSION}"
-          if ! http_status="$(
-            curl --silent --show-error \
-              --proto '=https' \
-              --tlsv1.2 \
-              --output "$registry_metadata" \
-              --write-out '%{http_code}' \
-              "$registry_url" \
-              2>"$curl_error"
-          )"; then
-            echo "::error::Failed to query npm registry for patchpage@${EXPECTED_VERSION}"
-            cat "$curl_error" >&2
-            exit 1
-          fi
-
-          case "$http_status" in
-            200)
-              registry_integrity="$(
-                node - "$registry_metadata" <<'NODE'
-          const { readFileSync } = require("node:fs");
-
-          const metadata = JSON.parse(readFileSync(process.argv[2], "utf8"));
-          const integrity = metadata.dist?.integrity;
-          if (typeof integrity === "string" && integrity.length > 0) {
-            process.stdout.write(integrity);
-          }
-          NODE
-              )"
-              if [[ -z "$registry_integrity" ]]; then
-                echo "::error::npm registry metadata is missing dist.integrity"
-                exit 1
-              fi
-
-              local_integrity="$(
-                node - "$tarball" <<'NODE'
-          const { createHash } = require("node:crypto");
-          const { readFileSync } = require("node:fs");
-
-          const digest = createHash("sha512")
-            .update(readFileSync(process.argv[2]))
-            .digest("base64");
-          process.stdout.write(`sha512-${digest}`);
-          NODE
-              )"
-              if [[ "$registry_integrity" != "$local_integrity" ]]; then
-                echo "::error::patchpage@${EXPECTED_VERSION} exists with different integrity"
-                exit 1
-              fi
-
-              echo "patchpage@${EXPECTED_VERSION} already published with matching integrity, skipping"
-              exit 0
-              ;;
-            404)
-              echo "patchpage@${EXPECTED_VERSION} is absent from npm; publishing"
-              ;;
-            *)
-              echo "::error::Unexpected npm registry HTTP status: $http_status"
-              exit 1
-              ;;
-          esac
-
-          node "$npm_cli" publish "$tarball" --ignore-scripts --provenance \
-            --registry=https://registry.npmjs.org
+          node "$publisher" \
+            --tarball "$tarball" \
+            --expected-filename "$EXPECTED_FILENAME" \
+            --expected-sha256 "$EXPECTED_SHA256" \
+            --expected-name patchpage \
+            --expected-version "$EXPECTED_VERSION" \
+            --expected-npm-version "$EXPECTED_NPM_VERSION" \
+            --npm-cli-dir "$npm_cli_dir"
 
   github-release:
     needs: publish-npm
