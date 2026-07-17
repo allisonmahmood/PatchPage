@@ -1,4 +1,6 @@
 locals {
+  managed_registry_login_server = "${azurerm_container_registry.patchpage.name}.azurecr.io"
+
   app_secret_env = {
     DATABASE_URL                  = { secret = "database-url", value = local.database_url }
     PATCHPAGE_BOOTSTRAP_API_TOKEN = { secret = "bootstrap-token", value = local.bootstrap_api_token }
@@ -34,7 +36,39 @@ resource "azurerm_container_app" "server" {
   # that leaf is ineffective; ignoring ingress prevents a later update from
   # replacing the CLI-managed binding with Terraform's original ingress shape.
   lifecycle {
-    ignore_changes = [ingress]
+    ignore_changes = [
+      ingress,
+      template[0].container[0].image,
+    ]
+
+    precondition {
+      condition = (
+        var.server_image != "mcr.microsoft.com/k8se/quickstart:latest" &&
+        can(regex("@sha256:[0-9a-f]{64}$", var.server_image))
+      )
+      error_message = "server_image must be an immutable digest reference ending in @sha256 followed by 64 lowercase hexadecimal characters; the quickstart placeholder cannot be deployed."
+    }
+
+    postcondition {
+      condition = try(
+        (
+          length(self.template) == 1 &&
+          length(self.template[0].container) == 1 &&
+          length(split("@", self.template[0].container[0].image)) == 2 &&
+          length(split("/", split("@", self.template[0].container[0].image)[0])) == 2 &&
+          length(split(":", split("@", self.template[0].container[0].image)[1])) == 2
+          ) ? (
+          split("/", split("@", self.template[0].container[0].image)[0])[1] == "patchpage-server" ? (
+            split("/", split("@", self.template[0].container[0].image)[0])[0] == local.managed_registry_login_server &&
+            split(":", split("@", self.template[0].container[0].image)[1])[0] == "sha256" &&
+            length(split(":", split("@", self.template[0].container[0].image)[1])[1]) == 64 &&
+            length(regexall("[^0-9a-f]", split(":", split("@", self.template[0].container[0].image)[1])[1])) == 0
+          ) : false
+        ) : false,
+        false
+      )
+      error_message = "The observed Container App image must remain an immutable patchpage-server digest in the managed Azure Container Registry."
+    }
 
     postcondition {
       condition     = length(self.ingress) == 1
