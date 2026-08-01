@@ -3,3 +3,8 @@ packages:
   - "packages/*"
 allowBuilds:
   esbuild: true
+# Force brace-expansion 1.x past the GHSA DoS floor. minimatch@3 (pulled by
+# eslint) still depends on ^1.1.7 and does not re-resolve on its own; remove
+# once minimatch@3 or eslint ships a lock that selects >=1.1.16 naturally.
+overrides:
+  "brace-expansion@1": "1.1.16"
