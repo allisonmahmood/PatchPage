@@ -195,8 +195,8 @@ const reviewedActions = new Map([
   [
     "actions/checkout",
     {
-      version: "v4.3.1",
-      sha: "34e114876b0b11c390a56381ad16ebd13914f8d5"
+      version: "v7.0.1",
+      sha: "3d3c42e5aac5ba805825da76410c181273ba90b1"
     }
   ],
   [
@@ -972,7 +972,7 @@ const reviewedReleaseJobContracts = new Map([
   [
     "guard",
     {
-      digest: "0d997fca5709187a66a6096e740de547c974114f580a134dfc5836798048ecb9",
+      digest: "e8a2912ef90d47893a66b8b981bfdf57bb333131d95671a96036cc9fae021319",
       permissions: { contents: "read" }
     }
   ],
@@ -986,7 +986,7 @@ const reviewedReleaseJobContracts = new Map([
   [
     "verify",
     {
-      digest: "433b56b691f3e5012b774f22f32239bba7676789b533e8564001e19018cfba49",
+      digest: "2154e1fc6919668c4505e3e7d5b260632a030ae3013fba549c7ed4ed00ac7184",
       permissions: { contents: "read" }
     }
   ],
@@ -1000,14 +1000,14 @@ const reviewedReleaseJobContracts = new Map([
   [
     "github-release",
     {
-      digest: "33a2d1d2592c5d0615da80eab88418df943ecc77d875506e220c3c1c26c013e2",
+      digest: "7e17684a3aca97672523bc322e2fa2338a0c295a4f83e8092086abc8f06d4008",
       permissions: { contents: "write" }
     }
   ],
   [
     "verify-server-image",
     {
-      digest: "067125da1d66d43b3bb3e1b45452fcde2a20549ac7c99725b7d3b4f1d1a32469",
+      digest: "31e26ce666c88fdc4f23e1434deac4b9afda2402ee05e5c3ed226de41af87811",
       permissions: { contents: "read" }
     }
   ],
@@ -1104,14 +1104,14 @@ const reviewedReconcileJobContracts = new Map([
   [
     "inspect",
     {
-      digest: "831898fb0c8a5b70132ce818898c247cabc9f5199fc387ab47b4e9a88ed5ce41",
+      digest: "99949fd32aec5717a51bac0edb7fe8abd5a5d669df2dadf98f6a0c355c6d71aa",
       permissions: { contents: "read", packages: "read" }
     }
   ],
   [
     "rebuild",
     {
-      digest: "ec539fabecbc0eabdd0807d2be89941492d8e4fa49fa61ddcb7492ee3a7cd891",
+      digest: "920fd409c864dae2f92f54f7ef14c57ceed3c45b0042ff084fca306dd8f69f55",
       permissions: { contents: "read" }
     }
   ],
@@ -4130,8 +4130,8 @@ async function runMutationChecks() {
         env: {
           PATCHPAGE_RECONCILE_WORKFLOW_SOURCE: replaceOnce(
             reconcileWorkflow,
-            "uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1",
-            "uses: actions/checkout@main # v4.3.1"
+            "uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1",
+            "uses: actions/checkout@main # v7.0.1"
           )
         },
         expected: /reconcile-ghcr\.yml:\d+ must pin actions\/checkout to a full commit SHA/
@@ -4587,8 +4587,8 @@ async function runMutationChecks() {
         env: {
           PATCHPAGE_RELEASE_WORKFLOW_SOURCE: replaceOnce(
             workflow,
-            "      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1\n      - id: version",
-            '      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1\n      - "uses": attacker/action@main # v1.0.0\n      - id: version'
+            "      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1\n      - id: version",
+            '      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1\n      - "uses": attacker/action@main # v1.0.0\n      - id: version'
           )
         },
         expected: /uses unreviewed Action attacker\/action/
@@ -4598,8 +4598,8 @@ async function runMutationChecks() {
         env: {
           PATCHPAGE_RELEASE_WORKFLOW_SOURCE: replaceOnce(
             replaceOnce(workflow, "name: Release\n", "name: Release\nx-uses-key: &uses_key uses\n"),
-            "      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1\n      - id: version",
-            "      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1\n      - *uses_key : attacker/action@main # v1.0.0\n      - id: version"
+            "      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1\n      - id: version",
+            "      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1\n      - *uses_key : attacker/action@main # v1.0.0\n      - id: version"
           )
         },
         expected:
@@ -4614,8 +4614,8 @@ async function runMutationChecks() {
               "name: Release\n",
               "name: Release\nx-attacker-action: &attacker_action attacker/action@main\n"
             ),
-            "      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1\n      - id: version",
-            "      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1\n      - uses: *attacker_action # v1.0.0\n      - id: version"
+            "      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1\n      - id: version",
+            "      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1\n      - uses: *attacker_action # v1.0.0\n      - id: version"
           )
         },
         expected:
@@ -4630,8 +4630,8 @@ async function runMutationChecks() {
               "name: Release\n",
               "name: Release\nx-attacker-step: &attacker_step\n  uses: attacker/action@main\n"
             ),
-            "      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1\n      - id: version",
-            "      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1\n      - <<: *attacker_step\n      - id: version"
+            "      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1\n      - id: version",
+            "      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1\n      - <<: *attacker_step\n      - id: version"
           )
         },
         expected:
@@ -5403,7 +5403,7 @@ async function runMutationChecks() {
           PATCHPAGE_RELEASE_WORKFLOW_SOURCE: replaceOnce(
             workflow,
             "      - name: Download the exact tested tarball",
-            "      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1\n      - name: Download the exact tested tarball"
+            "      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1\n      - name: Download the exact tested tarball"
           )
         },
         expected:
@@ -5539,8 +5539,8 @@ async function runMutationChecks() {
         env: {
           PATCHPAGE_RELEASE_WORKFLOW_SOURCE: replaceOnce(
             workflow,
-            "  github-release:\n    needs: publish-npm\n    runs-on: ubuntu-latest\n    permissions:\n      contents: write\n    steps:\n      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1",
-            "  github-release:\n    needs: publish-npm\n    runs-on: ubuntu-latest\n    permissions:\n      contents: write\n    steps:\n      - !attacker\n        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1"
+            "  github-release:\n    needs: publish-npm\n    runs-on: ubuntu-latest\n    permissions:\n      contents: write\n    steps:\n      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1",
+            "  github-release:\n    needs: publish-npm\n    runs-on: ubuntu-latest\n    permissions:\n      contents: write\n    steps:\n      - !attacker\n        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1"
           )
         },
         expected: /explicit tags are forbidden/
