@@ -14,11 +14,15 @@
           - "packages/db/**"
           - "packages/storage/**"
           - "packages/config/**"
+          # Terraform that deploys the hosting context.
+          - "infra/**"
 
 "area:cli":
   - changed-files:
       - any-glob-to-any-file:
           - "packages/cli/**"
+          # Single-sourced into packages/cli and shipped with it.
+          - "skills/**"
 
 "area:core":
   - changed-files:
@@ -30,11 +34,23 @@
       - any-glob-to-any-file:
           - ".github/**"
           - "scripts/**"
+          # Root-level workspace and tooling config. These patterns have no
+          # slash, so they match only at the root -- packages/*/package.json
+          # and packages/*/tsconfig.json belong to their own package's area.
           - "turbo.json"
           - "pnpm-workspace.yaml"
+          - "pnpm-lock.yaml"
+          - "package.json"
+          - "tsconfig*.json"
+          - "*.config.js"
+          - "skills-lock.json"
+          - ".dockerignore"
+          - ".env.example"
 
 "area:docs":
   - changed-files:
       - any-glob-to-any-file:
           - "docs/**"
           - "**/*.md"
+          # Sample artifacts that demonstrate published output.
+          - "examples/**"

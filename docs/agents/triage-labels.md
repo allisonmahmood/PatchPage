@@ -18,13 +18,15 @@ Edit the right-hand column to match whatever vocabulary you actually use.
 
 Triage sets one more axis: **which part of the codebase the issue touches**. Apply every area label that fits — an issue can legitimately span several. If the report doesn't say enough to tell, leave them off rather than guessing; a wrong area label is worse than none, because it's what `gh issue list --label area:cli` is filtered on.
 
-| Label         | Covers                                                                |
-| ------------- | --------------------------------------------------------------------- |
-| `area:server` | `apps/server`, plus `packages/db`, `packages/storage`, `packages/config` |
-| `area:cli`    | `packages/cli` — the `npx patchpage` package                           |
-| `area:core`   | `packages/core` — the safe-HTML policy, ids, crypto                    |
-| `area:ci`     | `.github/`, `scripts/`, and workspace build config                     |
-| `area:docs`   | `docs/`, README, and other Markdown                                    |
+| Label         | Covers                                                                              |
+| ------------- | ----------------------------------------------------------------------------------- |
+| `area:server` | `apps/server`, plus `packages/db`, `packages/storage`, `packages/config`, and `infra/` |
+| `area:cli`    | `packages/cli` — the `npx patchpage` package — and the `skills/` it ships             |
+| `area:core`   | `packages/core` — the safe-HTML policy, ids, crypto                                  |
+| `area:ci`     | `.github/`, `scripts/`, and root-level workspace and tooling config                  |
+| `area:docs`   | `docs/`, `examples/`, README, and other Markdown                                     |
+
+This table and the globs in `.github/labeler.yml` are meant to say the same thing. If you change one, change the other.
 
 The first three mirror the contexts in `CONTEXT-MAP.md`, so triage and the domain docs stay in one vocabulary — see `domain.md`.
 
