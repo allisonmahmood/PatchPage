@@ -390,7 +390,8 @@ export class JsonFilePatchPageDb implements PatchPageDb {
         // same-filesystem bind mounts that ordinary stat identity cannot detect.
         if (process.platform === "linux" && hasErrorCode(error, "EBUSY")) {
           throw new Error(
-            "JSON metadata file cannot be a Linux single-file bind mount; mount a writable containing directory instead."
+            "JSON metadata file cannot be a Linux single-file bind mount; mount a writable containing directory instead.",
+            { cause: error }
           );
         }
         throw error;

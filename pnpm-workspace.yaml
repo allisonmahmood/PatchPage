@@ -3,9 +3,3 @@ packages:
   - "packages/*"
 allowBuilds:
   esbuild: true
-# Force brace-expansion 1.x past both high-severity DoS floors
-# (GHSA-3jxr-9vmj-r5cp needs >=1.1.16; GHSA-mh99-v99m-4gvg needs >=1.1.17).
-# minimatch@3 (pulled by eslint) depends on ^1.1.7 and does not re-resolve
-# on its own; remove once minimatch@3 or eslint selects >=1.1.17 naturally.
-overrides:
-  "brace-expansion@1": "1.1.18"
