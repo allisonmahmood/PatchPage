@@ -202,8 +202,8 @@ const reviewedActions = new Map([
   [
     "actions/setup-node",
     {
-      version: "v4.4.0",
-      sha: "49933ea5288caeca8642d1e84afbd3f7d6820020"
+      version: "v7.0.0",
+      sha: "820762786026740c76f36085b0efc47a31fe5020"
     }
   ],
   [
@@ -979,21 +979,21 @@ const reviewedReleaseJobContracts = new Map([
   [
     "prepare-npm",
     {
-      digest: "06cad8342bc8f91548af697e797fd95e7ae2d506f4cf94cb9ef1acfe93ae3ad0",
+      digest: "5ff084fffef88eb349737664611606db928613c8e4dd9e596c6a4a1eeb454d01",
       permissions: {}
     }
   ],
   [
     "verify",
     {
-      digest: "5a03c293ed218596b2f51b9f7dd7073c30723be9bb7f636048248f9351ad5cae",
+      digest: "12fe8f367c6dee8d4a2d14494f3034dd0155d78d0202f1ee94fba6c8fbd516d5",
       permissions: { contents: "read" }
     }
   ],
   [
     "publish-npm",
     {
-      digest: "755fbbb2513b203689a265b4864deab012849f73efdcf469d12442409e3b62b5",
+      digest: "552499142e433bb6af278ef3dd63dd5695bcacd43fc7534ff1c4077f01e519a1",
       permissions: { "id-token": "write" }
     }
   ],
@@ -1028,7 +1028,7 @@ const reviewedReleaseJobContracts = new Map([
   [
     "npx-smoke",
     {
-      digest: "17cd0764c9612c7446ca10b444d462f9e3aed5309a0799b7c4a52ac257f330b2",
+      digest: "d2d5559c6e5f42281254494a024445dbee365476dcb00672ce5d9e093436d945",
       permissions: {}
     }
   ]
@@ -1104,7 +1104,7 @@ const reviewedReconcileJobContracts = new Map([
   [
     "inspect",
     {
-      digest: "99949fd32aec5717a51bac0edb7fe8abd5a5d669df2dadf98f6a0c355c6d71aa",
+      digest: "814dcf4ce06e6bec2e09535b635ebfae5773ab247048e684ec08ee21b239a0f9",
       permissions: { contents: "read", packages: "read" }
     }
   ],

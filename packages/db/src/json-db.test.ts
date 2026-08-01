@@ -1328,7 +1328,7 @@ describe("JsonFilePatchPageDb", () => {
     let stopReaders = false;
     let samples = 0;
     const readerFailures: unknown[] = [];
-    let openSnapshot = "";
+    let openSnapshot: string;
     const readers = Array.from({ length: 4 }, async () => {
       while (!stopReaders) {
         try {
