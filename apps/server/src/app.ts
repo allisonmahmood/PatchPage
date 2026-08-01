@@ -238,7 +238,7 @@ export function createApp(options: CreateAppOptions): FastifyInstance {
           await options.storage.deleteHtmlObject(objectKey);
         } catch (cleanupError) {
           app.log.error(cleanupError);
-          throw new Error("Upload cleanup failed.");
+          throw new Error("Upload cleanup failed.", { cause: cleanupError });
         }
         throw error;
       }
