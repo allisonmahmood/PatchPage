@@ -1,0 +1,40 @@
+# Path -> area label mapping for .github/workflows/pr-labels.yml
+#
+# The first three areas mirror the contexts in CONTEXT-MAP.md, so pull
+# requests and the domain docs stay in the same vocabulary. `db`, `storage`
+# and `config` roll into `area:server` because docs/agents/domain.md treats
+# them as the hosting context's supporting packages.
+#
+# A pull request can carry several area labels; that is intended.
+
+"area:server":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "apps/server/**"
+          - "packages/db/**"
+          - "packages/storage/**"
+          - "packages/config/**"
+
+"area:cli":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "packages/cli/**"
+
+"area:core":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "packages/core/**"
+
+"area:ci":
+  - changed-files:
+      - any-glob-to-any-file:
+          - ".github/**"
+          - "scripts/**"
+          - "turbo.json"
+          - "pnpm-workspace.yaml"
+
+"area:docs":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "docs/**"
+          - "**/*.md"
