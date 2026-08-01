@@ -1,0 +1,111 @@
+name: PR labels
+
+# Applies `area:*` labels from the changed paths and a single `size:*` label
+# from the changed line count.
+#
+# SECURITY -- why this uses `pull_request_target` and must never check out
+# the pull request:
+#
+# On the `pull_request` trigger, GITHUB_TOKEN is read-only for pull requests
+# opened from forks, so labeling silently fails for exactly the outside
+# contributions that most need triaging. `pull_request_target` runs with a
+# write token instead.
+#
+# The token is what makes `pull_request_target` dangerous: the workflow runs
+# in the base repository's context, so any pull request code it executes
+# would run with write access. This workflow never executes pull request
+# code. There is deliberately no `actions/checkout` step -- both the labeler
+# config and the changed-file list are read from the API at the base branch.
+#
+# Do not add a checkout of the pull request head to this file. Doing so would
+# let any fork run arbitrary code against this repository's token.
+
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened, ready_for_review]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  label:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - name: Apply area labels from changed paths
+        uses: actions/labeler@bf12e9b00b37c5c0ca2b87b79b2daf7891dbda13 # v7.0.0
+        with:
+          # Drops an area label again when a revision no longer touches it.
+          # Only manages labels named in .github/labeler.yml, so triage and
+          # size labels are left alone.
+          sync-labels: true
+
+      - name: Apply a size label from changed lines
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          script: |
+            // Generated and vendored files would otherwise make every
+            // dependency bump look like a large change.
+            const EXCLUDED = [
+              /(^|\/)pnpm-lock\.yaml$/,
+              /(^|\/)package-lock\.json$/,
+              /(^|\/)yarn\.lock$/,
+              /(^|\/)dist\//,
+              /(^|\/)\.turbo\//,
+              /\.min\.(js|css)$/,
+              /\.snap$/,
+            ];
+
+            const pr = context.payload.pull_request;
+            const files = await github.paginate(github.rest.pulls.listFiles, {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: pr.number,
+              per_page: 100,
+            });
+
+            let changed = 0;
+            const skipped = [];
+            for (const file of files) {
+              if (EXCLUDED.some((pattern) => pattern.test(file.filename))) {
+                skipped.push(file.filename);
+                continue;
+              }
+              changed += file.additions + file.deletions;
+            }
+
+            const desired =
+              changed < 100 ? "size:s" : changed <= 500 ? "size:m" : "size:l";
+            const sizes = ["size:s", "size:m", "size:l"];
+            const current = pr.labels.map((label) => label.name);
+
+            for (const name of sizes) {
+              if (name !== desired && current.includes(name)) {
+                await github.rest.issues.removeLabel({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: pr.number,
+                  name,
+                });
+              }
+            }
+
+            if (!current.includes(desired)) {
+              await github.rest.issues.addLabel({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: pr.number,
+                labels: [desired],
+              });
+            }
+
+            core.info(`${changed} changed lines -> ${desired}`);
+            if (skipped.length) {
+              core.info(`excluded from the count: ${skipped.join(", ")}`);
+            }

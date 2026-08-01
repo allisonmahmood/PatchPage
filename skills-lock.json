@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "skills": {
+    "patchpage": {
+      "source": "allisonmahmood/PatchPage",
+      "sourceType": "github",
+      "skillPath": "skills/patchpage/SKILL.md",
+      "computedHash": "dafe4c72054c5105057fefe5db697b1c51f058dc51818a6cab95d963c9065c17"
+    }
+  }
+}

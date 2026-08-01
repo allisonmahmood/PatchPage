@@ -1,0 +1,11 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Report a security vulnerability
+    url: https://github.com/allisonmahmood/PatchPage/security/advisories/new
+    about: Report privately through GitHub Private Vulnerability Reporting. Do not open a public issue for a vulnerability.
+  - name: Self-hosting a PatchPage instance
+    url: https://github.com/allisonmahmood/PatchPage/blob/main/docs/SELF_HOSTING.md
+    about: Setup and operations guide for running your own instance.
+  - name: Development setup
+    url: https://github.com/allisonmahmood/PatchPage/blob/main/docs/DEVELOPMENT.md
+    about: Building, testing, and working on PatchPage locally.
