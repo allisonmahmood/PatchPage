@@ -209,8 +209,8 @@ const reviewedActions = new Map([
   [
     "pnpm/action-setup",
     {
-      version: "v4.3.0",
-      sha: "b906affcce14559ad1aafd4ab0e942779e9f58b1"
+      version: "v6.0.9",
+      sha: "0ebf47130e4866e96fce0953f49152a61190b271"
     }
   ],
   [
@@ -986,7 +986,7 @@ const reviewedReleaseJobContracts = new Map([
   [
     "verify",
     {
-      digest: "5971add74af39307ccb7ea65f676c531c528c7ff6763350f6de5e0c943124095",
+      digest: "e7116cda7b4e44887931bd6e3e7947dd1dfeb17d8071ac2c4de7c48496864097",
       permissions: { contents: "read" }
     }
   ],
