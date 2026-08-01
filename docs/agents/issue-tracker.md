@@ -37,13 +37,7 @@ Run `gh issue view <number> --comments`.
 
 Used by `/wayfinder`. The **map** is a single issue with **child** issues as tickets.
 
-The `wayfinder:*` labels below are **not pre-created** on this repo — only the triage and `area:*` sets are. `gh issue create --label wayfinder:map` fails against a label that doesn't exist, so create it first the first time you need it:
-
-```
-gh label create wayfinder:map --color 5319E7 --description "Wayfinder map issue" || true
-```
-
-The same applies to each `wayfinder:<type>`.
+The `wayfinder:*` labels already exist on this repo: `wayfinder:map` for the map, and `wayfinder:research` / `wayfinder:prototype` / `wayfinder:grilling` / `wayfinder:task` for child tickets. Apply them directly — don't create them.
 
 - **Map**: a single issue labelled `wayfinder:map`, holding the Notes / Decisions-so-far / Fog body. `gh issue create --label wayfinder:map`.
 - **Child ticket**: an issue linked to the map as a GitHub sub-issue (`gh api` on the sub-issues endpoint). Where sub-issues aren't enabled, add the child to a task list in the map body and put `Part of #<map>` at the top of the child body. Labels: `wayfinder:<type>` (`research`/`prototype`/`grilling`/`task`). Once claimed, the ticket is assigned to the driving dev.
