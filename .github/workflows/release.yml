@@ -22,7 +22,7 @@ jobs:
       version: ${{ steps.version.outputs.version }}
       revision: ${{ steps.version.outputs.revision }}
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - id: version
         shell: bash
         run: |
@@ -139,7 +139,7 @@ jobs:
       publisher-sha256: ${{ steps.publisher.outputs.sha256 }}
       publisher-artifact-id: ${{ steps.publisher-artifact.outputs.artifact-id }}
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Prepare the exact npm publisher
         id: publisher
         shell: bash
@@ -402,7 +402,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Create GitHub release
         shell: bash
         env:
@@ -444,7 +444,7 @@ jobs:
       config-id: ${{ steps.image.outputs.config-id }}
       image-artifact-id: ${{ steps.image-artifact.outputs.artifact-id }}
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Build, verify, and save exact server image
         id: image
         shell: bash
