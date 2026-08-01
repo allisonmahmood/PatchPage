@@ -1,0 +1,92 @@
+name: Bug report
+description: Something in PatchPage isn't working
+labels: ["bug", "needs-triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the report.
+
+        **Security vulnerabilities do not belong here.** Report those privately
+        through [GitHub Private Vulnerability Reporting](https://github.com/allisonmahmood/PatchPage/security/advisories/new).
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: What did you see, and what did you expect instead?
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Steps to reproduce
+      description: The smallest sequence that reliably shows the problem.
+      placeholder: |
+        1. Run `npx patchpage ...`
+        2. ...
+        3. ...
+    validations:
+      required: true
+
+  - type: dropdown
+    id: instance
+    attributes:
+      label: Which instance are you using?
+      description: Self-hosted instances vary in version and configuration, which changes how a bug reproduces.
+      options:
+        - Self-hosted instance
+        - The hosted PatchPage deployment
+        - Not sure
+    validations:
+      required: true
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Which part of PatchPage does this affect?
+      description: A rough guess is fine, and "Not sure" is a perfectly good answer.
+      options:
+        - Not sure
+        - The CLI (npx patchpage)
+        - The server / hosting a published page
+        - HTML validation and safety rules
+        - Documentation
+    validations:
+      required: false
+
+  - type: input
+    id: cli-version
+    attributes:
+      label: CLI version
+      description: Output of `npx patchpage --version`.
+      placeholder: "0.1.1"
+    validations:
+      required: false
+
+  - type: input
+    id: node-version
+    attributes:
+      label: Node.js version
+      description: Output of `node --version`. PatchPage supports Node 22 and later.
+      placeholder: "v22.13.0"
+    validations:
+      required: false
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs or output
+      description: Relevant command output or server logs. This is rendered as code, so no backticks are needed.
+      render: shell
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: redaction
+    attributes:
+      label: Before submitting
+      options:
+        - label: I have removed API tokens, credentials, and other secrets from everything pasted above.
+          required: true

@@ -1,0 +1,41 @@
+name: Feature request
+description: Suggest a capability or an improvement
+labels: ["enhancement", "needs-triage"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem does this solve?
+      description: Describe the situation you ran into rather than the feature you have in mind. It usually leads somewhere better.
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: What would you like to happen?
+      description: A sketch is fine. Command names, flags, or output you would expect are especially useful.
+    validations:
+      required: false
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: What have you tried or considered?
+      description: Workarounds you are using today, and why they fall short.
+    validations:
+      required: false
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Which part of PatchPage would this touch?
+      description: A rough guess is fine, and "Not sure" is a perfectly good answer.
+      options:
+        - Not sure
+        - The CLI (npx patchpage)
+        - The server / hosting a published page
+        - HTML validation and safety rules
+        - Documentation
+    validations:
+      required: false
