@@ -6,6 +6,14 @@ All notable changes to PatchPage are documented in this file. The format is base
 
 ## [Unreleased]
 
+### Changed
+
+- Azure workload Blob Storage now defaults to geo-redundant replication (`GRS`). Existing
+  environments that still use `LRS` will see an in-place Storage account update on the first
+  infrastructure apply after upgrade; review cost and replication behavior before approving.
+  PostgreSQL flexible-server backups remain platform-local by default; configure independent
+  geo-capable database backups if regional recovery is required.
+
 ## [0.1.1] - 2026-07-14
 
 ### Added

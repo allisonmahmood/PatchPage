@@ -1,4 +1,18 @@
-mock_provider "azurerm" {}
+mock_provider "azurerm" {
+  mock_resource "azurerm_storage_account" {
+    defaults = {
+      id = "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg-patchpage-prod/providers/Microsoft.Storage/storageAccounts/stppmockdrafts"
+    }
+    override_during = plan
+  }
+
+  mock_resource "azurerm_postgresql_flexible_server" {
+    defaults = {
+      id = "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg-patchpage-prod/providers/Microsoft.DBforPostgreSQL/flexibleServers/pg-patchpage-mock"
+    }
+    override_during = plan
+  }
+}
 
 mock_provider "random" {}
 
@@ -55,6 +69,20 @@ run "protects_persistent_data_by_default" {
   assert {
     condition     = azurerm_management_lock.patchpage_postgres.lock_level == "CanNotDelete"
     error_message = "Expected a CanNotDelete lock for PostgreSQL."
+  }
+}
+
+run "locks_are_scoped_to_persistent_child_resources" {
+  command = plan
+
+  assert {
+    condition     = azurerm_management_lock.drafts_storage.scope == azurerm_storage_account.drafts.id
+    error_message = "Expected the drafts Storage lock to be scoped to the storage account, not a parent scope."
+  }
+
+  assert {
+    condition     = azurerm_management_lock.patchpage_postgres.scope == azurerm_postgresql_flexible_server.patchpage.id
+    error_message = "Expected the PostgreSQL lock to be scoped to the flexible server, not a parent scope."
   }
 }
 

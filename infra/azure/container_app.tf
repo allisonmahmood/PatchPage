@@ -42,11 +42,21 @@ resource "azurerm_container_app" "server" {
     ]
 
     precondition {
+      # Fail closed before create/update: require managed ACR + patchpage-server +
+      # lowercase SHA-256 digest. Targeted bootstrap plans that exclude this resource
+      # may still use the quickstart placeholder default.
       condition = (
         var.server_image != "mcr.microsoft.com/k8se/quickstart:latest" &&
-        can(regex("@sha256:[0-9a-f]{64}$", var.server_image))
+        length(split("@", var.server_image)) == 2 &&
+        length(split("/", split("@", var.server_image)[0])) == 2 &&
+        split("/", split("@", var.server_image)[0])[0] == local.managed_registry_login_server &&
+        split("/", split("@", var.server_image)[0])[1] == "patchpage-server" &&
+        length(split(":", split("@", var.server_image)[1])) == 2 &&
+        split(":", split("@", var.server_image)[1])[0] == "sha256" &&
+        length(split(":", split("@", var.server_image)[1])[1]) == 64 &&
+        length(regexall("[^0-9a-f]", split(":", split("@", var.server_image)[1])[1])) == 0
       )
-      error_message = "server_image must be an immutable digest reference ending in @sha256 followed by 64 lowercase hexadecimal characters; the quickstart placeholder cannot be deployed."
+      error_message = "server_image must be an immutable patchpage-server digest in the managed Azure Container Registry; the quickstart placeholder cannot be deployed."
     }
 
     postcondition {

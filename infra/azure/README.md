@@ -1545,6 +1545,7 @@ poll_pinned_revision_stable() {
 container_app_readiness_recovery_required() {
   OPERATION_LEASE_ACTIVE=false
   printf 'Container App readiness failed; second-operator recovery is required.\n' >&2
+  printf 'The operation lease remains held for second-operator recovery.\n' >&2
   exit 1
 }
 verify_operation_container() {
@@ -1600,7 +1601,6 @@ verify_operation_lease() {
 }
 acquire_operation_lease() {
   verify_operation_container || return 1
-  OPERATION_LEASE_ACTIVE=true
   private_az storage container lease acquire \
     --account-name "$STATE_STORAGE_ACCOUNT" \
     --container-name "$OPERATION_CONTAINER" \
@@ -1608,7 +1608,8 @@ acquire_operation_lease() {
     --lease-duration -1 \
     --proposed-lease-id "$OPERATION_LEASE_ID" \
     --output none >/dev/null || return 1
-  verify_operation_lease
+  verify_operation_lease || return 1
+  OPERATION_LEASE_ACTIVE=true
 }
 release_operation_lease() {
   verify_operation_lease || return 1
@@ -2179,6 +2180,7 @@ poll_pinned_revision_stable() {
 container_app_readiness_recovery_required() {
   OPERATION_LEASE_ACTIVE=false
   printf 'Container App readiness failed; second-operator recovery is required.\n' >&2
+  printf 'The operation lease remains held for second-operator recovery.\n' >&2
   exit 1
 }
 verify_operation_container() {
@@ -2234,7 +2236,6 @@ verify_operation_lease() {
 }
 acquire_operation_lease() {
   verify_operation_container || return 1
-  OPERATION_LEASE_ACTIVE=true
   private_az storage container lease acquire \
     --account-name "$STATE_STORAGE_ACCOUNT" \
     --container-name "$OPERATION_CONTAINER" \
@@ -2242,7 +2243,8 @@ acquire_operation_lease() {
     --lease-duration -1 \
     --proposed-lease-id "$OPERATION_LEASE_ID" \
     --output none >/dev/null || return 1
-  verify_operation_lease
+  verify_operation_lease || return 1
+  OPERATION_LEASE_ACTIVE=true
 }
 release_operation_lease() {
   verify_operation_lease || return 1
@@ -2872,6 +2874,7 @@ poll_pinned_revision_stable() {
 container_app_readiness_recovery_required() {
   OPERATION_LEASE_ACTIVE=false
   printf 'Container App readiness failed; second-operator recovery is required.\n' >&2
+  printf 'The operation lease remains held for second-operator recovery.\n' >&2
   exit 1
 }
 verify_operation_container() {
@@ -2987,7 +2990,6 @@ verify_operation_lease() {
 }
 acquire_operation_lease() {
   verify_operation_container || return 1
-  OPERATION_LEASE_ACTIVE=true
   private_az storage container lease acquire \
     --account-name "$STATE_STORAGE_ACCOUNT" \
     --container-name "$OPERATION_CONTAINER" \
@@ -2995,7 +2997,8 @@ acquire_operation_lease() {
     --lease-duration -1 \
     --proposed-lease-id "$OPERATION_LEASE_ID" \
     --output none >/dev/null || return 1
-  verify_operation_lease
+  verify_operation_lease || return 1
+  OPERATION_LEASE_ACTIVE=true
 }
 release_operation_lease() {
   verify_operation_lease || return 1
@@ -4273,6 +4276,8 @@ printf 'Operation lease recovery completed.\n'
 
 
 Source-local retention is not an independent backup. Before accepting durable production data or changing a persistent resource, configure independently protected Blob and PostgreSQL backups outside the workload resource group, document the accepted RPO/RTO, and complete an isolated end-to-end restore. Re-run that drill at least every 90 days. Geo-replication improves regional availability but replicates deletion; management locks protect control-plane deletion but not Blob data-plane deletion.
+
+Workload Storage defaults to geo-redundant replication (`GRS`). Existing environments that still use `LRS` will plan an in-place Storage account update on the first infrastructure apply after that default change; review cost and replication behavior before approving. PostgreSQL flexible-server backups remain platform-local by default (`geo_redundant_backup_enabled` is unset); regional database recovery therefore depends on the independent backup drill above rather than Storage GRS symmetry.
 
 ## Configure the custom domain and managed certificate
 

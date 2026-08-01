@@ -2345,6 +2345,10 @@ test_app_release() {
           'Container App readiness failed; second-operator recovery is required.' \
           "$output" ||
           fail "app release readiness failure omitted the generic recovery error"
+        grep -Fq \
+          'The operation lease remains held for second-operator recovery.' \
+          "$output" ||
+          fail "app release readiness failure omitted the retained-lease recovery warning after $scenario"
         ;;
     esac
     if grep -Eq \
@@ -3011,6 +3015,10 @@ test_app_rollback() {
           'Container App readiness failed; second-operator recovery is required.' \
           "$output" ||
           fail "rollback readiness failure omitted the generic recovery error"
+        grep -Fq \
+          'The operation lease remains held for second-operator recovery.' \
+          "$output" ||
+          fail "rollback readiness failure omitted the retained-lease recovery warning after $scenario"
         ;;
     esac
   done
@@ -4384,6 +4392,10 @@ azurerm_container_app.server'
           'Container App readiness failed; second-operator recovery is required.' \
           "$output" ||
           fail "infrastructure flow omitted the readiness recovery warning after $scenario"
+        grep -Fq \
+          'The operation lease remains held for second-operator recovery.' \
+          "$output" ||
+          fail "infrastructure flow readiness failure omitted the retained-lease warning after $scenario"
         ;;
     esac
     if test "$scenario" = "postapply_app_show_failure"; then
@@ -4672,6 +4684,44 @@ test_public_safe_runbook_static() {
     "$README"; then
     fail "Azure guide retains a verbose hostname or certificate error that exposes private values"
   fi
+  # Lifecycle prevent_destroy is a meta-argument and is invisible to plan-time
+  # terraform test assertions. Statically require the expected blocks.
+  azure_tf_dir="$ROOT/infra/azure"
+  for prevent_destroy_resource in \
+    'azurerm_storage_account.drafts' \
+    'azurerm_storage_container.drafts' \
+    'azurerm_postgresql_flexible_server.patchpage' \
+    'azurerm_postgresql_flexible_server_database.patchpage' \
+    'azurerm_management_lock.drafts_storage' \
+    'azurerm_management_lock.patchpage_postgres'; do
+    resource_type="${prevent_destroy_resource%%.*}"
+    resource_name="${prevent_destroy_resource#*.}"
+    if ! awk -v rtype="$resource_type" -v rname="$resource_name" '
+      $0 == ("resource \"" rtype "\" \"" rname "\" {") {
+        in_resource = 1
+        depth = 1
+        next
+      }
+      in_resource {
+        line = $0
+        opens = gsub(/\{/, "{", line)
+        line = $0
+        closes = gsub(/\}/, "}", line)
+        depth += opens - closes
+        if ($0 ~ /^[[:space:]]*prevent_destroy[[:space:]]*=[[:space:]]*true[[:space:]]*$/) {
+          found = 1
+        }
+        if (depth <= 0) {
+          exit !found
+        }
+      }
+      END {
+        if (!in_resource || !found) exit 1
+      }
+    ' "$azure_tf_dir"/*.tf; then
+      fail "persistent data resource $prevent_destroy_resource lacks prevent_destroy = true"
+    fi
+  done
 }
 
 test_custom_domain_context() {
@@ -5889,20 +5939,25 @@ test_deployed_smoke() {
     fail "failed canary replacement changed the existing record mode"
 }
 
-test_state_bootstrap
-test_deploy_resources
-test_app_release
-test_app_rollback
-test_infrastructure_change
-test_stale_lease_recovery
-test_public_safe_runbook_static
-test_custom_domain_context
-test_custom_domain_output_guards
-test_ingress_verification
-test_hostname_mutation_guard
-test_apex_dns
-test_caa_policy
-test_certificate_binding
-test_deployed_smoke
+set -- \
+  test_state_bootstrap \
+  test_deploy_resources \
+  test_app_release \
+  test_app_rollback \
+  test_infrastructure_change \
+  test_stale_lease_recovery \
+  test_public_safe_runbook_static \
+  test_custom_domain_context \
+  test_custom_domain_output_guards \
+  test_ingress_verification \
+  test_hostname_mutation_guard \
+  test_apex_dns \
+  test_caa_policy \
+  test_certificate_binding \
+  test_deployed_smoke
 
-printf 'guide_commands_test: 16 scenario groups passed\n'
+for guide_scenario_group in "$@"; do
+  "$guide_scenario_group"
+done
+
+printf 'guide_commands_test: %s scenario groups passed\n' "$#"
