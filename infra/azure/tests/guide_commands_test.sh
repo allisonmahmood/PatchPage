@@ -4686,6 +4686,12 @@ test_public_safe_runbook_static() {
   fi
   # Lifecycle prevent_destroy is a meta-argument and is invisible to plan-time
   # terraform test assertions. Statically require the expected blocks.
+  #
+  # Management-lock scope equality against child resource IDs also cannot be
+  # evaluated under terraform test on the CI-pinned Terraform 1.9.8: plan leaves
+  # those IDs unknown, mock_resource.override_during was only added after 1.9.8,
+  # and apply-time mocks need full Azure ID shapes for every dependent resource.
+  # Statically require each lock's scope to reference the child resource id.
   azure_tf_dir="$ROOT/infra/azure"
   for prevent_destroy_resource in \
     'azurerm_storage_account.drafts' \
@@ -4720,6 +4726,45 @@ test_public_safe_runbook_static() {
       }
     ' "$azure_tf_dir"/*.tf; then
       fail "persistent data resource $prevent_destroy_resource lacks prevent_destroy = true"
+    fi
+  done
+
+  # lock_resource|expected_scope_expression
+  for lock_scope_spec in \
+    'azurerm_management_lock.drafts_storage|azurerm_storage_account.drafts.id' \
+    'azurerm_management_lock.patchpage_postgres|azurerm_postgresql_flexible_server.patchpage.id'; do
+    lock_resource="${lock_scope_spec%%|*}"
+    expected_scope="${lock_scope_spec#*|}"
+    resource_type="${lock_resource%%.*}"
+    resource_name="${lock_resource#*.}"
+    if ! awk -v rtype="$resource_type" -v rname="$resource_name" -v expected="$expected_scope" '
+      $0 == ("resource \"" rtype "\" \"" rname "\" {") {
+        in_resource = 1
+        depth = 1
+        next
+      }
+      in_resource {
+        line = $0
+        opens = gsub(/\{/, "{", line)
+        line = $0
+        closes = gsub(/\}/, "}", line)
+        depth += opens - closes
+        if (match($0, /^[[:space:]]*scope[[:space:]]*=[[:space:]]*/)) {
+          rest = substr($0, RSTART + RLENGTH)
+          gsub(/[[:space:]]+$/, "", rest)
+          if (rest == expected) {
+            found = 1
+          }
+        }
+        if (depth <= 0) {
+          exit !found
+        }
+      }
+      END {
+        if (!in_resource || !found) exit 1
+      }
+    ' "$azure_tf_dir"/*.tf; then
+      fail "management lock $lock_resource is not scoped to $expected_scope"
     fi
   done
 }

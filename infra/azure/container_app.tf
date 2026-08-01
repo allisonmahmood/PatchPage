@@ -45,16 +45,22 @@ resource "azurerm_container_app" "server" {
       # Fail closed before create/update: require managed ACR + patchpage-server +
       # lowercase SHA-256 digest. Targeted bootstrap plans that exclude this resource
       # may still use the quickstart placeholder default.
-      condition = (
-        var.server_image != "mcr.microsoft.com/k8se/quickstart:latest" &&
-        length(split("@", var.server_image)) == 2 &&
-        length(split("/", split("@", var.server_image)[0])) == 2 &&
-        split("/", split("@", var.server_image)[0])[0] == local.managed_registry_login_server &&
-        split("/", split("@", var.server_image)[0])[1] == "patchpage-server" &&
-        length(split(":", split("@", var.server_image)[1])) == 2 &&
-        split(":", split("@", var.server_image)[1])[0] == "sha256" &&
-        length(split(":", split("@", var.server_image)[1])[1]) == 64 &&
-        length(regexall("[^0-9a-f]", split(":", split("@", var.server_image)[1])[1])) == 0
+      # Guard indexes with try() so malformed images fail the precondition instead
+      # of raising Invalid index during expression evaluation (Terraform 1.9.8).
+      condition = try(
+        (
+          var.server_image != "mcr.microsoft.com/k8se/quickstart:latest" &&
+          length(split("@", var.server_image)) == 2 &&
+          length(split("/", split("@", var.server_image)[0])) == 2 &&
+          length(split(":", split("@", var.server_image)[1])) == 2
+          ) ? (
+          split("/", split("@", var.server_image)[0])[0] == local.managed_registry_login_server &&
+          split("/", split("@", var.server_image)[0])[1] == "patchpage-server" &&
+          split(":", split("@", var.server_image)[1])[0] == "sha256" &&
+          length(split(":", split("@", var.server_image)[1])[1]) == 64 &&
+          length(regexall("[^0-9a-f]", split(":", split("@", var.server_image)[1])[1])) == 0
+        ) : false,
+        false
       )
       error_message = "server_image must be an immutable patchpage-server digest in the managed Azure Container Registry; the quickstart placeholder cannot be deployed."
     }
