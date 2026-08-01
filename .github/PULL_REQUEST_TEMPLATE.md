@@ -19,6 +19,16 @@ automation can decide: whether the change breaks anyone already depending on
 PatchPage, which is what drives the version bump and the changelog entry.
 -->
 
-- [ ] **Breaking change** — changes the CLI's public behaviour, the API contract, the database schema, or the configuration format in a way that requires action from existing users
+Tick exactly one.
 
-<!-- If checked, describe the break and the upgrade path: -->
+- [ ] **Breaking** — requires action from existing users
+- [ ] **Not breaking** — no action required
+
+<!--
+"Breaking" means a change to the CLI's public behaviour, the API contract, the
+database schema, or the configuration format that existing users must react to.
+
+If breaking, describe the break and the upgrade path below. If not breaking,
+say briefly why -- "lockfile only", "dev dependency", "internal refactor".
+Leaving both boxes unticked is not an answer; it reads as "not filled in".
+-->
