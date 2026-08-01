@@ -97,7 +97,7 @@ jobs:
             }
 
             if (!current.includes(desired)) {
-              await github.rest.issues.addLabel({
+              await github.rest.issues.addLabels({
                 owner: context.repo.owner,
                 repo: context.repo.repo,
                 issue_number: pr.number,
