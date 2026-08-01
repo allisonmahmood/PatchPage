@@ -53,6 +53,20 @@ interface DraftCache {
 
 const program = new Command();
 
+// Commander 15+ embeds excess argument values in its error text. Configure this
+// before subcommands are registered so they inherit it. Keep the pre-15 message
+// shape so a mistaken secret passed as a positional is never echoed on stderr.
+program.configureOutput({
+  outputError: (str, write) => {
+    write(
+      str.replace(
+        /(error: too many arguments(?: for '[^']+')?\. Expected \d+ arguments? but got \d+): .+\.(\n?)$/,
+        "$1.$2"
+      )
+    );
+  }
+});
+
 program.name("patchpage").description("Upload static HTML drafts to PatchPage.").version(VERSION);
 
 program
