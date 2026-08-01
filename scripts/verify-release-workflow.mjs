@@ -187,9 +187,9 @@ try {
 const reviewedNodeVersion = "24.18.0";
 const exactVersionPattern = /^\d+\.\d+\.\d+$/;
 const reviewedNpm = Object.freeze({
-  version: "11.18.0",
+  version: "12.0.2",
   integrity:
-    "sha512-T67M4L5wNm0cZ7EBLErcEkY1SmzEW/WJ+SADBzsFUY1UdAPfFHXFQtZ6SEXiK0+vzXysCvAsepbMaBTwnrAD+w=="
+    "sha512-uIXokLlBj6FpNUTQX1PmT5pz7BlIN9QlixX+zdaSNHsd0qUXsbDLr50xzY6Sw7cJVr0uzHKDOle0swmPW/p5Qw=="
 });
 const reviewedActions = new Map([
   [
@@ -979,7 +979,7 @@ const reviewedReleaseJobContracts = new Map([
   [
     "prepare-npm",
     {
-      digest: "5ff084fffef88eb349737664611606db928613c8e4dd9e596c6a4a1eeb454d01",
+      digest: "e5ba61286d82671bbff3e22a9ec98b66a388b8618bea30cfbb2567a0e9f25ef7",
       permissions: {}
     }
   ],

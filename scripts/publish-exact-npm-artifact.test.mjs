@@ -14,7 +14,7 @@ import {
 
 const PACKAGE_NAME = "patchpage";
 const PACKAGE_VERSION = "1.2.3";
-const NPM_VERSION = "11.18.0";
+const NPM_VERSION = "12.0.2";
 const AUTH_KEY = "//registry.npmjs.org/:_authToken";
 
 function digest(buffer, algorithm, encoding) {
