@@ -34,7 +34,7 @@ jobs:
       snapshot: ${{ steps.plan.outputs.snapshot }}
       complete-count: ${{ steps.plan.outputs.complete-count }}
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
@@ -188,7 +188,7 @@ jobs:
       max-parallel: 1
       matrix: ${{ fromJson(needs.inspect.outputs.matrix) }}
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
       - name: Build, validate, and save exact server image for replay
