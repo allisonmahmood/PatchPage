@@ -69,8 +69,8 @@ jobs:
         id: npm-cli
         shell: bash
         env:
-          EXPECTED_NPM_VERSION: 11.18.0
-          EXPECTED_NPM_INTEGRITY: sha512-T67M4L5wNm0cZ7EBLErcEkY1SmzEW/WJ+SADBzsFUY1UdAPfFHXFQtZ6SEXiK0+vzXysCvAsepbMaBTwnrAD+w==
+          EXPECTED_NPM_VERSION: 12.0.2
+          EXPECTED_NPM_INTEGRITY: sha512-uIXokLlBj6FpNUTQX1PmT5pz7BlIN9QlixX+zdaSNHsd0qUXsbDLr50xzY6Sw7cJVr0uzHKDOle0swmPW/p5Qw==
         run: |
           set -euo pipefail
 
