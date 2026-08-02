@@ -29,34 +29,100 @@ file_mode() {
   stat -c '%a' "$1" 2>/dev/null || stat -f '%Lp' "$1"
 }
 
+# The one interesting case in the exit-code contract ops.sh --help states: a
+# command that deliberately keeps the operation lease exits 75, and nothing else
+# does. 75 is EX_TEMPFAIL, picked so a caller that treats "nonzero" as
+# "retryable" has to special-case the one code where retrying is exactly wrong.
+#
+# The expectation is derived from the retention message the flow itself prints,
+# not from a hand-kept list of scenario names, so a new retaining path is held
+# to the contract the moment it is written. Both directions are checked: a
+# retained lease must exit 75, and 75 must mean a retained lease.
+GUIDE_RETAINED_LEASE_EXITS=0
+assert_retained_lease_exit_code() {
+  # flow scenario status output-file
+  if grep -Fq 'The operation lease remains held for second-operator recovery.' "$4"; then
+    GUIDE_RETAINED_LEASE_EXITS=$((GUIDE_RETAINED_LEASE_EXITS + 1))
+    test "$3" -eq 75 ||
+      fail "$1 kept the operation lease after $2 but exited $3 instead of 75"
+  else
+    test "$3" -ne 75 ||
+      fail "$1 exited 75 after $2 without keeping the operation lease"
+  fi
+}
+
 case "$TMP_DIR" in
   *' '*) ;;
   *) fail "guide harness temporary path does not contain spaces" ;;
 esac
 
-if grep -Fq -- '--header "Authorization: Bearer $BOOTSTRAP_API_TOKEN"' "$README"; then
+if grep -Fq -- '--header "Authorization: Bearer $BOOTSTRAP_API_TOKEN"' \
+  "$ROOT/infra/azure/cmd/deployed-smoke.sh"; then
   fail "deployed smoke exposes the bootstrap token in curl argv"
 fi
 
+# --- the operations CLI under test -------------------------------------------
+#
+# The runbooks this harness drives are infra/azure/cmd/*.sh, reached the way an
+# operator reaches them: `sh infra/azure/ops.sh <command>`. The guide documents
+# that invocation and nothing else, so there is no extraction step and no
+# generated copy of the runbook text to keep in sync.
+
+GUIDE_OPS="$ROOT/infra/azure/ops.sh"
+GUIDE_CMD_DIR="$ROOT/infra/azure/cmd"
+GUIDE_COMMANDS="state-bootstrap deploy-resources app-release app-rollback
+infrastructure-change stale-lease-recovery custom-domain-context
+ingress-verification apex-dns caa-policy hostname-mutation certificate-binding
+deployed-smoke"
+
+test -f "$GUIDE_OPS" || fail "infra/azure/ops.sh is missing"
+sh -n "$GUIDE_OPS" || fail "infra/azure/ops.sh is not valid POSIX shell"
+for guide_command in $GUIDE_COMMANDS; do
+  test -f "$GUIDE_CMD_DIR/$guide_command.sh" ||
+    fail "infra/azure/cmd/$guide_command.sh is missing"
+  sh -n "$GUIDE_CMD_DIR/$guide_command.sh" ||
+    fail "infra/azure/cmd/$guide_command.sh is not valid POSIX shell"
+  # ops.sh must be able to reach every command file, and must reject anything
+  # else, or a runbook could be present and undispatchable.
+  sh "$GUIDE_OPS" --help | grep -Fq -- "  $guide_command " ||
+    fail "ops.sh --help does not list $guide_command"
+done
+if sh "$GUIDE_OPS" not-a-command >/dev/null 2>&1; then
+  fail "ops.sh dispatched an unknown command"
+fi
+for guide_cmd_file in "$GUIDE_CMD_DIR"/*.sh; do
+  guide_cmd_name="${guide_cmd_file##*/}"
+  guide_cmd_name="${guide_cmd_name%.sh}"
+  case " $(printf '%s' "$GUIDE_COMMANDS" | tr '\n' ' ') " in
+    *" $guide_cmd_name "*) ;;
+    *) fail "infra/azure/cmd/$guide_cmd_name.sh is not a dispatchable command" ;;
+  esac
+done
+
 # --- mock shims --------------------------------------------------------------
 #
-# az, terraform, git, curl and dig are executables under tests/mocks, not shell
-# functions. Each extracted README block runs as a child process with the mock
-# directory first on PATH, so a documented command reaches a mock exactly the
-# way it would reach the real tool. Because a shim is a separate process it
-# cannot read the block's shell variables: everything it needs is exported
-# below, and everything it must remember between calls lives in a file under
-# the per-scenario state directory.
+# az, terraform, git, curl, dig, mktemp, cat, rm, chmod, jq and sleep are
+# executables under tests/mocks, not shell functions. Each runbook runs as a
+# child process with the mock directory first on PATH, so a documented command
+# reaches a mock exactly the way it would reach the real tool. Because a shim is
+# a separate process it cannot read the runbook's shell variables: everything it
+# needs is exported below, recomputed from those exports, or kept in a file
+# under the per-scenario state directory.
+#
+# mktemp, cat, rm, chmod and jq have to fall through to the real tool for every
+# call they are not injecting a failure into, and the mock directory is first on
+# PATH, so they need the PATH the harness started from.
 
 GUIDE_MOCK_DIR="$ROOT/infra/azure/tests/mocks"
 PP_MOCK_DIR="$GUIDE_MOCK_DIR"
-export PP_MOCK_DIR
+PP_MOCK_REAL_PATH="$PATH"
+export PP_MOCK_DIR PP_MOCK_REAL_PATH
 GUIDE_MOCK_PATH="$GUIDE_MOCK_DIR:$PATH"
-GUIDE_BLOCK_DIR="$TMP_ROOT/blocks"
-GUIDE_PART_DIR="$TMP_ROOT/block-parts"
-mkdir -p "$GUIDE_BLOCK_DIR" "$GUIDE_PART_DIR"
+GUIDE_WRAPPER_DIR="$TMP_ROOT/wrappers"
+GUIDE_PART_DIR="$TMP_ROOT/wrapper-parts"
+mkdir -p "$GUIDE_WRAPPER_DIR" "$GUIDE_PART_DIR"
 
-for guide_mock in mocklib.sh az terraform git curl dig; do
+for guide_mock in mocklib.sh az terraform git curl dig mktemp cat rm chmod jq sleep; do
   test -f "$GUIDE_MOCK_DIR/$guide_mock" ||
     fail "guide harness mock $guide_mock is missing"
   case "$guide_mock" in
@@ -78,29 +144,11 @@ test -f "$GUIDE_CANONICALIZER" ||
 sh -n "$GUIDE_CANONICALIZER" ||
   fail "guide log canonicalizer is not valid POSIX shell"
 
-# Block scripts are assembled from parts on disk rather than from shell
+# Wrapper scripts are assembled from parts on disk rather than from shell
 # variables: bash 3.2 mis-parses a quoted here-document inside a command
 # substitution when the document contains case patterns.
-write_block_part() {
+write_wrapper_part() {
   printf '%s\n' "$2" > "$GUIDE_PART_DIR/$1"
-}
-
-# Writes the child script that replaces the old in-process eval: an optional
-# preamble of the mocks that must stay in-process, the extracted README
-# block(s), and an optional trailer that re-expresses what used to be asserted
-# against the eval'ing shell itself. Sets BLOCK_SCRIPT to the written path.
-build_block_script() {
-  BLOCK_SCRIPT="$GUIDE_BLOCK_DIR/$1"
-  shift
-  {
-    # The README blocks are written for `sh -u` without errexit, which is what
-    # they already got: every block runner is invoked in a condition context,
-    # where POSIX shells suppress errexit inside the tested command.
-    printf '%s\n' 'set -u'
-    for block_part do
-      cat "$GUIDE_PART_DIR/$block_part"
-    done
-  } > "$BLOCK_SCRIPT"
 }
 
 # Empties and exports the state directory the shims use instead of the shell
@@ -112,359 +160,93 @@ prepare_mock_state() {
   export PP_MOCK_STATE
 }
 
-# Runs a prepared block script as a child process with the shims on PATH. The
-# caller has already exported the scenario environment.
-run_block_script() {
+# Runs one ops.sh command as a child process with the shims first on PATH, which
+# is exactly the documented operator invocation. The caller has already exported
+# the scenario environment.
+run_ops_command() {
   PATH="$GUIDE_MOCK_PATH"
   export PATH
-  sh "$1"
+  sh "$GUIDE_OPS" "$1"
 }
 
-cat > "$GUIDE_PART_DIR/completed-trailer" <<'GUIDE_BLOCK_PART'
-printf '%s\n' completed >> "$PP_MOCK_LOG"
-GUIDE_BLOCK_PART
-
-cat > "$GUIDE_PART_DIR/set-errexit-off" <<'GUIDE_BLOCK_PART'
-set +e
-GUIDE_BLOCK_PART
-
-extract_block() {
-  marker="<!-- guide-test:$1 -->"
-  awk -v marker="$marker" '
-    $0 == marker { marked = 1; next }
-    marked && $0 == "```sh" { copying = 1; next }
-    copying && $0 == "```" { found = 1; exit }
-    copying { print }
-    END { if (!found) exit 1 }
-  ' "$README"
+# Same, plus the completion marker the assembled block scripts used to append
+# after the runbook text. A runbook that reaches its last line exits 0, and
+# every early exit in these runbooks is a failure exit, so "the command reported
+# success" and "control reached the end of the runbook" are the same event --
+# with one exception, called out where it bites: app-release's already-deployed
+# no-op guard exits 0 deliberately, so it now records completed where the
+# in-process trailer could tell the two apart. test_app_release pins that guard
+# directly instead.
+run_ops_command_completed() {
+  PATH="$GUIDE_MOCK_PATH"
+  export PATH
+  sh "$GUIDE_OPS" "$1"
+  guide_command_status=$?
+  if test "$guide_command_status" -eq 0; then
+    printf '%s\n' completed >> "$PP_MOCK_LOG"
+  fi
+  return "$guide_command_status"
 }
 
-extract_second_block() {
-  marker="<!-- guide-test:$1 -->"
-  awk -v marker="$marker" '
-    $0 == marker { marked = 1; next }
-    marked && $0 == "```sh" { blocks++; copying = blocks == 2; next }
-    copying && $0 == "```" { found = 1; exit }
-    copying { print }
-    END { if (!found) exit 1 }
-  ' "$README"
+# Writes a wrapper script from parts and runs it with the shims on PATH. Used by
+# the two commands whose contract is stated about the shell that calls them.
+run_ops_wrapper() {
+  guide_wrapper="$GUIDE_WRAPPER_DIR/$1"
+  shift
+  {
+    printf '%s\n' 'set -u'
+    for wrapper_part do
+      cat "$GUIDE_PART_DIR/$wrapper_part"
+    done
+  } > "$guide_wrapper"
+  PATH="$GUIDE_MOCK_PATH"
+  export PATH
+  sh "$guide_wrapper"
 }
 
-HOSTNAME_MUTATION_BLOCK="$(extract_block hostname-mutation)"
-STATE_BOOTSTRAP_BLOCK="$(extract_block state-bootstrap)"
-DEPLOY_RESOURCES_BLOCK="$(extract_block deploy-resources)"
-APP_RELEASE_BLOCK="$(extract_block app-release)"
-APP_ROLLBACK_BLOCK="$(extract_block app-rollback)"
-INFRASTRUCTURE_CHANGE_BLOCK="$(extract_block infrastructure-change)"
-INFRASTRUCTURE_CHANGE_APPLY_BLOCK="$(extract_second_block infrastructure-change)"
-STALE_LEASE_RECOVERY_BLOCK="$(extract_block stale-lease-recovery)"
-CUSTOM_DOMAIN_CONTEXT_BLOCK="$(extract_block custom-domain-context)"
-INGRESS_VERIFICATION_BLOCK="$(extract_block ingress-verification)"
-APEX_DNS_BLOCK="$(extract_block apex-dns)"
-CAA_POLICY_BLOCK="$(extract_block caa-policy)"
-CERTIFICATE_BINDING_BLOCK="$(extract_block certificate-binding)"
-DEPLOYED_SMOKE_BLOCK="$(extract_block deployed-smoke)"
-
-# --- in-process mocks --------------------------------------------------------
+# --- wrapper parts -----------------------------------------------------------
 #
-# mktemp, cat, rm, chmod, jq and sleep stay shell functions inside the child
-# script. Unlike az/terraform/git/curl/dig they are only interesting because
-# they observe variables the extracted block itself sets (STATE_LIST_ERROR,
-# TERRAFORM_DIAGNOSTIC_DIR, SECURE_TARGET_DIR, SECURE_PLAN_DIR,
-# SECURE_CHANGE_DIR, INITIAL_PLAN_JSON, INFRA_PLAN_JSON, CANARY_RECORD), so a
-# separate process could not see what they are asked to check.
+# The mocks that used to be shell functions injected ahead of the README block
+# (mktemp, cat, rm, chmod, jq, sleep) are PATH shims now: a runbook is a real
+# script and nothing can be injected into it. What is left here is the part of
+# each old block script that was never the runbook -- the roles the *calling*
+# shell plays, which the wrapper scripts below still play.
 
-cat > "$GUIDE_PART_DIR/deploy-mocks" <<'GUIDE_BLOCK_PART'
-mktemp() {
-  mktemp_count_file="$PP_MOCK_SCENARIO_ROOT/mktemp-count"
-  mktemp_count=0
-  if test -e "$mktemp_count_file"; then
-    mktemp_count="$(cat "$mktemp_count_file")"
-  fi
-  mktemp_count=$((mktemp_count + 1))
-  printf '%s\n' "$mktemp_count" > "$mktemp_count_file"
-  if test "$PP_MOCK_SCENARIO" = "diagnostic_secure_dir_failure" &&
-    test "$mktemp_count" -eq 1; then
-    return 1
-  fi
-  if test "$PP_MOCK_SCENARIO" = "target_secure_dir_failure" &&
-    test "$mktemp_count" -eq 3; then
-    return 1
-  fi
-  if test "$PP_MOCK_SCENARIO" = "secure_plan_dir_failure" &&
-    test "$mktemp_count" -eq 4; then
-    return 1
-  fi
-  mktemp_result="$(command mktemp "$@")" || return 1
-  if test "$mktemp_count" -eq 1; then
-    printf '%s\n' "$mktemp_result" > "$PP_MOCK_SCENARIO_ROOT/diagnostic-dir"
-    if test "$PP_MOCK_SCENARIO" = "diagnostic_log_open_failure"; then
-      mkdir "$mktemp_result/terraform.log"
-    fi
-  elif test "$PP_MOCK_SCENARIO" = "state_diagnostic_open_failure" &&
-    test "$mktemp_count" -eq 2; then
-    command rm -f -- "$mktemp_result"
-    mkdir "$mktemp_result"
-  fi
-  printf '%s\n' "$mktemp_result"
-}
-
-cat() {
-  if test "$PP_MOCK_SCENARIO" = "state_diagnostic_read_failure" &&
-    test "${1:-}" = "--" &&
-    test "${2:-}" = "${STATE_LIST_ERROR:-}"; then
-    printf 'private read failure: %s\n' "$2" >&2
-    return 1
-  fi
-  command cat "$@"
-}
-
-rm() {
-  if test "$PP_MOCK_SCENARIO" = "state_diagnostic_remove_failure" &&
-    test "${1:-}" = "-f" &&
-    test "${3:-}" = "${STATE_LIST_ERROR:-}"; then
-    printf 'private remove failure: %s\n' "$3" >&2
-    return 1
-  fi
-  if test "$PP_MOCK_SCENARIO" = "diagnostic_cleanup_failure" &&
-    test "${1:-}" = "-rf" &&
-    test "${3:-}" = "${TERRAFORM_DIAGNOSTIC_DIR:-}"; then
-    printf 'private cleanup failure: %s\n' "$3" >&2
-    return 1
-  fi
-  if test "$PP_MOCK_SCENARIO" = "target_cleanup_failure" &&
-    test "${1:-}" = "-rf" &&
-    test "${3:-}" = "${SECURE_TARGET_DIR:-}"; then
-    printf 'private target cleanup failure: %s\n' "$3" >&2
-    return 1
-  fi
-  if test "$PP_MOCK_SCENARIO" = "initial_cleanup_failure" &&
-    test "${1:-}" = "-rf" &&
-    test "${3:-}" = "${SECURE_PLAN_DIR:-}"; then
-    printf 'private plan cleanup failure: %s\n' "$3" >&2
-    return 1
-  fi
-  command rm "$@"
-}
-
-jq() {
-  jq_input=
-  for jq_arg do
-    jq_input="$jq_arg"
-  done
-  if test -n "${INITIAL_PLAN_JSON:-}" &&
-    test "$jq_input" = "$INITIAL_PLAN_JSON"; then
-    jq_seen="$PP_MOCK_SCENARIO_ROOT/initial-plan-jq-seen"
-    if test "$PP_MOCK_SCENARIO" = "plan_summary_failure" && test -e "$jq_seen"; then
-      return 1
-    fi
-    : > "$jq_seen"
-  fi
-  command jq "$@"
-}
-GUIDE_BLOCK_PART
-
-cat > "$GUIDE_PART_DIR/release-mocks" <<'GUIDE_BLOCK_PART'
-mktemp() {
-  test "$PP_MOCK_SCENARIO" != "rollback_record_create_failure" || return 1
-  command mktemp "$@"
-}
-
-chmod() {
-  if test "$PP_MOCK_SCENARIO" = "rollback_record_chmod_failure"; then
-    case "$2" in
-      "${ROLLBACK_RECORD}.tmp."*) return 1 ;;
-    esac
-  fi
-  command chmod "$@"
-}
-
-sleep() {
-  printf 'sleep %s\n' "$*" >> "$PP_MOCK_LOG"
-}
-GUIDE_BLOCK_PART
-
-cat > "$GUIDE_PART_DIR/rollback-mocks" <<'GUIDE_BLOCK_PART'
-sleep() {
-  printf 'sleep %s\n' "$*" >> "$PP_MOCK_LOG"
-}
-GUIDE_BLOCK_PART
-
-cat > "$GUIDE_PART_DIR/infrastructure-mocks" <<'GUIDE_BLOCK_PART'
-chmod() {
-  if test "$PP_MOCK_SCENARIO" = "backend_chmod_failure" &&
-    test "$2" = "backend.hcl"; then
-    return 1
-  fi
-  command chmod "$@"
-}
-
-mktemp() {
-  mktemp_count_file="$PP_MOCK_SCENARIO_ROOT/mktemp-count"
-  mktemp_count=0
-  if test -e "$mktemp_count_file"; then
-    mktemp_count="$(cat "$mktemp_count_file")"
-  fi
-  mktemp_count=$((mktemp_count + 1))
-  printf '%s\n' "$mktemp_count" > "$mktemp_count_file"
-  if test "$PP_MOCK_SCENARIO" = "infra_diagnostic_secure_dir_failure" &&
-    test "$mktemp_count" -eq 1; then
-    return 1
-  fi
-  if test "$PP_MOCK_SCENARIO" = "secure_change_dir_failure" &&
-    test "$mktemp_count" -eq 2; then
-    return 1
-  fi
-  mktemp_result="$(command mktemp "$@")" || return 1
-  if test "$mktemp_count" -eq 1; then
-    printf '%s\n' "$mktemp_result" > "$PP_MOCK_SCENARIO_ROOT/diagnostic-dir"
-    if test "$PP_MOCK_SCENARIO" = "infra_diagnostic_log_open_failure"; then
-      mkdir "$mktemp_result/terraform.log"
-    fi
-  elif test "$PP_MOCK_SCENARIO" = "state_snapshot_open_failure" &&
-    test "$mktemp_count" -eq 2; then
-    mkdir "$mktemp_result/state.json"
-  fi
-  printf '%s\n' "$mktemp_result"
-}
-
-rm() {
-  if test "$PP_MOCK_SCENARIO" = "infra_diagnostic_cleanup_failure" &&
-    test "${1:-}" = "-rf" &&
-    test "${3:-}" = "${TERRAFORM_DIAGNOSTIC_DIR:-}"; then
-    printf 'private cleanup failure: %s\n' "$3" >&2
-    return 1
-  fi
-  if test "$PP_MOCK_SCENARIO" = "secure_change_cleanup_failure" &&
-    test "${1:-}" = "-rf" &&
-    test "${3:-}" = "${SECURE_CHANGE_DIR:-}"; then
-    printf 'private change cleanup failure: %s\n' "$3" >&2
-    return 1
-  fi
-  command rm "$@"
-}
-
-sleep() {
-  printf 'sleep %s\n' "$*" >> "$PP_MOCK_LOG"
-}
-
-jq() {
-  jq_input=
-  for jq_arg do
-    jq_input="$jq_arg"
-  done
-  if test -n "${INFRA_PLAN_JSON:-}" &&
-    test "$jq_input" = "$INFRA_PLAN_JSON"; then
-    jq_seen="$PP_MOCK_SCENARIO_ROOT/infrastructure-plan-jq-seen"
-    if test "$PP_MOCK_SCENARIO" = "plan_summary_failure" && test -e "$jq_seen"; then
-      return 1
-    fi
-    : > "$jq_seen"
-  fi
-  command jq "$@"
-}
-GUIDE_BLOCK_PART
-
-# The deployed-smoke group is the one place where the shell that runs the block
-# is itself under test: the block must not clobber the caller's traps and must
-# not remove a path the caller reuses. That caller role moves into the child
-# script, so the assertion keeps its original meaning.
-cat > "$GUIDE_PART_DIR/smoke-mocks" <<'GUIDE_BLOCK_PART'
-mktemp() {
-  case "$*" in
-    "-d")
-      mkdir -p "$PP_MOCK_SMOKE_TMP_DIR" || return 1
-      printf '%s\n' "$PP_MOCK_SMOKE_TMP_DIR"
-      ;;
-    "${CANARY_RECORD:-}.tmp.XXXXXX")
-      command mktemp "$@"
-      ;;
-    *)
-      return 1
-      ;;
-  esac
-}
-
-chmod() {
-  if test "$PP_MOCK_SCENARIO" = "canary_record_chmod_failure"; then
-    case "$2" in
-      "${CANARY_RECORD}.tmp."*) return 1 ;;
-    esac
-  fi
-  command chmod "$@"
-}
-
+# The deployed-smoke command is the one place where the shell that runs the
+# runbook is itself under test: the runbook must not clobber the caller's traps
+# and must not remove a path the caller reuses. The caller role stays in a
+# wrapper script that sets the traps, runs the command, snapshots the traps and
+# propagates the exit status, so the assertion keeps its original meaning with
+# ops.sh as the tested child.
+cat > "$GUIDE_PART_DIR/smoke-caller-traps" <<'GUIDE_WRAPPER_PART'
 trap 'printf "%s\n" caller-exit >> "$PP_MOCK_CALLER_TRAP_LOG"' EXIT
 trap 'printf "%s\n" caller-hup >> "$PP_MOCK_CALLER_TRAP_LOG"' HUP
 trap 'printf "%s\n" caller-int >> "$PP_MOCK_CALLER_TRAP_LOG"' INT
 trap 'printf "%s\n" caller-term >> "$PP_MOCK_CALLER_TRAP_LOG"' TERM
-GUIDE_BLOCK_PART
+GUIDE_WRAPPER_PART
 
-cat > "$GUIDE_PART_DIR/smoke-trailer" <<'GUIDE_BLOCK_PART'
+cat > "$GUIDE_PART_DIR/smoke-trailer" <<'GUIDE_WRAPPER_PART'
 smoke_status=$?
 trap > "$PP_MOCK_CALLER_TRAP_SNAPSHOT"
 mkdir -p "$PP_MOCK_SMOKE_TMP_DIR"
 : > "$PP_MOCK_SMOKE_TMP_DIR/reused-after-smoke"
 exit "$smoke_status"
-GUIDE_BLOCK_PART
+GUIDE_WRAPPER_PART
 
-# The custom-domain context block is the only one whose contract is stated in
-# terms of variables it leaves behind, so those checks run inside the child.
-# Chained with && so each one bites regardless of errexit.
-cat > "$GUIDE_PART_DIR/custom-domain-context-trailer" <<'GUIDE_BLOCK_PART'
+# The custom-domain context command is the only one whose contract is stated in
+# terms of the variables it leaves behind, so the guide tells the operator to
+# source it into the shell the later custom-domain commands run in. This test
+# sources it the same way and then checks those variables; the dispatched
+# `sh ops.sh custom-domain-context` form is what test_custom_domain_output_guards
+# drives. Chained with && so each check bites regardless of errexit.
+cat > "$GUIDE_PART_DIR/custom-domain-context-trailer" <<'GUIDE_WRAPPER_PART'
 test "$CUSTOM_DOMAIN" = "drafts.self-hoster.dev" &&
   test "$CONTAINER_APP_FQDN" = "app.azurecontainerapps.io" &&
   test "$NORMALIZED_PUBLIC_BASE_URL" = "https://drafts.self-hoster.dev"
-GUIDE_BLOCK_PART
+GUIDE_WRAPPER_PART
 
-write_block_part state-bootstrap-block "$STATE_BOOTSTRAP_BLOCK"
-write_block_part deploy-resources-block "$DEPLOY_RESOURCES_BLOCK"
-write_block_part app-release-block "$APP_RELEASE_BLOCK"
-write_block_part app-rollback-block "$APP_ROLLBACK_BLOCK"
-write_block_part infrastructure-change-block "$INFRASTRUCTURE_CHANGE_BLOCK"
-write_block_part infrastructure-change-apply-block "$INFRASTRUCTURE_CHANGE_APPLY_BLOCK"
-write_block_part stale-lease-recovery-block "$STALE_LEASE_RECOVERY_BLOCK"
-write_block_part custom-domain-context-block "$CUSTOM_DOMAIN_CONTEXT_BLOCK"
-write_block_part ingress-verification-block "$INGRESS_VERIFICATION_BLOCK"
-write_block_part hostname-mutation-block "$HOSTNAME_MUTATION_BLOCK"
-write_block_part apex-dns-block "$APEX_DNS_BLOCK"
-write_block_part caa-policy-block "$CAA_POLICY_BLOCK"
-write_block_part certificate-binding-block "$CERTIFICATE_BINDING_BLOCK"
-
-build_block_script state-bootstrap state-bootstrap-block
-STATE_BOOTSTRAP_SCRIPT="$BLOCK_SCRIPT"
-build_block_script deploy-resources \
-  deploy-mocks deploy-resources-block completed-trailer
-DEPLOY_RESOURCES_SCRIPT="$BLOCK_SCRIPT"
-build_block_script app-release \
-  release-mocks app-release-block completed-trailer
-APP_RELEASE_SCRIPT="$BLOCK_SCRIPT"
-build_block_script app-rollback \
-  rollback-mocks app-rollback-block completed-trailer
-APP_ROLLBACK_SCRIPT="$BLOCK_SCRIPT"
-build_block_script infrastructure-change \
-  infrastructure-mocks infrastructure-change-block \
-  infrastructure-change-apply-block completed-trailer
-INFRASTRUCTURE_CHANGE_SCRIPT="$BLOCK_SCRIPT"
-build_block_script stale-lease-recovery \
-  stale-lease-recovery-block completed-trailer
-STALE_LEASE_RECOVERY_SCRIPT="$BLOCK_SCRIPT"
-build_block_script custom-domain-context \
-  custom-domain-context-block custom-domain-context-trailer
-CUSTOM_DOMAIN_CONTEXT_SCRIPT="$BLOCK_SCRIPT"
-build_block_script custom-domain-output-guard \
-  set-errexit-off custom-domain-context-block completed-trailer
-CUSTOM_DOMAIN_OUTPUT_GUARD_SCRIPT="$BLOCK_SCRIPT"
-build_block_script ingress-verification ingress-verification-block
-INGRESS_VERIFICATION_SCRIPT="$BLOCK_SCRIPT"
-build_block_script hostname-mutation hostname-mutation-block
-HOSTNAME_MUTATION_SCRIPT="$BLOCK_SCRIPT"
-build_block_script apex-dns apex-dns-block
-APEX_DNS_SCRIPT="$BLOCK_SCRIPT"
-build_block_script caa-policy caa-policy-block
-CAA_POLICY_SCRIPT="$BLOCK_SCRIPT"
-build_block_script certificate-binding certificate-binding-block
-CERTIFICATE_BINDING_SCRIPT="$BLOCK_SCRIPT"
+write_wrapper_part custom-domain-context-source \
+  ". \"$GUIDE_CMD_DIR/custom-domain-context.sh\""
 
 run_state_bootstrap_block() {
   scenario="$1"
@@ -522,19 +304,17 @@ run_state_bootstrap_block() {
       : > "$PP_MOCK_STATE/role-assignment-created"
     fi
 
-    run_block_script "$STATE_BOOTSTRAP_SCRIPT"
+    run_ops_command state-bootstrap
   ) >"$output" 2>&1
 }
 
 test_state_bootstrap() {
-  printf '%s\n' "$STATE_BOOTSTRAP_BLOCK" |
-    grep -Fq -- '--role "$STORAGE_BLOB_DATA_CONTRIBUTOR_ROLE_ID"' ||
+  grep -Fq -- '--role "$STORAGE_BLOB_DATA_CONTRIBUTOR_ROLE_ID"' \
+    "$GUIDE_CMD_DIR/state-bootstrap.sh" ||
     fail "state bootstrap does not filter operation RBAC by the official built-in role ID"
-  printf '%s\n' "$STATE_BOOTSTRAP_BLOCK" |
-    grep -Fq -- '--include-inherited' ||
+  grep -Fq -- '--include-inherited' "$GUIDE_CMD_DIR/state-bootstrap.sh" ||
     fail "state bootstrap does not inspect inherited operation RBAC"
-  printf '%s\n' "$STATE_BOOTSTRAP_BLOCK" |
-    grep -Fq -- '--include-groups' ||
+  grep -Fq -- '--include-groups' "$GUIDE_CMD_DIR/state-bootstrap.sh" ||
     fail "state bootstrap does not inspect operation RBAC inherited through groups"
   for scenario in \
     subscription_set_failure \
@@ -800,7 +580,7 @@ run_deploy_resources_block() {
       'container_name = "foreign"' \
       'key = "foreign.tfstate"' > backend.hcl
 
-    run_block_script "$DEPLOY_RESOURCES_SCRIPT"
+    run_ops_command_completed deploy-resources
   ) >"$output" 2>&1
 }
 
@@ -1244,11 +1024,12 @@ run_app_release_block() {
       PP_MOCK_APP_UPDATED_FLAG
     prepare_mock_state "$TMP_DIR/release-$scenario.mockstate"
 
-    run_block_script "$APP_RELEASE_SCRIPT"
+    run_ops_command_completed app-release
   ) >"$output" 2>&1
 }
 
 test_app_release() {
+  release_retained_start="$GUIDE_RETAINED_LEASE_EXITS"
   for scenario in \
     empty_canary_marker \
     whitespace_canary_marker \
@@ -1341,6 +1122,8 @@ test_app_release() {
     fi
 
     log="$TMP_DIR/release-$scenario.log"
+    assert_retained_lease_exit_code "app release" "$scenario" "$status" \
+      "$TMP_DIR/release-$scenario.out"
     if test "$scenario" = "success" ||
       test "$scenario" = "uppercase_public_hostname" ||
       test "$scenario" = "scale_to_zero_revision"; then
@@ -1474,9 +1257,16 @@ test_app_release() {
         'Release image is already deployed; no update is required.' \
         "$TMP_DIR/release-$scenario.out" ||
         fail "app release omitted its no-op result"
-      if grep -Fq '^completed$' "$log"; then
-        fail "app release continued past its already-deployed digest guard"
-      fi
+      # This is the one guard in the guide that exits 0 on purpose, so the
+      # completion marker cannot separate "stopped here" from "ran to the end"
+      # now that the runbook is a child process and only its exit status crosses
+      # back. Pin the guard on what it actually did: giving the lease back was
+      # the last thing it did, and nothing followed.
+      no_op_last_command="$(grep '^az ' "$log" | sed -n '$p')"
+      case "$no_op_last_command" in
+        'az storage container lease release '*) ;;
+        *) fail "app release continued past its already-deployed digest guard" ;;
+      esac
     else
       test "$status" -ne 0 || fail "app release accepted $scenario"
       if grep -q '^completed$' "$log"; then
@@ -1619,6 +1409,8 @@ test_app_release() {
       fail "app release exposed a private ID or workload-binding hash after $scenario"
     fi
   done
+  test "$((GUIDE_RETAINED_LEASE_EXITS - release_retained_start))" -ge 5 ||
+    fail "app release never exercised a deliberately retained operation lease"
 }
 
 run_app_rollback_block() {
@@ -1715,11 +1507,12 @@ run_app_rollback_block() {
       PP_MOCK_APP_SHOW_COUNT_FILE PP_MOCK_APP_UPDATED_FLAG
     prepare_mock_state "$TMP_DIR/rollback-$scenario.mockstate"
 
-    run_block_script "$APP_ROLLBACK_SCRIPT"
+    run_ops_command_completed app-rollback
   ) >"$output" 2>&1
 }
 
 test_app_rollback() {
+  rollback_retained_start="$GUIDE_RETAINED_LEASE_EXITS"
   for scenario in \
     rollback_record_extra_line \
     rollback_record_trailing_blank \
@@ -1795,6 +1588,7 @@ test_app_rollback() {
 
     log="$TMP_DIR/rollback-$scenario.log"
     output="$TMP_DIR/rollback-$scenario.out"
+    assert_retained_lease_exit_code "app rollback" "$scenario" "$status" "$output"
     if test "$scenario" = "success" || test "$scenario" = "update_failure"; then
       grep -Fqx \
         'az containerapp update --resource-group rg-patchpage-workload --name patchpage-app --container-name server --image acrpatchpageabc123.azurecr.io/patchpage-server@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa --query properties.latestRevisionName --output tsv' \
@@ -1991,6 +1785,8 @@ test_app_rollback() {
         ;;
     esac
   done
+  test "$((GUIDE_RETAINED_LEASE_EXITS - rollback_retained_start))" -ge 5 ||
+    fail "app rollback never exercised a deliberately retained operation lease"
 }
 
 run_infrastructure_change_block() {
@@ -2101,11 +1897,12 @@ run_infrastructure_change_block() {
       *) : > "$PP_MOCK_STATE/operation-container-created" ;;
     esac
 
-    run_block_script "$INFRASTRUCTURE_CHANGE_SCRIPT"
+    run_ops_command_completed infrastructure-change
   ) >"$output" 2>&1
 }
 
 test_infrastructure_change() {
+  infrastructure_retained_start="$GUIDE_RETAINED_LEASE_EXITS"
   required_addresses='
 azurerm_resource_group.patchpage
 azurerm_container_registry.patchpage
@@ -2117,7 +1914,7 @@ azurerm_container_app.server'
   printf '%s\n' "$required_addresses" |
     while IFS= read -r address; do
       test -z "$address" && continue
-      printf '%s\n' "$INFRASTRUCTURE_CHANGE_BLOCK" | grep -Fq "$address" ||
+      grep -Fq "$address" "$GUIDE_CMD_DIR/infrastructure-change.sh" ||
         fail "infrastructure change omitted required state address $address"
     done
 
@@ -2242,6 +2039,8 @@ azurerm_container_app.server'
 
     log="$TMP_DIR/infrastructure-$scenario.log"
     output="$TMP_DIR/infrastructure-$scenario.out"
+    assert_retained_lease_exit_code "infrastructure change" "$scenario" "$status" \
+      "$output"
     diagnostic_path_file="$TMP_DIR/infrastructure-$scenario/diagnostic-dir"
     if test "$scenario" = "success" ||
       test "$scenario" = "infra_diagnostic_cleanup_failure" ||
@@ -2649,6 +2448,8 @@ azurerm_container_app.server'
         fail "failed infrastructure diagnostic log omitted provider diagnostics"
     fi
   done
+  test "$((GUIDE_RETAINED_LEASE_EXITS - infrastructure_retained_start))" -ge 3 ||
+    fail "infrastructure change never exercised a deliberately retained operation lease"
 }
 
 run_stale_lease_recovery_block() {
@@ -2691,7 +2492,7 @@ run_stale_lease_recovery_block() {
       PP_MOCK_LEASE_SCENARIO_PREFIX PP_MOCK_OPERATION_BINDING_SHA256
     prepare_mock_state "$TMP_DIR/stale-lease-$scenario.mockstate"
 
-    run_block_script "$STALE_LEASE_RECOVERY_SCRIPT"
+    run_ops_command_completed stale-lease-recovery
   ) >"$output" 2>&1
 }
 
@@ -2776,19 +2577,23 @@ test_stale_lease_recovery() {
     fail "stale operation lease guidance omitted uncatchable-kill behavior"
 }
 
-# Returns 0 when every ```sh block in the given guide reaches its tools through
-# PATH, 1 when one of them names a tool by absolute path. The harness only
-# proves a documented command because that command resolves to a shim in
-# tests/mocks; an absolute path such as /usr/bin/az would run the real tool and
-# silently take the step out of the harness's reach. Takes the guide file so
-# the check itself can be meta-tested against a sabotaged copy.
+# Returns 0 when every given shell source reaches its tools through PATH, 1 when
+# one of them names a tool by absolute path. The harness only proves a
+# documented command because that command resolves to a shim in tests/mocks; an
+# absolute path such as /usr/bin/az would run the real tool and silently take
+# the step out of the harness's reach. Takes the files so the check itself can
+# be meta-tested against a sabotaged copy.
 # Deliberately reports status instead of calling fail.
 #
-# Exactly what this guarantees: inside a ```sh block, none of the 13 tools the
-# harness mocks -- az, terraform, tofu, git, curl, dig, jq, openssl, mktemp,
-# chmod, sleep, cat, rm -- is named by an absolute path. That is the one bypass
-# that would fail silently, because the real tool would answer and the block
-# would still look like it passed.
+# The runbooks are executables now, so this scans ops.sh and cmd/*.sh whole
+# rather than the guide's ```sh fences: the shell moved, and the rule has to
+# move with it. PR E turns the guide-side check into fence purity.
+#
+# Exactly what this guarantees: none of the 13 tools the harness mocks -- az,
+# terraform, tofu, git, curl, dig, jq, openssl, mktemp, chmod, sleep, cat, rm --
+# is named by an absolute path. That is the one bypass that would fail silently,
+# because the real tool would answer and the command would still look like it
+# passed.
 #
 # What it deliberately does not catch: `command -p az`, which resolves against
 # the implementation-defined default PATH, and a `PATH=/usr/bin az ...`
@@ -2797,14 +2602,28 @@ test_stale_lease_recovery() {
 # loudly on the very first documented command instead of quietly passing. A
 # regex for them would also have to model shell quoting to avoid false
 # positives on prose and on the guide's own PATH-setting examples.
-readme_sh_blocks_reach_tools_through_path() {
+ops_sources_reach_tools_through_path() {
   awk '
-    $0 == "```sh" { in_block = 1; next }
-    in_block && $0 == "```" { in_block = 0; next }
-    in_block && $0 ~ "(^|[^[:alnum:]_./-])/([[:alnum:]_.-]+/)*(az|terraform|tofu|git|curl|dig|jq|openssl|mktemp|chmod|sleep|cat|rm)([^[:alnum:]_./-]|$)" {
+    $0 ~ "(^|[^[:alnum:]_./-])/([[:alnum:]_.-]+/)*(az|terraform|tofu|git|curl|dig|jq|openssl|mktemp|chmod|sleep|cat|rm)([^[:alnum:]_./-]|$)" {
       absolute_tool_path = 1
     }
     END { exit absolute_tool_path ? 1 : 0 }
+  ' "$@"
+}
+
+# Returns 0 when the guide no longer carries any of the runbooks that moved into
+# cmd/, 1 otherwise. Two independent statements, because either one alone rots:
+# no `guide-test` marker survives, and no ```sh fence is anywhere near
+# block-sized. The smallest runbook that moved is 45 lines, so a 40-line ceiling
+# cannot be satisfied by a re-inlined runbook. Takes the guide file so the check
+# itself can be meta-tested against a sabotaged copy.
+# Deliberately reports status instead of calling fail.
+guide_carries_no_moved_runbook() {
+  awk '
+    /^<!-- guide-test:/ { marker = 1 }
+    $0 == "```sh" { fence = NR; next }
+    $0 == "```" && fence { if (NR - fence - 1 > 40) oversized = 1; fence = 0 }
+    END { exit (marker || oversized) ? 1 : 0 }
   ' "$1"
 }
 
@@ -2913,7 +2732,19 @@ server_image_precondition_is_pinned() {
 }
 
 test_public_safe_runbook_static() {
-  if grep -Eiq 'If[-]Match|e[t]ag|patchpageOperation[L]ock|private_az r[e]st' "$README"; then
+  # The runbooks are files under cmd/ now, so every check that is really about
+  # the shell reads those files; the checks that are about what the guide says
+  # still read the guide. GUIDE_SHELL_SOURCES is the whole executable surface.
+  set -- "$GUIDE_OPS"
+  for guide_command in $GUIDE_COMMANDS; do
+    set -- "$@" "$GUIDE_CMD_DIR/$guide_command.sh"
+  done
+  GUIDE_SHELL_SOURCES_COUNT="$#"
+  test "$GUIDE_SHELL_SOURCES_COUNT" -eq 14 ||
+    fail "the operations CLI is not ops.sh plus the 13 documented commands"
+
+  if grep -Eiq 'If[-]Match|e[t]ag|patchpageOperation[L]ock|private_az r[e]st' \
+    "$README" "$@"; then
     fail "Azure guide retains the unsupported Container App tag/conditional-REST mutex"
   fi
   if ! awk '
@@ -2923,32 +2754,33 @@ test_public_safe_runbook_static() {
       if ($0 != "  az \"$@\" --subscription \"$SUBSCRIPTION_ID\" 2>/dev/null") exit 1
     }
     END { if (wrappers == 0) exit 1 }
-  ' "$README"; then
+  ' "$@"; then
     fail "a private_az wrapper does not pin every command to the explicit subscription"
   fi
   if grep -Eq -- \
     'az account show[^|;]*(--query[ =]+['"'"'"]?(user|tenantId|environmentName)|--output json)' \
-    "$README"; then
+    "$README" "$@"; then
     fail "Azure guide queries caller details instead of only the active subscription ID"
   fi
   if grep -Eq -- \
     'terraform state pull[[:space:]]*>[[:space:]]*[^[:space:]"$]|terraform show[[:space:]]+"\$[^"]*PLAN"|terraform plan[[:space:]]+-out=[^[:space:]"$]' \
-    "$README"; then
+    "$README" "$@"; then
     fail "Azure guide writes raw Terraform state or plan output to a repository-visible path"
   fi
-  printf '%s\n%s\n' "$APP_RELEASE_BLOCK" "$INFRASTRUCTURE_CHANGE_BLOCK" |
-    grep -Eq '(^|[;&|][[:space:]]*)echo[[:space:]].*\$(IMAGE|.*_ID|RESOURCE_GROUP|STATE_)' &&
-    fail "new runbook blocks directly echo a sensitive image or resource value"
-  printf '%s\n' "$APP_RELEASE_BLOCK" |
-    grep -Fq 'terraform ' &&
-    fail "app release block contains a Terraform command"
+  if grep -Eq '(^|[;&|][[:space:]]*)echo[[:space:]].*\$(IMAGE|.*_ID|RESOURCE_GROUP|STATE_)' \
+    "$GUIDE_CMD_DIR/app-release.sh" "$GUIDE_CMD_DIR/infrastructure-change.sh"; then
+    fail "new runbook commands directly echo a sensitive image or resource value"
+  fi
+  if grep -Fq 'terraform ' "$GUIDE_CMD_DIR/app-release.sh"; then
+    fail "app release command contains a Terraform command"
+  fi
   if grep -Eq \
     'Could not select Azure subscription %s|Expected subscription %s|Could not add hostname %s|Could not bind a managed certificate for %s|empty managed certificate ID for %s|No SNI binding for %s uses exact certificate ID %s' \
-    "$README"; then
+    "$README" "$@"; then
     fail "Azure guide retains a verbose hostname or certificate error that exposes private values"
   fi
-  readme_sh_blocks_reach_tools_through_path "$README" ||
-    fail "an Azure guide shell block names a tool by absolute path and would bypass the harness shims"
+  ops_sources_reach_tools_through_path "$@" ||
+    fail "an operations CLI source names a tool by absolute path and would bypass the harness shims"
 
   # Meta-test the check above: a sabotaged copy that calls a tool by absolute
   # path must be rejected, otherwise the restricted-PATH rule is decorative.
@@ -2958,19 +2790,53 @@ test_public_safe_runbook_static() {
     fail "could not create the restricted-PATH probe directory"
   awk '
     { print }
-    !sabotaged && $0 == "```sh" {
+    NR == 1 {
       sabotaged = 1
       print "/usr/bin/az account show --query id --output tsv"
     }
     END { if (!sabotaged) exit 1 }
-  ' "$README" > "$restricted_path_probe_dir/README.md" ||
+  ' "$GUIDE_CMD_DIR/state-bootstrap.sh" \
+    > "$restricted_path_probe_dir/state-bootstrap.sh" ||
     fail "could not build the absolute-tool-path probe"
-  if cmp -s "$README" "$restricted_path_probe_dir/README.md"; then
+  if cmp -s "$GUIDE_CMD_DIR/state-bootstrap.sh" \
+    "$restricted_path_probe_dir/state-bootstrap.sh"; then
     fail "the absolute-tool-path probe did not sabotage anything"
   fi
-  if readme_sh_blocks_reach_tools_through_path "$restricted_path_probe_dir/README.md"; then
-    fail "the restricted-PATH check accepts an absolute tool path in a guide shell block"
+  if ops_sources_reach_tools_through_path \
+    "$restricted_path_probe_dir/state-bootstrap.sh"; then
+    fail "the restricted-PATH check accepts an absolute tool path in an operations CLI source"
   fi
+
+  # The runbooks left the guide in this change, and nothing may bring one back:
+  # a re-inlined block would be documentation the harness never runs.
+  guide_carries_no_moved_runbook "$README" ||
+    fail "the Azure guide still carries a guide-test marker or a runbook-sized shell fence"
+
+  # Meta-test both halves of that check separately, otherwise one of them could
+  # rot into decoration behind the other.
+  moved_runbook_probe_dir="$TMP_DIR/moved-runbook-probe"
+  rm -rf "$moved_runbook_probe_dir"
+  mkdir -p "$moved_runbook_probe_dir" ||
+    fail "could not create the moved-runbook probe directory"
+  {
+    cat "$README" &&
+      printf '%s\n' '<!-- guide-test:app-release -->'
+  } > "$moved_runbook_probe_dir/marker.md" ||
+    fail "could not build the guide-test marker probe"
+  if guide_carries_no_moved_runbook "$moved_runbook_probe_dir/marker.md"; then
+    fail "the moved-runbook check accepts a surviving guide-test marker"
+  fi
+  {
+    cat "$README" &&
+      printf '%s\n' '```sh' &&
+      awk 'NR > 1 && NR <= 60' "$GUIDE_CMD_DIR/hostname-mutation.sh" &&
+      printf '%s\n' '```'
+  } > "$moved_runbook_probe_dir/inlined.md" ||
+    fail "could not build the re-inlined runbook probe"
+  if guide_carries_no_moved_runbook "$moved_runbook_probe_dir/inlined.md"; then
+    fail "the moved-runbook check accepts a re-inlined runbook fence"
+  fi
+  rm -rf "$moved_runbook_probe_dir"
   rm -rf "$restricted_path_probe_dir"
 
   guide_harness_file="$ROOT/infra/azure/tests/guide_commands_test.sh"
@@ -3155,7 +3021,8 @@ test_custom_domain_context() {
 
     # The trailer inside the block script checks the normalized hostnames the
     # block is contracted to leave behind; see the custom-domain-context-trailer block part.
-    run_block_script "$CUSTOM_DOMAIN_CONTEXT_SCRIPT"
+    run_ops_wrapper custom-domain-context \
+      custom-domain-context-source custom-domain-context-trailer
   ) >"$context_output" 2>&1; then
     fail "Terraform hostnames were not normalized before DNS and certificate checks"
   fi
@@ -3181,7 +3048,7 @@ run_custom_domain_output_guard_block() {
       PP_MOCK_EXPECTED_SUBSCRIPTION PP_MOCK_SUBSCRIPTION_ID
     prepare_mock_state "$TMP_DIR/custom-domain-output-$scenario.mockstate"
 
-    run_block_script "$CUSTOM_DOMAIN_OUTPUT_GUARD_SCRIPT"
+    run_ops_command_completed custom-domain-context
   ) >"$output" 2>&1
 }
 
@@ -3250,7 +3117,7 @@ run_ingress_verification_block() {
     export PP_MOCK_GROUP PP_MOCK_SCENARIO PP_MOCK_LOG
     prepare_mock_state "$TMP_DIR/ingress-$scenario.mockstate"
 
-    run_block_script "$INGRESS_VERIFICATION_SCRIPT"
+    run_ops_command ingress-verification
   ) >/dev/null 2>&1
 }
 
@@ -3327,7 +3194,7 @@ test_hostname_mutation_guard() {
         PP_MOCK_EXPECTED_SUBSCRIPTION PP_MOCK_EXPECTED_CERTIFICATE_ID
       prepare_mock_state "$TMP_DIR/hostname-$scenario.mockstate"
 
-      run_block_script "$HOSTNAME_MUTATION_SCRIPT"
+      run_ops_command hostname-mutation
     ) >"$output" 2>&1; then
       status=0
     else
@@ -3389,7 +3256,7 @@ run_apex_block() {
       PP_MOCK_APEX_AAAA_SCENARIO
     prepare_mock_state "$TMP_DIR/apex.mockstate"
 
-    run_block_script "$APEX_DNS_SCRIPT"
+    run_ops_command apex-dns
   ) >/dev/null 2>&1
 }
 
@@ -3429,7 +3296,7 @@ run_caa_block() {
     export PP_MOCK_GROUP PP_MOCK_SCENARIO PP_MOCK_LOG
     prepare_mock_state "$TMP_DIR/caa-$scenario.mockstate"
 
-    run_block_script "$CAA_POLICY_SCRIPT"
+    run_ops_command caa-policy
   ) >/dev/null 2>&1
 }
 
@@ -3552,7 +3419,7 @@ run_certificate_block() {
       PP_MOCK_CERTIFICATE_BINDING_ID PP_MOCK_CERTIFICATE_PROVISIONING_STATE
     prepare_mock_state "$TMP_DIR/certificate-binding.mockstate"
 
-    run_block_script "$CERTIFICATE_BINDING_SCRIPT"
+    run_ops_command certificate-binding
   ) >"$output" 2>&1
   certificate_status=$?
   if grep -Eq \
@@ -3683,44 +3550,51 @@ run_deployed_smoke_block() {
       PP_MOCK_CALLER_TRAP_SNAPSHOT PP_MOCK_SMOKE_MARKER
     prepare_mock_state "$TMP_DIR/deployed-smoke-$scenario.mockstate"
 
-    smoke_block="$DEPLOYED_SMOKE_BLOCK"
+    # Two scenarios prove that the upload request's shape is load-bearing, by
+    # sabotaging it. The runbook is a file now, so the sabotage produces a
+    # scratch copy of the whole CLI -- ops.sh beside its own cmd/ directory --
+    # and the wrapper dispatches through that copy instead. ops.sh resolves cmd/
+    # relative to itself, so the scratch tree is a complete, self-consistent CLI
+    # and the invocation under test stays `sh <ops.sh> deployed-smoke`.
+    smoke_ops="$GUIDE_OPS"
     case "$scenario" in
-      upload_body_header_file_mutation)
-        if ! smoke_block="$(
-          printf '%s\n' "$DEPLOYED_SMOKE_BLOCK" |
-            awk '
-              $0 == "    --data \"$UPLOAD_PAYLOAD\" \\" {
-                replacements++
-                print "    --data-binary \"@$AUTH_HEADER_FILE\" \\"
-                next
-              }
-              { print }
-              END { if (replacements != 1) exit 1 }
-            '
-        )"; then
-          return 1
-        fi
-        ;;
-      upload_duplicate_body_mutation)
-        if ! smoke_block="$(
-          printf '%s\n' "$DEPLOYED_SMOKE_BLOCK" |
-            awk '
-              $0 == "    --data \"$UPLOAD_PAYLOAD\" \\" {
-                replacements++
-                print
-              }
-              { print }
-              END { if (replacements != 1) exit 1 }
-            '
-        )"; then
-          return 1
-        fi
+      upload_body_header_file_mutation | upload_duplicate_body_mutation)
+        smoke_ops_root="$TMP_DIR/deployed-smoke-$scenario-ops"
+        rm -rf "$smoke_ops_root"
+        mkdir -p "$smoke_ops_root/cmd" || return 1
+        cp "$GUIDE_OPS" "$smoke_ops_root/ops.sh" || return 1
+        smoke_ops="$smoke_ops_root/ops.sh"
         ;;
     esac
-    write_block_part "deployed-smoke-$scenario-block" "$smoke_block"
-    build_block_script "deployed-smoke-$scenario" \
-      smoke-mocks "deployed-smoke-$scenario-block" smoke-trailer
-    run_block_script "$BLOCK_SCRIPT"
+    case "$scenario" in
+      upload_body_header_file_mutation)
+        awk '
+          $0 == "    --data \"$UPLOAD_PAYLOAD\" \\" {
+            replacements++
+            print "    --data-binary \"@$AUTH_HEADER_FILE\" \\"
+            next
+          }
+          { print }
+          END { if (replacements != 1) exit 1 }
+        ' "$GUIDE_CMD_DIR/deployed-smoke.sh" \
+          > "$smoke_ops_root/cmd/deployed-smoke.sh" || return 1
+        ;;
+      upload_duplicate_body_mutation)
+        awk '
+          $0 == "    --data \"$UPLOAD_PAYLOAD\" \\" {
+            replacements++
+            print
+          }
+          { print }
+          END { if (replacements != 1) exit 1 }
+        ' "$GUIDE_CMD_DIR/deployed-smoke.sh" \
+          > "$smoke_ops_root/cmd/deployed-smoke.sh" || return 1
+        ;;
+    esac
+    write_wrapper_part "deployed-smoke-$scenario-dispatch" \
+      "sh \"$smoke_ops\" deployed-smoke"
+    run_ops_wrapper "deployed-smoke-$scenario" \
+      smoke-caller-traps "deployed-smoke-$scenario-dispatch" smoke-trailer
   ) >"$output" 2>&1
 }
 

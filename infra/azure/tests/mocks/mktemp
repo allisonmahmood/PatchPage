@@ -1,0 +1,96 @@
+#!/bin/sh
+# mktemp shim for the guide harness. Reached only through PATH.
+#
+# Two jobs.
+#
+# It injects the "a private temporary directory could not be created" and
+# "...could not be opened" failures each flow has to survive. Those used to be a
+# shell function inside the block script, keyed off a per-scenario call counter;
+# the counter now lives in the scenario state directory instead of a variable.
+#
+# It also records the path it handed back for every call, in call order, so the
+# cat, rm and jq shims can recognise the block's own TERRAFORM_DIAGNOSTIC_DIR,
+# STATE_LIST_ERROR, SECURE_TARGET_DIR, SECURE_PLAN_DIR and SECURE_CHANGE_DIR
+# without being able to read the block's variables. The terraform shim already
+# does this for the saved plan paths; see mock_mktemp_recall in mocklib.sh for
+# the call-order map.
+
+set -u
+
+. "${PP_MOCK_DIR:-${0%/*}}/mocklib.sh"
+
+mktemp_real() {
+  mock_real mktemp "$@"
+}
+
+case "$group" in
+  deploy | infrastructure | release | smoke) ;;
+  *)
+    mktemp_real "$@"
+    exit $?
+    ;;
+esac
+
+case "$group" in
+  release)
+    test "$scenario" != "rollback_record_create_failure" || exit 1
+    mktemp_real "$@"
+    exit $?
+    ;;
+  smoke)
+    case "$*" in
+      "-d")
+        mkdir -p "$PP_MOCK_SMOKE_TMP_DIR" || exit 1
+        printf '%s\n' "$PP_MOCK_SMOKE_TMP_DIR"
+        exit 0
+        ;;
+      "${CANARY_RECORD:-}.tmp.XXXXXX")
+        mktemp_real "$@"
+        exit $?
+        ;;
+      *)
+        exit 1
+        ;;
+    esac
+    ;;
+esac
+
+mktemp_count="$(mock_state_count mktemp-count)"
+
+case "$group" in
+  deploy)
+    test "$scenario" != "diagnostic_secure_dir_failure" || test "$mktemp_count" -ne 1 || exit 1
+    test "$scenario" != "target_secure_dir_failure" || test "$mktemp_count" -ne 3 || exit 1
+    test "$scenario" != "secure_plan_dir_failure" || test "$mktemp_count" -ne 4 || exit 1
+    ;;
+  infrastructure)
+    test "$scenario" != "infra_diagnostic_secure_dir_failure" || test "$mktemp_count" -ne 1 || exit 1
+    test "$scenario" != "secure_change_dir_failure" || test "$mktemp_count" -ne 2 || exit 1
+    ;;
+esac
+
+mktemp_result="$(mktemp_real "$@")" || exit 1
+mock_state_write "mktemp-path-$mktemp_count" "$mktemp_result"
+
+if test "$mktemp_count" -eq 1; then
+  # The harness reads the diagnostic directory back from the scenario root, so
+  # that one recording keeps its established home.
+  printf '%s\n' "$mktemp_result" > "$PP_MOCK_SCENARIO_ROOT/diagnostic-dir"
+  case "$group:$scenario" in
+    deploy:diagnostic_log_open_failure | infrastructure:infra_diagnostic_log_open_failure)
+      mkdir "$mktemp_result/terraform.log"
+      ;;
+  esac
+elif test "$mktemp_count" -eq 2; then
+  case "$group:$scenario" in
+    deploy:state_diagnostic_open_failure)
+      mock_real rm -f -- "$mktemp_result"
+      mkdir "$mktemp_result"
+      ;;
+    infrastructure:state_snapshot_open_failure)
+      mkdir "$mktemp_result/state.json"
+      ;;
+  esac
+fi
+
+printf '%s\n' "$mktemp_result"

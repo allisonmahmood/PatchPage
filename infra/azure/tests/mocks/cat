@@ -1,0 +1,21 @@
+#!/bin/sh
+# cat shim for the guide harness. Reached only through PATH.
+#
+# One injection: the deploy flow has to survive being unable to read back the
+# private stderr capture it took from `terraform state list`. Everything else --
+# including the reads the other shims make through mocklib -- falls through to
+# the real cat.
+
+set -u
+
+. "${PP_MOCK_DIR:-${0%/*}}/mocklib.sh"
+
+if test "$group" = "deploy" &&
+  test "$scenario" = "state_diagnostic_read_failure" &&
+  test "${1:-}" = "--" &&
+  mock_is_mktemp_path 2 "${2:-}"; then
+  printf 'private read failure: %s\n' "$2" >&2
+  exit 1
+fi
+
+mock_real cat "$@"

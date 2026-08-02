@@ -1,0 +1,12 @@
+#!/bin/sh
+# sleep shim for the guide harness. Reached only through PATH.
+#
+# The bounded readiness polling in the release, rollback and infrastructure
+# flows is part of what the harness proves, so every sleep is recorded, and
+# none of them actually waits.
+
+set -u
+
+. "${PP_MOCK_DIR:-${0%/*}}/mocklib.sh"
+
+mock_log "sleep $*"

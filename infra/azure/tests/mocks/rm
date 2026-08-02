@@ -1,0 +1,62 @@
+#!/bin/sh
+# rm shim for the guide harness. Reached only through PATH.
+#
+# Injects the private-cleanup failures both Terraform flows have to report
+# without leaking the path they could not remove. Each injection is keyed to one
+# of the directories or files the block obtained from mktemp, recovered here
+# from the mktemp shim's call-order recording rather than from the block's own
+# variables. Everything else falls through to the real rm.
+
+set -u
+
+. "${PP_MOCK_DIR:-${0%/*}}/mocklib.sh"
+
+# Report the failure the runbook has to handle, on stderr, naming the path the
+# same way the removed in-block mock did.
+rm_refuse() {
+  printf '%s: %s\n' "$1" "$2" >&2
+  exit 1
+}
+
+case "$group" in
+  deploy)
+    case "$scenario" in
+      state_diagnostic_remove_failure)
+        if test "${1:-}" = "-f" && mock_is_mktemp_path 2 "${3:-}"; then
+          rm_refuse 'private remove failure' "$3"
+        fi
+        ;;
+      diagnostic_cleanup_failure)
+        if test "${1:-}" = "-rf" && mock_is_mktemp_path 1 "${3:-}"; then
+          rm_refuse 'private cleanup failure' "$3"
+        fi
+        ;;
+      target_cleanup_failure)
+        if test "${1:-}" = "-rf" && mock_is_mktemp_path 3 "${3:-}"; then
+          rm_refuse 'private target cleanup failure' "$3"
+        fi
+        ;;
+      initial_cleanup_failure)
+        if test "${1:-}" = "-rf" && mock_is_mktemp_path 4 "${3:-}"; then
+          rm_refuse 'private plan cleanup failure' "$3"
+        fi
+        ;;
+    esac
+    ;;
+  infrastructure)
+    case "$scenario" in
+      infra_diagnostic_cleanup_failure)
+        if test "${1:-}" = "-rf" && mock_is_mktemp_path 1 "${3:-}"; then
+          rm_refuse 'private cleanup failure' "$3"
+        fi
+        ;;
+      secure_change_cleanup_failure)
+        if test "${1:-}" = "-rf" && mock_is_mktemp_path 2 "${3:-}"; then
+          rm_refuse 'private change cleanup failure' "$3"
+        fi
+        ;;
+    esac
+    ;;
+esac
+
+mock_real rm "$@"

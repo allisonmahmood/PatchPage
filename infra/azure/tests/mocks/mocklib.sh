@@ -12,6 +12,17 @@
 
 scenario="${PP_MOCK_SCENARIO:-}"
 state_dir="${PP_MOCK_STATE:-}"
+group="${PP_MOCK_GROUP:-}"
+
+# The shim directory is first on PATH, so a shim that has to fall through to the
+# real tool -- mktemp, cat, rm, chmod, jq -- would otherwise find itself again.
+# The harness exports the PATH it started from; delegating through it is the
+# only way those five shims can do their real work.
+mock_real() (
+  PATH="${PP_MOCK_REAL_PATH:?PP_MOCK_REAL_PATH must be exported by the harness}"
+  export PATH
+  "$@"
+)
 
 # The subscription every private_az wrapper is required to pin. Most flows take
 # it as a documented input the harness exports; the custom-domain context block
@@ -61,6 +72,37 @@ mock_state_count() {
   mock_count=$((mock_count + 1))
   printf '%s\n' "$mock_count" > "$mock_count_file"
   printf '%s\n' "$mock_count"
+}
+
+# --- mktemp path recording ---------------------------------------------------
+#
+# The mktemp shim records the path it returned for every call, in call order, as
+# mktemp-path-<n>. That recording is how the cat, rm and jq shims recognise a
+# path the block is holding in a variable they cannot see. The call order is
+# fixed by the runbook text, so <n> names a specific variable:
+#
+#   deploy-resources        1 TERRAFORM_DIAGNOSTIC_DIR  2 STATE_LIST_ERROR
+#                           3 SECURE_TARGET_DIR         4 SECURE_PLAN_DIR
+#   infrastructure-change   1 TERRAFORM_DIAGNOSTIC_DIR  2 SECURE_CHANGE_DIR
+#
+# Recalling an unrecorded call yields the empty string, and every consumer
+# refuses to match on an empty recording: a shim must never fire a failure
+# injection just because a path has not been created yet.
+mock_mktemp_recall() {
+  mock_recall_value=''
+  if test -f "$state_dir/mktemp-path-$1"; then
+    IFS= read -r mock_recall_value < "$state_dir/mktemp-path-$1" || mock_recall_value=''
+  fi
+  printf '%s\n' "$mock_recall_value"
+}
+
+# Returns 0 when $2 is a non-empty path and equals the recorded result of the
+# $1'th mktemp call.
+mock_is_mktemp_path() {
+  test -n "$2" || return 1
+  mock_recalled="$(mock_mktemp_recall "$1")"
+  test -n "$mock_recalled" || return 1
+  test "$2" = "$mock_recalled"
 }
 
 # --- argument helpers --------------------------------------------------------
