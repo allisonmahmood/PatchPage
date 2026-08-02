@@ -13,6 +13,10 @@ All notable changes to PatchPage are documented in this file. The format is base
   infrastructure apply after upgrade; review cost and replication behavior before approving.
   PostgreSQL flexible-server backups remain platform-local by default; configure independent
   geo-capable database backups if regional recovery is required.
+- Azure PostgreSQL now defaults to 35-day backup retention (`postgres_backup_retention_days`).
+  Existing environments left on the platform default (about 7 days) will see an in-place
+  flexible-server update on the first infrastructure apply after upgrade; review the added
+  backup storage cost before approving.
 
 ## [0.1.1] - 2026-07-14
 

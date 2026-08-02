@@ -1509,6 +1509,14 @@ mock_operation_lease() {
       test -f "$operation_lease_file" || return 1
       test "$operation_lease_id" = "$(cat "$operation_lease_file")" || return 1
       test "$scenario" != "operation_lease_renew_failure" || return 1
+      # Transient renew blip: acquire already succeeded and Azure holds the
+      # infinite lease, but the first renew-as-proof fails. Later renews recover,
+      # so the EXIT trap can and must still release the lease it owns.
+      if test "$scenario" = "operation_lease_acquire_ok_renew_fails" &&
+        test ! -e "$scenario_root/operation-lease-renew-blip"; then
+        : > "$scenario_root/operation-lease-renew-blip"
+        return 1
+      fi
       ;;
     release)
       test -f "$operation_lease_file" || return 1
@@ -2050,6 +2058,7 @@ test_app_release() {
     operation_lease_held \
     operation_lease_acquire_failure \
     operation_lease_renew_failure \
+    operation_lease_acquire_ok_renew_fails \
     operation_lease_release_failure \
     rollback_image_show_failure \
     rollback_image_invalid \
@@ -2283,7 +2292,8 @@ test_app_release() {
         operation_container_nonempty | operation_binding_mismatch | \
         operation_binding_foreign_metadata | mixed_state_workload_record | \
         operation_lease_held | operation_lease_acquire_failure | \
-        operation_lease_renew_failure | preexisting_pending_revision | \
+        operation_lease_renew_failure | operation_lease_acquire_ok_renew_fails | \
+        preexisting_pending_revision | \
         preexisting_failed_revision | prelease_locked_image_mismatch)
         if grep -Eq '^az acr build |^az containerapp update ' "$log"; then
           fail "app release built or updated after fail-closed preflight $scenario"
@@ -2320,6 +2330,15 @@ test_app_release() {
         ;;
     esac
     case "$scenario" in
+      operation_lease_acquire_ok_renew_fails)
+        # Acquire succeeded, so Azure holds the infinite lease even though the
+        # renew-as-proof blipped. The EXIT trap must still release it.
+        if grep -Fq 'az containerapp update ' "$log"; then
+          fail "app release updated the image after rejecting $scenario"
+        fi
+        grep -Eq '^az storage container lease release ' "$log" ||
+          fail "app release orphaned the acquired operation lease after a renew blip"
+        ;;
       operation_container_missing | operation_container_nonempty | \
         operation_container_id_mismatch | operation_binding_mismatch | \
         operation_binding_foreign_metadata | mixed_state_workload_record | \
@@ -2814,6 +2833,7 @@ test_app_rollback() {
     operation_lease_held \
     operation_lease_acquire_failure \
     operation_lease_renew_failure \
+    operation_lease_acquire_ok_renew_fails \
     operation_lease_release_failure \
     preexisting_pending_revision \
     preexisting_failed_revision \
@@ -2963,6 +2983,15 @@ test_app_rollback() {
         if grep -Eq '^az acr manifest |^az containerapp update ' "$log"; then
           fail "rollback accessed an image or updated the workload after $scenario"
         fi
+        ;;
+      operation_lease_acquire_ok_renew_fails)
+        # Acquire succeeded, so Azure holds the infinite lease even though the
+        # renew-as-proof blipped. The EXIT trap must still release it.
+        if grep -Fq 'az containerapp update ' "$log"; then
+          fail "rollback updated after fail-closed preflight $scenario"
+        fi
+        grep -Eq '^az storage container lease release ' "$log" ||
+          fail "rollback orphaned the acquired operation lease after a renew blip"
         ;;
       container_app_id_mismatch | fqdn_mismatch | public_env_missing | \
         public_env_duplicate | public_env_mismatch | custom_domain_missing | \
@@ -4033,6 +4062,7 @@ azurerm_container_app.server'
     operation_lease_held \
     operation_lease_acquire_failure \
     operation_lease_renew_failure \
+    operation_lease_acquire_ok_renew_fails \
     operation_lease_release_failure \
     workload_retention_too_low \
     workload_lock_show_failure \
@@ -4363,6 +4393,15 @@ azurerm_container_app.server'
           fail "safety adoption planned after Terraform rejected the synchronized image"
         fi
         ;;
+      operation_lease_acquire_ok_renew_fails)
+        # Acquire succeeded, so Azure holds the infinite lease even though the
+        # renew-as-proof blipped. The EXIT trap must still release it.
+        if grep -Eq '^terraform (plan|apply) ' "$log"; then
+          fail "infrastructure change planned or applied after rejecting $scenario"
+        fi
+        grep -Eq '^az storage container lease release ' "$log" ||
+          fail "infrastructure change orphaned the acquired operation lease after a renew blip"
+        ;;
       operation_container_id_mismatch | operation_container_missing | operation_container_nonempty | operation_lease_held | \
         operation_lease_acquire_failure | operation_lease_renew_failure)
         if grep -Eq '^terraform (plan|apply) ' "$log"; then
@@ -4649,6 +4688,36 @@ test_stale_lease_recovery() {
     fail "stale operation lease guidance omitted uncatchable-kill behavior"
 }
 
+# Returns 0 when the Container App create-time image gate delegates to
+# local.server_image_is_managed_digest, 1 otherwise. Takes the directory holding
+# container_app.tf so the check itself can be meta-tested against a sabotaged copy.
+# Deliberately reports status instead of calling fail.
+server_image_precondition_is_pinned() {
+  awk '
+    $0 ~ /^[[:space:]]*precondition \{[[:space:]]*$/ {
+      in_precondition = 1
+      depth = 1
+      next
+    }
+    in_precondition {
+      line = $0
+      opens = gsub(/\{/, "{", line)
+      line = $0
+      closes = gsub(/\}/, "}", line)
+      depth += opens - closes
+      if ($0 ~ /^[[:space:]]*condition[[:space:]]*=[[:space:]]*local\.server_image_is_managed_digest[[:space:]]*$/) {
+        found = 1
+      }
+      if (depth <= 0) {
+        in_precondition = 0
+      }
+    }
+    END {
+      if (!found) exit 1
+    }
+  ' "$1/container_app.tf"
+}
+
 test_public_safe_runbook_static() {
   if grep -Eiq 'If[-]Match|e[t]ag|patchpageOperation[L]ock|private_az r[e]st' "$README"; then
     fail "Azure guide retains the unsupported Container App tag/conditional-REST mutex"
@@ -4767,6 +4836,31 @@ test_public_safe_runbook_static() {
       fail "management lock $lock_resource is not scoped to $expected_scope"
     fi
   done
+
+  # The Container App create-time server_image gate is invisible to plan-time
+  # terraform test: expect_failures on azurerm_container_app.server is satisfied by
+  # the postcondition, so deleting or neutering the precondition alone stays green.
+  # Statically require the precondition to delegate to the named local that
+  # server_image_invariants.tftest.hcl asserts through its output.
+  server_image_precondition_is_pinned "$azure_tf_dir" ||
+    fail "the Container App server_image precondition does not evaluate local.server_image_is_managed_digest"
+
+  # Meta-test the check above: a neutered precondition in a scratch copy must be
+  # rejected, otherwise the static assertion is decorative.
+  precondition_probe_dir="$TMP_DIR/server-image-precondition-probe"
+  rm -rf "$precondition_probe_dir"
+  mkdir -p "$precondition_probe_dir" ||
+    fail "could not create the server_image precondition probe directory"
+  sed 's/^\([[:space:]]*\)condition[[:space:]]*=[[:space:]]*local\.server_image_is_managed_digest[[:space:]]*$/\1condition = length(var.server_image) >= 0/' \
+    "$azure_tf_dir/container_app.tf" > "$precondition_probe_dir/container_app.tf" ||
+    fail "could not build the neutered server_image precondition probe"
+  if cmp -s "$azure_tf_dir/container_app.tf" "$precondition_probe_dir/container_app.tf"; then
+    fail "the server_image precondition probe did not neuter anything"
+  fi
+  if server_image_precondition_is_pinned "$precondition_probe_dir"; then
+    fail "the server_image precondition static check accepts a neutered precondition"
+  fi
+  rm -rf "$precondition_probe_dir"
 }
 
 test_custom_domain_context() {

@@ -36,6 +36,136 @@ run "accepts_valid_observed_managed_digest" {
   variables {
     server_image = "acrpatchpageabc123.azurecr.io/patchpage-server@sha256:0000000000000000000000000000000000000000000000000000000000000000"
   }
+
+  assert {
+    condition     = output.server_image_is_managed_digest
+    error_message = "The create-time server_image predicate must accept a managed patchpage-server digest."
+  }
+}
+
+# The rejects_* runs below prove the Container App fails closed, but plan-time
+# expect_failures cannot tell the precondition apart from the postcondition on the
+# same resource: deleting the precondition alone leaves them green. These runs
+# assert local.server_image_is_managed_digest directly instead. The registry target
+# keeps azurerm_container_app.server out of the plan so the precondition cannot be
+# the thing that fails, leaving the predicate itself under test.
+run "predicate_rejects_quickstart_placeholder" {
+  command = plan
+
+  plan_options {
+    target = [azurerm_container_registry.patchpage]
+  }
+
+  variables {
+    server_image = "mcr.microsoft.com/k8se/quickstart:latest"
+  }
+
+  assert {
+    condition     = output.server_image_is_managed_digest == false
+    error_message = "The create-time server_image predicate must reject the quickstart placeholder."
+  }
+}
+
+run "predicate_rejects_mutable_release_tag" {
+  command = plan
+
+  plan_options {
+    target = [azurerm_container_registry.patchpage]
+  }
+
+  variables {
+    server_image = "registry.invalid/patchpage-server:release"
+  }
+
+  assert {
+    condition     = output.server_image_is_managed_digest == false
+    error_message = "The create-time server_image predicate must reject a mutable release tag."
+  }
+}
+
+run "predicate_rejects_uppercase_digest" {
+  command = plan
+
+  plan_options {
+    target = [azurerm_container_registry.patchpage]
+  }
+
+  variables {
+    server_image = "registry.invalid/patchpage-server@sha256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+  }
+
+  assert {
+    condition     = output.server_image_is_managed_digest == false
+    error_message = "The create-time server_image predicate must reject an uppercase digest."
+  }
+}
+
+run "predicate_rejects_wrong_registry" {
+  command = plan
+
+  plan_options {
+    target = [azurerm_container_registry.patchpage]
+  }
+
+  variables {
+    server_image = "other.azurecr.io/patchpage-server@sha256:4444444444444444444444444444444444444444444444444444444444444444"
+  }
+
+  assert {
+    condition     = output.server_image_is_managed_digest == false
+    error_message = "The create-time server_image predicate must reject an unmanaged registry."
+  }
+}
+
+run "predicate_rejects_wrong_repository" {
+  command = plan
+
+  plan_options {
+    target = [azurerm_container_registry.patchpage]
+  }
+
+  variables {
+    server_image = "acrpatchpageabc123.azurecr.io/other-server@sha256:2222222222222222222222222222222222222222222222222222222222222222"
+  }
+
+  assert {
+    condition     = output.server_image_is_managed_digest == false
+    error_message = "The create-time server_image predicate must reject a foreign repository."
+  }
+}
+
+run "predicate_rejects_nested_repository_path" {
+  command = plan
+
+  plan_options {
+    target = [azurerm_container_registry.patchpage]
+  }
+
+  variables {
+    server_image = "acrpatchpageabc123.azurecr.io/team/patchpage-server@sha256:3333333333333333333333333333333333333333333333333333333333333333"
+  }
+
+  assert {
+    condition     = output.server_image_is_managed_digest == false
+    error_message = "The create-time server_image predicate must reject a nested repository path."
+  }
+}
+
+run "predicate_rejects_short_digest" {
+  command = plan
+
+  plan_options {
+    target = [azurerm_container_registry.patchpage]
+  }
+
+  variables {
+    server_image = "acrpatchpageabc123.azurecr.io/patchpage-server@sha256:abc123"
+  }
+
+  assert {
+    condition     = output.server_image_is_managed_digest == false
+    error_message = "The create-time server_image predicate must reject a truncated digest."
+  }
 }
 
 run "rejects_quickstart_placeholder" {

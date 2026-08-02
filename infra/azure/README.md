@@ -1608,8 +1608,11 @@ acquire_operation_lease() {
     --lease-duration -1 \
     --proposed-lease-id "$OPERATION_LEASE_ID" \
     --output none >/dev/null || return 1
-  verify_operation_lease || return 1
+  # Azure now holds the infinite lease, so the EXIT trap owes a release from this
+  # point on. Set the flag before the renew-as-proof: a single renew blip must not
+  # leave a held lease behind with the trap believing there is nothing to release.
   OPERATION_LEASE_ACTIVE=true
+  verify_operation_lease || return 1
 }
 release_operation_lease() {
   verify_operation_lease || return 1
@@ -2243,8 +2246,11 @@ acquire_operation_lease() {
     --lease-duration -1 \
     --proposed-lease-id "$OPERATION_LEASE_ID" \
     --output none >/dev/null || return 1
-  verify_operation_lease || return 1
+  # Azure now holds the infinite lease, so the EXIT trap owes a release from this
+  # point on. Set the flag before the renew-as-proof: a single renew blip must not
+  # leave a held lease behind with the trap believing there is nothing to release.
   OPERATION_LEASE_ACTIVE=true
+  verify_operation_lease || return 1
 }
 release_operation_lease() {
   verify_operation_lease || return 1
@@ -2997,8 +3003,11 @@ acquire_operation_lease() {
     --lease-duration -1 \
     --proposed-lease-id "$OPERATION_LEASE_ID" \
     --output none >/dev/null || return 1
-  verify_operation_lease || return 1
+  # Azure now holds the infinite lease, so the EXIT trap owes a release from this
+  # point on. Set the flag before the renew-as-proof: a single renew blip must not
+  # leave a held lease behind with the trap believing there is nothing to release.
   OPERATION_LEASE_ACTIVE=true
+  verify_operation_lease || return 1
 }
 release_operation_lease() {
   verify_operation_lease || return 1
@@ -4278,6 +4287,8 @@ printf 'Operation lease recovery completed.\n'
 Source-local retention is not an independent backup. Before accepting durable production data or changing a persistent resource, configure independently protected Blob and PostgreSQL backups outside the workload resource group, document the accepted RPO/RTO, and complete an isolated end-to-end restore. Re-run that drill at least every 90 days. Geo-replication improves regional availability but replicates deletion; management locks protect control-plane deletion but not Blob data-plane deletion.
 
 Workload Storage defaults to geo-redundant replication (`GRS`). Existing environments that still use `LRS` will plan an in-place Storage account update on the first infrastructure apply after that default change; review cost and replication behavior before approving. PostgreSQL flexible-server backups remain platform-local by default (`geo_redundant_backup_enabled` is unset); regional database recovery therefore depends on the independent backup drill above rather than Storage GRS symmetry.
+
+PostgreSQL backup retention defaults to 35 days (`postgres_backup_retention_days`). Existing environments left on the platform default (about 7 days) will plan an in-place flexible-server update on the first infrastructure apply after that default change; review the added backup storage cost before approving.
 
 ## Configure the custom domain and managed certificate
 
