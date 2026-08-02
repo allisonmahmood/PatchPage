@@ -1,0 +1,427 @@
+#!/bin/sh
+# Terraform shim for the guide harness. Reached only through PATH.
+
+set -u
+
+. "${PP_MOCK_DIR:-${0%/*}}/mocklib.sh"
+
+# ---------------------------------------------------------------------------
+# initial deployment
+# ---------------------------------------------------------------------------
+
+terraform_deploy() {
+  case "$*" in
+    "init -input=false -reconfigure -backend-config=backend.hcl")
+      if test "$scenario" = "state_list_aggregate_false_missing"; then
+        printf '%s\n' "No state file was found in an unrelated init diagnostic." >&2
+      fi
+      test "$scenario" != "init_failure"
+      ;;
+    "console -no-color")
+      IFS= read -r console_expression || return 1
+      case "$console_expression" in
+        "var.subscription_id")
+          test "$scenario" != "terraform_subscription_console_failure" || return 1
+          if test "$scenario" = "terraform_subscription_mismatch"; then
+            printf '%s\n' '"33333333-3333-3333-3333-333333333333"'
+          else
+            printf '"%s"\n' "$SUBSCRIPTION_ID"
+          fi
+          ;;
+        '"rg-patchpage-${var.environment_name}"')
+          test "$scenario" != "terraform_resource_group_console_failure" || return 1
+          if test "$scenario" = "terraform_resource_group_invalid"; then
+            printf '%s\n' "not-json"
+          else
+            printf '%s\n' '"rg-patchpage-workload"'
+          fi
+          ;;
+        "azurerm_storage_account.drafts.id")
+          printf '"/subscriptions/%s/resourceGroups/rg-patchpage-workload/providers/Microsoft.Storage/storageAccounts/patchpagedrafts"\n' "$SUBSCRIPTION_ID"
+          ;;
+        "azurerm_postgresql_flexible_server.patchpage.id")
+          printf '"/subscriptions/%s/resourceGroups/rg-patchpage-workload/providers/Microsoft.DBforPostgreSQL/flexibleServers/patchpage-postgres"\n' "$SUBSCRIPTION_ID"
+          ;;
+        "azurerm_container_app.server.id")
+          printf '"/subscriptions/%s/resourceGroups/rg-patchpage-workload/providers/Microsoft.App/containerApps/patchpage-app"\n' "$SUBSCRIPTION_ID"
+          ;;
+        "azurerm_container_registry.patchpage.id")
+          printf '"/subscriptions/%s/resourceGroups/rg-patchpage-workload/providers/Microsoft.ContainerRegistry/registries/acrpatchpageabc123"\n' "$SUBSCRIPTION_ID"
+          ;;
+        *)
+          return 1
+          ;;
+      esac
+      ;;
+    "state list")
+      case "$scenario" in
+        state_list_failure | state_list_aggregate_false_missing)
+          printf '%s\n' "Backend state lookup failed." >&2
+          return 1
+          ;;
+        nonempty_initial_state)
+          printf '%s\n' "azurerm_resource_group.existing"
+          ;;
+        resume_partial_rg_success | resume_live_foreign_resource | resume_stronger_lock)
+          printf '%s\n' \
+            "random_string.unique" \
+            "azurerm_resource_group.patchpage"
+          ;;
+        resume_target_complete_success | resume_acr_id_mismatch)
+          printf '%s\n' \
+            "random_string.unique" \
+            "azurerm_resource_group.patchpage" \
+            "azurerm_container_registry.patchpage"
+          ;;
+        resume_full_state)
+          printf '%s\n' \
+            "random_string.unique" \
+            "azurerm_resource_group.patchpage" \
+            "azurerm_container_registry.patchpage" \
+            "azurerm_storage_account.drafts" \
+            "azurerm_container_app.server"
+          ;;
+        resume_acr_without_random)
+          printf '%s\n' \
+            "azurerm_resource_group.patchpage" \
+            "azurerm_container_registry.patchpage"
+          ;;
+        resume_unexpected_state)
+          printf '%s\n' "azurerm_resource_group.unexpected"
+          ;;
+        *)
+          printf '%s\n' "No state file was found!" >&2
+          return 1
+          ;;
+      esac
+      ;;
+    "output -raw resource_group_name")
+      test "$scenario" != "resource_group_output_failure" || return 1
+      test "$scenario" != "resource_group_output_empty" || return 0
+      printf '%s\n' "rg-patchpage-workload"
+      ;;
+    "output -raw acr_name")
+      test "$scenario" != "acr_output_failure" || return 1
+      test "$scenario" != "acr_output_empty" || return 0
+      if test "$scenario" = "unexpected_acr_name"; then
+        printf '%s\n' "not-an-acr-name"
+      else
+        printf '%s\n' "acrpatchpageabc123"
+      fi
+      ;;
+    "output -raw acr_login_server")
+      test "$scenario" != "login_output_failure" || return 1
+      test "$scenario" != "login_output_empty" || return 0
+      if test "$scenario" = "unexpected_login_server"; then
+        printf '%s\n' "other.azurecr.io"
+      else
+        printf '%s\n' "acrpatchpageabc123.azurecr.io"
+      fi
+      ;;
+    "output -raw container_app_name")
+      printf '%s\n' "patchpage-app"
+      ;;
+    plan\ -target=azurerm_container_registry.patchpage\ -input=false\ -out=*)
+      mock_state_write registry-target-plan "${4#-out=}"
+      test "$scenario" != "target_plan_failure" || return 1
+      # Marked only after the plan succeeds, so the apply dispatch below can
+      # refuse an apply of a plan this shim never produced.
+      mock_state_mark registry-target-plan-created
+      ;;
+    plan\ -input=false\ -out=*)
+      mock_state_write initial-plan "${3#-out=}"
+      test "$scenario" != "plan_failure" || return 1
+      mock_state_mark initial-plan-created
+      ;;
+    show\ -json\ *)
+      case "$3" in
+        *"/registry-target.tfplan")
+          test "$scenario" != "target_plan_show_failure" || return 1
+          if test "$scenario" = "target_plan_delete"; then
+            printf '%s\n' \
+              '{"resource_changes":[{"address":"azurerm_container_registry.patchpage","change":{"actions":["delete","create"]}}]}'
+          else
+            printf '%s\n' \
+              '{"resource_changes":[{"address":"azurerm_container_registry.patchpage","change":{"actions":["create"]}}]}'
+          fi
+          ;;
+        *)
+          test "$scenario" != "plan_gate_show_failure" || return 1
+          case "$scenario" in
+            plan_delete)
+              printf '%s\n' \
+                '{"resource_changes":[{"address":"azurerm_storage_account.drafts","change":{"actions":["delete"]}}]}'
+              ;;
+            plan_replacement)
+              printf '%s\n' \
+                '{"resource_changes":[{"address":"azurerm_postgresql_flexible_server.patchpage","change":{"actions":["delete","create"]}}]}'
+              ;;
+            *)
+              printf '%s\n' \
+                '{"resource_changes":[{"address":"azurerm_container_app.server","change":{"actions":["create"]}}]}'
+              ;;
+          esac
+          ;;
+      esac
+      ;;
+    apply\ -input=false\ *)
+      # The block holds the two saved plan paths in shell variables the shim
+      # cannot see, so compare against the paths this shim itself handed out
+      # when the corresponding plan was created. The gate is the post-success
+      # *-created marker, not the recorded path: an apply of a plan whose own
+      # plan run failed is refused here rather than only being caught by a log
+      # assertion afterwards.
+      #
+      # This dispatch is ordered, so the registry-target plan path and the
+      # full plan path must stay distinct: the guide gives each its own
+      # `mktemp -d` directory (patchpage-registry-target.XXXXXX and
+      # patchpage-initial-plan.XXXXXX) and its own basename
+      # (registry-target.tfplan and initial.tfplan). If either the directories
+      # or the basenames ever collide, the first branch would answer for the
+      # full apply too and the final_apply_failure scenario would silently
+      # become vacuous.
+      if mock_state_exists registry-target-plan-created &&
+        test "$3" = "$(mock_state_read registry-target-plan)"; then
+        test "$scenario" != "target_apply_failure"
+      elif mock_state_exists initial-plan-created &&
+        test "$3" = "$(mock_state_read initial-plan)"; then
+        test "$scenario" != "final_apply_failure"
+      else
+        return 1
+      fi
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+# ---------------------------------------------------------------------------
+# infrastructure change
+# ---------------------------------------------------------------------------
+
+terraform_infrastructure() {
+  case "$*" in
+    "init -input=false -reconfigure -backend-config=backend.hcl")
+      test "$scenario" != "init_failure"
+      ;;
+    "console -no-color")
+      IFS= read -r console_expression || return 1
+      case "$console_expression" in
+        "var.subscription_id")
+          test "$scenario" != "infra_subscription_console_failure" || return 1
+          if test "$scenario" = "infra_subscription_mismatch"; then
+            printf '%s\n' '"44444444-4444-4444-4444-444444444444"'
+          else
+            printf '"%s"\n' "$SUBSCRIPTION_ID"
+          fi
+          ;;
+        '"rg-patchpage-${var.environment_name}"')
+          test "$scenario" != "infra_resource_group_console_failure" || return 1
+          if test "$scenario" = "infra_resource_group_invalid"; then
+            printf '%s\n' "not-json"
+          elif test "$scenario" = "infra_resource_group_mismatch"; then
+            printf '%s\n' '"rg-patchpage-other"'
+          else
+            printf '"%s"\n' "$RESOURCE_GROUP"
+          fi
+          ;;
+        "var.storage_delete_retention_days")
+          printf '%s\n' "30"
+          ;;
+        "var.server_image")
+          if test "$scenario" = "adoption_image_config_mismatch"; then
+            printf '%s\n' '"registry.invalid/patchpage-server@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"'
+          else
+            configured_server_image="$(
+              sed -n 's/^server_image = "\(.*\)"$/\1/p' \
+                server-image.auto.tfvars
+            )" || return 1
+            test -n "$configured_server_image" || return 1
+            printf '"%s"\n' "$configured_server_image"
+          fi
+          ;;
+        *)
+          return 1
+          ;;
+      esac
+      ;;
+    "state pull")
+      test "$scenario" != "state_pull_failure" || return 1
+      if test "$scenario" = "wrong_lineage"; then
+        printf '%s\n' '{"lineage":"22222222-2222-2222-2222-222222222222"}'
+      else
+        printf '{"lineage":"%s"}\n' "$EXPECTED_STATE_LINEAGE"
+      fi
+      ;;
+    "show -json")
+      test "$scenario" != "state_values_failure" || return 1
+      resource_group_id="$EXPECTED_RESOURCE_GROUP_ID"
+      storage_account_id="$EXPECTED_STORAGE_ACCOUNT_ID"
+      postgres_server_id="$EXPECTED_POSTGRES_SERVER_ID"
+      acr_id="$EXPECTED_ACR_ID"
+      container_app_id="$EXPECTED_CONTAINER_APP_ID"
+      case "$scenario" in
+        wrong_resource_group_id) resource_group_id="$resource_group_id-other" ;;
+        wrong_storage_account_id) storage_account_id="$storage_account_id-other" ;;
+        wrong_postgres_server_id) postgres_server_id="$postgres_server_id-other" ;;
+        wrong_acr_id) acr_id="$acr_id-other" ;;
+        wrong_container_app_id) container_app_id="$container_app_id-other" ;;
+      esac
+      state_values_count="$(mock_state_count state-values-count)"
+      lock_resources=
+      if test "$ADOPT_SAFETY_GUARDS" = "false" ||
+        test "$state_values_count" -gt 1; then
+        lock_resources=',{"address":"azurerm_management_lock.drafts_storage","values":{"id":"'"$EXPECTED_STORAGE_ACCOUNT_ID"'/providers/Microsoft.Authorization/locks/protect-patchpage-drafts"}},{"address":"azurerm_management_lock.patchpage_postgres","values":{"id":"'"$EXPECTED_POSTGRES_SERVER_ID"'/providers/Microsoft.Authorization/locks/protect-patchpage-postgres"}}'
+      fi
+      printf \
+        '{"values":{"root_module":{"resources":[{"address":"azurerm_resource_group.patchpage","values":{"id":"%s"}},{"address":"azurerm_storage_account.drafts","values":{"id":"%s"}},{"address":"azurerm_postgresql_flexible_server.patchpage","values":{"id":"%s"}},{"address":"azurerm_container_registry.patchpage","values":{"id":"%s"}},{"address":"azurerm_container_app.server","values":{"id":"%s"}}%s]}}}\n' \
+        "$resource_group_id" \
+        "$storage_account_id" \
+        "$postgres_server_id" \
+        "$acr_id" \
+        "$container_app_id" \
+        "$lock_resources"
+      ;;
+    state\ show\ *)
+      if test "$scenario" = "missing_required_state_address" &&
+        test "$3" = "azurerm_storage_container.drafts"; then
+        return 1
+      fi
+      case "$3" in
+        azurerm_management_lock.drafts_storage)
+          test "$ADOPT_SAFETY_GUARDS" = "false" ||
+            mock_state_exists storage-lock-imported
+          ;;
+        azurerm_management_lock.patchpage_postgres)
+          test "$ADOPT_SAFETY_GUARDS" = "false" ||
+            mock_state_exists postgres-lock-imported
+          ;;
+      esac
+      ;;
+    import\ -input=false\ *)
+      case "$3" in
+        azurerm_management_lock.drafts_storage)
+          test "$4" = "$EXPECTED_STORAGE_ACCOUNT_ID/providers/Microsoft.Authorization/locks/protect-patchpage-drafts" ||
+            return 1
+          test "$scenario" != "adoption_storage_lock_import_failure" || return 1
+          mock_state_mark storage-lock-imported
+          ;;
+        azurerm_management_lock.patchpage_postgres)
+          test "$4" = "$EXPECTED_POSTGRES_SERVER_ID/providers/Microsoft.Authorization/locks/protect-patchpage-postgres" ||
+            return 1
+          test "$scenario" != "adoption_postgres_lock_import_failure" || return 1
+          mock_state_mark postgres-lock-imported
+          ;;
+        *) return 1 ;;
+      esac
+      ;;
+    plan\ -input=false\ -out=*)
+      infra_plan="${3#-out=}"
+      mock_state_write infra-plan "$infra_plan"
+      test "$scenario" != "plan_failure" || return 1
+      mock_state_mark infra-plan-created
+      if test "$scenario" = "plan_json_open_failure"; then
+        # The block writes the plan JSON beside the saved plan; see
+        # INFRA_PLAN_JSON in the infrastructure-change block.
+        mkdir "${infra_plan%/*}/infrastructure-plan.json"
+      fi
+      ;;
+    show\ -json\ *)
+      test "$scenario" != "plan_gate_show_failure" || return 1
+      case "$scenario" in
+        delete_plan)
+          plan_change_json='[{"address":"azurerm_storage_account.drafts","change":{"actions":["delete"]}}]'
+          ;;
+        replacement_plan)
+          plan_change_json='[{"address":"azurerm_postgresql_flexible_server.patchpage","change":{"actions":["delete","create"]}}]'
+          ;;
+        missing_container_plan)
+          plan_change_json='[{"address":"azurerm_storage_container.drafts","change":{"actions":["create"]}}]'
+          ;;
+        missing_database_plan)
+          plan_change_json='[{"address":"azurerm_postgresql_flexible_server_database.patchpage","change":{"actions":["create"]}}]'
+          ;;
+        *)
+          plan_change_json='[{"address":"azurerm_container_app.server","change":{"actions":["update"]}}]'
+          ;;
+      esac
+      printf \
+        '{"planned_values":{"root_module":{"resources":[{"address":"azurerm_container_app.server","values":{"template":[{"container":[{"image":"acrpatchpageabc123.azurecr.io/patchpage-server@%s"}]}]}}]}},"resource_changes":%s}\n' \
+        "$LEGACY_IMAGE_DIGEST" \
+        "$plan_change_json"
+      ;;
+    apply\ *)
+      test "$2" = "-input=false" || return 1
+      # infra-plan-created is set only after a successful plan, so an apply
+      # that follows a failed plan is refused by the shim itself.
+      mock_state_exists infra-plan-created || return 1
+      test "$3" = "$(mock_state_read infra-plan)" || return 1
+      test "$scenario" != "final_apply_failure" || return 1
+      mock_state_mark infra-apply-completed
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+# ---------------------------------------------------------------------------
+
+case "$PP_MOCK_GROUP" in
+  deploy)
+    mock_log "terraform $*"
+    printf 'private-terraform-diagnostic %s\n' "$*" >&2
+    terraform_deploy "$@"
+    ;;
+  infrastructure)
+    mock_log "terraform $*"
+    printf 'private-infra-terraform-diagnostic %s\n' "$*" >&2
+    terraform_infrastructure "$@"
+    ;;
+  release | rollback)
+    # No documented release or rollback step may touch Terraform.
+    mock_log "terraform $*"
+    exit 1
+    ;;
+  custom-domain)
+    case "$*" in
+      "output -raw subscription_id") printf '%s\n' "$PP_MOCK_EXPECTED_SUBSCRIPTION" ;;
+      "output -raw resource_group_name") printf '%s\n' "rg-test" ;;
+      "output -raw container_app_name") printf '%s\n' "app-test" ;;
+      "output -raw container_app_environment_name") printf '%s\n' "env-test" ;;
+      "output -raw container_app_fqdn") printf '%s\n' "APP.AZURECONTAINERAPPS.IO." ;;
+      "output -raw container_app_environment_static_ip") printf '%s\n' "203.0.113.10" ;;
+      "output -raw custom_domain_verification_id") printf '%s\n' "verification-id" ;;
+      "output -raw public_base_url") printf '%s\n' "https://DRAFTS.SELF-HOSTER.DEV" ;;
+      "output -raw custom_domain_hostname") printf '%s\n' "DRAFTS.SELF-HOSTER.DEV." ;;
+      *) exit 1 ;;
+    esac
+    ;;
+  custom-domain-guard)
+    output_name="$3"
+    test "$scenario" != "failure_$output_name" || exit 1
+    test "$scenario" != "empty_$output_name" || exit 0
+    case "$output_name" in
+      subscription_id) printf '%s\n' "$PP_MOCK_EXPECTED_SUBSCRIPTION" ;;
+      resource_group_name) printf '%s\n' "rg-test" ;;
+      container_app_name) printf '%s\n' "app-test" ;;
+      container_app_environment_name) printf '%s\n' "env-test" ;;
+      container_app_fqdn) printf '%s\n' "app.azurecontainerapps.io" ;;
+      container_app_environment_static_ip) printf '%s\n' "203.0.113.10" ;;
+      custom_domain_verification_id) printf '%s\n' "verification-id" ;;
+      public_base_url) printf '%s\n' "https://drafts.self-hoster.dev" ;;
+      custom_domain_hostname) printf '%s\n' "drafts.self-hoster.dev" ;;
+      *) exit 1 ;;
+    esac
+    ;;
+  smoke)
+    test "$*" = "output -raw bootstrap_api_token"
+    test "$scenario" != "token_failure" || exit 1
+    test "$scenario" != "token_empty" || exit 0
+    printf '%s\n' "test-token"
+    ;;
+  *)
+    exit 1
+    ;;
+esac

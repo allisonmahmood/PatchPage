@@ -7,7 +7,18 @@ README="$ROOT/infra/azure/README.md"
 TMP_ROOT="$(mktemp -d)"
 TMP_DIR="$TMP_ROOT/guide commands"
 mkdir -p "$TMP_DIR"
-trap 'rm -rf "$TMP_ROOT"' 0 HUP INT TERM
+
+# Set PP_KEEP_TMP=1 to keep the scenario command logs, stdout/stderr captures
+# and mock state for inspection; tests/canonicalize_guide_logs.sh turns what is
+# left behind into a diffable form.
+guide_cleanup() {
+  if test -n "${PP_KEEP_TMP:-}"; then
+    printf 'guide_commands_test: PP_KEEP_TMP set, preserving %s\n' "$TMP_ROOT" >&2
+    return 0
+  fi
+  rm -rf "$TMP_ROOT"
+}
+trap guide_cleanup 0 HUP INT TERM
 
 fail() {
   printf 'guide_commands_test: %s\n' "$1" >&2
@@ -18,17 +29,6 @@ file_mode() {
   stat -c '%a' "$1" 2>/dev/null || stat -f '%Lp' "$1"
 }
 
-normalize_az_args() {
-  raw_az_args="$*"
-  az_subscription_suffix=" --subscription $SUBSCRIPTION_ID"
-  case "$raw_az_args" in
-    *"$az_subscription_suffix")
-      NORMALIZED_AZ_ARGS="${raw_az_args%"$az_subscription_suffix"}"
-      ;;
-    *) return 1 ;;
-  esac
-}
-
 case "$TMP_DIR" in
   *' '*) ;;
   *) fail "guide harness temporary path does not contain spaces" ;;
@@ -37,6 +37,96 @@ esac
 if grep -Fq -- '--header "Authorization: Bearer $BOOTSTRAP_API_TOKEN"' "$README"; then
   fail "deployed smoke exposes the bootstrap token in curl argv"
 fi
+
+# --- mock shims --------------------------------------------------------------
+#
+# az, terraform, git, curl and dig are executables under tests/mocks, not shell
+# functions. Each extracted README block runs as a child process with the mock
+# directory first on PATH, so a documented command reaches a mock exactly the
+# way it would reach the real tool. Because a shim is a separate process it
+# cannot read the block's shell variables: everything it needs is exported
+# below, and everything it must remember between calls lives in a file under
+# the per-scenario state directory.
+
+GUIDE_MOCK_DIR="$ROOT/infra/azure/tests/mocks"
+PP_MOCK_DIR="$GUIDE_MOCK_DIR"
+export PP_MOCK_DIR
+GUIDE_MOCK_PATH="$GUIDE_MOCK_DIR:$PATH"
+GUIDE_BLOCK_DIR="$TMP_ROOT/blocks"
+GUIDE_PART_DIR="$TMP_ROOT/block-parts"
+mkdir -p "$GUIDE_BLOCK_DIR" "$GUIDE_PART_DIR"
+
+for guide_mock in mocklib.sh az terraform git curl dig; do
+  test -f "$GUIDE_MOCK_DIR/$guide_mock" ||
+    fail "guide harness mock $guide_mock is missing"
+  case "$guide_mock" in
+    mocklib.sh) ;;
+    *)
+      test -x "$GUIDE_MOCK_DIR/$guide_mock" ||
+        fail "guide harness mock $guide_mock is not executable"
+      ;;
+  esac
+  sh -n "$GUIDE_MOCK_DIR/$guide_mock" ||
+    fail "guide harness mock $guide_mock is not valid POSIX shell"
+done
+
+# The log canonicalizer is developer tooling rather than a shim, but CI runs
+# only this harness, so syntax-check it here for the same reason.
+GUIDE_CANONICALIZER="$ROOT/infra/azure/tests/canonicalize_guide_logs.sh"
+test -f "$GUIDE_CANONICALIZER" ||
+  fail "guide log canonicalizer is missing"
+sh -n "$GUIDE_CANONICALIZER" ||
+  fail "guide log canonicalizer is not valid POSIX shell"
+
+# Block scripts are assembled from parts on disk rather than from shell
+# variables: bash 3.2 mis-parses a quoted here-document inside a command
+# substitution when the document contains case patterns.
+write_block_part() {
+  printf '%s\n' "$2" > "$GUIDE_PART_DIR/$1"
+}
+
+# Writes the child script that replaces the old in-process eval: an optional
+# preamble of the mocks that must stay in-process, the extracted README
+# block(s), and an optional trailer that re-expresses what used to be asserted
+# against the eval'ing shell itself. Sets BLOCK_SCRIPT to the written path.
+build_block_script() {
+  BLOCK_SCRIPT="$GUIDE_BLOCK_DIR/$1"
+  shift
+  {
+    # The README blocks are written for `sh -u` without errexit, which is what
+    # they already got: every block runner is invoked in a condition context,
+    # where POSIX shells suppress errexit inside the tested command.
+    printf '%s\n' 'set -u'
+    for block_part do
+      cat "$GUIDE_PART_DIR/$block_part"
+    done
+  } > "$BLOCK_SCRIPT"
+}
+
+# Empties and exports the state directory the shims use instead of the shell
+# variables the old function mocks carried.
+prepare_mock_state() {
+  PP_MOCK_STATE="$1"
+  rm -rf "$PP_MOCK_STATE"
+  mkdir -p "$PP_MOCK_STATE"
+  export PP_MOCK_STATE
+}
+
+# Runs a prepared block script as a child process with the shims on PATH. The
+# caller has already exported the scenario environment.
+run_block_script() {
+  PATH="$GUIDE_MOCK_PATH"
+  export PATH
+  sh "$1"
+}
+
+cat > "$GUIDE_PART_DIR/completed-trailer" <<'GUIDE_BLOCK_PART'
+printf '%s\n' completed >> "$PP_MOCK_LOG"
+GUIDE_BLOCK_PART
+
+cat > "$GUIDE_PART_DIR/set-errexit-off" <<'GUIDE_BLOCK_PART'
+set +e
+GUIDE_BLOCK_PART
 
 extract_block() {
   marker="<!-- guide-test:$1 -->"
@@ -75,6 +165,307 @@ CAA_POLICY_BLOCK="$(extract_block caa-policy)"
 CERTIFICATE_BINDING_BLOCK="$(extract_block certificate-binding)"
 DEPLOYED_SMOKE_BLOCK="$(extract_block deployed-smoke)"
 
+# --- in-process mocks --------------------------------------------------------
+#
+# mktemp, cat, rm, chmod, jq and sleep stay shell functions inside the child
+# script. Unlike az/terraform/git/curl/dig they are only interesting because
+# they observe variables the extracted block itself sets (STATE_LIST_ERROR,
+# TERRAFORM_DIAGNOSTIC_DIR, SECURE_TARGET_DIR, SECURE_PLAN_DIR,
+# SECURE_CHANGE_DIR, INITIAL_PLAN_JSON, INFRA_PLAN_JSON, CANARY_RECORD), so a
+# separate process could not see what they are asked to check.
+
+cat > "$GUIDE_PART_DIR/deploy-mocks" <<'GUIDE_BLOCK_PART'
+mktemp() {
+  mktemp_count_file="$PP_MOCK_SCENARIO_ROOT/mktemp-count"
+  mktemp_count=0
+  if test -e "$mktemp_count_file"; then
+    mktemp_count="$(cat "$mktemp_count_file")"
+  fi
+  mktemp_count=$((mktemp_count + 1))
+  printf '%s\n' "$mktemp_count" > "$mktemp_count_file"
+  if test "$PP_MOCK_SCENARIO" = "diagnostic_secure_dir_failure" &&
+    test "$mktemp_count" -eq 1; then
+    return 1
+  fi
+  if test "$PP_MOCK_SCENARIO" = "target_secure_dir_failure" &&
+    test "$mktemp_count" -eq 3; then
+    return 1
+  fi
+  if test "$PP_MOCK_SCENARIO" = "secure_plan_dir_failure" &&
+    test "$mktemp_count" -eq 4; then
+    return 1
+  fi
+  mktemp_result="$(command mktemp "$@")" || return 1
+  if test "$mktemp_count" -eq 1; then
+    printf '%s\n' "$mktemp_result" > "$PP_MOCK_SCENARIO_ROOT/diagnostic-dir"
+    if test "$PP_MOCK_SCENARIO" = "diagnostic_log_open_failure"; then
+      mkdir "$mktemp_result/terraform.log"
+    fi
+  elif test "$PP_MOCK_SCENARIO" = "state_diagnostic_open_failure" &&
+    test "$mktemp_count" -eq 2; then
+    command rm -f -- "$mktemp_result"
+    mkdir "$mktemp_result"
+  fi
+  printf '%s\n' "$mktemp_result"
+}
+
+cat() {
+  if test "$PP_MOCK_SCENARIO" = "state_diagnostic_read_failure" &&
+    test "${1:-}" = "--" &&
+    test "${2:-}" = "${STATE_LIST_ERROR:-}"; then
+    printf 'private read failure: %s\n' "$2" >&2
+    return 1
+  fi
+  command cat "$@"
+}
+
+rm() {
+  if test "$PP_MOCK_SCENARIO" = "state_diagnostic_remove_failure" &&
+    test "${1:-}" = "-f" &&
+    test "${3:-}" = "${STATE_LIST_ERROR:-}"; then
+    printf 'private remove failure: %s\n' "$3" >&2
+    return 1
+  fi
+  if test "$PP_MOCK_SCENARIO" = "diagnostic_cleanup_failure" &&
+    test "${1:-}" = "-rf" &&
+    test "${3:-}" = "${TERRAFORM_DIAGNOSTIC_DIR:-}"; then
+    printf 'private cleanup failure: %s\n' "$3" >&2
+    return 1
+  fi
+  if test "$PP_MOCK_SCENARIO" = "target_cleanup_failure" &&
+    test "${1:-}" = "-rf" &&
+    test "${3:-}" = "${SECURE_TARGET_DIR:-}"; then
+    printf 'private target cleanup failure: %s\n' "$3" >&2
+    return 1
+  fi
+  if test "$PP_MOCK_SCENARIO" = "initial_cleanup_failure" &&
+    test "${1:-}" = "-rf" &&
+    test "${3:-}" = "${SECURE_PLAN_DIR:-}"; then
+    printf 'private plan cleanup failure: %s\n' "$3" >&2
+    return 1
+  fi
+  command rm "$@"
+}
+
+jq() {
+  jq_input=
+  for jq_arg do
+    jq_input="$jq_arg"
+  done
+  if test -n "${INITIAL_PLAN_JSON:-}" &&
+    test "$jq_input" = "$INITIAL_PLAN_JSON"; then
+    jq_seen="$PP_MOCK_SCENARIO_ROOT/initial-plan-jq-seen"
+    if test "$PP_MOCK_SCENARIO" = "plan_summary_failure" && test -e "$jq_seen"; then
+      return 1
+    fi
+    : > "$jq_seen"
+  fi
+  command jq "$@"
+}
+GUIDE_BLOCK_PART
+
+cat > "$GUIDE_PART_DIR/release-mocks" <<'GUIDE_BLOCK_PART'
+mktemp() {
+  test "$PP_MOCK_SCENARIO" != "rollback_record_create_failure" || return 1
+  command mktemp "$@"
+}
+
+chmod() {
+  if test "$PP_MOCK_SCENARIO" = "rollback_record_chmod_failure"; then
+    case "$2" in
+      "${ROLLBACK_RECORD}.tmp."*) return 1 ;;
+    esac
+  fi
+  command chmod "$@"
+}
+
+sleep() {
+  printf 'sleep %s\n' "$*" >> "$PP_MOCK_LOG"
+}
+GUIDE_BLOCK_PART
+
+cat > "$GUIDE_PART_DIR/rollback-mocks" <<'GUIDE_BLOCK_PART'
+sleep() {
+  printf 'sleep %s\n' "$*" >> "$PP_MOCK_LOG"
+}
+GUIDE_BLOCK_PART
+
+cat > "$GUIDE_PART_DIR/infrastructure-mocks" <<'GUIDE_BLOCK_PART'
+chmod() {
+  if test "$PP_MOCK_SCENARIO" = "backend_chmod_failure" &&
+    test "$2" = "backend.hcl"; then
+    return 1
+  fi
+  command chmod "$@"
+}
+
+mktemp() {
+  mktemp_count_file="$PP_MOCK_SCENARIO_ROOT/mktemp-count"
+  mktemp_count=0
+  if test -e "$mktemp_count_file"; then
+    mktemp_count="$(cat "$mktemp_count_file")"
+  fi
+  mktemp_count=$((mktemp_count + 1))
+  printf '%s\n' "$mktemp_count" > "$mktemp_count_file"
+  if test "$PP_MOCK_SCENARIO" = "infra_diagnostic_secure_dir_failure" &&
+    test "$mktemp_count" -eq 1; then
+    return 1
+  fi
+  if test "$PP_MOCK_SCENARIO" = "secure_change_dir_failure" &&
+    test "$mktemp_count" -eq 2; then
+    return 1
+  fi
+  mktemp_result="$(command mktemp "$@")" || return 1
+  if test "$mktemp_count" -eq 1; then
+    printf '%s\n' "$mktemp_result" > "$PP_MOCK_SCENARIO_ROOT/diagnostic-dir"
+    if test "$PP_MOCK_SCENARIO" = "infra_diagnostic_log_open_failure"; then
+      mkdir "$mktemp_result/terraform.log"
+    fi
+  elif test "$PP_MOCK_SCENARIO" = "state_snapshot_open_failure" &&
+    test "$mktemp_count" -eq 2; then
+    mkdir "$mktemp_result/state.json"
+  fi
+  printf '%s\n' "$mktemp_result"
+}
+
+rm() {
+  if test "$PP_MOCK_SCENARIO" = "infra_diagnostic_cleanup_failure" &&
+    test "${1:-}" = "-rf" &&
+    test "${3:-}" = "${TERRAFORM_DIAGNOSTIC_DIR:-}"; then
+    printf 'private cleanup failure: %s\n' "$3" >&2
+    return 1
+  fi
+  if test "$PP_MOCK_SCENARIO" = "secure_change_cleanup_failure" &&
+    test "${1:-}" = "-rf" &&
+    test "${3:-}" = "${SECURE_CHANGE_DIR:-}"; then
+    printf 'private change cleanup failure: %s\n' "$3" >&2
+    return 1
+  fi
+  command rm "$@"
+}
+
+sleep() {
+  printf 'sleep %s\n' "$*" >> "$PP_MOCK_LOG"
+}
+
+jq() {
+  jq_input=
+  for jq_arg do
+    jq_input="$jq_arg"
+  done
+  if test -n "${INFRA_PLAN_JSON:-}" &&
+    test "$jq_input" = "$INFRA_PLAN_JSON"; then
+    jq_seen="$PP_MOCK_SCENARIO_ROOT/infrastructure-plan-jq-seen"
+    if test "$PP_MOCK_SCENARIO" = "plan_summary_failure" && test -e "$jq_seen"; then
+      return 1
+    fi
+    : > "$jq_seen"
+  fi
+  command jq "$@"
+}
+GUIDE_BLOCK_PART
+
+# The deployed-smoke group is the one place where the shell that runs the block
+# is itself under test: the block must not clobber the caller's traps and must
+# not remove a path the caller reuses. That caller role moves into the child
+# script, so the assertion keeps its original meaning.
+cat > "$GUIDE_PART_DIR/smoke-mocks" <<'GUIDE_BLOCK_PART'
+mktemp() {
+  case "$*" in
+    "-d")
+      mkdir -p "$PP_MOCK_SMOKE_TMP_DIR" || return 1
+      printf '%s\n' "$PP_MOCK_SMOKE_TMP_DIR"
+      ;;
+    "${CANARY_RECORD:-}.tmp.XXXXXX")
+      command mktemp "$@"
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+chmod() {
+  if test "$PP_MOCK_SCENARIO" = "canary_record_chmod_failure"; then
+    case "$2" in
+      "${CANARY_RECORD}.tmp."*) return 1 ;;
+    esac
+  fi
+  command chmod "$@"
+}
+
+trap 'printf "%s\n" caller-exit >> "$PP_MOCK_CALLER_TRAP_LOG"' EXIT
+trap 'printf "%s\n" caller-hup >> "$PP_MOCK_CALLER_TRAP_LOG"' HUP
+trap 'printf "%s\n" caller-int >> "$PP_MOCK_CALLER_TRAP_LOG"' INT
+trap 'printf "%s\n" caller-term >> "$PP_MOCK_CALLER_TRAP_LOG"' TERM
+GUIDE_BLOCK_PART
+
+cat > "$GUIDE_PART_DIR/smoke-trailer" <<'GUIDE_BLOCK_PART'
+smoke_status=$?
+trap > "$PP_MOCK_CALLER_TRAP_SNAPSHOT"
+mkdir -p "$PP_MOCK_SMOKE_TMP_DIR"
+: > "$PP_MOCK_SMOKE_TMP_DIR/reused-after-smoke"
+exit "$smoke_status"
+GUIDE_BLOCK_PART
+
+# The custom-domain context block is the only one whose contract is stated in
+# terms of variables it leaves behind, so those checks run inside the child.
+# Chained with && so each one bites regardless of errexit.
+cat > "$GUIDE_PART_DIR/custom-domain-context-trailer" <<'GUIDE_BLOCK_PART'
+test "$CUSTOM_DOMAIN" = "drafts.self-hoster.dev" &&
+  test "$CONTAINER_APP_FQDN" = "app.azurecontainerapps.io" &&
+  test "$NORMALIZED_PUBLIC_BASE_URL" = "https://drafts.self-hoster.dev"
+GUIDE_BLOCK_PART
+
+write_block_part state-bootstrap-block "$STATE_BOOTSTRAP_BLOCK"
+write_block_part deploy-resources-block "$DEPLOY_RESOURCES_BLOCK"
+write_block_part app-release-block "$APP_RELEASE_BLOCK"
+write_block_part app-rollback-block "$APP_ROLLBACK_BLOCK"
+write_block_part infrastructure-change-block "$INFRASTRUCTURE_CHANGE_BLOCK"
+write_block_part infrastructure-change-apply-block "$INFRASTRUCTURE_CHANGE_APPLY_BLOCK"
+write_block_part stale-lease-recovery-block "$STALE_LEASE_RECOVERY_BLOCK"
+write_block_part custom-domain-context-block "$CUSTOM_DOMAIN_CONTEXT_BLOCK"
+write_block_part ingress-verification-block "$INGRESS_VERIFICATION_BLOCK"
+write_block_part hostname-mutation-block "$HOSTNAME_MUTATION_BLOCK"
+write_block_part apex-dns-block "$APEX_DNS_BLOCK"
+write_block_part caa-policy-block "$CAA_POLICY_BLOCK"
+write_block_part certificate-binding-block "$CERTIFICATE_BINDING_BLOCK"
+
+build_block_script state-bootstrap state-bootstrap-block
+STATE_BOOTSTRAP_SCRIPT="$BLOCK_SCRIPT"
+build_block_script deploy-resources \
+  deploy-mocks deploy-resources-block completed-trailer
+DEPLOY_RESOURCES_SCRIPT="$BLOCK_SCRIPT"
+build_block_script app-release \
+  release-mocks app-release-block completed-trailer
+APP_RELEASE_SCRIPT="$BLOCK_SCRIPT"
+build_block_script app-rollback \
+  rollback-mocks app-rollback-block completed-trailer
+APP_ROLLBACK_SCRIPT="$BLOCK_SCRIPT"
+build_block_script infrastructure-change \
+  infrastructure-mocks infrastructure-change-block \
+  infrastructure-change-apply-block completed-trailer
+INFRASTRUCTURE_CHANGE_SCRIPT="$BLOCK_SCRIPT"
+build_block_script stale-lease-recovery \
+  stale-lease-recovery-block completed-trailer
+STALE_LEASE_RECOVERY_SCRIPT="$BLOCK_SCRIPT"
+build_block_script custom-domain-context \
+  custom-domain-context-block custom-domain-context-trailer
+CUSTOM_DOMAIN_CONTEXT_SCRIPT="$BLOCK_SCRIPT"
+build_block_script custom-domain-output-guard \
+  set-errexit-off custom-domain-context-block completed-trailer
+CUSTOM_DOMAIN_OUTPUT_GUARD_SCRIPT="$BLOCK_SCRIPT"
+build_block_script ingress-verification ingress-verification-block
+INGRESS_VERIFICATION_SCRIPT="$BLOCK_SCRIPT"
+build_block_script hostname-mutation hostname-mutation-block
+HOSTNAME_MUTATION_SCRIPT="$BLOCK_SCRIPT"
+build_block_script apex-dns apex-dns-block
+APEX_DNS_SCRIPT="$BLOCK_SCRIPT"
+build_block_script caa-policy caa-policy-block
+CAA_POLICY_SCRIPT="$BLOCK_SCRIPT"
+build_block_script certificate-binding certificate-binding-block
+CERTIFICATE_BINDING_SCRIPT="$BLOCK_SCRIPT"
+
 run_state_bootstrap_block() {
   scenario="$1"
   scenario_root="$TMP_DIR/state-$scenario"
@@ -105,317 +496,33 @@ run_state_bootstrap_block() {
       resume_* | state_key_history_*) RESUME_STATE_BOOTSTRAP="true" ;;
       *) RESUME_STATE_BOOTSTRAP="false" ;;
     esac
+    export SUBSCRIPTION_ID STATE_STORAGE_ACCOUNT STATE_CONTAINER \
+      OPERATION_PRINCIPAL_ID OPERATION_PRINCIPAL_TYPE STATE_KEY \
+      RESUME_STATE_BOOTSTRAP
+
+    PP_MOCK_GROUP="state"
+    PP_MOCK_SCENARIO="$scenario"
+    PP_MOCK_LOG="$log"
+    PP_MOCK_REPO_ROOT="$scenario_root"
+    export PP_MOCK_GROUP PP_MOCK_SCENARIO PP_MOCK_LOG PP_MOCK_REPO_ROOT
+    prepare_mock_state "$TMP_DIR/state-$scenario.mockstate"
+
+    # Seed the mock state files that used to be shell variables initialized
+    # before the eval: which containers and role assignments already exist.
     case "$scenario" in
       resume_account_success | resume_exact_operation_role | resume_retention_preserved | \
         resume_foreign_container | \
         resume_deleted_container | resume_stronger_state_lock | \
         state_key_history_*)
-        state_container_created="true"
-        operation_container_created="true"
-        ;;
-      *)
-        state_container_created="false"
-        operation_container_created="false"
+        : > "$PP_MOCK_STATE/state-container-created"
+        : > "$PP_MOCK_STATE/operation-container-created"
         ;;
     esac
-    state_account_created="false"
     if test "$scenario" = "resume_exact_operation_role"; then
-      role_assignment_created="true"
-    else
-      role_assignment_created="false"
+      : > "$PP_MOCK_STATE/role-assignment-created"
     fi
-    resource_list_count=0
 
-    git() {
-      test "$*" = "rev-parse --show-toplevel" || return 1
-      printf '%s\n' "$scenario_root"
-    }
-
-    az() {
-      normalize_az_args "$@" || return 1
-      printf '%s\n' "$NORMALIZED_AZ_ARGS" >> "$log"
-      printf 'private-az-diagnostic %s\n' "$NORMALIZED_AZ_ARGS" >&2
-      case "$1 $2" in
-        "account set")
-          test "$scenario" != "subscription_set_failure"
-          ;;
-        "account show")
-          test "$scenario" != "subscription_show_failure" || return 1
-          if test "$scenario" = "subscription_mismatch"; then
-            printf '%s\n' "11111111-1111-1111-1111-111111111111"
-          else
-            printf '%s\n' "$SUBSCRIPTION_ID"
-          fi
-          ;;
-        "group exists")
-          test "$scenario" != "state_resource_group_check_failure" || return 1
-          case "$scenario" in
-            state_resource_group_exists | resume_* | state_key_history_*)
-              printf '%s\n' "true"
-              ;;
-            *) printf '%s\n' "false" ;;
-          esac
-          ;;
-        "resource list")
-          resource_list_count=$((resource_list_count + 1))
-          case "$scenario" in
-            resume_foreign_resource)
-              printf '%s\n' \
-                "/subscriptions/$SUBSCRIPTION_ID/resourceGroups/rg-patchpage-tfstate/providers/Microsoft.KeyVault/vaults/foreign"
-              ;;
-            resume_account_success | resume_exact_operation_role | resume_retention_preserved | \
-              resume_foreign_container | \
-              resume_deleted_container | resume_stronger_state_lock | \
-              state_key_history_*)
-              printf '%s\n' \
-                "/subscriptions/$SUBSCRIPTION_ID/resourceGroups/rg-patchpage-tfstate/providers/Microsoft.Storage/storageAccounts/patchpagestate"
-              ;;
-            foreign_resource_after_group_create)
-              printf '%s\n' \
-                "/subscriptions/$SUBSCRIPTION_ID/resourceGroups/rg-patchpage-tfstate/providers/Microsoft.KeyVault/vaults/foreign"
-              ;;
-            foreign_resource_before_lock)
-              if test "$state_account_created" = "true"; then
-                printf '%s\n' \
-                  "/subscriptions/$SUBSCRIPTION_ID/resourceGroups/rg-patchpage-tfstate/providers/Microsoft.Storage/storageAccounts/patchpagestate"
-                printf '%s\n' \
-                  "/subscriptions/$SUBSCRIPTION_ID/resourceGroups/rg-patchpage-tfstate/providers/Microsoft.KeyVault/vaults/foreign"
-              fi
-              ;;
-            *)
-              if test "$state_account_created" = "true"; then
-                printf '%s\n' \
-                  "/subscriptions/$SUBSCRIPTION_ID/resourceGroups/rg-patchpage-tfstate/providers/Microsoft.Storage/storageAccounts/patchpagestate"
-              fi
-              ;;
-          esac
-          ;;
-        "group create")
-          test "$scenario" != "group_create_failure"
-          ;;
-        "group show")
-          if test "$scenario" = "group_verification_failure"; then
-            return 1
-          elif test "$scenario" = "group_location_drift"; then
-            printf '%s\n' "eastus"
-          else
-            printf '%s\n' "centralus"
-          fi
-          ;;
-        "storage account")
-          case "$3" in
-            check-name)
-              test "$scenario" != "state_account_check_failure" || return 1
-              case "$scenario" in
-                resume_account_success | resume_exact_operation_role | resume_retention_preserved | \
-                  resume_foreign_container | resume_deleted_container | resume_stronger_state_lock | \
-                  state_key_history_*)
-                  printf '%s\n' "false"
-                  ;;
-                *) printf '%s\n' "true" ;;
-              esac
-              ;;
-            create)
-              test "$scenario" != "account_create_failure" || return 1
-              state_account_created="true"
-              ;;
-            show)
-              test "$scenario" != "account_verification_failure" || return 1
-              account_location="centralus"
-              account_kind="StorageV2"
-              account_sku="Standard_GRS"
-              account_tls="TLS1_2"
-              account_https="true"
-              account_public_blob="false"
-              case "$scenario" in
-                account_location_drift) account_location="eastus" ;;
-                account_kind_drift) account_kind="BlobStorage" ;;
-                account_sku_drift) account_sku="Standard_LRS" ;;
-                account_tls_drift) account_tls="TLS1_0" ;;
-                account_https_drift) account_https="false" ;;
-                account_public_blob_drift) account_public_blob="true" ;;
-              esac
-              printf \
-                '{"id":"/subscriptions/%s/resourceGroups/rg-patchpage-tfstate/providers/Microsoft.Storage/storageAccounts/patchpagestate","location":"%s","kind":"%s","sku":{"name":"%s"},"minimumTlsVersion":"%s","enableHttpsTrafficOnly":%s,"allowBlobPublicAccess":%s}\n' \
-                "$SUBSCRIPTION_ID" \
-                "$account_location" \
-                "$account_kind" \
-                "$account_sku" \
-                "$account_tls" \
-                "$account_https" \
-                "$account_public_blob"
-              ;;
-            blob-service-properties)
-              case "$4" in
-                update)
-                  test "$scenario" != "blob_protection_update_failure"
-                  ;;
-                show)
-                  test "$scenario" != "blob_protection_show_failure" || return 1
-                  versioning="true"
-                  blob_delete_enabled="true"
-                  blob_delete_days="30"
-                  permanent_delete="false"
-                  container_delete_enabled="true"
-                  container_delete_days="30"
-                  case "$scenario" in
-                    versioning_drift) versioning="false" ;;
-                    blob_delete_disabled) blob_delete_enabled="false" ;;
-                    blob_delete_too_short) blob_delete_days="29" ;;
-                    permanent_delete_enabled) permanent_delete="true" ;;
-                    container_delete_disabled) container_delete_enabled="false" ;;
-                    container_delete_too_short) container_delete_days="29" ;;
-                    resume_retention_preserved)
-                      blob_delete_days="90"
-                      container_delete_days="365"
-                      ;;
-                  esac
-                  printf \
-                    '{"isVersioningEnabled":%s,"deleteRetentionPolicy":{"enabled":%s,"allowPermanentDelete":%s,"days":%s},"containerDeleteRetentionPolicy":{"enabled":%s,"days":%s}}\n' \
-                    "$versioning" \
-                    "$blob_delete_enabled" \
-                    "$permanent_delete" \
-                    "$blob_delete_days" \
-                    "$container_delete_enabled" \
-                    "$container_delete_days"
-                  ;;
-                *)
-                  return 1
-                  ;;
-              esac
-              ;;
-            *)
-              return 1
-              ;;
-          esac
-          ;;
-        "storage container")
-          case " $* " in
-            *" --auth-mode key "*) ;;
-            *) return 1 ;;
-          esac
-          case "$3" in
-            create)
-              test "$scenario" != "create_failure" || return 1
-              case " $* " in
-                *" --name tfstate "*) state_container_created="true" ;;
-                *" --name patchpage-operations "*) operation_container_created="true" ;;
-                *) return 1 ;;
-              esac
-              ;;
-            exists)
-              if test "$scenario" = "verification_failure"; then
-                return 1
-              elif test "$scenario" = "container_missing"; then
-                printf '%s\n' "false"
-              else
-                case " $* " in
-                  *" --name tfstate "*) printf '%s\n' "$state_container_created" ;;
-                  *" --name patchpage-operations "*) printf '%s\n' "$operation_container_created" ;;
-                  *) return 1 ;;
-                esac
-              fi
-              ;;
-            list)
-              if test "$scenario" = "resume_foreign_container"; then
-                printf 'foreign\tfalse\n'
-              elif test "$scenario" = "resume_deleted_container"; then
-                printf 'tfstate\ttrue\n'
-              else
-                test "$state_container_created" = "false" || printf 'tfstate\t\n'
-                test "$operation_container_created" = "false" || printf 'patchpage-operations\t\n'
-              fi
-              ;;
-            metadata)
-              test "$4" = "show" || return 1
-              if test "$scenario" = "operation_container_foreign_metadata"; then
-                printf '%s\n' '{"foreign":"value"}'
-              else
-                printf '%s\n' '{}'
-              fi
-              ;;
-            *)
-              return 1
-              ;;
-          esac
-          ;;
-        "storage blob")
-          test "$3" = "list" || return 1
-          case " $* " in
-            *" --container-name patchpage-operations "*)
-              test "$scenario" != "operation_container_nonempty" ||
-                printf '%s\n' "unexpected"
-              ;;
-          esac
-          test "$scenario" != "state_key_history_check_failure" || return 1
-          if test "$scenario" = "state_key_history_exists" &&
-            case " $* " in *" --container-name tfstate "*) true ;; *) false ;; esac; then
-            printf '%s\n' "patchpage-prod.tfstate"
-          fi
-          ;;
-        "role assignment")
-          case "$3" in
-            list)
-              case " $* " in
-                *" --assignee-object-id $OPERATION_PRINCIPAL_ID --role /subscriptions/$SUBSCRIPTION_ID/providers/Microsoft.Authorization/roleDefinitions/ba92f5b4-2d11-453d-a403-e96b0029c9fe --scope /subscriptions/$SUBSCRIPTION_ID/resourceGroups/rg-patchpage-tfstate/providers/Microsoft.Storage/storageAccounts/patchpagestate/blobServices/default/containers/patchpage-operations --include-inherited --include-groups --fill-principal-name false --fill-role-definition-name false --output json "*)
-                  role_assignment_scope="operation"
-                  ;;
-                *" --assignee-object-id $OPERATION_PRINCIPAL_ID --scope /subscriptions/$SUBSCRIPTION_ID/resourceGroups/rg-patchpage-tfstate/providers/Microsoft.Storage/storageAccounts/patchpagestate/blobServices/default/containers/tfstate --include-inherited --include-groups --fill-principal-name false --fill-role-definition-name false --output json "*)
-                  role_assignment_scope="state"
-                  ;;
-                *) return 1 ;;
-              esac
-              if test "$scenario" = "operation_role_inherited_broad"; then
-                printf '[{"principalId":"%s","roleDefinitionId":"/subscriptions/%s/providers/Microsoft.Authorization/roleDefinitions/ba92f5b4-2d11-453d-a403-e96b0029c9fe","scope":"/subscriptions/%s/resourceGroups/rg-patchpage-tfstate/providers/Microsoft.Storage/storageAccounts/patchpagestate"}]\n' \
-                  "$OPERATION_PRINCIPAL_ID" "$SUBSCRIPTION_ID" "$SUBSCRIPTION_ID"
-              elif test "$role_assignment_scope" = "state"; then
-                if test "$scenario" = "operation_role_state_reader"; then
-                  printf '[{"principalId":"%s","roleDefinitionId":"/subscriptions/%s/providers/Microsoft.Authorization/roleDefinitions/2a2b9908-6ea1-4ae2-8e65-a410df84e7d1","scope":"/subscriptions/%s/resourceGroups/rg-patchpage-tfstate/providers/Microsoft.Storage/storageAccounts/patchpagestate/blobServices/default/containers/tfstate"}]\n' \
-                    "$OPERATION_PRINCIPAL_ID" "$SUBSCRIPTION_ID" "$SUBSCRIPTION_ID"
-                else
-                  printf '%s\n' '[]'
-                fi
-              elif test "$role_assignment_created" = "true"; then
-                printf '[{"principalId":"%s","roleDefinitionId":"/subscriptions/%s/providers/Microsoft.Authorization/roleDefinitions/ba92f5b4-2d11-453d-a403-e96b0029c9fe","scope":"/subscriptions/%s/resourceGroups/rg-patchpage-tfstate/providers/Microsoft.Storage/storageAccounts/patchpagestate/blobServices/default/containers/patchpage-operations"}]\n' \
-                  "$OPERATION_PRINCIPAL_ID" "$SUBSCRIPTION_ID" "$SUBSCRIPTION_ID"
-              else
-                printf '%s\n' '[]'
-              fi
-              ;;
-            create)
-              test "$scenario" != "operation_role_create_failure" || return 1
-              case " $* " in
-                *" --role /subscriptions/$SUBSCRIPTION_ID/providers/Microsoft.Authorization/roleDefinitions/ba92f5b4-2d11-453d-a403-e96b0029c9fe --scope /subscriptions/$SUBSCRIPTION_ID/resourceGroups/rg-patchpage-tfstate/providers/Microsoft.Storage/storageAccounts/patchpagestate/blobServices/default/containers/patchpage-operations "*) ;;
-                *) return 1 ;;
-              esac
-              role_assignment_created="true"
-              ;;
-            *) return 1 ;;
-          esac
-          ;;
-        "lock list")
-          if test "$scenario" = "resume_stronger_state_lock"; then
-            printf 'ReadOnly\t/subscriptions/%s/resourceGroups/rg-patchpage-tfstate/providers/Microsoft.Storage/storageAccounts/patchpagestate/providers/Microsoft.Authorization/locks/protect-patchpage-tfstate\n' "$SUBSCRIPTION_ID"
-          fi
-          ;;
-        "lock create")
-          test "$scenario" != "state_lock_create_failure"
-          ;;
-        "lock show")
-          test "$scenario" != "state_lock_show_failure" || return 1
-          if test "$scenario" = "state_lock_level_drift"; then
-            printf 'ReadOnly\t/subscriptions/%s/resourceGroups/rg-patchpage-tfstate/providers/Microsoft.Storage/storageAccounts/patchpagestate/providers/Microsoft.Authorization/locks/protect-patchpage-tfstate\n' "$SUBSCRIPTION_ID"
-          else
-            printf 'CanNotDelete\t/subscriptions/%s/resourceGroups/rg-patchpage-tfstate/providers/Microsoft.Storage/storageAccounts/patchpagestate/providers/Microsoft.Authorization/locks/protect-patchpage-tfstate\n' "$SUBSCRIPTION_ID"
-          fi
-          ;;
-        *)
-          return 1
-          ;;
-      esac
-    }
-
-    eval "$STATE_BOOTSTRAP_BLOCK"
+    run_block_script "$STATE_BOOTSTRAP_SCRIPT"
   ) >"$output" 2>&1
 }
 
@@ -668,12 +775,24 @@ run_deploy_resources_block() {
     FULL_SHA="1111111111111111111111111111111111111111"
     IMAGE_DIGEST_VALUE="sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
     TERRAFORM_DIAGNOSTIC_ROOT="$diagnostic_root"
-    export TERRAFORM_DIAGNOSTIC_ROOT
     EXPECTED_OPERATION_AUTH_MODE="key"
     case "$scenario" in
       resume_*) RESUME_INITIAL_DEPLOY="true" ;;
       *) RESUME_INITIAL_DEPLOY="false" ;;
     esac
+    export SUBSCRIPTION_ID STATE_STORAGE_ACCOUNT STATE_KEY FULL_SHA \
+      IMAGE_DIGEST_VALUE TERRAFORM_DIAGNOSTIC_ROOT EXPECTED_OPERATION_AUTH_MODE \
+      RESUME_INITIAL_DEPLOY
+
+    PP_MOCK_GROUP="deploy"
+    PP_MOCK_SCENARIO="$scenario"
+    PP_MOCK_LOG="$log"
+    PP_MOCK_REPO_ROOT="$scenario_root"
+    PP_MOCK_SCENARIO_ROOT="$scenario_root"
+    export PP_MOCK_GROUP PP_MOCK_SCENARIO PP_MOCK_LOG PP_MOCK_REPO_ROOT \
+      PP_MOCK_SCENARIO_ROOT
+    prepare_mock_state "$TMP_DIR/deploy-$scenario.mockstate"
+
     cd "$scenario_root/infra/azure"
     printf '%s\n' \
       'resource_group_name = "foreign"' \
@@ -681,463 +800,7 @@ run_deploy_resources_block() {
       'container_name = "foreign"' \
       'key = "foreign.tfstate"' > backend.hcl
 
-    git() {
-      case "$*" in
-        "rev-parse --show-toplevel")
-          test "$scenario" != "repo_root_failure" || return 1
-          printf '%s\n' "$scenario_root"
-          ;;
-        "-C ../.. status --porcelain")
-          test "$scenario" != "git_status_failure" || return 1
-          if test "$scenario" = "dirty_worktree"; then
-            printf '%s\n' " M apps/server/src/start.ts"
-          fi
-          ;;
-        "-C ../.. rev-parse HEAD")
-          test "$scenario" != "git_failure" || return 1
-          test "$scenario" != "git_empty" || return 0
-          if test "$scenario" = "git_short"; then
-            printf '%s\n' "1111111"
-          else
-            printf '%s\n' "$FULL_SHA"
-          fi
-          ;;
-        *)
-          return 1
-          ;;
-      esac
-    }
-
-    mktemp() {
-      mktemp_count_file="$scenario_root/mktemp-count"
-      mktemp_count=0
-      if test -e "$mktemp_count_file"; then
-        mktemp_count="$(cat "$mktemp_count_file")"
-      fi
-      mktemp_count=$((mktemp_count + 1))
-      printf '%s\n' "$mktemp_count" > "$mktemp_count_file"
-      if test "$scenario" = "diagnostic_secure_dir_failure" &&
-        test "$mktemp_count" -eq 1; then
-        return 1
-      fi
-      if test "$scenario" = "target_secure_dir_failure" &&
-        test "$mktemp_count" -eq 3; then
-        return 1
-      fi
-      if test "$scenario" = "secure_plan_dir_failure" &&
-        test "$mktemp_count" -eq 4; then
-        return 1
-      fi
-      mktemp_result="$(command mktemp "$@")" || return 1
-      if test "$mktemp_count" -eq 1; then
-        printf '%s\n' "$mktemp_result" > "$scenario_root/diagnostic-dir"
-        if test "$scenario" = "diagnostic_log_open_failure"; then
-          mkdir "$mktemp_result/terraform.log"
-        fi
-      elif test "$scenario" = "state_diagnostic_open_failure" &&
-        test "$mktemp_count" -eq 2; then
-        command rm -f -- "$mktemp_result"
-        mkdir "$mktemp_result"
-      fi
-      printf '%s\n' "$mktemp_result"
-    }
-
-    cat() {
-      if test "$scenario" = "state_diagnostic_read_failure" &&
-        test "${1:-}" = "--" &&
-        test "${2:-}" = "${STATE_LIST_ERROR:-}"; then
-        printf 'private read failure: %s\n' "$2" >&2
-        return 1
-      fi
-      command cat "$@"
-    }
-
-    rm() {
-      if test "$scenario" = "state_diagnostic_remove_failure" &&
-        test "${1:-}" = "-f" &&
-        test "${3:-}" = "${STATE_LIST_ERROR:-}"; then
-        printf 'private remove failure: %s\n' "$3" >&2
-        return 1
-      fi
-      if test "$scenario" = "diagnostic_cleanup_failure" &&
-        test "${1:-}" = "-rf" &&
-        test "${3:-}" = "${TERRAFORM_DIAGNOSTIC_DIR:-}"; then
-        printf 'private cleanup failure: %s\n' "$3" >&2
-        return 1
-      fi
-      if test "$scenario" = "target_cleanup_failure" &&
-        test "${1:-}" = "-rf" &&
-        test "${3:-}" = "${SECURE_TARGET_DIR:-}"; then
-        printf 'private target cleanup failure: %s\n' "$3" >&2
-        return 1
-      fi
-      if test "$scenario" = "initial_cleanup_failure" &&
-        test "${1:-}" = "-rf" &&
-        test "${3:-}" = "${SECURE_PLAN_DIR:-}"; then
-        printf 'private plan cleanup failure: %s\n' "$3" >&2
-        return 1
-      fi
-      command rm "$@"
-    }
-
-    jq() {
-      jq_input=
-      for jq_arg do
-        jq_input="$jq_arg"
-      done
-      if test -n "${INITIAL_PLAN_JSON:-}" &&
-        test "$jq_input" = "$INITIAL_PLAN_JSON"; then
-        jq_seen="$scenario_root/initial-plan-jq-seen"
-        if test "$scenario" = "plan_summary_failure" && test -e "$jq_seen"; then
-          return 1
-        fi
-        : > "$jq_seen"
-      fi
-      command jq "$@"
-    }
-
-    terraform() {
-      printf 'terraform %s\n' "$*" >> "$log"
-      printf 'private-terraform-diagnostic %s\n' "$*" >&2
-      case "$*" in
-        "init -input=false -reconfigure -backend-config=backend.hcl")
-          if test "$scenario" = "state_list_aggregate_false_missing"; then
-            printf '%s\n' "No state file was found in an unrelated init diagnostic." >&2
-          fi
-          test "$scenario" != "init_failure"
-          ;;
-        "console -no-color")
-          IFS= read -r console_expression || return 1
-          case "$console_expression" in
-            "var.subscription_id")
-              test "$scenario" != "terraform_subscription_console_failure" || return 1
-              if test "$scenario" = "terraform_subscription_mismatch"; then
-                printf '%s\n' '"33333333-3333-3333-3333-333333333333"'
-              else
-                printf '"%s"\n' "$SUBSCRIPTION_ID"
-              fi
-              ;;
-            '"rg-patchpage-${var.environment_name}"')
-              test "$scenario" != "terraform_resource_group_console_failure" || return 1
-              if test "$scenario" = "terraform_resource_group_invalid"; then
-                printf '%s\n' "not-json"
-              else
-                printf '%s\n' '"rg-patchpage-workload"'
-              fi
-              ;;
-            "azurerm_storage_account.drafts.id")
-              printf '"/subscriptions/%s/resourceGroups/rg-patchpage-workload/providers/Microsoft.Storage/storageAccounts/patchpagedrafts"\n' "$SUBSCRIPTION_ID"
-              ;;
-            "azurerm_postgresql_flexible_server.patchpage.id")
-              printf '"/subscriptions/%s/resourceGroups/rg-patchpage-workload/providers/Microsoft.DBforPostgreSQL/flexibleServers/patchpage-postgres"\n' "$SUBSCRIPTION_ID"
-              ;;
-            "azurerm_container_app.server.id")
-              printf '"/subscriptions/%s/resourceGroups/rg-patchpage-workload/providers/Microsoft.App/containerApps/patchpage-app"\n' "$SUBSCRIPTION_ID"
-              ;;
-            "azurerm_container_registry.patchpage.id")
-              printf '"/subscriptions/%s/resourceGroups/rg-patchpage-workload/providers/Microsoft.ContainerRegistry/registries/acrpatchpageabc123"\n' "$SUBSCRIPTION_ID"
-              ;;
-            *)
-              return 1
-              ;;
-          esac
-          ;;
-        "state list")
-          case "$scenario" in
-            state_list_failure | state_list_aggregate_false_missing)
-              printf '%s\n' "Backend state lookup failed." >&2
-              return 1
-              ;;
-            nonempty_initial_state)
-              printf '%s\n' "azurerm_resource_group.existing"
-              ;;
-            resume_partial_rg_success | resume_live_foreign_resource | resume_stronger_lock)
-              printf '%s\n' \
-                "random_string.unique" \
-                "azurerm_resource_group.patchpage"
-              ;;
-            resume_target_complete_success | resume_acr_id_mismatch)
-              printf '%s\n' \
-                "random_string.unique" \
-                "azurerm_resource_group.patchpage" \
-                "azurerm_container_registry.patchpage"
-              ;;
-            resume_full_state)
-              printf '%s\n' \
-                "random_string.unique" \
-                "azurerm_resource_group.patchpage" \
-                "azurerm_container_registry.patchpage" \
-                "azurerm_storage_account.drafts" \
-                "azurerm_container_app.server"
-              ;;
-            resume_acr_without_random)
-              printf '%s\n' \
-                "azurerm_resource_group.patchpage" \
-                "azurerm_container_registry.patchpage"
-              ;;
-            resume_unexpected_state)
-              printf '%s\n' "azurerm_resource_group.unexpected"
-              ;;
-            *)
-              printf '%s\n' "No state file was found!" >&2
-              return 1
-              ;;
-          esac
-          ;;
-        "output -raw resource_group_name")
-          test "$scenario" != "resource_group_output_failure" || return 1
-          test "$scenario" != "resource_group_output_empty" || return 0
-          printf '%s\n' "rg-patchpage-workload"
-          ;;
-        "output -raw acr_name")
-          test "$scenario" != "acr_output_failure" || return 1
-          test "$scenario" != "acr_output_empty" || return 0
-          if test "$scenario" = "unexpected_acr_name"; then
-            printf '%s\n' "not-an-acr-name"
-          else
-            printf '%s\n' "acrpatchpageabc123"
-          fi
-          ;;
-        "output -raw acr_login_server")
-          test "$scenario" != "login_output_failure" || return 1
-          test "$scenario" != "login_output_empty" || return 0
-          if test "$scenario" = "unexpected_login_server"; then
-            printf '%s\n' "other.azurecr.io"
-          else
-            printf '%s\n' "acrpatchpageabc123.azurecr.io"
-          fi
-          ;;
-        "output -raw container_app_name")
-          printf '%s\n' "patchpage-app"
-          ;;
-        plan\ -target=azurerm_container_registry.patchpage\ -input=false\ -out=*)
-          test "$scenario" != "target_plan_failure"
-          ;;
-        plan\ -input=false\ -out=*)
-          test "$scenario" != "plan_failure"
-          ;;
-        show\ -json\ *)
-          case "$3" in
-            *"/registry-target.tfplan")
-              test "$scenario" != "target_plan_show_failure" || return 1
-              if test "$scenario" = "target_plan_delete"; then
-                printf '%s\n' \
-                  '{"resource_changes":[{"address":"azurerm_container_registry.patchpage","change":{"actions":["delete","create"]}}]}'
-              else
-                printf '%s\n' \
-                  '{"resource_changes":[{"address":"azurerm_container_registry.patchpage","change":{"actions":["create"]}}]}'
-              fi
-              ;;
-            *)
-              test "$scenario" != "plan_gate_show_failure" || return 1
-              case "$scenario" in
-                plan_delete)
-                  printf '%s\n' \
-                    '{"resource_changes":[{"address":"azurerm_storage_account.drafts","change":{"actions":["delete"]}}]}'
-                  ;;
-                plan_replacement)
-                  printf '%s\n' \
-                    '{"resource_changes":[{"address":"azurerm_postgresql_flexible_server.patchpage","change":{"actions":["delete","create"]}}]}'
-                  ;;
-                *)
-                  printf '%s\n' \
-                    '{"resource_changes":[{"address":"azurerm_container_app.server","change":{"actions":["create"]}}]}'
-                  ;;
-              esac
-              ;;
-          esac
-          ;;
-        apply\ -input=false\ *)
-          if test "$3" = "$REGISTRY_TARGET_PLAN"; then
-            test "$scenario" != "target_apply_failure"
-          elif test "$3" = "$INITIAL_PLAN"; then
-            test "$scenario" != "final_apply_failure"
-          else
-            return 1
-          fi
-          ;;
-        *)
-          return 1
-          ;;
-      esac
-    }
-
-    az() {
-      normalize_az_args "$@" || return 1
-      printf 'az %s\n' "$NORMALIZED_AZ_ARGS" >> "$log"
-      printf 'private-az-diagnostic %s\n' "$NORMALIZED_AZ_ARGS" >&2
-      case "$1 $2" in
-        "account set")
-          test "$scenario" != "subscription_set_failure"
-          ;;
-        "account show")
-          test "$scenario" != "subscription_show_failure" || return 1
-          if test "$scenario" = "subscription_mismatch"; then
-            printf '%s\n' "22222222-2222-2222-2222-222222222222"
-          else
-            printf '%s\n' "$SUBSCRIPTION_ID"
-          fi
-          ;;
-        "group exists")
-          test "$scenario" != "workload_group_exists_check_failure" || return 1
-          case "$scenario" in
-            workload_group_exists | resume_*) printf '%s\n' "true" ;;
-            *) printf '%s\n' "false" ;;
-          esac
-          ;;
-        "group show")
-          printf '%s\n' \
-            "/subscriptions/$SUBSCRIPTION_ID/resourceGroups/rg-patchpage-workload"
-          ;;
-        "resource list")
-          case "$scenario" in
-            resume_target_complete_success)
-              printf '%s\n' \
-                "/subscriptions/$SUBSCRIPTION_ID/resourceGroups/rg-patchpage-workload/providers/Microsoft.ContainerRegistry/registries/acrpatchpageabc123"
-              ;;
-            resume_live_foreign_resource)
-              printf '%s\n' \
-                "/subscriptions/$SUBSCRIPTION_ID/resourceGroups/rg-patchpage-workload/providers/Microsoft.Storage/storageAccounts/foreign"
-              ;;
-          esac
-          ;;
-        "storage container-rm")
-          test "$3" = "show" || return 1
-          if test "$scenario" = "operation_container_id_mismatch"; then
-            printf '%s\n' "/subscriptions/$SUBSCRIPTION_ID/resourceGroups/rg-patchpage-tfstate/providers/Microsoft.Storage/storageAccounts/foreign/blobServices/default/containers/patchpage-operations"
-          else
-            printf '%s\n' "/subscriptions/$SUBSCRIPTION_ID/resourceGroups/rg-patchpage-tfstate/providers/Microsoft.Storage/storageAccounts/patchpagestate/blobServices/default/containers/patchpage-operations"
-          fi
-          ;;
-        "storage container")
-          case "$3 $4" in
-            "exists --account-name") printf '%s\n' "true" ;;
-            "metadata show")
-              operation_metadata_count_file="$scenario_root/operation-metadata-count"
-              operation_metadata_count=0
-              if test -f "$operation_metadata_count_file"; then
-                operation_metadata_count="$(command cat "$operation_metadata_count_file")"
-              fi
-              operation_metadata_count=$((operation_metadata_count + 1))
-              printf '%s\n' "$operation_metadata_count" > "$operation_metadata_count_file"
-              if test "$scenario" = "operation_binding_foreign" ||
-                { test "$scenario" = "operation_binding_concurrent_metadata" &&
-                  test "$operation_metadata_count" -gt 1; }; then
-                printf '%s\n' '{"foreign":"binding"}'
-              elif test -f "$scenario_root/operation-binding"; then
-                operation_binding="$(command cat "$scenario_root/operation-binding")"
-                printf '{"patchpage_workload_binding_sha256":"%s"}\n' "$operation_binding"
-              else
-                printf '%s\n' '{}'
-              fi
-              ;;
-            "metadata update")
-              test "$scenario" != "operation_binding_update_failure" || return 1
-              operation_metadata_lease_id=
-              operation_binding=
-              while test "$#" -gt 0; do
-                case "$1" in
-                  --lease-id)
-                    operation_metadata_lease_id="$2"
-                    shift 2
-                    ;;
-                  patchpage_workload_binding_sha256=*)
-                    operation_binding="${1#*=}"
-                    shift
-                    ;;
-                  *) shift ;;
-                esac
-              done
-              test -f "$scenario_root/operation-lease-id" || return 1
-              test "$operation_metadata_lease_id" = "$(
-                command cat "$scenario_root/operation-lease-id"
-              )" || return 1
-              test -n "$operation_binding" || return 1
-              printf '%s\n' "$operation_binding" > "$scenario_root/operation-binding"
-              ;;
-            "lease acquire" | "lease renew" | "lease release")
-              mock_operation_lease "$@"
-              ;;
-            *) return 1 ;;
-          esac
-          ;;
-        "storage blob")
-          test "$3" = "list" || return 1
-          test "$scenario" != "operation_container_nonempty" ||
-            printf '%s\n' "foreign"
-          ;;
-        "lock list")
-          protected_resource=""
-          while test "$#" -gt 0; do
-            if test "$1" = "--resource"; then
-              protected_resource="$2"
-              break
-            fi
-            shift
-          done
-          test -n "$protected_resource" || return 1
-          protected_name="protect-patchpage-drafts"
-          case "$protected_resource" in
-            *"/Microsoft.DBforPostgreSQL/flexibleServers/"*) protected_name="protect-patchpage-postgres" ;;
-          esac
-          if test "$scenario" = "foreign_workload_lock"; then
-            printf 'foreign-lock\tReadOnly\t%s/providers/Microsoft.Authorization/locks/foreign-lock\n' "$protected_resource"
-          elif test -f "$scenario_root/$protected_name"; then
-            printf '%s\tCanNotDelete\t%s/providers/Microsoft.Authorization/locks/%s\n' \
-              "$protected_name" "$protected_resource" "$protected_name"
-          fi
-          ;;
-        "lock create")
-          test "$scenario" != "workload_lock_create_failure" || return 1
-          case " $NORMALIZED_AZ_ARGS " in
-            *" --name protect-patchpage-drafts "*) : > "$scenario_root/protect-patchpage-drafts" ;;
-            *" --name protect-patchpage-postgres "*) : > "$scenario_root/protect-patchpage-postgres" ;;
-            *) return 1 ;;
-          esac
-          ;;
-        "lock show")
-          test "$scenario" != "workload_lock_show_failure" || return 1
-          lock_id=""
-          while test "$#" -gt 0; do
-            if test "$1" = "--ids"; then lock_id="$2"; break; fi
-            shift
-          done
-          test -n "$lock_id" || return 1
-          if test "$scenario" = "workload_lock_level_drift"; then
-            printf 'ReadOnly\t%s\n' "$lock_id"
-          else
-            printf 'CanNotDelete\t%s\n' "$lock_id"
-          fi
-          ;;
-        "acr show")
-          if test "$scenario" = "resume_acr_id_mismatch"; then
-            printf '%s\n' \
-              "/subscriptions/$SUBSCRIPTION_ID/resourceGroups/rg-patchpage-workload/providers/Microsoft.ContainerRegistry/registries/other"
-          else
-            printf '%s\n' \
-              "/subscriptions/$SUBSCRIPTION_ID/resourceGroups/rg-patchpage-workload/providers/Microsoft.ContainerRegistry/registries/acrpatchpageabc123"
-          fi
-          ;;
-        "acr build")
-          test "$scenario" != "build_failure"
-          ;;
-        "acr manifest")
-          test "$3" = "show-metadata" || return 1
-          test "$scenario" != "digest_resolution_failure" || return 1
-          if test "$scenario" = "invalid_digest"; then
-            printf '%s\n' "sha256:not-a-digest"
-          else
-            printf '%s\n' "$IMAGE_DIGEST_VALUE"
-          fi
-          ;;
-        *)
-          return 1
-          ;;
-      esac
-    }
-
-    eval "$DEPLOY_RESOURCES_BLOCK"
-    printf '%s\n' completed >> "$log"
+    run_block_script "$DEPLOY_RESOURCES_SCRIPT"
   ) >"$output" 2>&1
 }
 
@@ -1460,72 +1123,26 @@ key                  = "patchpage-prod.tfstate"' ||
   done
 }
 
-mock_operation_lease() {
-  test "$1 $2 $3" = "storage container lease" || return 1
-  operation_lease_action="$4"
-  shift 4
-  operation_account=
-  operation_container=
-  operation_auth_mode=
-  operation_duration=
-  operation_proposed_id=
-  operation_lease_id=
-  while test "$#" -gt 0; do
-    case "$1" in
-      --account-name) operation_account="$2"; shift 2 ;;
-      --container-name) operation_container="$2"; shift 2 ;;
-      --auth-mode) operation_auth_mode="$2"; shift 2 ;;
-      --lease-duration) operation_duration="$2"; shift 2 ;;
-      --proposed-lease-id) operation_proposed_id="$2"; shift 2 ;;
-      --lease-id) operation_lease_id="$2"; shift 2 ;;
-      --output) shift 2 ;;
-      --subscription)
-        test "$2" = "$SUBSCRIPTION_ID" || return 1
-        shift 2
-        ;;
-      *) return 1 ;;
-    esac
-  done
-  test "$operation_account" = "$STATE_STORAGE_ACCOUNT" || return 1
-  test "$operation_container" = "patchpage-operations" || return 1
-  test "$operation_auth_mode" = "${EXPECTED_OPERATION_AUTH_MODE:-login}" || return 1
-  operation_lease_file="$scenario_root/operation-lease-id"
-  case "$operation_lease_action" in
-    acquire)
-      case "$operation_duration" in
-        -1 | 60) ;;
-        *) return 1 ;;
-      esac
-      printf '%s\n' "$operation_proposed_id" |
-        grep -Eq '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$' ||
-        return 1
-      case "$scenario" in
-        operation_lease_held | operation_lease_acquire_failure) return 1 ;;
-      esac
-      test ! -e "$operation_lease_file" || return 1
-      printf '%s\n' "$operation_proposed_id" > "$operation_lease_file"
-      ;;
-    renew)
-      test -f "$operation_lease_file" || return 1
-      test "$operation_lease_id" = "$(cat "$operation_lease_file")" || return 1
-      test "$scenario" != "operation_lease_renew_failure" || return 1
-      # Transient renew blip: acquire already succeeded and Azure holds the
-      # infinite lease, but the first renew-as-proof fails. Later renews recover,
-      # so the EXIT trap can and must still release the lease it owns.
-      if test "$scenario" = "operation_lease_acquire_ok_renew_fails" &&
-        test ! -e "$scenario_root/operation-lease-renew-blip"; then
-        : > "$scenario_root/operation-lease-renew-blip"
-        return 1
-      fi
-      ;;
-    release)
-      test -f "$operation_lease_file" || return 1
-      test "$operation_lease_id" = "$(cat "$operation_lease_file")" || return 1
-      test "$scenario" != "operation_lease_release_failure" || return 1
-      rm -f "$operation_lease_file"
-      ;;
-    *) return 1 ;;
-  esac
+# The binding tuple the operation container is sealed with. The release,
+# rollback, infrastructure and stale-lease flows all recompute it from the same
+# documented inputs, so computing it here keeps the mock's answer independent
+# of the block instead of echoing the block's own variable back.
+guide_operation_binding_sha256() {
+  printf '%s\n' \
+    'patchpage-operation-binding-v1' \
+    "subscription_id=$SUBSCRIPTION_ID" \
+    "state_storage_account=$STATE_STORAGE_ACCOUNT" \
+    "state_key=$1" \
+    "resource_group=$RESOURCE_GROUP" \
+    "container_app=$CONTAINER_APP" \
+    "acr=$ACR" \
+    "operation_container_id=/subscriptions/$SUBSCRIPTION_ID/resourceGroups/rg-patchpage-tfstate/providers/Microsoft.Storage/storageAccounts/$STATE_STORAGE_ACCOUNT/blobServices/default/containers/patchpage-operations" \
+    "container_app_id=/subscriptions/$SUBSCRIPTION_ID/resourceGroups/$RESOURCE_GROUP/providers/Microsoft.App/containerApps/$CONTAINER_APP" \
+    "acr_id=/subscriptions/$SUBSCRIPTION_ID/resourceGroups/$RESOURCE_GROUP/providers/Microsoft.ContainerRegistry/registries/$ACR" \
+    "storage_account_id=$EXPECTED_STORAGE_ACCOUNT_ID" \
+    "postgres_server_id=$EXPECTED_POSTGRES_SERVER_ID" |
+    openssl dgst -sha256 -r |
+    cut -d ' ' -f1
 }
 
 run_app_release_block() {
@@ -1588,21 +1205,7 @@ run_app_release_block() {
     NEW_REVISION_NAME="patchpage-app--new"
     LATER_REVISION_NAME="patchpage-app--later"
     EXPECTED_OPERATION_BINDING_SHA256="$(
-      printf '%s\n' \
-        'patchpage-operation-binding-v1' \
-        "subscription_id=$SUBSCRIPTION_ID" \
-        "state_storage_account=$STATE_STORAGE_ACCOUNT" \
-        'state_key=patchpage-prod.tfstate' \
-        "resource_group=$RESOURCE_GROUP" \
-        "container_app=$CONTAINER_APP" \
-        "acr=$ACR" \
-        "operation_container_id=/subscriptions/$SUBSCRIPTION_ID/resourceGroups/rg-patchpage-tfstate/providers/Microsoft.Storage/storageAccounts/$STATE_STORAGE_ACCOUNT/blobServices/default/containers/patchpage-operations" \
-        "container_app_id=/subscriptions/$SUBSCRIPTION_ID/resourceGroups/$RESOURCE_GROUP/providers/Microsoft.App/containerApps/$CONTAINER_APP" \
-        "acr_id=/subscriptions/$SUBSCRIPTION_ID/resourceGroups/$RESOURCE_GROUP/providers/Microsoft.ContainerRegistry/registries/$ACR" \
-        "storage_account_id=$EXPECTED_STORAGE_ACCOUNT_ID" \
-        "postgres_server_id=$EXPECTED_POSTGRES_SERVER_ID" |
-        openssl dgst -sha256 -r |
-        cut -d ' ' -f1
+      guide_operation_binding_sha256 patchpage-prod.tfstate
     )"
     ROLLBACK_RECORD="$TMP_DIR/release-$scenario.rollback.env"
     case "$scenario" in
@@ -1611,408 +1214,37 @@ run_app_release_block() {
         ;;
       rollback_record_symlink)
         printf '%s\n' "existing-rollback-record" > "${ROLLBACK_RECORD}.target"
-        command ln -s "${ROLLBACK_RECORD}.target" "$ROLLBACK_RECORD"
+        ln -s "${ROLLBACK_RECORD}.target" "$ROLLBACK_RECORD"
         ;;
       *)
         printf '%s\n' "existing-rollback-record" > "$ROLLBACK_RECORD"
-        command chmod 644 "$ROLLBACK_RECORD"
+        chmod 644 "$ROLLBACK_RECORD"
         ;;
     esac
+    export SUBSCRIPTION_ID STATE_STORAGE_ACCOUNT STATE_CONTAINER STATE_KEY \
+      RESOURCE_GROUP CONTAINER_APP ACR EXPECTED_STORAGE_ACCOUNT_ID \
+      EXPECTED_POSTGRES_SERVER_ID LOGIN_SERVER CONTAINER_APP_FQDN \
+      PUBLIC_BASE_URL CANARY_URL CANARY_MARKER FULL_SHA \
+      ROLLBACK_DIGEST_VALUE RELEASE_DIGEST_VALUE ROLLBACK_IMAGE_VALUE \
+      RELEASE_IMAGE_VALUE OLD_REVISION_NAME NEW_REVISION_NAME \
+      LATER_REVISION_NAME EXPECTED_OPERATION_BINDING_SHA256 ROLLBACK_RECORD
 
-    mktemp() {
-      test "$scenario" != "rollback_record_create_failure" || return 1
-      command mktemp "$@"
-    }
+    PP_MOCK_GROUP="release"
+    PP_MOCK_SCENARIO="$scenario"
+    PP_MOCK_LOG="$log"
+    PP_MOCK_REPO_ROOT="$scenario_root"
+    PP_MOCK_REPO_ROOT_CANONICAL="$scenario_root_canonical"
+    PP_MOCK_APP_CURRENT_IMAGE="$ROLLBACK_IMAGE_VALUE"
+    PP_MOCK_APP_UPDATED_IMAGE="$RELEASE_IMAGE_VALUE"
+    PP_MOCK_APP_SHOW_COUNT_FILE="containerapp-show-count"
+    PP_MOCK_APP_UPDATED_FLAG="release-updated"
+    export PP_MOCK_GROUP PP_MOCK_SCENARIO PP_MOCK_LOG PP_MOCK_REPO_ROOT \
+      PP_MOCK_REPO_ROOT_CANONICAL PP_MOCK_APP_CURRENT_IMAGE \
+      PP_MOCK_APP_UPDATED_IMAGE PP_MOCK_APP_SHOW_COUNT_FILE \
+      PP_MOCK_APP_UPDATED_FLAG
+    prepare_mock_state "$TMP_DIR/release-$scenario.mockstate"
 
-    chmod() {
-      if test "$scenario" = "rollback_record_chmod_failure"; then
-        case "$2" in
-          "${ROLLBACK_RECORD}.tmp."*) return 1 ;;
-        esac
-      fi
-      command chmod "$@"
-    }
-
-    git() {
-      printf 'git %s\n' "$*" >> "$log"
-      case "$*" in
-        "rev-parse --show-toplevel")
-          test "$scenario" != "repo_root_failure" || return 1
-          printf '%s\n' "$scenario_root"
-          ;;
-        "-C $scenario_root_canonical status --porcelain")
-          test "$scenario" != "git_status_failure" || return 1
-          if test "$scenario" = "dirty_worktree"; then
-            printf '%s\n' " M apps/server/src/index.ts"
-          fi
-          ;;
-        "-C $scenario_root_canonical rev-parse HEAD")
-          test "$scenario" != "git_failure" || return 1
-          if test "$scenario" = "git_short"; then
-            printf '%s\n' "1111111"
-          else
-            printf '%s\n' "$FULL_SHA"
-          fi
-          ;;
-        *)
-          return 1
-          ;;
-      esac
-    }
-
-    terraform() {
-      printf 'terraform %s\n' "$*" >> "$log"
-      return 1
-    }
-
-    sleep() {
-      printf 'sleep %s\n' "$*" >> "$log"
-    }
-
-    az() {
-      normalize_az_args "$@" || return 1
-      printf 'az %s\n' "$NORMALIZED_AZ_ARGS" >> "$log"
-      case "$1 $2" in
-        "account set")
-          test "$scenario" != "subscription_set_failure"
-          ;;
-        "account show")
-          test "$scenario" != "subscription_show_failure" || return 1
-          if test "$scenario" = "subscription_mismatch"; then
-            printf '%s\n' "22222222-2222-2222-2222-222222222222"
-          else
-            printf '%s\n' "$SUBSCRIPTION_ID"
-          fi
-          ;;
-        "lock show")
-          test "$scenario" != "workload_lock_show_failure" || return 1
-          lock_id=""
-          while test "$#" -gt 0; do
-            if test "$1" = "--ids"; then lock_id="$2"; break; fi
-            shift
-          done
-          test -n "$lock_id" || return 1
-          if test "$scenario" = "workload_lock_level_drift"; then
-            printf 'ReadOnly\t%s\n' "$lock_id"
-          else
-            printf 'CanNotDelete\t%s\n' "$lock_id"
-          fi
-          ;;
-        "storage account")
-          return 1
-          ;;
-        "storage container-rm")
-          test "$3" = "show" || return 1
-          if test "$scenario" = "operation_container_id_mismatch"; then
-            printf '%s\n' "/subscriptions/$SUBSCRIPTION_ID/resourceGroups/rg-patchpage-tfstate/providers/Microsoft.Storage/storageAccounts/foreign/blobServices/default/containers/patchpage-operations"
-          else
-            printf '%s\n' "/subscriptions/$SUBSCRIPTION_ID/resourceGroups/rg-patchpage-tfstate/providers/Microsoft.Storage/storageAccounts/$STATE_STORAGE_ACCOUNT/blobServices/default/containers/patchpage-operations"
-          fi
-          ;;
-        "storage container")
-          case "$3" in
-            exists)
-              if test "$scenario" = "operation_container_missing"; then
-                printf '%s\n' "false"
-              else
-                printf '%s\n' "true"
-              fi
-              ;;
-            metadata)
-              test "$4" = "show" || return 1
-              if test "$scenario" = "operation_binding_mismatch"; then
-                printf '%s\n' '{"patchpage_workload_binding_sha256":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"}'
-              elif test "$scenario" = "operation_binding_foreign_metadata"; then
-                printf '%s\n' '{"foreign":"value"}'
-              else
-                printf '{"patchpage_workload_binding_sha256":"%s"}\n' "$EXPECTED_OPERATION_BINDING_SHA256"
-              fi
-              ;;
-            lease) mock_operation_lease "$@" ;;
-            *) return 1 ;;
-          esac
-          ;;
-        "storage blob")
-          test "$3" = "list" || return 1
-          test "$scenario" != "operation_container_nonempty" ||
-            printf '%s\n' "unexpected"
-          ;;
-        "acr show")
-          case " $* " in
-            *" --query id "*)
-              if test "$scenario" = "wrong_acr_id"; then
-                printf '%s\n' "/subscriptions/$SUBSCRIPTION_ID/resourceGroups/$RESOURCE_GROUP/providers/Microsoft.ContainerRegistry/registries/otherregistry"
-              else
-                printf '%s\n' "$EXPECTED_ACR_ID"
-              fi
-              ;;
-            *" --query loginServer "*)
-              if test "$scenario" = "wrong_live_login_server"; then
-                printf '%s\n' "otherregistry.azurecr.io"
-              else
-                printf '%s\n' "acrpatchpageabc123.azurecr.io"
-              fi
-              ;;
-            *) return 1 ;;
-          esac
-          ;;
-        "containerapp show")
-          case " $* " in
-            *" --ids "*" --output json "*)
-              app_show_count_file="$scenario_root/containerapp-show-count"
-              app_show_count=0
-              if test -e "$app_show_count_file"; then
-                app_show_count="$(cat "$app_show_count_file")"
-              fi
-              app_show_count=$((app_show_count + 1))
-              printf '%s\n' "$app_show_count" > "$app_show_count_file"
-              app_id="$EXPECTED_CONTAINER_APP_ID"
-              app_fqdn="$CONTAINER_APP_FQDN"
-              app_public_base_url="$PUBLIC_BASE_URL"
-              app_public_hostname="$(
-                printf '%s' "${PUBLIC_BASE_URL#https://}" |
-                  tr '[:upper:]' '[:lower:]'
-              )"
-              app_custom_domains="[{\"name\":\"$app_public_hostname\",\"bindingType\":\"SniEnabled\",\"certificateId\":\"managed-cert-id\"}]"
-              app_env='[{"name":"PATCHPAGE_PUBLIC_BASE_URL","value":"PLACEHOLDER"}]'
-              app_image="$ROLLBACK_IMAGE_VALUE"
-              app_latest_revision="$OLD_REVISION_NAME"
-              app_ready_revision="$OLD_REVISION_NAME"
-              if test -e "$scenario_root/release-updated"; then
-                app_image="$RELEASE_IMAGE_VALUE"
-                app_latest_revision="$NEW_REVISION_NAME"
-                app_ready_revision="$NEW_REVISION_NAME"
-                updated_app_show_count_file="$scenario_root/updated-app-show-count"
-                updated_app_show_count=0
-                if test -e "$updated_app_show_count_file"; then
-                  updated_app_show_count="$(cat "$updated_app_show_count_file")"
-                fi
-                updated_app_show_count=$((updated_app_show_count + 1))
-                printf '%s\n' "$updated_app_show_count" > "$updated_app_show_count_file"
-                if test "$scenario" = "final_pinned_drift" &&
-                  test "$updated_app_show_count" -ge 3; then
-                  app_latest_revision="$LATER_REVISION_NAME"
-                  app_ready_revision="$LATER_REVISION_NAME"
-                fi
-              else
-                case "$scenario" in
-                  preexisting_pending_revision)
-                    app_latest_revision="patchpage-app--pending"
-                    ;;
-                  preexisting_failed_revision)
-                    app_latest_revision="patchpage-app--failed"
-                    ;;
-                esac
-              fi
-              case "$scenario" in
-                container_app_id_mismatch) app_id="${EXPECTED_CONTAINER_APP_ID%/*}/foreign" ;;
-                fqdn_mismatch) app_fqdn="foreign.example.invalid" ;;
-                public_env_mismatch) app_public_base_url="https://foreign.example.invalid" ;;
-                public_env_missing) app_env='[]' ;;
-                public_env_duplicate) app_env='[{"name":"PATCHPAGE_PUBLIC_BASE_URL","value":"PLACEHOLDER"},{"name":"PATCHPAGE_PUBLIC_BASE_URL","value":"PLACEHOLDER"}]' ;;
-                custom_domain_missing) app_custom_domains='[]' ;;
-                custom_domain_duplicate) app_custom_domains="[{\"name\":\"$app_public_hostname\",\"bindingType\":\"SniEnabled\",\"certificateId\":\"managed-cert-id\"},{\"name\":\"$app_public_hostname\",\"bindingType\":\"SniEnabled\",\"certificateId\":\"managed-cert-id\"}]" ;;
-                custom_domain_mismatch) app_custom_domains='[{"name":"foreign.example.invalid","bindingType":"SniEnabled","certificateId":"managed-cert-id"}]' ;;
-                custom_domain_binding_invalid) app_custom_domains="[{\"name\":\"$app_public_hostname\",\"bindingType\":\"Disabled\",\"certificateId\":\"managed-cert-id\"}]" ;;
-                custom_domain_certificate_missing) app_custom_domains="[{\"name\":\"$app_public_hostname\",\"bindingType\":\"SniEnabled\"}]" ;;
-                rollback_image_show_failure) app_image="" ;;
-                rollback_image_invalid) app_image="$LOGIN_SERVER/patchpage-server:mutable" ;;
-                rollback_digest_invalid) app_image="$LOGIN_SERVER/patchpage-server@sha256:invalid" ;;
-                prelease_locked_image_mismatch)
-                  if test "$app_show_count" -ge 2; then
-                    app_image="$RELEASE_IMAGE_VALUE"
-                  fi
-                  ;;
-                preupdate_image_mismatch)
-                  if test "$app_show_count" -ge 4; then
-                    app_image="$RELEASE_IMAGE_VALUE"
-                  fi
-                  ;;
-              esac
-              app_env="$(printf '%s\n' "$app_env" | sed "s|PLACEHOLDER|$app_public_base_url|g")"
-              printf '{"id":"%s","properties":{"provisioningState":"Succeeded","latestRevisionName":"%s","latestReadyRevisionName":"%s","configuration":{"activeRevisionsMode":"Single","ingress":{"fqdn":"%s","customDomains":%s,"traffic":[{"latestRevision":true,"weight":100}]}},"template":{"containers":[{"name":"server","image":"%s","env":%s}]}}}\n' \
-                "$app_id" "$app_latest_revision" "$app_ready_revision" \
-                "$app_fqdn" "$app_custom_domains" "$app_image" "$app_env"
-              return
-              ;;
-          esac
-          return 1
-          ;;
-        "containerapp revision")
-          revision_action="$3"
-          revision_name=
-          while test "$#" -gt 0; do
-            if test "$1" = "--revision"; then
-              revision_name="$2"
-              break
-            fi
-            shift
-          done
-          case "$revision_action" in
-            show)
-              revision_image="$ROLLBACK_IMAGE_VALUE"
-              revision_active=true
-              revision_provisioning="Provisioned"
-              revision_health="Healthy"
-              revision_running="Running"
-              revision_weight=100
-              case "$revision_name" in
-                "$NEW_REVISION_NAME")
-                  revision_image="$RELEASE_IMAGE_VALUE"
-                  new_revision_show_count_file="$scenario_root/new-revision-show-count"
-                  new_revision_show_count=0
-                  if test -e "$new_revision_show_count_file"; then
-                    new_revision_show_count="$(cat "$new_revision_show_count_file")"
-                  fi
-                  new_revision_show_count=$((new_revision_show_count + 1))
-                  printf '%s\n' "$new_revision_show_count" > "$new_revision_show_count_file"
-                  if test "$new_revision_show_count" -eq 1 ||
-                    test "$scenario" = "never_ready_revision" ||
-                    test "$scenario" = "deployed_image_show_failure"; then
-                    revision_active=false
-                    revision_provisioning="Provisioning"
-                    revision_health="Unknown"
-                    revision_running="Processing"
-                    revision_weight=0
-                  fi
-                  case "$scenario" in
-                    wrong_revision_image | deployed_image_mismatch)
-                      revision_image="$ROLLBACK_IMAGE_VALUE"
-                      ;;
-                    final_image_show_failure)
-                      test "$new_revision_show_count" -lt 3 || return 1
-                      ;;
-                    final_image_mismatch)
-                      if test "$new_revision_show_count" -ge 3; then
-                        revision_image="$ROLLBACK_IMAGE_VALUE"
-                      fi
-                      ;;
-                  esac
-                  ;;
-                patchpage-app--pending)
-                  revision_active=false
-                  revision_provisioning="Provisioning"
-                  revision_health="Unknown"
-                  revision_running="Processing"
-                  revision_weight=0
-                  ;;
-                patchpage-app--failed)
-                  revision_active=false
-                  revision_provisioning="Failed"
-                  revision_health="Unhealthy"
-                  revision_running="Stopped"
-                  revision_weight=0
-                  ;;
-                "$OLD_REVISION_NAME") ;;
-                *) return 1 ;;
-              esac
-              if test "$scenario" = "scale_to_zero_revision"; then
-                revision_health="None"
-                revision_running="ScaleToZero"
-              fi
-              printf '{"name":"%s","properties":{"active":%s,"provisioningState":"%s","healthState":"%s","runningState":"%s","trafficWeight":%s,"template":{"containers":[{"name":"server","image":"%s"}]}}}\n' \
-                "$revision_name" "$revision_active" "$revision_provisioning" \
-                "$revision_health" "$revision_running" "$revision_weight" \
-                "$revision_image"
-              ;;
-            list)
-              if test -e "$scenario_root/release-updated"; then
-                if test "$scenario" = "multiple_active_revisions"; then
-                  printf '[{"name":"%s","properties":{"active":true}},{"name":"%s","properties":{"active":true}}]\n' \
-                    "$OLD_REVISION_NAME" "$NEW_REVISION_NAME"
-                else
-                  printf '[{"name":"%s","properties":{"active":true}}]\n' \
-                    "$NEW_REVISION_NAME"
-                fi
-              else
-                printf '[{"name":"%s","properties":{"active":true}}]\n' \
-                  "$OLD_REVISION_NAME"
-              fi
-              ;;
-            *) return 1 ;;
-          esac
-          ;;
-        "containerapp update")
-          test "$scenario" != "containerapp_update_failure" || return 1
-          : > "$scenario_root/release-updated"
-          case "$scenario" in
-            update_empty_revision) ;;
-            update_same_revision) printf '%s\n' "$OLD_REVISION_NAME" ;;
-            *) printf '%s\n' "$NEW_REVISION_NAME" ;;
-          esac
-          ;;
-        "acr build")
-          test "$scenario" != "build_failure"
-          ;;
-        "acr manifest")
-          test "$3" = "show-metadata" || return 1
-          case " $* " in
-            *" patchpage-server@$ROLLBACK_DIGEST_VALUE "*)
-              test "$scenario" != "rollback_manifest_failure" || return 1
-              if test "$scenario" = "rollback_manifest_mismatch"; then
-                printf '%s\n' "$RELEASE_DIGEST_VALUE"
-              else
-                printf '%s\n' "$ROLLBACK_DIGEST_VALUE"
-              fi
-              ;;
-            *" patchpage-server:$FULL_SHA-"*)
-              test "$scenario" != "release_manifest_failure" || return 1
-              if test "$scenario" = "release_digest_invalid"; then
-                printf '%s\n' "sha256:invalid"
-              else
-                printf '%s\n' "$RELEASE_DIGEST_VALUE"
-              fi
-              ;;
-            *)
-              return 1
-              ;;
-          esac
-          ;;
-        *)
-          return 1
-          ;;
-      esac
-    }
-
-    curl() {
-      printf 'curl %s\n' "$*" >> "$log"
-      url=
-      for arg do
-        url="$arg"
-      done
-      case "$url" in
-        "https://$CONTAINER_APP_FQDN/healthz")
-          test "$scenario" != "native_health_failure" || return 1
-          if test "$scenario" = "native_health_status_mismatch"; then
-            printf '{"ok":true}\n204'
-          else
-            printf '{"ok":true}\n200'
-          fi
-          ;;
-        "$PUBLIC_BASE_URL/healthz")
-          test "$scenario" != "public_health_failure" || return 1
-          if test "$scenario" = "public_health_body_mismatch"; then
-            printf '{"ok":false}\n200'
-          else
-            printf '{"ok":true}\n200'
-          fi
-          ;;
-        "$CANARY_URL")
-          test "$scenario" != "canary_request_failure" || return 1
-          if test "$scenario" = "canary_marker_failure"; then
-            printf '%s\n' "STALE_CANARY"
-          else
-            printf '%s\n' "$CANARY_MARKER"
-          fi
-          ;;
-        *)
-          return 1
-          ;;
-      esac
-    }
-
-    eval "$APP_RELEASE_BLOCK"
-    printf '%s\n' completed >> "$log"
+    run_block_script "$APP_RELEASE_SCRIPT"
   ) >"$output" 2>&1
 }
 
@@ -2442,21 +1674,7 @@ run_app_rollback_block() {
     NEW_REVISION_NAME="patchpage-app--rollback"
     LATER_REVISION_NAME="patchpage-app--later"
     EXPECTED_OPERATION_BINDING_SHA256="$(
-      printf '%s\n' \
-        'patchpage-operation-binding-v1' \
-        "subscription_id=$SUBSCRIPTION_ID" \
-        "state_storage_account=$STATE_STORAGE_ACCOUNT" \
-        'state_key=patchpage-prod.tfstate' \
-        "resource_group=$RESOURCE_GROUP" \
-        "container_app=$CONTAINER_APP" \
-        "acr=$ACR" \
-        "operation_container_id=/subscriptions/$SUBSCRIPTION_ID/resourceGroups/rg-patchpage-tfstate/providers/Microsoft.Storage/storageAccounts/$STATE_STORAGE_ACCOUNT/blobServices/default/containers/patchpage-operations" \
-        "container_app_id=/subscriptions/$SUBSCRIPTION_ID/resourceGroups/$RESOURCE_GROUP/providers/Microsoft.App/containerApps/$CONTAINER_APP" \
-        "acr_id=/subscriptions/$SUBSCRIPTION_ID/resourceGroups/$RESOURCE_GROUP/providers/Microsoft.ContainerRegistry/registries/$ACR" \
-        "storage_account_id=$EXPECTED_STORAGE_ACCOUNT_ID" \
-        "postgres_server_id=$EXPECTED_POSTGRES_SERVER_ID" |
-        openssl dgst -sha256 -r |
-        cut -d ' ' -f1
+      guide_operation_binding_sha256 patchpage-prod.tfstate
     )"
     ROLLBACK_RECORD="$TMP_DIR/rollback-$scenario.env"
     case "$scenario" in
@@ -2476,328 +1694,28 @@ run_app_rollback_block() {
           "$ROLLBACK_IMAGE_VALUE" "$RELEASE_IMAGE_VALUE" > "$ROLLBACK_RECORD"
         ;;
     esac
+    export SUBSCRIPTION_ID STATE_STORAGE_ACCOUNT STATE_CONTAINER STATE_KEY \
+      RESOURCE_GROUP CONTAINER_APP ACR EXPECTED_STORAGE_ACCOUNT_ID \
+      EXPECTED_POSTGRES_SERVER_ID LOGIN_SERVER CONTAINER_APP_FQDN \
+      PUBLIC_BASE_URL CANARY_URL CANARY_MARKER \
+      ROLLBACK_DIGEST_VALUE RELEASE_DIGEST_VALUE ROLLBACK_IMAGE_VALUE \
+      RELEASE_IMAGE_VALUE OLD_REVISION_NAME NEW_REVISION_NAME \
+      LATER_REVISION_NAME EXPECTED_OPERATION_BINDING_SHA256 ROLLBACK_RECORD
 
-    git() {
-      test "$*" = "rev-parse --show-toplevel" || return 1
-      printf '%s\n' "$scenario_root"
-    }
+    PP_MOCK_GROUP="rollback"
+    PP_MOCK_SCENARIO="$scenario"
+    PP_MOCK_LOG="$log"
+    PP_MOCK_REPO_ROOT="$scenario_root"
+    PP_MOCK_APP_CURRENT_IMAGE="$RELEASE_IMAGE_VALUE"
+    PP_MOCK_APP_UPDATED_IMAGE="$ROLLBACK_IMAGE_VALUE"
+    PP_MOCK_APP_SHOW_COUNT_FILE="rollback-app-show-count"
+    PP_MOCK_APP_UPDATED_FLAG="rollback-updated"
+    export PP_MOCK_GROUP PP_MOCK_SCENARIO PP_MOCK_LOG PP_MOCK_REPO_ROOT \
+      PP_MOCK_APP_CURRENT_IMAGE PP_MOCK_APP_UPDATED_IMAGE \
+      PP_MOCK_APP_SHOW_COUNT_FILE PP_MOCK_APP_UPDATED_FLAG
+    prepare_mock_state "$TMP_DIR/rollback-$scenario.mockstate"
 
-    sleep() {
-      printf 'sleep %s\n' "$*" >> "$log"
-    }
-
-    az() {
-      normalize_az_args "$@" || return 1
-      printf 'az %s\n' "$NORMALIZED_AZ_ARGS" >> "$log"
-      printf 'private-rollback-diagnostic %s\n' "$*" >&2
-      case "$1 $2" in
-        "account set")
-          test "$scenario" != "subscription_set_failure"
-          ;;
-        "account show")
-          if test "$scenario" = "subscription_mismatch"; then
-            printf '%s\n' "22222222-2222-2222-2222-222222222222"
-          else
-            printf '%s\n' "$SUBSCRIPTION_ID"
-          fi
-          ;;
-        "lock show")
-          lock_id=""
-          while test "$#" -gt 0; do
-            if test "$1" = "--ids"; then lock_id="$2"; break; fi
-            shift
-          done
-          test -n "$lock_id" || return 1
-          if test "$scenario" = "lock_drift"; then
-            printf 'ReadOnly\t%s\n' "$lock_id"
-          else
-            printf 'CanNotDelete\t%s\n' "$lock_id"
-          fi
-          ;;
-        "storage account")
-          return 1
-          ;;
-        "storage container-rm")
-          test "$3" = "show" || return 1
-          if test "$scenario" = "operation_container_id_mismatch"; then
-            printf '%s\n' "/subscriptions/$SUBSCRIPTION_ID/resourceGroups/rg-patchpage-tfstate/providers/Microsoft.Storage/storageAccounts/foreign/blobServices/default/containers/patchpage-operations"
-          else
-            printf '%s\n' "/subscriptions/$SUBSCRIPTION_ID/resourceGroups/rg-patchpage-tfstate/providers/Microsoft.Storage/storageAccounts/$STATE_STORAGE_ACCOUNT/blobServices/default/containers/patchpage-operations"
-          fi
-          ;;
-        "storage container")
-          case "$3" in
-            exists)
-              if test "$scenario" = "operation_container_missing"; then
-                printf '%s\n' "false"
-              else
-                printf '%s\n' "true"
-              fi
-              ;;
-            metadata)
-              test "$4" = "show" || return 1
-              if test "$scenario" = "operation_binding_mismatch"; then
-                printf '%s\n' '{"patchpage_workload_binding_sha256":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"}'
-              elif test "$scenario" = "operation_binding_foreign_metadata"; then
-                printf '%s\n' '{"foreign":"value"}'
-              else
-                printf '{"patchpage_workload_binding_sha256":"%s"}\n' "$EXPECTED_OPERATION_BINDING_SHA256"
-              fi
-              ;;
-            lease) mock_operation_lease "$@" ;;
-            *) return 1 ;;
-          esac
-          ;;
-        "storage blob")
-          test "$3" = "list" || return 1
-          test "$scenario" != "operation_container_nonempty" ||
-            printf '%s\n' "unexpected"
-          ;;
-        "acr show")
-          case " $* " in
-            *" --query id "*)
-              if test "$scenario" = "wrong_acr_id"; then
-                printf '%s\n' "/subscriptions/$SUBSCRIPTION_ID/resourceGroups/$RESOURCE_GROUP/providers/Microsoft.ContainerRegistry/registries/otherregistry"
-              else
-                printf '%s\n' "$EXPECTED_ACR_ID"
-              fi
-              ;;
-            *" --query loginServer "*)
-              if test "$scenario" = "wrong_live_login_server"; then
-                printf '%s\n' "otherregistry.azurecr.io"
-              else
-                printf '%s\n' "acrpatchpageabc123.azurecr.io"
-              fi
-              ;;
-            *) return 1 ;;
-          esac
-          ;;
-        "acr manifest")
-          if test "$scenario" = "manifest_mismatch"; then
-            printf '%s\n' "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
-          else
-            printf '%s\n' "$ROLLBACK_DIGEST_VALUE"
-          fi
-          ;;
-        "containerapp show")
-          case " $* " in
-            *" --ids "*" --output json "*)
-              app_show_count_file="$scenario_root/rollback-app-show-count"
-              app_show_count=0
-              if test -e "$app_show_count_file"; then
-                app_show_count="$(cat "$app_show_count_file")"
-              fi
-              app_show_count=$((app_show_count + 1))
-              printf '%s\n' "$app_show_count" > "$app_show_count_file"
-              app_id="$EXPECTED_CONTAINER_APP_ID"
-              app_fqdn="$CONTAINER_APP_FQDN"
-              app_public_base_url="$PUBLIC_BASE_URL"
-              app_public_hostname="$(
-                printf '%s' "${PUBLIC_BASE_URL#https://}" |
-                  tr '[:upper:]' '[:lower:]'
-              )"
-              app_custom_domains="[{\"name\":\"$app_public_hostname\",\"bindingType\":\"SniEnabled\",\"certificateId\":\"managed-cert-id\"}]"
-              app_env='[{"name":"PATCHPAGE_PUBLIC_BASE_URL","value":"PLACEHOLDER"}]'
-              app_image="$RELEASE_IMAGE_VALUE"
-              app_latest_revision="$OLD_REVISION_NAME"
-              app_ready_revision="$OLD_REVISION_NAME"
-              if test -e "$scenario_root/rollback-updated"; then
-                app_image="$ROLLBACK_IMAGE_VALUE"
-                app_latest_revision="$NEW_REVISION_NAME"
-                app_ready_revision="$NEW_REVISION_NAME"
-                updated_app_show_count_file="$scenario_root/updated-app-show-count"
-                updated_app_show_count=0
-                if test -e "$updated_app_show_count_file"; then
-                  updated_app_show_count="$(cat "$updated_app_show_count_file")"
-                fi
-                updated_app_show_count=$((updated_app_show_count + 1))
-                printf '%s\n' "$updated_app_show_count" > "$updated_app_show_count_file"
-                if test "$scenario" = "final_pinned_drift" &&
-                  test "$updated_app_show_count" -ge 3; then
-                  app_latest_revision="$LATER_REVISION_NAME"
-                  app_ready_revision="$LATER_REVISION_NAME"
-                fi
-              else
-                case "$scenario" in
-                  preexisting_pending_revision)
-                    app_latest_revision="patchpage-app--pending"
-                    ;;
-                  preexisting_failed_revision)
-                    app_latest_revision="patchpage-app--failed"
-                    ;;
-                  stale_current_image)
-                    if test "$app_show_count" -ge 2; then
-                      app_image="$ROLLBACK_IMAGE_VALUE"
-                    fi
-                    ;;
-                esac
-              fi
-              case "$scenario" in
-                container_app_id_mismatch) app_id="${EXPECTED_CONTAINER_APP_ID%/*}/foreign" ;;
-                fqdn_mismatch) app_fqdn="foreign.example.invalid" ;;
-                public_env_mismatch) app_public_base_url="https://foreign.example.invalid" ;;
-                public_env_missing) app_env='[]' ;;
-                public_env_duplicate) app_env='[{"name":"PATCHPAGE_PUBLIC_BASE_URL","value":"PLACEHOLDER"},{"name":"PATCHPAGE_PUBLIC_BASE_URL","value":"PLACEHOLDER"}]' ;;
-                custom_domain_missing) app_custom_domains='[]' ;;
-                custom_domain_duplicate) app_custom_domains="[{\"name\":\"$app_public_hostname\",\"bindingType\":\"SniEnabled\",\"certificateId\":\"managed-cert-id\"},{\"name\":\"$app_public_hostname\",\"bindingType\":\"SniEnabled\",\"certificateId\":\"managed-cert-id\"}]" ;;
-                custom_domain_mismatch) app_custom_domains='[{"name":"foreign.example.invalid","bindingType":"SniEnabled","certificateId":"managed-cert-id"}]' ;;
-                custom_domain_binding_invalid) app_custom_domains="[{\"name\":\"$app_public_hostname\",\"bindingType\":\"Disabled\",\"certificateId\":\"managed-cert-id\"}]" ;;
-                custom_domain_certificate_missing) app_custom_domains="[{\"name\":\"$app_public_hostname\",\"bindingType\":\"SniEnabled\"}]" ;;
-              esac
-              app_env="$(printf '%s\n' "$app_env" | sed "s|PLACEHOLDER|$app_public_base_url|g")"
-              printf '{"id":"%s","properties":{"provisioningState":"Succeeded","latestRevisionName":"%s","latestReadyRevisionName":"%s","configuration":{"activeRevisionsMode":"Single","ingress":{"fqdn":"%s","customDomains":%s,"traffic":[{"latestRevision":true,"weight":100}]}},"template":{"containers":[{"name":"server","image":"%s","env":%s}]}}}\n' \
-                "$app_id" "$app_latest_revision" "$app_ready_revision" \
-                "$app_fqdn" "$app_custom_domains" "$app_image" "$app_env"
-              ;;
-            *) return 1 ;;
-          esac
-          ;;
-        "containerapp revision")
-          revision_action="$3"
-          revision_name=
-          while test "$#" -gt 0; do
-            if test "$1" = "--revision"; then
-              revision_name="$2"
-              break
-            fi
-            shift
-          done
-          case "$revision_action" in
-            show)
-              revision_image="$RELEASE_IMAGE_VALUE"
-              revision_active=true
-              revision_provisioning="Provisioned"
-              revision_health="Healthy"
-              revision_running="Running"
-              revision_weight=100
-              case "$revision_name" in
-                "$NEW_REVISION_NAME")
-                  revision_image="$ROLLBACK_IMAGE_VALUE"
-                  new_revision_show_count_file="$scenario_root/new-revision-show-count"
-                  new_revision_show_count=0
-                  if test -e "$new_revision_show_count_file"; then
-                    new_revision_show_count="$(cat "$new_revision_show_count_file")"
-                  fi
-                  new_revision_show_count=$((new_revision_show_count + 1))
-                  printf '%s\n' "$new_revision_show_count" > "$new_revision_show_count_file"
-                  if test "$new_revision_show_count" -eq 1 ||
-                    test "$scenario" = "never_ready_revision"; then
-                    revision_active=false
-                    revision_provisioning="Provisioning"
-                    revision_health="Unknown"
-                    revision_running="Processing"
-                    revision_weight=0
-                  fi
-                  case "$scenario" in
-                    wrong_revision_image | postupdate_image_mismatch)
-                      revision_image="$RELEASE_IMAGE_VALUE"
-                      ;;
-                    final_image_show_failure)
-                      test "$new_revision_show_count" -lt 3 || return 1
-                      ;;
-                    final_image_mismatch)
-                      if test "$new_revision_show_count" -ge 3; then
-                        revision_image="$RELEASE_IMAGE_VALUE"
-                      fi
-                      ;;
-                  esac
-                  ;;
-                patchpage-app--pending)
-                  revision_active=false
-                  revision_provisioning="Provisioning"
-                  revision_health="Unknown"
-                  revision_running="Processing"
-                  revision_weight=0
-                  ;;
-                patchpage-app--failed)
-                  revision_active=false
-                  revision_provisioning="Failed"
-                  revision_health="Unhealthy"
-                  revision_running="Stopped"
-                  revision_weight=0
-                  ;;
-                "$OLD_REVISION_NAME") ;;
-                *) return 1 ;;
-              esac
-              if test "$scenario" = "scale_to_zero_revision"; then
-                revision_health="None"
-                revision_running="ScaleToZero"
-              fi
-              printf '{"name":"%s","properties":{"active":%s,"provisioningState":"%s","healthState":"%s","runningState":"%s","trafficWeight":%s,"template":{"containers":[{"name":"server","image":"%s"}]}}}\n' \
-                "$revision_name" "$revision_active" "$revision_provisioning" \
-                "$revision_health" "$revision_running" "$revision_weight" \
-                "$revision_image"
-              ;;
-            list)
-              if test -e "$scenario_root/rollback-updated"; then
-                if test "$scenario" = "multiple_active_revisions"; then
-                  printf '[{"name":"%s","properties":{"active":true}},{"name":"%s","properties":{"active":true}}]\n' \
-                    "$OLD_REVISION_NAME" "$NEW_REVISION_NAME"
-                else
-                  printf '[{"name":"%s","properties":{"active":true}}]\n' \
-                    "$NEW_REVISION_NAME"
-                fi
-              else
-                printf '[{"name":"%s","properties":{"active":true}}]\n' \
-                  "$OLD_REVISION_NAME"
-              fi
-              ;;
-            *) return 1 ;;
-          esac
-          ;;
-        "containerapp update")
-          test "$scenario" != "update_failure" || return 1
-          : > "$scenario_root/rollback-updated"
-          case "$scenario" in
-            update_empty_revision) ;;
-            update_same_revision) printf '%s\n' "$OLD_REVISION_NAME" ;;
-            *) printf '%s\n' "$NEW_REVISION_NAME" ;;
-          esac
-          ;;
-        *)
-          return 1
-          ;;
-      esac
-    }
-
-    curl() {
-      test -f "$scenario_root/operation-lease-id" || return 1
-      printf 'curl %s\n' "$*" >> "$log"
-      url=
-      for arg do
-        url="$arg"
-      done
-      case "$url" in
-        "https://$CONTAINER_APP_FQDN/healthz")
-          test "$scenario" != "native_health_failure" || return 1
-          if test "$scenario" = "native_health_status_mismatch"; then
-            printf '{"ok":true}\n204'
-          else
-            printf '{"ok":true}\n200'
-          fi
-          ;;
-        "$PUBLIC_BASE_URL/healthz")
-          test "$scenario" != "public_health_failure" || return 1
-          if test "$scenario" = "public_health_body_mismatch"; then
-            printf '{"ok":false}\n200'
-          else
-            printf '{"ok":true}\n200'
-          fi
-          ;;
-        "$CANARY_URL")
-          test "$scenario" != "canary_request_failure" || return 1
-          if test "$scenario" = "canary_marker_failure"; then
-            printf '%s\n' "STALE_CANARY"
-          else
-            printf '%s\n' "$CANARY_MARKER"
-          fi
-          ;;
-        *) return 1 ;;
-      esac
-    }
-
-    eval "$APP_ROLLBACK_BLOCK"
-    printf '%s\n' completed >> "$log"
+    run_block_script "$APP_ROLLBACK_SCRIPT"
   ) >"$output" 2>&1
 }
 
@@ -3109,6 +2027,8 @@ run_infrastructure_change_block() {
     EXPECTED_ACR_ID="$EXPECTED_RESOURCE_GROUP_ID/providers/Microsoft.ContainerRegistry/registries/acrpatchpageabc123"
     EXPECTED_CONTAINER_APP_ID="$EXPECTED_RESOURCE_GROUP_ID/providers/Microsoft.App/containerApps/patchpage-app"
     RESOURCE_GROUP="rg-patchpage-workload"
+    CONTAINER_APP="patchpage-app"
+    ACR="acrpatchpageabc123"
     LEGACY_IMAGE_TAG="1111111"
     LEGACY_IMAGE_DIGEST="sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
     IMMUTABLE_IMAGE="acrpatchpageabc123.azurecr.io/patchpage-server@$LEGACY_IMAGE_DIGEST"
@@ -3117,35 +2037,13 @@ run_infrastructure_change_block() {
     POSTAPPLY_REVISION_NAME="patchpage-app--infra"
     LATER_REVISION_NAME="patchpage-app--later"
     EXPECTED_OPERATION_BINDING_SHA256="$(
-      printf '%s\n' \
-        'patchpage-operation-binding-v1' \
-        "subscription_id=$SUBSCRIPTION_ID" \
-        "state_storage_account=$STATE_STORAGE_ACCOUNT" \
-        "state_key=$STATE_KEY" \
-        "resource_group=$RESOURCE_GROUP" \
-        'container_app=patchpage-app' \
-        'acr=acrpatchpageabc123' \
-        "operation_container_id=/subscriptions/$SUBSCRIPTION_ID/resourceGroups/rg-patchpage-tfstate/providers/Microsoft.Storage/storageAccounts/$STATE_STORAGE_ACCOUNT/blobServices/default/containers/patchpage-operations" \
-        "container_app_id=$EXPECTED_CONTAINER_APP_ID" \
-        "acr_id=$EXPECTED_ACR_ID" \
-        "storage_account_id=$EXPECTED_STORAGE_ACCOUNT_ID" \
-        "postgres_server_id=$EXPECTED_POSTGRES_SERVER_ID" |
-        openssl dgst -sha256 -r |
-        cut -d ' ' -f1
+      guide_operation_binding_sha256 "$STATE_KEY"
     )"
     TERRAFORM_DIAGNOSTIC_ROOT="$diagnostic_root"
-    export TERRAFORM_DIAGNOSTIC_ROOT
     case "$scenario" in
       adoption_*) ADOPT_SAFETY_GUARDS="true" ;;
       invalid_adopt_value) ADOPT_SAFETY_GUARDS="yes" ;;
       *) ADOPT_SAFETY_GUARDS="false" ;;
-    esac
-    case "$scenario" in
-      adoption_operation_principal_id_missing) unset OPERATION_PRINCIPAL_ID ;;
-      adoption_operation_principal_id_invalid) OPERATION_PRINCIPAL_ID="not-a-guid" ;;
-      adoption_operation_principal_type_missing) unset OPERATION_PRINCIPAL_TYPE ;;
-      adoption_operation_principal_type_invalid) OPERATION_PRINCIPAL_TYPE="Application" ;;
-      adoption_operation_principal_group) OPERATION_PRINCIPAL_TYPE="Group" ;;
     esac
     case "$scenario" in
       adoption_digest_current | adoption_legacy_digest_missing) ;;
@@ -3154,831 +2052,56 @@ run_infrastructure_change_block() {
         ;;
       adoption_*) EXPECTED_LEGACY_IMAGE_DIGEST="$LEGACY_IMAGE_DIGEST" ;;
     esac
+    export SUBSCRIPTION_ID STATE_STORAGE_ACCOUNT STATE_CONTAINER STATE_KEY \
+      OPERATION_PRINCIPAL_ID OPERATION_PRINCIPAL_TYPE \
+      EXPECTED_OPERATION_AUTH_MODE EXPECTED_STATE_LINEAGE \
+      EXPECTED_RESOURCE_GROUP_ID EXPECTED_STORAGE_ACCOUNT_ID \
+      EXPECTED_POSTGRES_SERVER_ID EXPECTED_ACR_ID EXPECTED_CONTAINER_APP_ID \
+      RESOURCE_GROUP CONTAINER_APP ACR LEGACY_IMAGE_TAG LEGACY_IMAGE_DIGEST \
+      IMMUTABLE_IMAGE OLD_REVISION_NAME ADOPTION_REVISION_NAME \
+      POSTAPPLY_REVISION_NAME LATER_REVISION_NAME \
+      EXPECTED_OPERATION_BINDING_SHA256 TERRAFORM_DIAGNOSTIC_ROOT \
+      ADOPT_SAFETY_GUARDS
+    if test -n "${EXPECTED_LEGACY_IMAGE_DIGEST:-}"; then
+      export EXPECTED_LEGACY_IMAGE_DIGEST
+    fi
+    # The block reads these as required private inputs, so an absent value has
+    # to be absent from the child's environment too.
+    case "$scenario" in
+      adoption_operation_principal_id_missing) unset OPERATION_PRINCIPAL_ID ;;
+      adoption_operation_principal_id_invalid)
+        OPERATION_PRINCIPAL_ID="not-a-guid"
+        export OPERATION_PRINCIPAL_ID
+        ;;
+      adoption_operation_principal_type_missing) unset OPERATION_PRINCIPAL_TYPE ;;
+      adoption_operation_principal_type_invalid)
+        OPERATION_PRINCIPAL_TYPE="Application"
+        export OPERATION_PRINCIPAL_TYPE
+        ;;
+      adoption_operation_principal_group)
+        OPERATION_PRINCIPAL_TYPE="Group"
+        export OPERATION_PRINCIPAL_TYPE
+        ;;
+    esac
+
+    PP_MOCK_GROUP="infrastructure"
+    PP_MOCK_SCENARIO="$scenario"
+    PP_MOCK_LOG="$log"
+    PP_MOCK_REPO_ROOT="$scenario_root"
+    PP_MOCK_SCENARIO_ROOT="$scenario_root"
+    export PP_MOCK_GROUP PP_MOCK_SCENARIO PP_MOCK_LOG PP_MOCK_REPO_ROOT \
+      PP_MOCK_SCENARIO_ROOT
+    prepare_mock_state "$TMP_DIR/infrastructure-$scenario.mockstate"
     case "$scenario" in
       adoption_existing_unbound_success | adoption_binding_update_failure | \
         adoption_binding_concurrent_metadata | adoption_foreign_binding)
-        operation_container_created="true"
+        : > "$PP_MOCK_STATE/operation-container-created"
         ;;
-      adoption_*) operation_container_created="false" ;;
-      *) operation_container_created="true" ;;
+      adoption_*) ;;
+      *) : > "$PP_MOCK_STATE/operation-container-created" ;;
     esac
-    role_assignment_created="false"
 
-    git() {
-      printf 'git %s\n' "$*" >> "$log"
-      test "$*" = "rev-parse --show-toplevel" || return 1
-      test "$scenario" != "infra_repo_root_failure" || return 1
-      printf '%s\n' "$scenario_root"
-    }
-
-    chmod() {
-      if test "$scenario" = "backend_chmod_failure" &&
-        test "$2" = "backend.hcl"; then
-        return 1
-      fi
-      command chmod "$@"
-    }
-
-    mktemp() {
-      mktemp_count_file="$scenario_root/mktemp-count"
-      mktemp_count=0
-      if test -e "$mktemp_count_file"; then
-        mktemp_count="$(cat "$mktemp_count_file")"
-      fi
-      mktemp_count=$((mktemp_count + 1))
-      printf '%s\n' "$mktemp_count" > "$mktemp_count_file"
-      if test "$scenario" = "infra_diagnostic_secure_dir_failure" &&
-        test "$mktemp_count" -eq 1; then
-        return 1
-      fi
-      if test "$scenario" = "secure_change_dir_failure" &&
-        test "$mktemp_count" -eq 2; then
-        return 1
-      fi
-      mktemp_result="$(command mktemp "$@")" || return 1
-      if test "$mktemp_count" -eq 1; then
-        printf '%s\n' "$mktemp_result" > "$scenario_root/diagnostic-dir"
-        if test "$scenario" = "infra_diagnostic_log_open_failure"; then
-          mkdir "$mktemp_result/terraform.log"
-        fi
-      elif test "$scenario" = "state_snapshot_open_failure" &&
-        test "$mktemp_count" -eq 2; then
-        mkdir "$mktemp_result/state.json"
-      fi
-      printf '%s\n' "$mktemp_result"
-    }
-
-    rm() {
-      if test "$scenario" = "infra_diagnostic_cleanup_failure" &&
-        test "${1:-}" = "-rf" &&
-        test "${3:-}" = "${TERRAFORM_DIAGNOSTIC_DIR:-}"; then
-        printf 'private cleanup failure: %s\n' "$3" >&2
-        return 1
-      fi
-      if test "$scenario" = "secure_change_cleanup_failure" &&
-        test "${1:-}" = "-rf" &&
-        test "${3:-}" = "${SECURE_CHANGE_DIR:-}"; then
-        printf 'private change cleanup failure: %s\n' "$3" >&2
-        return 1
-      fi
-      command rm "$@"
-    }
-
-    sleep() {
-      printf 'sleep %s\n' "$*" >> "$log"
-    }
-
-    jq() {
-      jq_input=
-      for jq_arg do
-        jq_input="$jq_arg"
-      done
-      if test -n "${INFRA_PLAN_JSON:-}" &&
-        test "$jq_input" = "$INFRA_PLAN_JSON"; then
-        jq_seen="$scenario_root/infrastructure-plan-jq-seen"
-        if test "$scenario" = "plan_summary_failure" && test -e "$jq_seen"; then
-          return 1
-        fi
-        : > "$jq_seen"
-      fi
-      command jq "$@"
-    }
-
-    terraform() {
-      printf 'terraform %s\n' "$*" >> "$log"
-      printf 'private-infra-terraform-diagnostic %s\n' "$*" >&2
-      case "$*" in
-        "init -input=false -reconfigure -backend-config=backend.hcl")
-          test "$scenario" != "init_failure"
-          ;;
-        "console -no-color")
-          IFS= read -r console_expression || return 1
-          case "$console_expression" in
-            "var.subscription_id")
-              test "$scenario" != "infra_subscription_console_failure" || return 1
-              if test "$scenario" = "infra_subscription_mismatch"; then
-                printf '%s\n' '"44444444-4444-4444-4444-444444444444"'
-              else
-                printf '"%s"\n' "$SUBSCRIPTION_ID"
-              fi
-              ;;
-            '"rg-patchpage-${var.environment_name}"')
-              test "$scenario" != "infra_resource_group_console_failure" || return 1
-              if test "$scenario" = "infra_resource_group_invalid"; then
-                printf '%s\n' "not-json"
-              elif test "$scenario" = "infra_resource_group_mismatch"; then
-                printf '%s\n' '"rg-patchpage-other"'
-              else
-                printf '"%s"\n' "$RESOURCE_GROUP"
-              fi
-              ;;
-            "var.storage_delete_retention_days")
-              printf '%s\n' "30"
-              ;;
-            "var.server_image")
-              if test "$scenario" = "adoption_image_config_mismatch"; then
-                printf '%s\n' '"registry.invalid/patchpage-server@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"'
-              else
-                configured_server_image="$(
-                  sed -n 's/^server_image = "\(.*\)"$/\1/p' \
-                    server-image.auto.tfvars
-                )" || return 1
-                test -n "$configured_server_image" || return 1
-                printf '"%s"\n' "$configured_server_image"
-              fi
-              ;;
-            *)
-              return 1
-              ;;
-          esac
-          ;;
-        "state pull")
-          test "$scenario" != "state_pull_failure" || return 1
-          if test "$scenario" = "wrong_lineage"; then
-            printf '%s\n' '{"lineage":"22222222-2222-2222-2222-222222222222"}'
-          else
-            printf '{"lineage":"%s"}\n' "$EXPECTED_STATE_LINEAGE"
-          fi
-          ;;
-        "show -json")
-          test "$scenario" != "state_values_failure" || return 1
-          resource_group_id="$EXPECTED_RESOURCE_GROUP_ID"
-          storage_account_id="$EXPECTED_STORAGE_ACCOUNT_ID"
-          postgres_server_id="$EXPECTED_POSTGRES_SERVER_ID"
-          acr_id="$EXPECTED_ACR_ID"
-          container_app_id="$EXPECTED_CONTAINER_APP_ID"
-          case "$scenario" in
-            wrong_resource_group_id) resource_group_id="$resource_group_id-other" ;;
-            wrong_storage_account_id) storage_account_id="$storage_account_id-other" ;;
-            wrong_postgres_server_id) postgres_server_id="$postgres_server_id-other" ;;
-            wrong_acr_id) acr_id="$acr_id-other" ;;
-            wrong_container_app_id) container_app_id="$container_app_id-other" ;;
-          esac
-          state_values_count_file="$scenario_root/state-values-count"
-          state_values_count=0
-          if test -f "$state_values_count_file"; then
-            state_values_count="$(cat "$state_values_count_file")"
-          fi
-          state_values_count=$((state_values_count + 1))
-          printf '%s\n' "$state_values_count" > "$state_values_count_file"
-          lock_resources=
-          if test "$ADOPT_SAFETY_GUARDS" = "false" ||
-            test "$state_values_count" -gt 1; then
-            lock_resources=',{"address":"azurerm_management_lock.drafts_storage","values":{"id":"'"$EXPECTED_STORAGE_ACCOUNT_ID"'/providers/Microsoft.Authorization/locks/protect-patchpage-drafts"}},{"address":"azurerm_management_lock.patchpage_postgres","values":{"id":"'"$EXPECTED_POSTGRES_SERVER_ID"'/providers/Microsoft.Authorization/locks/protect-patchpage-postgres"}}'
-          fi
-          printf \
-            '{"values":{"root_module":{"resources":[{"address":"azurerm_resource_group.patchpage","values":{"id":"%s"}},{"address":"azurerm_storage_account.drafts","values":{"id":"%s"}},{"address":"azurerm_postgresql_flexible_server.patchpage","values":{"id":"%s"}},{"address":"azurerm_container_registry.patchpage","values":{"id":"%s"}},{"address":"azurerm_container_app.server","values":{"id":"%s"}}%s]}}}\n' \
-            "$resource_group_id" \
-            "$storage_account_id" \
-            "$postgres_server_id" \
-            "$acr_id" \
-            "$container_app_id" \
-            "$lock_resources"
-          ;;
-        state\ show\ *)
-          if test "$scenario" = "missing_required_state_address" &&
-            test "$3" = "azurerm_storage_container.drafts"; then
-            return 1
-          fi
-          case "$3" in
-            azurerm_management_lock.drafts_storage)
-              test "$ADOPT_SAFETY_GUARDS" = "false" ||
-                test -f "$scenario_root/storage-lock-imported"
-              ;;
-            azurerm_management_lock.patchpage_postgres)
-              test "$ADOPT_SAFETY_GUARDS" = "false" ||
-                test -f "$scenario_root/postgres-lock-imported"
-              ;;
-          esac
-          ;;
-        import\ -input=false\ *)
-          case "$3" in
-            azurerm_management_lock.drafts_storage)
-              test "$4" = "$EXPECTED_STORAGE_ACCOUNT_ID/providers/Microsoft.Authorization/locks/protect-patchpage-drafts" ||
-                return 1
-              test "$scenario" != "adoption_storage_lock_import_failure" || return 1
-              : > "$scenario_root/storage-lock-imported"
-              ;;
-            azurerm_management_lock.patchpage_postgres)
-              test "$4" = "$EXPECTED_POSTGRES_SERVER_ID/providers/Microsoft.Authorization/locks/protect-patchpage-postgres" ||
-                return 1
-              test "$scenario" != "adoption_postgres_lock_import_failure" || return 1
-              : > "$scenario_root/postgres-lock-imported"
-              ;;
-            *) return 1 ;;
-          esac
-          ;;
-        plan\ -input=false\ -out=*)
-          test "$scenario" != "plan_failure" || return 1
-          : > "$scenario_root/infra-plan-created"
-          if test "$scenario" = "plan_json_open_failure"; then
-            mkdir "$INFRA_PLAN_JSON"
-          fi
-          ;;
-        show\ -json\ *)
-          test "$scenario" != "plan_gate_show_failure" || return 1
-          case "$scenario" in
-            delete_plan)
-              plan_change_json='[{"address":"azurerm_storage_account.drafts","change":{"actions":["delete"]}}]'
-              ;;
-            replacement_plan)
-              plan_change_json='[{"address":"azurerm_postgresql_flexible_server.patchpage","change":{"actions":["delete","create"]}}]'
-              ;;
-            missing_container_plan)
-              plan_change_json='[{"address":"azurerm_storage_container.drafts","change":{"actions":["create"]}}]'
-              ;;
-            missing_database_plan)
-              plan_change_json='[{"address":"azurerm_postgresql_flexible_server_database.patchpage","change":{"actions":["create"]}}]'
-              ;;
-            *)
-              plan_change_json='[{"address":"azurerm_container_app.server","change":{"actions":["update"]}}]'
-              ;;
-          esac
-          printf \
-            '{"planned_values":{"root_module":{"resources":[{"address":"azurerm_container_app.server","values":{"template":[{"container":[{"image":"acrpatchpageabc123.azurecr.io/patchpage-server@%s"}]}]}}]}},"resource_changes":%s}\n' \
-            "$LEGACY_IMAGE_DIGEST" \
-            "$plan_change_json"
-          ;;
-        apply\ *)
-          test "$2" = "-input=false" && test "$3" = "$INFRA_PLAN" || return 1
-          test "$scenario" != "final_apply_failure" || return 1
-          : > "$scenario_root/infra-apply-completed"
-          ;;
-        *)
-          return 1
-          ;;
-      esac
-    }
-
-    az() {
-      normalize_az_args "$@" || return 1
-      printf 'az %s\n' "$NORMALIZED_AZ_ARGS" >> "$log"
-      printf 'private-infra-az-diagnostic %s\n' "$*" >&2
-      case "$1 $2" in
-        "account set")
-          test "$scenario" != "subscription_set_failure"
-          ;;
-        "account show")
-          test "$scenario" != "subscription_show_failure" || return 1
-          if test "$scenario" = "subscription_mismatch"; then
-            printf '%s\n' "33333333-3333-3333-3333-333333333333"
-          else
-            printf '%s\n' "$SUBSCRIPTION_ID"
-          fi
-          ;;
-        "storage blob")
-          case "$3" in
-            exists)
-              case " $* " in
-                *" --account-name $STATE_STORAGE_ACCOUNT --container-name $STATE_CONTAINER --name $STATE_KEY --auth-mode key --query exists --output tsv "*) ;;
-                *) return 1 ;;
-              esac
-              test "$scenario" != "state_blob_check_failure" || return 1
-              if test "$scenario" = "missing_state_blob"; then
-                printf '%s\n' "false"
-              else
-                printf '%s\n' "true"
-              fi
-              ;;
-            list)
-              case " $* " in
-                *" --account-name $STATE_STORAGE_ACCOUNT --container-name patchpage-operations --auth-mode key --include d v --num-results * --query [].name --output tsv "*)
-                  test "$scenario" != "operation_container_nonempty" ||
-                    printf '%s\n' "unexpected"
-                  ;;
-                *) return 1 ;;
-              esac
-              ;;
-            *) return 1 ;;
-          esac
-          ;;
-        "storage account")
-          if test "$3" = "show"; then
-            if test "$scenario" = "state_account_identity_mismatch"; then
-              printf '%s\n' "/subscriptions/$SUBSCRIPTION_ID/resourceGroups/rg-patchpage-tfstate/providers/Microsoft.Storage/storageAccounts/otherstate"
-            else
-              printf '%s\n' "/subscriptions/$SUBSCRIPTION_ID/resourceGroups/rg-patchpage-tfstate/providers/Microsoft.Storage/storageAccounts/$STATE_STORAGE_ACCOUNT"
-            fi
-          else
-            case "$3 $4" in
-            "blob-service-properties update")
-              test "$scenario" != "adoption_retention_update_failure"
-              ;;
-            "blob-service-properties show")
-              test "$scenario" != "retention_show_failure" || return 1
-              versioning="true"
-              blob_delete_enabled="true"
-              blob_delete_days="30"
-              permanent_delete="false"
-              container_delete_enabled="true"
-              container_delete_days="30"
-              case " $* " in
-                *" --account-name patchpagedrafts "*)
-                  if test "$scenario" = "workload_retention_too_low"; then
-                    blob_delete_days="90"
-                    container_delete_days="365"
-                  fi
-                  ;;
-                *)
-                  case "$scenario" in
-                    versioning_missing) versioning="false" ;;
-                    blob_retention_missing) blob_delete_enabled="false" ;;
-                    state_permanent_delete_enabled) permanent_delete="true" ;;
-                    blob_retention_too_short) blob_delete_days="29" ;;
-                    container_retention_missing) container_delete_enabled="false" ;;
-                    container_retention_too_short) container_delete_days="29" ;;
-                    adoption_preserves_state_retention)
-                      blob_delete_days="90"
-                      container_delete_days="365"
-                      ;;
-                  esac
-                  ;;
-              esac
-              printf \
-                '{"isVersioningEnabled":%s,"deleteRetentionPolicy":{"enabled":%s,"allowPermanentDelete":%s,"days":%s},"containerDeleteRetentionPolicy":{"enabled":%s,"days":%s}}\n' \
-                "$versioning" \
-                "$blob_delete_enabled" \
-                "$permanent_delete" \
-                "$blob_delete_days" \
-                "$container_delete_enabled" \
-                "$container_delete_days"
-              ;;
-            *)
-              return 1
-              ;;
-            esac
-          fi
-          ;;
-        "storage container-rm")
-          test "$3" = "show" || return 1
-          if test "$scenario" = "operation_container_id_mismatch"; then
-            printf '%s\n' "$EXPECTED_STATE_STORAGE_ACCOUNT_ID/blobServices/default/containers/foreign"
-          else
-            printf '%s\n' "$EXPECTED_STATE_STORAGE_ACCOUNT_ID/blobServices/default/containers/patchpage-operations"
-          fi
-          ;;
-        "storage container")
-          case "$3" in
-            create)
-              case " $* " in
-                *" --name patchpage-operations --account-name $STATE_STORAGE_ACCOUNT --public-access off --auth-mode key --fail-on-exist --metadata patchpage_workload_binding_sha256=$EXPECTED_OPERATION_BINDING_SHA256 "*) ;;
-                *) return 1 ;;
-              esac
-              test "$scenario" != "adoption_operation_container_create_failure" || return 1
-              operation_container_created="true"
-              printf '%s\n' "$EXPECTED_OPERATION_BINDING_SHA256" > "$scenario_root/operation-binding"
-              ;;
-            exists)
-              case " $* " in
-                *" --name $STATE_CONTAINER --account-name $STATE_STORAGE_ACCOUNT --auth-mode key --query exists --output tsv "*)
-                  printf '%s\n' "true"
-                  ;;
-                *" --name patchpage-operations --account-name $STATE_STORAGE_ACCOUNT --auth-mode key --query exists --output tsv "*)
-                  if test "$scenario" = "operation_container_missing"; then
-                    printf '%s\n' "false"
-                  else
-                    printf '%s\n' "$operation_container_created"
-                  fi
-                  ;;
-                *" --account-name $STATE_STORAGE_ACCOUNT --name patchpage-operations --auth-mode key --query exists --output tsv "*)
-                  if test "$scenario" = "operation_container_missing"; then
-                    printf '%s\n' "false"
-                  else
-                    printf '%s\n' "$operation_container_created"
-                  fi
-                  ;;
-                *) return 1 ;;
-              esac
-              ;;
-            metadata)
-              case "$4" in
-                show)
-                  operation_metadata_count_file="$scenario_root/operation-metadata-count"
-                  operation_metadata_count=0
-                  if test -f "$operation_metadata_count_file"; then
-                    operation_metadata_count="$(command cat "$operation_metadata_count_file")"
-                  fi
-                  operation_metadata_count=$((operation_metadata_count + 1))
-                  printf '%s\n' "$operation_metadata_count" > "$operation_metadata_count_file"
-                  if test "$scenario" = "adoption_foreign_binding" ||
-                    { test "$scenario" = "adoption_binding_concurrent_metadata" &&
-                      test "$operation_metadata_count" -gt 1; }; then
-                    printf '%s\n' '{"foreign":"binding"}'
-                  elif test -f "$scenario_root/operation-binding"; then
-                    operation_binding="$(command cat "$scenario_root/operation-binding")"
-                    printf '{"patchpage_workload_binding_sha256":"%s"}\n' "$operation_binding"
-                  elif test "$scenario" = "adoption_existing_unbound_success" ||
-                    test "$scenario" = "adoption_binding_update_failure" ||
-                    test "$scenario" = "adoption_binding_concurrent_metadata"; then
-                    printf '%s\n' '{}'
-                  else
-                    printf '{"patchpage_workload_binding_sha256":"%s"}\n' "$EXPECTED_OPERATION_BINDING_SHA256"
-                  fi
-                  ;;
-                update)
-                  test "$scenario" != "adoption_binding_update_failure" || return 1
-                  operation_metadata_lease_id=
-                  operation_binding=
-                  while test "$#" -gt 0; do
-                    case "$1" in
-                      --lease-id)
-                        operation_metadata_lease_id="$2"
-                        shift 2
-                        ;;
-                      patchpage_workload_binding_sha256=*)
-                        operation_binding="${1#*=}"
-                        shift
-                        ;;
-                      *) shift ;;
-                    esac
-                  done
-                  test -f "$scenario_root/operation-lease-id" || return 1
-                  test "$operation_metadata_lease_id" = "$(
-                    command cat "$scenario_root/operation-lease-id"
-                  )" || return 1
-                  test -n "$operation_binding" || return 1
-                  printf '%s\n' "$operation_binding" > "$scenario_root/operation-binding"
-                  ;;
-                *) return 1 ;;
-              esac
-              ;;
-            list)
-              case " $* " in
-                *" --account-name $STATE_STORAGE_ACCOUNT --auth-mode key --include-deleted true --num-results * --query [].[name,deleted] --output tsv "*) ;;
-                *) return 1 ;;
-              esac
-              case "$scenario" in
-                adoption_foreign_container)
-                  printf 'tfstate\tfalse\nforeign\tfalse\n'
-                  ;;
-                adoption_recoverable_container)
-                  printf 'tfstate\tfalse\npatchpage-operations\ttrue\n'
-                  ;;
-                adoption_duplicate_container)
-                  printf 'tfstate\tfalse\ntfstate\tfalse\n'
-                  ;;
-                adoption_container_inventory_inconsistent)
-                  printf 'tfstate\tfalse\npatchpage-operations\tfalse\n'
-                  ;;
-                *)
-                  printf 'tfstate\tfalse\n'
-                  test "$operation_container_created" = "false" ||
-                    printf 'patchpage-operations\tfalse\n'
-                  ;;
-              esac
-              ;;
-            lease) mock_operation_lease "$@" ;;
-            *) return 1 ;;
-          esac
-          ;;
-        "role assignment")
-          case "$3" in
-            list)
-              case " $* " in
-                *" --assignee-object-id ${OPERATION_PRINCIPAL_ID:-} --role /subscriptions/$SUBSCRIPTION_ID/providers/Microsoft.Authorization/roleDefinitions/ba92f5b4-2d11-453d-a403-e96b0029c9fe --scope $EXPECTED_STATE_STORAGE_ACCOUNT_ID/blobServices/default/containers/patchpage-operations --include-inherited --include-groups --fill-principal-name false --fill-role-definition-name false --output json "*)
-                  role_assignment_scope="operation"
-                  ;;
-                *" --assignee-object-id ${OPERATION_PRINCIPAL_ID:-} --scope $EXPECTED_STATE_STORAGE_ACCOUNT_ID/blobServices/default/containers/tfstate --include-inherited --include-groups --fill-principal-name false --fill-role-definition-name false --output json "*)
-                  role_assignment_scope="state"
-                  ;;
-                *) return 1 ;;
-              esac
-              if test "$scenario" = "adoption_operation_role_broad"; then
-                printf '[{"principalId":"%s","roleDefinitionId":"/subscriptions/%s/providers/Microsoft.Authorization/roleDefinitions/ba92f5b4-2d11-453d-a403-e96b0029c9fe","scope":"%s"}]\n' \
-                  "$OPERATION_PRINCIPAL_ID" "$SUBSCRIPTION_ID" "$EXPECTED_STATE_STORAGE_ACCOUNT_ID"
-              elif test "$role_assignment_scope" = "state"; then
-                if test "$scenario" = "adoption_state_role_reader"; then
-                  printf '[{"principalId":"%s","roleDefinitionId":"/subscriptions/%s/providers/Microsoft.Authorization/roleDefinitions/2a2b9908-6ea1-4ae2-8e65-a410df84e7d1","scope":"%s/blobServices/default/containers/tfstate"}]\n' \
-                    "$OPERATION_PRINCIPAL_ID" "$SUBSCRIPTION_ID" "$EXPECTED_STATE_STORAGE_ACCOUNT_ID"
-                elif test "$scenario" = "adoption_operation_role_ambiguous"; then
-                  printf '[{"principalId":"%s","roleDefinitionId":"/subscriptions/%s/providers/Microsoft.Authorization/roleDefinitions/ba92f5b4-2d11-453d-a403-e96b0029c9fe","scope":"%s"}]\n' \
-                    "$OPERATION_PRINCIPAL_ID" "$SUBSCRIPTION_ID" "$EXPECTED_STATE_STORAGE_ACCOUNT_ID"
-                else
-                  printf '%s\n' '[]'
-                fi
-              else
-                case "$scenario" in
-                  adoption_operation_role_wrong)
-                    printf '[{"principalId":"%s","roleDefinitionId":"/subscriptions/%s/providers/Microsoft.Authorization/roleDefinitions/acdd72a7-3385-48ef-bd42-f606fba81ae7","scope":"%s/blobServices/default/containers/patchpage-operations"}]\n' \
-                      "$OPERATION_PRINCIPAL_ID" "$SUBSCRIPTION_ID" "$EXPECTED_STATE_STORAGE_ACCOUNT_ID"
-                    ;;
-                  adoption_operation_role_ambiguous)
-                    printf '[{"principalId":"%s","roleDefinitionId":"/subscriptions/%s/providers/Microsoft.Authorization/roleDefinitions/ba92f5b4-2d11-453d-a403-e96b0029c9fe","scope":"%s/blobServices/default/containers/patchpage-operations"},{"principalId":"%s","roleDefinitionId":"/subscriptions/%s/providers/Microsoft.Authorization/roleDefinitions/ba92f5b4-2d11-453d-a403-e96b0029c9fe","scope":"%s"}]\n' \
-                      "$OPERATION_PRINCIPAL_ID" "$SUBSCRIPTION_ID" "$EXPECTED_STATE_STORAGE_ACCOUNT_ID" \
-                      "$OPERATION_PRINCIPAL_ID" "$SUBSCRIPTION_ID" "$EXPECTED_STATE_STORAGE_ACCOUNT_ID"
-                    ;;
-                  *)
-                    if test "$role_assignment_created" = "true"; then
-                      printf '[{"principalId":"%s","roleDefinitionId":"/subscriptions/%s/providers/Microsoft.Authorization/roleDefinitions/ba92f5b4-2d11-453d-a403-e96b0029c9fe","scope":"%s/blobServices/default/containers/patchpage-operations"}]\n' \
-                        "$OPERATION_PRINCIPAL_ID" "$SUBSCRIPTION_ID" "$EXPECTED_STATE_STORAGE_ACCOUNT_ID"
-                    else
-                      printf '%s\n' '[]'
-                    fi
-                    ;;
-                esac
-              fi
-              ;;
-            create)
-              case " $* " in
-                *" --assignee-object-id ${OPERATION_PRINCIPAL_ID:-} --assignee-principal-type ${OPERATION_PRINCIPAL_TYPE:-} --role /subscriptions/$SUBSCRIPTION_ID/providers/Microsoft.Authorization/roleDefinitions/ba92f5b4-2d11-453d-a403-e96b0029c9fe --scope $EXPECTED_STATE_STORAGE_ACCOUNT_ID/blobServices/default/containers/patchpage-operations --output none "*) ;;
-                *) return 1 ;;
-              esac
-              test "$scenario" != "adoption_operation_role_create_failure" || return 1
-              role_assignment_created="true"
-              ;;
-            *) return 1 ;;
-          esac
-          ;;
-        "lock list")
-          lock_resource=""
-          while test "$#" -gt 0; do
-            if test "$1" = "--resource"; then lock_resource="$2"; break; fi
-            shift
-          done
-          case "$lock_resource" in
-            "$EXPECTED_STATE_STORAGE_ACCOUNT_ID")
-              lock_name="protect-patchpage-tfstate"
-              stronger_scenario="adoption_state_stronger_lock"
-              ;;
-            "$EXPECTED_STORAGE_ACCOUNT_ID")
-              lock_name="protect-patchpage-drafts"
-              stronger_scenario="adoption_workload_stronger_lock"
-              ;;
-            "$EXPECTED_POSTGRES_SERVER_ID")
-              lock_name="protect-patchpage-postgres"
-              stronger_scenario="adoption_postgres_foreign_lock"
-              ;;
-            *) return 1 ;;
-          esac
-          if test "$scenario" = "$stronger_scenario"; then
-            printf '%s\tReadOnly\t%s/providers/Microsoft.Authorization/locks/%s\n' \
-              "$lock_name" "$lock_resource" "$lock_name"
-          elif test "${ADOPT_SAFETY_GUARDS:-false}" != "true"; then
-            printf '%s\tCanNotDelete\t%s/providers/Microsoft.Authorization/locks/%s\n' \
-              "$lock_name" "$lock_resource" "$lock_name"
-          fi
-          ;;
-        "lock create")
-          case " $* " in
-            *" --name protect-patchpage-tfstate "*)
-              test "$scenario" != "adoption_state_lock_create_failure"
-              ;;
-            *" --name protect-patchpage-drafts "*)
-              test "$scenario" != "adoption_workload_lock_create_failure"
-              ;;
-            *" --name protect-patchpage-postgres "*)
-              test "$scenario" != "adoption_postgres_lock_create_failure"
-              ;;
-            *)
-              return 1
-              ;;
-          esac
-          ;;
-        "lock show")
-          case " $* " in
-            *" --ids $EXPECTED_STATE_STORAGE_ACCOUNT_ID/providers/Microsoft.Authorization/locks/protect-patchpage-tfstate "*)
-              test "$scenario" != "state_lock_show_failure" || return 1
-              if test "$scenario" = "state_lock_missing"; then
-                printf 'ReadOnly\t%s/providers/Microsoft.Authorization/locks/protect-patchpage-tfstate\n' "$EXPECTED_STATE_STORAGE_ACCOUNT_ID"
-              else
-                printf 'CanNotDelete\t%s/providers/Microsoft.Authorization/locks/protect-patchpage-tfstate\n' "$EXPECTED_STATE_STORAGE_ACCOUNT_ID"
-              fi
-              ;;
-            *" --ids $EXPECTED_STORAGE_ACCOUNT_ID/providers/Microsoft.Authorization/locks/protect-patchpage-drafts "*)
-              test "$scenario" != "workload_lock_show_failure" || return 1
-              if test "$scenario" = "workload_lock_missing"; then
-                printf 'ReadOnly\t%s/providers/Microsoft.Authorization/locks/protect-patchpage-drafts\n' "$EXPECTED_STORAGE_ACCOUNT_ID"
-              else
-                printf 'CanNotDelete\t%s/providers/Microsoft.Authorization/locks/protect-patchpage-drafts\n' "$EXPECTED_STORAGE_ACCOUNT_ID"
-              fi
-              ;;
-            *" --ids $EXPECTED_POSTGRES_SERVER_ID/providers/Microsoft.Authorization/locks/protect-patchpage-postgres "*)
-              printf 'CanNotDelete\t%s/providers/Microsoft.Authorization/locks/protect-patchpage-postgres\n' "$EXPECTED_POSTGRES_SERVER_ID"
-              ;;
-            *)
-              return 1
-              ;;
-          esac
-          ;;
-        "resource show")
-          test "$3" = "--ids" || return 1
-          case "$4" in
-            "$EXPECTED_STORAGE_ACCOUNT_ID")
-              test "$scenario" != "storage_resource_missing"
-              ;;
-            "$EXPECTED_POSTGRES_SERVER_ID")
-              test "$scenario" != "postgres_resource_missing"
-              ;;
-            "$EXPECTED_ACR_ID")
-              test "$scenario" != "acr_resource_missing"
-              ;;
-            "$EXPECTED_CONTAINER_APP_ID")
-              test "$scenario" != "container_app_resource_missing"
-              ;;
-            *)
-              return 1
-              ;;
-          esac
-          ;;
-        "acr show")
-          printf '%s\n' "acrpatchpageabc123.azurecr.io"
-          ;;
-        "acr manifest")
-          test "$3" = "show-metadata" || return 1
-          test "$scenario" != "adoption_manifest_failure" || return 1
-          printf '%s\n' "$LEGACY_IMAGE_DIGEST"
-          ;;
-        "containerapp show")
-          case " $* " in
-            *" --ids $EXPECTED_CONTAINER_APP_ID --output json "*) ;;
-            *) return 1 ;;
-          esac
-          if test "$scenario" = "postapply_app_show_failure" &&
-            test -e "$scenario_root/infra-apply-completed"; then
-            return 1
-          fi
-          app_image="$IMMUTABLE_IMAGE"
-          app_latest_revision="$OLD_REVISION_NAME"
-          app_ready_revision="$OLD_REVISION_NAME"
-          if test -e "$scenario_root/infra-apply-completed"; then
-            case "$scenario" in
-              nonrevision_apply_success)
-                app_latest_revision="$(
-                  if test -e "$scenario_root/legacy-image-updated"; then
-                    printf '%s\n' "$ADOPTION_REVISION_NAME"
-                  else
-                    printf '%s\n' "$OLD_REVISION_NAME"
-                  fi
-                )"
-                app_ready_revision="$app_latest_revision"
-                ;;
-              *)
-                app_latest_revision="$POSTAPPLY_REVISION_NAME"
-                app_ready_revision="$POSTAPPLY_REVISION_NAME"
-                ;;
-            esac
-            postapply_app_show_count_file="$scenario_root/postapply-app-show-count"
-            postapply_app_show_count=0
-            if test -e "$postapply_app_show_count_file"; then
-              postapply_app_show_count="$(cat "$postapply_app_show_count_file")"
-            fi
-            postapply_app_show_count=$((postapply_app_show_count + 1))
-            printf '%s\n' "$postapply_app_show_count" > "$postapply_app_show_count_file"
-            if test "$scenario" = "final_pinned_drift" &&
-              test "$postapply_app_show_count" -ge 4; then
-              app_latest_revision="$LATER_REVISION_NAME"
-              app_ready_revision="$LATER_REVISION_NAME"
-            fi
-          elif test -e "$scenario_root/legacy-image-updated"; then
-            app_latest_revision="$ADOPTION_REVISION_NAME"
-            app_ready_revision="$ADOPTION_REVISION_NAME"
-          elif test "${ADOPT_SAFETY_GUARDS:-false}" = "true"; then
-            if test "$scenario" = "adoption_invalid_legacy_tag"; then
-              app_image="acrpatchpageabc123.azurecr.io/patchpage-server:latest"
-            elif test "$scenario" != "adoption_digest_current"; then
-              app_image="acrpatchpageabc123.azurecr.io/patchpage-server:$LEGACY_IMAGE_TAG"
-            fi
-          else
-            case "$scenario" in
-              preexisting_pending_revision)
-                app_latest_revision="patchpage-app--pending"
-                ;;
-              preexisting_failed_revision)
-                app_latest_revision="patchpage-app--failed"
-                ;;
-            esac
-          fi
-          if test -e "$scenario_root/infra-plan-created" &&
-            ! test -e "$scenario_root/infra-apply-completed" &&
-            test "$scenario" = "preapply_image_mismatch"; then
-            app_image="acrpatchpageabc123.azurecr.io/patchpage-server@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
-          fi
-          printf '{"id":"%s","properties":{"provisioningState":"Succeeded","latestRevisionName":"%s","latestReadyRevisionName":"%s","configuration":{"activeRevisionsMode":"Single","ingress":{"traffic":[{"latestRevision":true,"weight":100}]}},"template":{"containers":[{"name":"server","image":"%s"}]}}}\n' \
-            "$EXPECTED_CONTAINER_APP_ID" "$app_latest_revision" \
-            "$app_ready_revision" "$app_image"
-          ;;
-        "containerapp revision")
-          revision_action="$3"
-          revision_name=
-          while test "$#" -gt 0; do
-            if test "$1" = "--revision"; then
-              revision_name="$2"
-              break
-            fi
-            shift
-          done
-          case "$revision_action" in
-            show)
-              revision_image="$IMMUTABLE_IMAGE"
-              revision_active=true
-              revision_provisioning="Provisioned"
-              revision_health="Healthy"
-              revision_running="Running"
-              revision_weight=100
-              case "$revision_name" in
-                "$OLD_REVISION_NAME") ;;
-                "$ADOPTION_REVISION_NAME")
-                  adoption_revision_show_count_file="$scenario_root/adoption-revision-show-count"
-                  adoption_revision_show_count=0
-                  if test -e "$adoption_revision_show_count_file"; then
-                    adoption_revision_show_count="$(cat "$adoption_revision_show_count_file")"
-                  fi
-                  adoption_revision_show_count=$((adoption_revision_show_count + 1))
-                  printf '%s\n' "$adoption_revision_show_count" > "$adoption_revision_show_count_file"
-                  if test "$adoption_revision_show_count" -eq 1; then
-                    revision_active=false
-                    revision_provisioning="Provisioning"
-                    revision_health="Unknown"
-                    revision_running="Processing"
-                    revision_weight=0
-                  fi
-                  if test "$scenario" = "adoption_image_verification_failure"; then
-                    revision_image="acrpatchpageabc123.azurecr.io/patchpage-server@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
-                  fi
-                  ;;
-                "$POSTAPPLY_REVISION_NAME")
-                  postapply_revision_show_count_file="$scenario_root/postapply-revision-show-count"
-                  postapply_revision_show_count=0
-                  if test -e "$postapply_revision_show_count_file"; then
-                    postapply_revision_show_count="$(cat "$postapply_revision_show_count_file")"
-                  fi
-                  postapply_revision_show_count=$((postapply_revision_show_count + 1))
-                  printf '%s\n' "$postapply_revision_show_count" > "$postapply_revision_show_count_file"
-                  if test "$postapply_revision_show_count" -eq 1 ||
-                    test "$scenario" = "postapply_never_ready"; then
-                    revision_active=false
-                    revision_provisioning="Provisioning"
-                    revision_health="Unknown"
-                    revision_running="Processing"
-                    revision_weight=0
-                  fi
-                  if test "$scenario" = "postapply_image_mismatch"; then
-                    revision_image="acrpatchpageabc123.azurecr.io/patchpage-server@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
-                  fi
-                  ;;
-                patchpage-app--pending)
-                  revision_active=false
-                  revision_provisioning="Provisioning"
-                  revision_health="Unknown"
-                  revision_running="Processing"
-                  revision_weight=0
-                  ;;
-                patchpage-app--failed)
-                  revision_active=false
-                  revision_provisioning="Failed"
-                  revision_health="Unhealthy"
-                  revision_running="Stopped"
-                  revision_weight=0
-                  ;;
-                *) return 1 ;;
-              esac
-              if test "$scenario" = "scale_to_zero_success"; then
-                revision_health="None"
-                revision_running="ScaleToZero"
-              fi
-              printf '{"name":"%s","properties":{"active":%s,"provisioningState":"%s","healthState":"%s","runningState":"%s","trafficWeight":%s,"template":{"containers":[{"name":"server","image":"%s"}]}}}\n' \
-                "$revision_name" "$revision_active" "$revision_provisioning" \
-                "$revision_health" "$revision_running" "$revision_weight" \
-                "$revision_image"
-              ;;
-            list)
-              active_revision="$OLD_REVISION_NAME"
-              if test -e "$scenario_root/infra-apply-completed"; then
-                if test "$scenario" = "nonrevision_apply_success"; then
-                  if test -e "$scenario_root/legacy-image-updated"; then
-                    active_revision="$ADOPTION_REVISION_NAME"
-                  fi
-                else
-                  active_revision="$POSTAPPLY_REVISION_NAME"
-                fi
-                if test "$scenario" = "postapply_multiple_active"; then
-                  printf '[{"name":"%s","properties":{"active":true}},{"name":"%s","properties":{"active":true}}]\n' \
-                    "$OLD_REVISION_NAME" "$POSTAPPLY_REVISION_NAME"
-                  return
-                fi
-              elif test -e "$scenario_root/legacy-image-updated"; then
-                active_revision="$ADOPTION_REVISION_NAME"
-              fi
-              printf '[{"name":"%s","properties":{"active":true}}]\n' \
-                "$active_revision"
-              ;;
-            *) return 1 ;;
-          esac
-          ;;
-        "containerapp update")
-          test "$scenario" != "adoption_image_update_failure" || return 1
-          : > "$scenario_root/legacy-image-updated"
-          printf '%s\n' "$ADOPTION_REVISION_NAME"
-          ;;
-        *)
-          return 1
-          ;;
-      esac
-    }
-
-    eval "$INFRASTRUCTURE_CHANGE_BLOCK"
-    eval "$INFRASTRUCTURE_CHANGE_APPLY_BLOCK"
-    printf '%s\n' completed >> "$log"
+    run_block_script "$INFRASTRUCTURE_CHANGE_SCRIPT"
   ) >"$output" 2>&1
 }
 
@@ -4547,97 +2670,28 @@ run_stale_lease_recovery_block() {
     ACR="acrpatchpageabc123"
     EXPECTED_STORAGE_ACCOUNT_ID="/subscriptions/$SUBSCRIPTION_ID/resourceGroups/$RESOURCE_GROUP/providers/Microsoft.Storage/storageAccounts/patchpagedrafts"
     EXPECTED_POSTGRES_SERVER_ID="/subscriptions/$SUBSCRIPTION_ID/resourceGroups/$RESOURCE_GROUP/providers/Microsoft.DBforPostgreSQL/flexibleServers/patchpage-db"
+    export SUBSCRIPTION_ID STATE_STORAGE_ACCOUNT STATE_CONTAINER STATE_KEY \
+      RESOURCE_GROUP CONTAINER_APP ACR EXPECTED_STORAGE_ACCOUNT_ID \
+      EXPECTED_POSTGRES_SERVER_ID
     if test "$scenario" != "confirmation_missing"; then
       CONFIRM_STALE_OPERATION_LEASE="second-operator-confirmed-no-active-operation"
+      export CONFIRM_STALE_OPERATION_LEASE
     fi
 
-    az() {
-      normalize_az_args "$@" || return 1
-      printf 'az %s\n' "$NORMALIZED_AZ_ARGS" >> "$log"
-      case "$1 $2" in
-        "account set") ;;
-        "account show") printf '%s\n' "$SUBSCRIPTION_ID" ;;
-        "storage container-rm")
-          test "$3" = "show" || return 1
-          test "$NORMALIZED_AZ_ARGS" = \
-            "storage container-rm show --ids /subscriptions/$SUBSCRIPTION_ID/resourceGroups/rg-patchpage-tfstate/providers/Microsoft.Storage/storageAccounts/$STATE_STORAGE_ACCOUNT/blobServices/default/containers/patchpage-operations --query id --output tsv" ||
-            return 1
-          test "$scenario" != "operation_container_lookup_failure" || return 1
-          if test "$scenario" = "operation_container_identity_mismatch"; then
-            printf '%s\n' "/subscriptions/$SUBSCRIPTION_ID/resourceGroups/rg-patchpage-tfstate/providers/Microsoft.Storage/storageAccounts/$STATE_STORAGE_ACCOUNT/blobServices/default/containers/foreign"
-          else
-            printf '%s\n' "/subscriptions/$SUBSCRIPTION_ID/resourceGroups/rg-patchpage-tfstate/providers/Microsoft.Storage/storageAccounts/$STATE_STORAGE_ACCOUNT/blobServices/default/containers/patchpage-operations"
-          fi
-          ;;
-        "storage container")
-          case "$3" in
-            exists)
-              if test "$scenario" = "container_missing"; then
-                printf '%s\n' "false"
-              else
-                printf '%s\n' "true"
-              fi
-              ;;
-            metadata)
-              test "$4" = "show" || return 1
-              test "$scenario" != "binding_lookup_failure" || return 1
-              if test "$scenario" = "foreign_binding"; then
-                printf '%s\n' '{"patchpage_workload_binding_sha256":"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"}'
-              else
-                printf '{"patchpage_workload_binding_sha256":"%s"}\n' "$OPERATION_BINDING_SHA256"
-              fi
-              ;;
-            lease)
-              action="$4"
-              case "$action" in
-                break)
-                  case " $* " in
-                    *" --auth-mode login --lease-break-period 0 --output none "*) ;;
-                    *) return 1 ;;
-                  esac
-                  test "$scenario" != "break_failure" || return 1
-                  ;;
-                acquire)
-                  recovery_lease_id="$(
-                    printf '%s\n' "$*" |
-                      sed -n 's/.* --proposed-lease-id \([^ ]*\) --output none.*/\1/p'
-                  )"
-                  printf '%s\n' "$recovery_lease_id" |
-                    grep -Eq '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$' ||
-                    return 1
-                  test "$scenario" != "acquire_failure" || return 1
-                  printf '%s\n' "$recovery_lease_id" > "$scenario_root/recovery-lease-id"
-                  ;;
-                renew | release)
-                  requested_lease_id="$(
-                    printf '%s\n' "$*" |
-                      sed -n 's/.* --lease-id \([^ ]*\) --output none.*/\1/p'
-                  )"
-                  test -f "$scenario_root/recovery-lease-id" || return 1
-                  test "$requested_lease_id" = "$(cat "$scenario_root/recovery-lease-id")" || return 1
-                  if test "$action" = "renew"; then
-                    test "$scenario" != "renew_failure" || return 1
-                  else
-                    test "$scenario" != "release_failure" || return 1
-                    rm -f "$scenario_root/recovery-lease-id"
-                  fi
-                  ;;
-                *) return 1 ;;
-              esac
-              ;;
-            *) return 1 ;;
-          esac
-          ;;
-        "storage blob")
-          test "$3" = "list" || return 1
-          test "$scenario" != "container_nonempty" || printf '%s\n' "unexpected"
-          ;;
-        *) return 1 ;;
-      esac
-    }
+    PP_MOCK_GROUP="stale-lease"
+    PP_MOCK_SCENARIO="$scenario"
+    PP_MOCK_LOG="$log"
+    # This flow names its lease failures without the operation_lease_ prefix
+    # the release, rollback, deploy and infrastructure flows use.
+    PP_MOCK_LEASE_SCENARIO_PREFIX=""
+    PP_MOCK_OPERATION_BINDING_SHA256="$(
+      guide_operation_binding_sha256 "$STATE_KEY"
+    )"
+    export PP_MOCK_GROUP PP_MOCK_SCENARIO PP_MOCK_LOG \
+      PP_MOCK_LEASE_SCENARIO_PREFIX PP_MOCK_OPERATION_BINDING_SHA256
+    prepare_mock_state "$TMP_DIR/stale-lease-$scenario.mockstate"
 
-    eval "$STALE_LEASE_RECOVERY_BLOCK"
-    printf '%s\n' completed >> "$log"
+    run_block_script "$STALE_LEASE_RECOVERY_SCRIPT"
   ) >"$output" 2>&1
 }
 
@@ -4722,6 +2776,99 @@ test_stale_lease_recovery() {
     fail "stale operation lease guidance omitted uncatchable-kill behavior"
 }
 
+# Returns 0 when every ```sh block in the given guide reaches its tools through
+# PATH, 1 when one of them names a tool by absolute path. The harness only
+# proves a documented command because that command resolves to a shim in
+# tests/mocks; an absolute path such as /usr/bin/az would run the real tool and
+# silently take the step out of the harness's reach. Takes the guide file so
+# the check itself can be meta-tested against a sabotaged copy.
+# Deliberately reports status instead of calling fail.
+#
+# Exactly what this guarantees: inside a ```sh block, none of the 13 tools the
+# harness mocks -- az, terraform, tofu, git, curl, dig, jq, openssl, mktemp,
+# chmod, sleep, cat, rm -- is named by an absolute path. That is the one bypass
+# that would fail silently, because the real tool would answer and the block
+# would still look like it passed.
+#
+# What it deliberately does not catch: `command -p az`, which resolves against
+# the implementation-defined default PATH, and a `PATH=/usr/bin az ...`
+# assignment prefix. Both are left to CI rather than pattern-matched here: no
+# real az, terraform or dig exists on the runner, so either construct fails
+# loudly on the very first documented command instead of quietly passing. A
+# regex for them would also have to model shell quoting to avoid false
+# positives on prose and on the guide's own PATH-setting examples.
+readme_sh_blocks_reach_tools_through_path() {
+  awk '
+    $0 == "```sh" { in_block = 1; next }
+    in_block && $0 == "```" { in_block = 0; next }
+    in_block && $0 ~ "(^|[^[:alnum:]_./-])/([[:alnum:]_.-]+/)*(az|terraform|tofu|git|curl|dig|jq|openssl|mktemp|chmod|sleep|cat|rm)([^[:alnum:]_./-]|$)" {
+      absolute_tool_path = 1
+    }
+    END { exit absolute_tool_path ? 1 : 0 }
+  ' "$1"
+}
+
+# Returns 0 when every scenario name the merged release/rollback Container App
+# mocks treat as flow-specific is used by exactly one of the two flows, 1
+# otherwise. Takes the harness file and the az shim so the check itself can be
+# meta-tested against a sabotaged copy.
+# Deliberately reports status instead of calling fail.
+#
+# az_containerapp_show and az_containerapp_revision in tests/mocks/az serve both
+# flows from one implementation. The two scenario lists overlap heavily, and
+# that is fine: a shared name drives an assertion both flows make. What would
+# not be fine is a name that means one thing to release and another to rollback,
+# because the merged case arm would fire in a flow it was never written for. The
+# names below are the ones those arms special-case, so each must stay exclusive
+# to its flow -- and must still be referenced in the merged functions, so the
+# pin cannot rot into a check of names nothing reads any more.
+merged_containerapp_scenarios_are_flow_exclusive() {
+  awk -v harness="$1" -v az_mock="$2" \
+    -v release_only_names="deployed_image_mismatch deployed_image_show_failure prelease_locked_image_mismatch preupdate_image_mismatch rollback_image_show_failure rollback_image_invalid rollback_digest_invalid" \
+    -v rollback_only_names="stale_current_image postupdate_image_mismatch" '
+    BEGIN {
+      release_only_count = split(release_only_names, release_only, " ")
+      rollback_only_count = split(rollback_only_names, rollback_only, " ")
+    }
+    FILENAME == harness {
+      if ($0 == "test_app_release() {") { flow = "release"; next }
+      if ($0 == "test_app_rollback() {") { flow = "rollback"; next }
+      if (flow != "" && $0 == "  for scenario in \\") { collecting = 1; next }
+      if (collecting) {
+        gsub(/\\/, " ")
+        gsub(/;/, " ")
+        for (i = 1; i <= NF; i++) {
+          if ($i == "do") { collecting = 0; flow = ""; break }
+          used[flow " " $i] = 1
+        }
+      }
+      next
+    }
+    FILENAME == az_mock {
+      if ($0 == "az_containerapp_show() {") { in_merged = 1 }
+      else if (in_merged && $0 ~ /^# -----/) { in_merged = 0 }
+      if (in_merged) { merged = merged " " $0 }
+      next
+    }
+    END {
+      broken = 0
+      # Both lists must have been found at all, or every check below is vacuous.
+      if (!used["release success"] || !used["rollback success"]) { broken = 1 }
+      for (i = 1; i <= release_only_count; i++) {
+        name = release_only[i]
+        if (!used["release " name] || used["rollback " name]) { broken = 1 }
+        if (merged !~ ("[^[:alnum:]_]" name "[^[:alnum:]_]")) { broken = 1 }
+      }
+      for (i = 1; i <= rollback_only_count; i++) {
+        name = rollback_only[i]
+        if (!used["rollback " name] || used["release " name]) { broken = 1 }
+        if (merged !~ ("[^[:alnum:]_]" name "[^[:alnum:]_]")) { broken = 1 }
+      }
+      exit broken ? 1 : 0
+    }
+  ' "$1" "$2"
+}
+
 # Returns 0 when the Container App create-time image gate delegates to
 # local.server_image_is_managed_digest, 1 otherwise. Takes the directory holding
 # container_app.tf so the check itself can be meta-tested against a sabotaged copy.
@@ -4800,6 +2947,63 @@ test_public_safe_runbook_static() {
     "$README"; then
     fail "Azure guide retains a verbose hostname or certificate error that exposes private values"
   fi
+  readme_sh_blocks_reach_tools_through_path "$README" ||
+    fail "an Azure guide shell block names a tool by absolute path and would bypass the harness shims"
+
+  # Meta-test the check above: a sabotaged copy that calls a tool by absolute
+  # path must be rejected, otherwise the restricted-PATH rule is decorative.
+  restricted_path_probe_dir="$TMP_DIR/restricted-path-probe"
+  rm -rf "$restricted_path_probe_dir"
+  mkdir -p "$restricted_path_probe_dir" ||
+    fail "could not create the restricted-PATH probe directory"
+  awk '
+    { print }
+    !sabotaged && $0 == "```sh" {
+      sabotaged = 1
+      print "/usr/bin/az account show --query id --output tsv"
+    }
+    END { if (!sabotaged) exit 1 }
+  ' "$README" > "$restricted_path_probe_dir/README.md" ||
+    fail "could not build the absolute-tool-path probe"
+  if cmp -s "$README" "$restricted_path_probe_dir/README.md"; then
+    fail "the absolute-tool-path probe did not sabotage anything"
+  fi
+  if readme_sh_blocks_reach_tools_through_path "$restricted_path_probe_dir/README.md"; then
+    fail "the restricted-PATH check accepts an absolute tool path in a guide shell block"
+  fi
+  rm -rf "$restricted_path_probe_dir"
+
+  guide_harness_file="$ROOT/infra/azure/tests/guide_commands_test.sh"
+  merged_containerapp_scenarios_are_flow_exclusive \
+    "$guide_harness_file" "$GUIDE_MOCK_DIR/az" ||
+    fail "a scenario name the merged release/rollback Container App mocks special-case is used by both flows"
+
+  # Meta-test the check above: a copy that adds a release-only scenario name to
+  # the rollback list must be rejected, otherwise the merged-dispatch invariant
+  # is decorative.
+  flow_exclusive_probe_dir="$TMP_DIR/flow-exclusive-probe"
+  rm -rf "$flow_exclusive_probe_dir"
+  mkdir -p "$flow_exclusive_probe_dir" ||
+    fail "could not create the merged-dispatch probe directory"
+  awk '
+    { print }
+    !sabotaged && in_rollback && $0 == "  for scenario in \\" {
+      sabotaged = 1
+      print "    rollback_digest_invalid \\"
+    }
+    $0 == "test_app_rollback() {" { in_rollback = 1 }
+    END { if (!sabotaged) exit 1 }
+  ' "$guide_harness_file" > "$flow_exclusive_probe_dir/guide_commands_test.sh" ||
+    fail "could not build the merged-dispatch probe"
+  if cmp -s "$guide_harness_file" "$flow_exclusive_probe_dir/guide_commands_test.sh"; then
+    fail "the merged-dispatch probe did not sabotage anything"
+  fi
+  if merged_containerapp_scenarios_are_flow_exclusive \
+    "$flow_exclusive_probe_dir/guide_commands_test.sh" "$GUIDE_MOCK_DIR/az"; then
+    fail "the merged-dispatch check accepts a release-only scenario name in the rollback list"
+  fi
+  rm -rf "$flow_exclusive_probe_dir"
+
   # Lifecycle prevent_destroy is a meta-argument and is invisible to plan-time
   # terraform test assertions. Statically require the expected blocks.
   #
@@ -4938,36 +3142,20 @@ test_public_safe_runbook_static() {
 test_custom_domain_context() {
   context_output="$TMP_DIR/custom-domain-context.out"
   if ! (
-    expected_subscription="00000000-0000-0000-0000-000000000000"
+    PP_MOCK_GROUP="custom-domain"
+    PP_MOCK_SCENARIO=""
+    PP_MOCK_LOG=""
+    PP_MOCK_EXPECTED_SUBSCRIPTION="00000000-0000-0000-0000-000000000000"
+    # This block derives SUBSCRIPTION_ID from Terraform instead of taking it as
+    # an input, so the subscription guard needs the expected value separately.
+    PP_MOCK_SUBSCRIPTION_ID="$PP_MOCK_EXPECTED_SUBSCRIPTION"
+    export PP_MOCK_GROUP PP_MOCK_SCENARIO PP_MOCK_LOG \
+      PP_MOCK_EXPECTED_SUBSCRIPTION PP_MOCK_SUBSCRIPTION_ID
+    prepare_mock_state "$TMP_DIR/custom-domain-context.mockstate"
 
-    terraform() {
-      case "$*" in
-        "output -raw subscription_id") printf '%s\n' "$expected_subscription" ;;
-        "output -raw resource_group_name") printf '%s\n' "rg-test" ;;
-        "output -raw container_app_name") printf '%s\n' "app-test" ;;
-        "output -raw container_app_environment_name") printf '%s\n' "env-test" ;;
-        "output -raw container_app_fqdn") printf '%s\n' "APP.AZURECONTAINERAPPS.IO." ;;
-        "output -raw container_app_environment_static_ip") printf '%s\n' "203.0.113.10" ;;
-        "output -raw custom_domain_verification_id") printf '%s\n' "verification-id" ;;
-        "output -raw public_base_url") printf '%s\n' "https://DRAFTS.SELF-HOSTER.DEV" ;;
-        "output -raw custom_domain_hostname") printf '%s\n' "DRAFTS.SELF-HOSTER.DEV." ;;
-        *) return 1 ;;
-      esac
-    }
-
-    az() {
-      normalize_az_args "$@" || return 1
-      case "$1 $2" in
-        "account set") return 0 ;;
-        "account show") printf '%s\n' "$expected_subscription" ;;
-        *) return 1 ;;
-      esac
-    }
-
-    eval "$CUSTOM_DOMAIN_CONTEXT_BLOCK"
-    test "$CUSTOM_DOMAIN" = "drafts.self-hoster.dev"
-    test "$CONTAINER_APP_FQDN" = "app.azurecontainerapps.io"
-    test "$NORMALIZED_PUBLIC_BASE_URL" = "https://drafts.self-hoster.dev"
+    # The trailer inside the block script checks the normalized hostnames the
+    # block is contracted to leave behind; see the custom-domain-context-trailer block part.
+    run_block_script "$CUSTOM_DOMAIN_CONTEXT_SCRIPT"
   ) >"$context_output" 2>&1; then
     fail "Terraform hostnames were not normalized before DNS and certificate checks"
   fi
@@ -4982,48 +3170,18 @@ run_custom_domain_output_guard_block() {
   : > "$log"
 
   (
-    expected_subscription="00000000-0000-0000-0000-000000000000"
+    PP_MOCK_GROUP="custom-domain-guard"
+    PP_MOCK_SCENARIO="$scenario"
+    PP_MOCK_LOG="$log"
+    PP_MOCK_EXPECTED_SUBSCRIPTION="00000000-0000-0000-0000-000000000000"
+    # This block derives SUBSCRIPTION_ID from Terraform instead of taking it as
+    # an input, so the subscription guard needs the expected value separately.
+    PP_MOCK_SUBSCRIPTION_ID="$PP_MOCK_EXPECTED_SUBSCRIPTION"
+    export PP_MOCK_GROUP PP_MOCK_SCENARIO PP_MOCK_LOG \
+      PP_MOCK_EXPECTED_SUBSCRIPTION PP_MOCK_SUBSCRIPTION_ID
+    prepare_mock_state "$TMP_DIR/custom-domain-output-$scenario.mockstate"
 
-    terraform() {
-      output_name="$3"
-      test "$scenario" != "failure_$output_name" || return 1
-      test "$scenario" != "empty_$output_name" || return 0
-      case "$output_name" in
-        subscription_id) printf '%s\n' "$expected_subscription" ;;
-        resource_group_name) printf '%s\n' "rg-test" ;;
-        container_app_name) printf '%s\n' "app-test" ;;
-        container_app_environment_name) printf '%s\n' "env-test" ;;
-        container_app_fqdn) printf '%s\n' "app.azurecontainerapps.io" ;;
-        container_app_environment_static_ip) printf '%s\n' "203.0.113.10" ;;
-        custom_domain_verification_id) printf '%s\n' "verification-id" ;;
-        public_base_url) printf '%s\n' "https://drafts.self-hoster.dev" ;;
-        custom_domain_hostname) printf '%s\n' "drafts.self-hoster.dev" ;;
-        *) return 1 ;;
-      esac
-    }
-
-    az() {
-      normalize_az_args "$@" || return 1
-      printf 'az %s\n' "$NORMALIZED_AZ_ARGS" >> "$log"
-      case "$1 $2" in
-        "account set")
-          test "$scenario" != "account_set_failure"
-          ;;
-        "account show")
-          test "$scenario" != "account_show_failure" || return 1
-          if test "$scenario" = "subscription_mismatch"; then
-            printf '%s\n' "11111111-1111-1111-1111-111111111111"
-          else
-            printf '%s\n' "$expected_subscription"
-          fi
-          ;;
-        *) return 1 ;;
-      esac
-    }
-
-    set +e
-    eval "$CUSTOM_DOMAIN_CONTEXT_BLOCK"
-    printf '%s\n' completed >> "$log"
+    run_block_script "$CUSTOM_DOMAIN_OUTPUT_GUARD_SCRIPT"
   ) >"$output" 2>&1
 }
 
@@ -5084,72 +3242,15 @@ run_ingress_verification_block() {
     SUBSCRIPTION_ID="00000000-0000-0000-0000-000000000000"
     RESOURCE_GROUP="rg-test"
     CONTAINER_APP="app-test"
+    export SUBSCRIPTION_ID RESOURCE_GROUP CONTAINER_APP
 
-    az() {
-      normalize_az_args "$@" || return 1
-      printf '%s\n' "$NORMALIZED_AZ_ARGS" >> "$log"
-      test "$scenario" != "command_failure" || return 1
-      test "$NORMALIZED_AZ_ARGS" = \
-        "containerapp ingress show --resource-group rg-test --name app-test --output json" ||
-        return 1
+    PP_MOCK_GROUP="ingress"
+    PP_MOCK_SCENARIO="$scenario"
+    PP_MOCK_LOG="$log"
+    export PP_MOCK_GROUP PP_MOCK_SCENARIO PP_MOCK_LOG
+    prepare_mock_state "$TMP_DIR/ingress-$scenario.mockstate"
 
-      external="true"
-      allow_insecure="false"
-      target_port="3000"
-      transport='"Auto"'
-      traffic='[{"latestRevision":true,"weight":100}]'
-      client_certificate_mode='"Ignore"'
-      cors_policy="null"
-      exposed_port="null"
-      ip_security_restrictions="null"
-      additional_port_mappings="null"
-      sticky_sessions="null"
-      case "$scenario" in
-        malformed_json)
-          printf '%s\n' '{not-json'
-          return 0
-          ;;
-        external_drift) external="false" ;;
-        insecure_drift) allow_insecure="true" ;;
-        target_port_drift) target_port="8080" ;;
-        transport_drift) transport='"http2"' ;;
-        missing_transport) transport="null" ;;
-        client_certificate_accept_drift) client_certificate_mode='"Accept"' ;;
-        client_certificate_require_drift) client_certificate_mode='"Require"' ;;
-        null_client_certificate) client_certificate_mode="null" ;;
-        cors_drift) cors_policy='{"allowedOrigins":["https://other.example"]}' ;;
-        exposed_port_drift) exposed_port="8443" ;;
-        additional_port_drift)
-          additional_port_mappings='[{"external":true,"targetPort":9000,"exposedPort":9000}]'
-          ;;
-        sticky_session_drift) sticky_sessions='{"affinity":"sticky"}' ;;
-        ip_restriction_drift)
-          ip_security_restrictions='[{"action":"Allow","ipAddressRange":"192.0.2.0/24","name":"unexpected"}]'
-          ;;
-        empty_traffic) traffic='[]' ;;
-        multiple_traffic)
-          traffic='[{"latestRevision":true,"weight":50},{"latestRevision":false,"weight":50}]'
-          ;;
-        empty_label_dynamic)
-          traffic='[{"label":"","latestRevision":true,"revisionName":"","weight":100}]'
-          ;;
-        pinned_revision)
-          traffic='[{"latestRevision":false,"revisionName":"app-test--old","weight":100}]'
-          ;;
-        label_drift)
-          traffic='[{"label":"canary","latestRevision":true,"weight":100}]'
-          ;;
-        weight_drift) traffic='[{"latestRevision":true,"weight":90}]' ;;
-      esac
-      printf \
-        '{"external":%s,"allowInsecure":%s,"targetPort":%s,"transport":%s,"clientCertificateMode":%s,"corsPolicy":%s,"exposedPort":%s,"additionalPortMappings":%s,"stickySessions":%s,"ipSecurityRestrictions":%s,"traffic":%s}\n' \
-        "$external" "$allow_insecure" "$target_port" "$transport" \
-        "$client_certificate_mode" "$cors_policy" "$exposed_port" \
-        "$additional_port_mappings" "$sticky_sessions" \
-        "$ip_security_restrictions" "$traffic"
-    }
-
-    eval "$INGRESS_VERIFICATION_BLOCK"
+    run_block_script "$INGRESS_VERIFICATION_SCRIPT"
   ) >/dev/null 2>&1
 }
 
@@ -5214,43 +3315,19 @@ test_hostname_mutation_guard() {
       CONTAINER_APP_ENVIRONMENT="env-test"
       CUSTOM_DOMAIN="drafts.self-hoster.dev"
       VALIDATION_METHOD="CNAME"
+      export SUBSCRIPTION_ID ACTIVE_SUBSCRIPTION_ID RESOURCE_GROUP \
+        CONTAINER_APP CONTAINER_APP_ENVIRONMENT CUSTOM_DOMAIN VALIDATION_METHOD
 
-      az() {
-        normalize_az_args "$@" || return 1
-        printf '%s\n' "$NORMALIZED_AZ_ARGS" >> "$log"
-        case "$1 $2" in
-          "account set")
-            test "$scenario" != "set_failure"
-            ;;
-          "account show")
-            if test "$scenario" = "wrong_selection"; then
-              printf '%s\n' "11111111-1111-1111-1111-111111111111"
-            else
-              printf '%s\n' "$expected_subscription"
-            fi
-            ;;
-          "containerapp hostname")
-            case "$3" in
-              add)
-                test "$scenario" != "hostname_add_failure"
-                ;;
-              bind)
-                test "$scenario" != "hostname_bind_failure" || return 1
-                test "$scenario" != "empty_certificate_id" || return 0
-                printf '%s\n' "$expected_certificate_id"
-                ;;
-              *)
-                return 1
-                ;;
-            esac
-            ;;
-          *)
-            return 1
-            ;;
-        esac
-      }
+      PP_MOCK_GROUP="hostname"
+      PP_MOCK_SCENARIO="$scenario"
+      PP_MOCK_LOG="$log"
+      PP_MOCK_EXPECTED_SUBSCRIPTION="$expected_subscription"
+      PP_MOCK_EXPECTED_CERTIFICATE_ID="$expected_certificate_id"
+      export PP_MOCK_GROUP PP_MOCK_SCENARIO PP_MOCK_LOG \
+        PP_MOCK_EXPECTED_SUBSCRIPTION PP_MOCK_EXPECTED_CERTIFICATE_ID
+      prepare_mock_state "$TMP_DIR/hostname-$scenario.mockstate"
 
-      eval "$HOSTNAME_MUTATION_BLOCK"
+      run_block_script "$HOSTNAME_MUTATION_SCRIPT"
     ) >"$output" 2>&1; then
       status=0
     else
@@ -5301,49 +3378,18 @@ run_apex_block() {
     CUSTOM_DOMAIN="drafts.self-hoster.dev"
     CONTAINER_APP_STATIC_IP="203.0.113.10"
     DOMAIN_VERIFICATION_ID="verification-id"
+    export DNS_ZONE CUSTOM_DOMAIN CONTAINER_APP_STATIC_IP DOMAIN_VERIFICATION_ID
 
-    dig() {
-      case "$1" in
-        +short)
-          case "$2" in
-            A) printf '%s\n' "$a_records" ;;
-            AAAA)
-              case "$aaaa_scenario" in
-                command_error) return 1 ;;
-                noerror_answer) printf '%s\n' '2001:db8::10' ;;
-                *) printf '%s' "" ;;
-              esac
-              ;;
-            TXT) printf '%s\n' '"verification-id"' ;;
-            *) return 1 ;;
-          esac
-          ;;
-        +noall)
-          test "$1 $2 $3 $4" = "+noall +comments +answer AAAA" || return 1
-          case "$aaaa_scenario" in
-            command_error) return 1 ;;
-            missing_status)
-              printf '%s\n' ';; ->>HEADER<<- opcode: QUERY, id: 12345'
-              return 0
-              ;;
-            noerror_empty|noerror_answer) status="NOERROR" ;;
-            servfail) status="SERVFAIL" ;;
-            refused) status="REFUSED" ;;
-            unknown_status) status="UNKNOWN" ;;
-            *) return 1 ;;
-          esac
-          printf '%s\n' ";; ->>HEADER<<- opcode: QUERY, status: $status, id: 12345"
-          if test "$aaaa_scenario" = "noerror_answer"; then
-            printf '%s\n' 'drafts.self-hoster.dev. 300 IN AAAA 2001:db8::10'
-          fi
-          ;;
-        *)
-          return 1
-          ;;
-      esac
-    }
+    PP_MOCK_GROUP="apex"
+    PP_MOCK_SCENARIO="$aaaa_scenario"
+    PP_MOCK_LOG=""
+    PP_MOCK_APEX_A_RECORDS="$a_records"
+    PP_MOCK_APEX_AAAA_SCENARIO="$aaaa_scenario"
+    export PP_MOCK_GROUP PP_MOCK_SCENARIO PP_MOCK_LOG PP_MOCK_APEX_A_RECORDS \
+      PP_MOCK_APEX_AAAA_SCENARIO
+    prepare_mock_state "$TMP_DIR/apex.mockstate"
 
-    eval "$APEX_DNS_BLOCK"
+    run_block_script "$APEX_DNS_SCRIPT"
   ) >/dev/null 2>&1
 }
 
@@ -5375,140 +3421,15 @@ run_caa_block() {
   (
     CUSTOM_DOMAIN="drafts.team.example.com"
     DNS_ZONE="example.com"
+    export CUSTOM_DOMAIN DNS_ZONE
 
-    dig() {
-      for name do :; done
-      record_type="$4"
-      test "$1 $2 $3" = "+noall +comments +answer" || return 1
-      case "$record_type" in CNAME|CAA) ;; *) return 1 ;; esac
-      printf '%s %s\n' "$record_type" "$name" >> "$log"
+    PP_MOCK_GROUP="caa"
+    PP_MOCK_SCENARIO="$scenario"
+    PP_MOCK_LOG="$log"
+    export PP_MOCK_GROUP PP_MOCK_SCENARIO PP_MOCK_LOG
+    prepare_mock_state "$TMP_DIR/caa-$scenario.mockstate"
 
-      case "$scenario:$record_type:$name" in
-        command_error:CAA:team.example.com | cname_command_error:CNAME:drafts.team.example.com)
-          return 1
-          ;;
-        servfail:CAA:team.example.com | cname_servfail:CNAME:drafts.team.example.com)
-          status="SERVFAIL"
-          ;;
-        refused:CAA:team.example.com)
-          status="REFUSED"
-          ;;
-        missing_status:CAA:team.example.com | cname_missing_status:CNAME:drafts.team.example.com)
-          printf '%s\n' ';; ->>HEADER<<- opcode: QUERY, id: 12345'
-          return 0
-          ;;
-        *)
-          status="NOERROR"
-          ;;
-      esac
-      printf '%s\n' ";; ->>HEADER<<- opcode: QUERY, status: $status, id: 12345"
-
-      case "$record_type:$scenario:$name" in
-        CNAME:cname_success:drafts.team.example.com)
-          printf '%s\n' \
-            'DRAFTS.TEAM.EXAMPLE.COM. 300 IN CNAME CAA.Target.Example.NET.'
-          ;;
-        CNAME:cname_ambiguity:drafts.team.example.com)
-          printf '%s\n' \
-            'drafts.team.example.com. 300 IN CNAME first.example.net.' \
-            'drafts.team.example.com. 300 IN CNAME second.example.net.'
-          ;;
-        CNAME:cname_loop:drafts.team.example.com)
-          printf '%s\n' \
-            'drafts.team.example.com. 300 IN CNAME Alias.Example.NET.'
-          ;;
-        CNAME:cname_loop:alias.example.net)
-          printf '%s\n' \
-            'ALIAS.EXAMPLE.NET. 300 IN CNAME DRAFTS.TEAM.EXAMPLE.COM.'
-          ;;
-        CNAME:cname_invalid_ttl:drafts.team.example.com)
-          printf '%s\n' \
-            'drafts.team.example.com. invalid IN CNAME alias.example.net.'
-          ;;
-        CNAME:cname_invalid_class:drafts.team.example.com)
-          printf '%s\n' \
-            'drafts.team.example.com. 300 CH CNAME alias.example.net.'
-          ;;
-        CNAME:cname_wrong_type:drafts.team.example.com)
-          printf '%s\n' \
-            'drafts.team.example.com. 300 IN A 192.0.2.10'
-          ;;
-        CNAME:cname_misaligned:drafts.team.example.com)
-          printf '%s\n' \
-            'drafts.team.example.com. IN CNAME alias.example.net.'
-          ;;
-        CNAME:cname_unexpected_owner:drafts.team.example.com)
-          printf '%s\n' \
-            'other.team.example.com. 300 IN CNAME alias.example.net.'
-          ;;
-        CAA:inherit_noerror:example.com)
-          printf '%s\n' 'example.com. 300 IN CAA 0 IsSuE "DiGiCeRt.CoM"'
-          ;;
-        CAA:cname_success:team.example.com)
-          printf '%s\n' 'team.example.com. 300 IN CAA 0 issue "digicert.com"'
-          ;;
-        CAA:deny_nearer:team.example.com)
-          printf '%s\n' 'team.example.com. 300 IN CAA 0 issue "letsencrypt.org"'
-          ;;
-        CAA:deny_nearer:example.com)
-          printf '%s\n' 'example.com. 300 IN CAA 0 issue "digicert.com"'
-          ;;
-        CAA:unrelated:team.example.com)
-          printf '%s\n' 'team.example.com. 300 IN CAA 0 iodef "mailto:security@example.com"'
-          ;;
-        CAA:denying:team.example.com)
-          printf '%s\n' 'team.example.com. 300 IN CAA 0 issue ";"'
-          ;;
-        CAA:constrained_digicert:team.example.com)
-          printf '%s\n' 'team.example.com. 300 IN CAA 0 issue "digicert.com; accounturi=https://example.com/account/123"'
-          ;;
-        CAA:constrained_digicert_spaced:team.example.com)
-          printf '%s\n' 'team.example.com. 300 IN CAA 0 issue "digicert.com ; accounturi=https://example.com/account/123"'
-          ;;
-        CAA:unknown_critical:team.example.com)
-          printf '%s\n' \
-            'team.example.com. 300 IN CAA 0 issue "digicert.com"' \
-            'team.example.com. 300 IN CAA 128 unknowncritical "x"'
-          ;;
-        CAA:malformed_flags:team.example.com)
-          printf '%s\n' \
-            'team.example.com. 300 IN CAA 0 issue "digicert.com"' \
-            'team.example.com. 300 IN CAA invalid issue "letsencrypt.org"'
-          ;;
-        CAA:malformed_fields:team.example.com)
-          printf '%s\n' \
-            'team.example.com. 300 IN CAA 0 issue "digicert.com"' \
-            'team.example.com. 300 IN CAA 0 issue'
-          ;;
-        CAA:malformed_value:team.example.com)
-          printf '%s\n' \
-            'team.example.com. 300 IN CAA 0 issue "digicert.com"' \
-            'team.example.com. 300 IN CAA 0 iodef mailto:security@example.com'
-          ;;
-        CAA:caa_invalid_ttl:team.example.com)
-          printf '%s\n' \
-            'team.example.com. invalid IN CAA 0 issue "digicert.com"'
-          ;;
-        CAA:caa_invalid_class:team.example.com)
-          printf '%s\n' \
-            'team.example.com. 300 CH CAA 0 issue "digicert.com"'
-          ;;
-        CAA:caa_wrong_type:team.example.com)
-          printf '%s\n' \
-            'team.example.com. 300 IN TXT "ignored"'
-          ;;
-        CAA:caa_misaligned:team.example.com)
-          printf '%s\n' \
-            'team.example.com. IN CAA 0 issue "digicert.com"'
-          ;;
-        CAA:caa_unexpected_owner:team.example.com)
-          printf '%s\n' \
-            'other.example.com. 300 IN CAA 0 issue "digicert.com"'
-          ;;
-      esac
-    }
-
-    eval "$CAA_POLICY_BLOCK"
+    run_block_script "$CAA_POLICY_SCRIPT"
   ) >/dev/null 2>&1
 }
 
@@ -5616,27 +3537,22 @@ run_certificate_block() {
     CONTAINER_APP_ENVIRONMENT="env-test"
     CUSTOM_DOMAIN="drafts.self-hoster.dev"
     MANAGED_CERTIFICATE_ID="/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg-test/providers/Microsoft.App/managedEnvironments/env-test/managedCertificates/cert-one"
+    export SUBSCRIPTION_ID RESOURCE_GROUP CONTAINER_APP \
+      CONTAINER_APP_ENVIRONMENT CUSTOM_DOMAIN MANAGED_CERTIFICATE_ID
 
-    az() {
-      normalize_az_args "$@" || return 1
-      case "$*" in
-        *"env certificate list"*)
-          case " $* " in
-            *" --managed-certificates-only --certificate $MANAGED_CERTIFICATE_ID --query [].[id,properties.subjectName,properties.provisioningState] --output tsv "*) ;;
-            *) return 1 ;;
-          esac
-          printf '%s\t%s\t%s\n' "$certificate_id" "$subject" "$provisioning_state"
-          ;;
-        *"hostname list"*)
-          printf 'Drafts.Self-Hoster.Dev.\tSniEnabled\t%s\n' "$binding_id"
-          ;;
-        *)
-          return 1
-          ;;
-      esac
-    }
+    PP_MOCK_GROUP="certificate"
+    PP_MOCK_SCENARIO=""
+    PP_MOCK_LOG=""
+    PP_MOCK_CERTIFICATE_SUBJECT="$subject"
+    PP_MOCK_CERTIFICATE_ID="$certificate_id"
+    PP_MOCK_CERTIFICATE_BINDING_ID="$binding_id"
+    PP_MOCK_CERTIFICATE_PROVISIONING_STATE="$provisioning_state"
+    export PP_MOCK_GROUP PP_MOCK_SCENARIO PP_MOCK_LOG \
+      PP_MOCK_CERTIFICATE_SUBJECT PP_MOCK_CERTIFICATE_ID \
+      PP_MOCK_CERTIFICATE_BINDING_ID PP_MOCK_CERTIFICATE_PROVISIONING_STATE
+    prepare_mock_state "$TMP_DIR/certificate-binding.mockstate"
 
-    eval "$CERTIFICATE_BINDING_BLOCK"
+    run_block_script "$CERTIFICATE_BINDING_SCRIPT"
   ) >"$output" 2>&1
   certificate_status=$?
   if grep -Eq \
@@ -5702,6 +3618,7 @@ run_deployed_smoke_block() {
       PUBLIC_BASE_URL="https://drafts.self-hoster.dev"
     fi
     CUSTOM_DOMAIN="drafts.self-hoster.dev"
+    export PUBLIC_BASE_URL CUSTOM_DOMAIN
     smoke_repo="$TMP_DIR/deployed-smoke-$scenario-repo"
     rm -rf "$smoke_repo"
     mkdir -p "$smoke_repo"
@@ -5709,7 +3626,7 @@ run_deployed_smoke_block() {
       success | canary_record_chmod_failure)
         CANARY_RECORD="$TMP_DIR/deployed-smoke-$scenario.canary"
         printf '%s\n' "existing-canary-record" > "$CANARY_RECORD"
-        command chmod 644 "$CANARY_RECORD"
+        chmod 644 "$CANARY_RECORD"
         ;;
       canary_record_directory)
         CANARY_RECORD="$TMP_DIR/deployed-smoke-$scenario.canary"
@@ -5718,7 +3635,7 @@ run_deployed_smoke_block() {
       canary_record_symlink)
         CANARY_RECORD="$TMP_DIR/deployed-smoke-$scenario.canary"
         printf '%s\n' "existing-canary-record" > "${CANARY_RECORD}.target"
-        command ln -s "${CANARY_RECORD}.target" "$CANARY_RECORD"
+        ln -s "${CANARY_RECORD}.target" "$CANARY_RECORD"
         ;;
       canary_relative_path)
         CANARY_RECORD="canary.env"
@@ -5731,13 +3648,16 @@ run_deployed_smoke_block() {
         CANARY_RECORD="$TMP_DIR/traversal-parent/../deployed-smoke-$scenario-repo/canary.env"
         ;;
       canary_symlink_parent)
-        command ln -s "$smoke_repo" "$TMP_DIR/deployed-smoke-$scenario-link"
+        ln -s "$smoke_repo" "$TMP_DIR/deployed-smoke-$scenario-link"
         CANARY_RECORD="$TMP_DIR/deployed-smoke-$scenario-link/canary.env"
         ;;
       *)
         unset CANARY_RECORD
         ;;
     esac
+    if test -n "${CANARY_RECORD:-}"; then
+      export CANARY_RECORD
+    fi
     smoke_tmp_dir="$TMP_DIR/deployed-smoke-$scenario-tmp"
     curl_argv_log="$TMP_DIR/deployed-smoke-$scenario-curl-argv.log"
     caller_trap_log="$TMP_DIR/deployed-smoke-$scenario-caller-trap.log"
@@ -5746,266 +3666,22 @@ run_deployed_smoke_block() {
     : > "$curl_argv_log"
     : > "$caller_trap_log"
 
-    mktemp() {
-      case "$*" in
-        "-d")
-          mkdir -p "$smoke_tmp_dir" || return 1
-          printf '%s\n' "$smoke_tmp_dir"
-          ;;
-        "${CANARY_RECORD:-}.tmp.XXXXXX")
-          command mktemp "$@"
-          ;;
-        *)
-          return 1
-          ;;
-      esac
-    }
-
-    chmod() {
-      if test "$scenario" = "canary_record_chmod_failure"; then
-        case "$2" in
-          "${CANARY_RECORD}.tmp."*) return 1 ;;
-        esac
-      fi
-      command chmod "$@"
-    }
-
-    trap 'printf "%s\n" caller-exit >> "$caller_trap_log"' EXIT
-    trap 'printf "%s\n" caller-hup >> "$caller_trap_log"' HUP
-    trap 'printf "%s\n" caller-int >> "$caller_trap_log"' INT
-    trap 'printf "%s\n" caller-term >> "$caller_trap_log"' TERM
-
-    git() {
-      test "$*" = "rev-parse --show-toplevel" || return 1
-      printf '%s\n' "$smoke_repo"
-    }
-    terraform() {
-      test "$*" = "output -raw bootstrap_api_token"
-      test "$scenario" != "token_failure" || return 1
-      test "$scenario" != "token_empty" || return 0
-      printf '%s\n' "test-token"
-    }
-
-    curl() {
-      output_file=""
-      header_file=""
-      authorization_header_file=""
-      url=""
-      url_count=0
-      request=""
-      content_type=""
-      data=""
-      body_source_count=0
-      for curl_arg do
-        printf '%s\n' "$curl_arg" >> "$curl_argv_log"
-        case "$curl_arg" in
-          *test-token*) return 1 ;;
-        esac
-      done
-      while test "$#" -gt 0; do
-        case "$1" in
-          --output)
-            test -z "$output_file" || return 1
-            shift
-            test "$#" -gt 0 || return 1
-            output_file="$1"
-            ;;
-          --dump-header)
-            test -z "$header_file" || return 1
-            shift
-            test "$#" -gt 0 || return 1
-            header_file="$1"
-            ;;
-          --request)
-            test -z "$request" || return 1
-            shift
-            test "$#" -gt 0 || return 1
-            request="$1"
-            ;;
-          --header)
-            shift
-            test "$#" -gt 0 || return 1
-            case "$1" in
-              @*)
-                test -z "$authorization_header_file" || return 1
-                authorization_header_file="${1#@}"
-                ;;
-              "Authorization: "*) return 1 ;;
-              "Content-Type: "*)
-                test -z "$content_type" || return 1
-                content_type="$1"
-                ;;
-              *) return 1 ;;
-            esac
-            ;;
-          --data)
-            body_source_count=$((body_source_count + 1))
-            test "$body_source_count" -eq 1 || return 1
-            shift
-            test "$#" -gt 0 || return 1
-            data="$1"
-            ;;
-          --write-out)
-            shift
-            test "$#" -gt 0 || return 1
-            test "$1" = '%{http_code}' || return 1
-            ;;
-          --proto)
-            shift
-            test "$#" -gt 0 || return 1
-            test "$1" = '=https' || return 1
-            ;;
-          --silent|--show-error|--tlsv1.2)
-            ;;
-          http://*|https://*)
-            test "$url_count" -eq 0 || return 1
-            url="$1"
-            url_count=1
-            ;;
-          *)
-            return 1
-            ;;
-        esac
-        shift
-      done
-      test "$url_count" -eq 1 || return 1
-      case "$url" in
-        */api/uploads)
-          test "$body_source_count" -eq 1 || return 1
-          ;;
-        *)
-          test "$body_source_count" -eq 0 || return 1
-          ;;
-      esac
-
-      case "$url" in
-        http://drafts.self-hoster.dev/healthz)
-          test "$scenario" != "http_command_failure" || return 1
-          test -n "$header_file" || return 1
-          case "$scenario" in
-            redirect_missing)
-              printf 'HTTP/1.1 301 Moved Permanently\r\n\r\n' > "$header_file"
-              ;;
-            redirect_ambiguous)
-              printf \
-                'HTTP/1.1 301 Moved Permanently\r\nLocation: https://drafts.self-hoster.dev/healthz\r\nLocation: https://other.example/healthz\r\n\r\n' \
-                > "$header_file"
-              ;;
-            redirect_mismatch)
-              printf \
-                'HTTP/1.1 301 Moved Permanently\r\nLocation: https://drafts.self-hoster.dev/other\r\n\r\n' \
-                > "$header_file"
-              ;;
-            *)
-              printf \
-                'HTTP/1.1 301 Moved Permanently\r\nLocation: https://drafts.self-hoster.dev/healthz\r\n\r\n' \
-                > "$header_file"
-              ;;
-          esac
-          case "$scenario" in
-            http_status_mismatch) printf '%s' "200" ;;
-            redirect_status_302) printf '%s' "302" ;;
-            redirect_status_307) printf '%s' "307" ;;
-            redirect_status_308) printf '%s' "308" ;;
-            *) printf '%s' "301" ;;
-          esac
-          ;;
-        https://drafts.self-hoster.dev/healthz)
-          test "$scenario" != "health_command_failure" || return 1
-          test -n "$output_file" || return 1
-          if test "$scenario" = "health_body_mismatch"; then
-            printf '%s' '{"ok":false}' > "$output_file"
-          else
-            printf '%s' '{"ok":true}' > "$output_file"
-          fi
-          if test "$scenario" = "health_status_mismatch"; then
-            printf '%s' "503"
-          else
-            printf '%s' "200"
-          fi
-          ;;
-        https://drafts.self-hoster.dev/api/uploads | https://Drafts.Self-Hoster.Dev/api/uploads)
-          test "$scenario" != "upload_command_failure" || return 1
-          test -n "$output_file" || return 1
-          test "$request" = "POST" || return 1
-          test -f "$authorization_header_file" || return 1
-          test "$(LC_ALL=C ls -l "$authorization_header_file" | cut -c1-10)" = \
-            "-rw-------" || return 1
-          test "$(cat "$authorization_header_file")" = \
-            "Authorization: Bearer test-token" || return 1
-          test "$content_type" = "Content-Type: application/json" || return 1
-          printf '%s\n' "$data" |
-            jq -e --arg marker "$SMOKE_MARKER" '
-              type == "object" and
-              (keys == ["filename", "html"]) and
-              .filename == "azure-smoke.html" and
-              .html == (
-                "<!doctype html><html><head><title>Azure smoke test</title></head><body><h1>" +
-                $marker +
-                "</h1></body></html>"
-              )
-            ' >/dev/null ||
-            return 1
-          case "$scenario" in
-            upload_invalid_json)
-              printf '%s' '{not-json' > "$output_file"
-              ;;
-            upload_ok_mismatch)
-              printf '%s' \
-                '{"ok":false,"draftId":"abc123def456","publicUrl":"https://drafts.self-hoster.dev/d/abc123def456"}' \
-                > "$output_file"
-              ;;
-            upload_draft_id_mismatch)
-              printf '%s' \
-                '{"ok":true,"draftId":"bad/id","publicUrl":"https://drafts.self-hoster.dev/d/bad/id"}' \
-                > "$output_file"
-              ;;
-            upload_url_mismatch)
-              printf '%s' \
-                '{"ok":true,"draftId":"abc123def456","publicUrl":"https://other.example/d/abc123def456"}' \
-                > "$output_file"
-              ;;
-            *)
-              printf \
-                '{"ok":true,"draftId":"abc123def456","publicUrl":"%s/d/abc123def456"}' \
-                "$PUBLIC_BASE_URL" > "$output_file"
-              ;;
-          esac
-          if test "$scenario" = "upload_status_mismatch"; then
-            printf '%s' "200"
-          else
-            printf '%s' "201"
-          fi
-          ;;
-        https://drafts.self-hoster.dev/d/abc123def456 | https://Drafts.Self-Hoster.Dev/d/abc123def456)
-          test "$scenario" != "fetch_command_failure" || return 1
-          test -n "$output_file" || return 1
-          case "$scenario" in
-            fetch_body_mismatch)
-              printf '%s' '<html><body>wrong draft</body></html>' > "$output_file"
-              ;;
-            fetch_stale_marker)
-              printf '%s' \
-                '<html><iframe srcdoc="&lt;h1&gt;PATCHPAGE_AZURE_SMOKE_STALE&lt;/h1&gt;"></iframe></html>' \
-                > "$output_file"
-              ;;
-            *)
-              printf \
-                '<html><iframe srcdoc="&lt;h1&gt;%s&lt;/h1&gt;"></iframe></html>' \
-                "$SMOKE_MARKER" > "$output_file"
-              ;;
-          esac
-          if test "$scenario" = "fetch_status_mismatch"; then
-            printf '%s' "404"
-          else
-            printf '%s' "200"
-          fi
-          ;;
-        *)
-          return 1
-          ;;
-      esac
-    }
+    PP_MOCK_GROUP="smoke"
+    PP_MOCK_SCENARIO="$scenario"
+    PP_MOCK_LOG=""
+    PP_MOCK_REPO_ROOT="$smoke_repo"
+    PP_MOCK_SMOKE_TMP_DIR="$smoke_tmp_dir"
+    PP_MOCK_CURL_ARGV_LOG="$curl_argv_log"
+    PP_MOCK_CALLER_TRAP_LOG="$caller_trap_log"
+    PP_MOCK_CALLER_TRAP_SNAPSHOT="$caller_trap_snapshot"
+    # The block derives its unique marker from the temporary directory the
+    # mocked mktemp -d hands out, which the curl shim cannot read from the
+    # block's environment.
+    PP_MOCK_SMOKE_MARKER="PATCHPAGE_AZURE_SMOKE_${smoke_tmp_dir##*/}"
+    export PP_MOCK_GROUP PP_MOCK_SCENARIO PP_MOCK_LOG PP_MOCK_REPO_ROOT \
+      PP_MOCK_SMOKE_TMP_DIR PP_MOCK_CURL_ARGV_LOG PP_MOCK_CALLER_TRAP_LOG \
+      PP_MOCK_CALLER_TRAP_SNAPSHOT PP_MOCK_SMOKE_MARKER
+    prepare_mock_state "$TMP_DIR/deployed-smoke-$scenario.mockstate"
 
     smoke_block="$DEPLOYED_SMOKE_BLOCK"
     case "$scenario" in
@@ -6041,12 +3717,10 @@ run_deployed_smoke_block() {
         fi
         ;;
     esac
-    eval "$smoke_block"
-    smoke_status=$?
-    trap > "$caller_trap_snapshot"
-    mkdir -p "$smoke_tmp_dir"
-    : > "$smoke_tmp_dir/reused-after-smoke"
-    exit "$smoke_status"
+    write_block_part "deployed-smoke-$scenario-block" "$smoke_block"
+    build_block_script "deployed-smoke-$scenario" \
+      smoke-mocks "deployed-smoke-$scenario-block" smoke-trailer
+    run_block_script "$BLOCK_SCRIPT"
   ) >"$output" 2>&1
 }
 

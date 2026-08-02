@@ -1,0 +1,185 @@
+#!/bin/sh
+# dig shim for the guide harness. Reached only through PATH.
+
+set -u
+
+. "${PP_MOCK_DIR:-${0%/*}}/mocklib.sh"
+
+dig_apex() {
+  case "$1" in
+    +short)
+      case "$2" in
+        A) printf '%s\n' "$PP_MOCK_APEX_A_RECORDS" ;;
+        AAAA)
+          case "$PP_MOCK_APEX_AAAA_SCENARIO" in
+            command_error) return 1 ;;
+            noerror_answer) printf '%s\n' '2001:db8::10' ;;
+            *) printf '%s' "" ;;
+          esac
+          ;;
+        TXT) printf '%s\n' '"verification-id"' ;;
+        *) return 1 ;;
+      esac
+      ;;
+    +noall)
+      test "$1 $2 $3 $4" = "+noall +comments +answer AAAA" || return 1
+      case "$PP_MOCK_APEX_AAAA_SCENARIO" in
+        command_error) return 1 ;;
+        missing_status)
+          printf '%s\n' ';; ->>HEADER<<- opcode: QUERY, id: 12345'
+          return 0
+          ;;
+        noerror_empty | noerror_answer) status="NOERROR" ;;
+        servfail) status="SERVFAIL" ;;
+        refused) status="REFUSED" ;;
+        unknown_status) status="UNKNOWN" ;;
+        *) return 1 ;;
+      esac
+      printf '%s\n' ";; ->>HEADER<<- opcode: QUERY, status: $status, id: 12345"
+      if test "$PP_MOCK_APEX_AAAA_SCENARIO" = "noerror_answer"; then
+        printf '%s\n' 'drafts.self-hoster.dev. 300 IN AAAA 2001:db8::10'
+      fi
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+dig_caa() {
+  name="$(mock_last_arg "$@")"
+  record_type="$4"
+  test "$1 $2 $3" = "+noall +comments +answer" || return 1
+  case "$record_type" in CNAME | CAA) ;; *) return 1 ;; esac
+  mock_log "$record_type $name"
+
+  case "$scenario:$record_type:$name" in
+    command_error:CAA:team.example.com | cname_command_error:CNAME:drafts.team.example.com)
+      return 1
+      ;;
+    servfail:CAA:team.example.com | cname_servfail:CNAME:drafts.team.example.com)
+      status="SERVFAIL"
+      ;;
+    refused:CAA:team.example.com)
+      status="REFUSED"
+      ;;
+    missing_status:CAA:team.example.com | cname_missing_status:CNAME:drafts.team.example.com)
+      printf '%s\n' ';; ->>HEADER<<- opcode: QUERY, id: 12345'
+      return 0
+      ;;
+    *)
+      status="NOERROR"
+      ;;
+  esac
+  printf '%s\n' ";; ->>HEADER<<- opcode: QUERY, status: $status, id: 12345"
+
+  case "$record_type:$scenario:$name" in
+    CNAME:cname_success:drafts.team.example.com)
+      printf '%s\n' \
+        'DRAFTS.TEAM.EXAMPLE.COM. 300 IN CNAME CAA.Target.Example.NET.'
+      ;;
+    CNAME:cname_ambiguity:drafts.team.example.com)
+      printf '%s\n' \
+        'drafts.team.example.com. 300 IN CNAME first.example.net.' \
+        'drafts.team.example.com. 300 IN CNAME second.example.net.'
+      ;;
+    CNAME:cname_loop:drafts.team.example.com)
+      printf '%s\n' \
+        'drafts.team.example.com. 300 IN CNAME Alias.Example.NET.'
+      ;;
+    CNAME:cname_loop:alias.example.net)
+      printf '%s\n' \
+        'ALIAS.EXAMPLE.NET. 300 IN CNAME DRAFTS.TEAM.EXAMPLE.COM.'
+      ;;
+    CNAME:cname_invalid_ttl:drafts.team.example.com)
+      printf '%s\n' \
+        'drafts.team.example.com. invalid IN CNAME alias.example.net.'
+      ;;
+    CNAME:cname_invalid_class:drafts.team.example.com)
+      printf '%s\n' \
+        'drafts.team.example.com. 300 CH CNAME alias.example.net.'
+      ;;
+    CNAME:cname_wrong_type:drafts.team.example.com)
+      printf '%s\n' \
+        'drafts.team.example.com. 300 IN A 192.0.2.10'
+      ;;
+    CNAME:cname_misaligned:drafts.team.example.com)
+      printf '%s\n' \
+        'drafts.team.example.com. IN CNAME alias.example.net.'
+      ;;
+    CNAME:cname_unexpected_owner:drafts.team.example.com)
+      printf '%s\n' \
+        'other.team.example.com. 300 IN CNAME alias.example.net.'
+      ;;
+    CAA:inherit_noerror:example.com)
+      printf '%s\n' 'example.com. 300 IN CAA 0 IsSuE "DiGiCeRt.CoM"'
+      ;;
+    CAA:cname_success:team.example.com)
+      printf '%s\n' 'team.example.com. 300 IN CAA 0 issue "digicert.com"'
+      ;;
+    CAA:deny_nearer:team.example.com)
+      printf '%s\n' 'team.example.com. 300 IN CAA 0 issue "letsencrypt.org"'
+      ;;
+    CAA:deny_nearer:example.com)
+      printf '%s\n' 'example.com. 300 IN CAA 0 issue "digicert.com"'
+      ;;
+    CAA:unrelated:team.example.com)
+      printf '%s\n' 'team.example.com. 300 IN CAA 0 iodef "mailto:security@example.com"'
+      ;;
+    CAA:denying:team.example.com)
+      printf '%s\n' 'team.example.com. 300 IN CAA 0 issue ";"'
+      ;;
+    CAA:constrained_digicert:team.example.com)
+      printf '%s\n' 'team.example.com. 300 IN CAA 0 issue "digicert.com; accounturi=https://example.com/account/123"'
+      ;;
+    CAA:constrained_digicert_spaced:team.example.com)
+      printf '%s\n' 'team.example.com. 300 IN CAA 0 issue "digicert.com ; accounturi=https://example.com/account/123"'
+      ;;
+    CAA:unknown_critical:team.example.com)
+      printf '%s\n' \
+        'team.example.com. 300 IN CAA 0 issue "digicert.com"' \
+        'team.example.com. 300 IN CAA 128 unknowncritical "x"'
+      ;;
+    CAA:malformed_flags:team.example.com)
+      printf '%s\n' \
+        'team.example.com. 300 IN CAA 0 issue "digicert.com"' \
+        'team.example.com. 300 IN CAA invalid issue "letsencrypt.org"'
+      ;;
+    CAA:malformed_fields:team.example.com)
+      printf '%s\n' \
+        'team.example.com. 300 IN CAA 0 issue "digicert.com"' \
+        'team.example.com. 300 IN CAA 0 issue'
+      ;;
+    CAA:malformed_value:team.example.com)
+      printf '%s\n' \
+        'team.example.com. 300 IN CAA 0 issue "digicert.com"' \
+        'team.example.com. 300 IN CAA 0 iodef mailto:security@example.com'
+      ;;
+    CAA:caa_invalid_ttl:team.example.com)
+      printf '%s\n' \
+        'team.example.com. invalid IN CAA 0 issue "digicert.com"'
+      ;;
+    CAA:caa_invalid_class:team.example.com)
+      printf '%s\n' \
+        'team.example.com. 300 CH CAA 0 issue "digicert.com"'
+      ;;
+    CAA:caa_wrong_type:team.example.com)
+      printf '%s\n' \
+        'team.example.com. 300 IN TXT "ignored"'
+      ;;
+    CAA:caa_misaligned:team.example.com)
+      printf '%s\n' \
+        'team.example.com. IN CAA 0 issue "digicert.com"'
+      ;;
+    CAA:caa_unexpected_owner:team.example.com)
+      printf '%s\n' \
+        'other.example.com. 300 IN CAA 0 issue "digicert.com"'
+      ;;
+  esac
+}
+
+case "$PP_MOCK_GROUP" in
+  apex) dig_apex "$@" ;;
+  caa) dig_caa "$@" ;;
+  *) exit 1 ;;
+esac

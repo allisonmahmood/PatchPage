@@ -1,0 +1,1554 @@
+#!/bin/sh
+# Azure CLI shim for the guide harness. Reached only through PATH.
+
+set -u
+
+. "${PP_MOCK_DIR:-${0%/*}}/mocklib.sh"
+
+# ---------------------------------------------------------------------------
+# state bootstrap
+# ---------------------------------------------------------------------------
+
+az_state() {
+  mock_state_account_id="$(mock_expected_state_storage_account_id)"
+  mock_operation_container_id="$(mock_expected_operation_container_id)"
+  mock_contributor_role="$(mock_role_definition_id "$MOCK_BLOB_CONTRIBUTOR_ROLE_ID")"
+  case "$1 $2" in
+    "account set")
+      test "$scenario" != "subscription_set_failure"
+      ;;
+    "account show")
+      test "$scenario" != "subscription_show_failure" || return 1
+      if test "$scenario" = "subscription_mismatch"; then
+        printf '%s\n' "11111111-1111-1111-1111-111111111111"
+      else
+        printf '%s\n' "$SUBSCRIPTION_ID"
+      fi
+      ;;
+    "group exists")
+      test "$scenario" != "state_resource_group_check_failure" || return 1
+      case "$scenario" in
+        state_resource_group_exists | resume_* | state_key_history_*)
+          printf '%s\n' "true"
+          ;;
+        *) printf '%s\n' "false" ;;
+      esac
+      ;;
+    "resource list")
+      case "$scenario" in
+        resume_foreign_resource)
+          printf '%s\n' \
+            "/subscriptions/$SUBSCRIPTION_ID/resourceGroups/rg-patchpage-tfstate/providers/Microsoft.KeyVault/vaults/foreign"
+          ;;
+        resume_account_success | resume_exact_operation_role | resume_retention_preserved | \
+          resume_foreign_container | \
+          resume_deleted_container | resume_stronger_state_lock | \
+          state_key_history_*)
+          printf '%s\n' \
+            "/subscriptions/$SUBSCRIPTION_ID/resourceGroups/rg-patchpage-tfstate/providers/Microsoft.Storage/storageAccounts/patchpagestate"
+          ;;
+        foreign_resource_after_group_create)
+          printf '%s\n' \
+            "/subscriptions/$SUBSCRIPTION_ID/resourceGroups/rg-patchpage-tfstate/providers/Microsoft.KeyVault/vaults/foreign"
+          ;;
+        foreign_resource_before_lock)
+          if mock_state_exists state-account-created; then
+            printf '%s\n' \
+              "/subscriptions/$SUBSCRIPTION_ID/resourceGroups/rg-patchpage-tfstate/providers/Microsoft.Storage/storageAccounts/patchpagestate"
+            printf '%s\n' \
+              "/subscriptions/$SUBSCRIPTION_ID/resourceGroups/rg-patchpage-tfstate/providers/Microsoft.KeyVault/vaults/foreign"
+          fi
+          ;;
+        *)
+          if mock_state_exists state-account-created; then
+            printf '%s\n' \
+              "/subscriptions/$SUBSCRIPTION_ID/resourceGroups/rg-patchpage-tfstate/providers/Microsoft.Storage/storageAccounts/patchpagestate"
+          fi
+          ;;
+      esac
+      ;;
+    "group create")
+      test "$scenario" != "group_create_failure"
+      ;;
+    "group show")
+      if test "$scenario" = "group_verification_failure"; then
+        return 1
+      elif test "$scenario" = "group_location_drift"; then
+        printf '%s\n' "eastus"
+      else
+        printf '%s\n' "centralus"
+      fi
+      ;;
+    "storage account")
+      case "$3" in
+        check-name)
+          test "$scenario" != "state_account_check_failure" || return 1
+          case "$scenario" in
+            resume_account_success | resume_exact_operation_role | resume_retention_preserved | \
+              resume_foreign_container | resume_deleted_container | resume_stronger_state_lock | \
+              state_key_history_*)
+              printf '%s\n' "false"
+              ;;
+            *) printf '%s\n' "true" ;;
+          esac
+          ;;
+        create)
+          test "$scenario" != "account_create_failure" || return 1
+          mock_state_mark state-account-created
+          ;;
+        show)
+          test "$scenario" != "account_verification_failure" || return 1
+          account_location="centralus"
+          account_kind="StorageV2"
+          account_sku="Standard_GRS"
+          account_tls="TLS1_2"
+          account_https="true"
+          account_public_blob="false"
+          case "$scenario" in
+            account_location_drift) account_location="eastus" ;;
+            account_kind_drift) account_kind="BlobStorage" ;;
+            account_sku_drift) account_sku="Standard_LRS" ;;
+            account_tls_drift) account_tls="TLS1_0" ;;
+            account_https_drift) account_https="false" ;;
+            account_public_blob_drift) account_public_blob="true" ;;
+          esac
+          printf \
+            '{"id":"%s","location":"%s","kind":"%s","sku":{"name":"%s"},"minimumTlsVersion":"%s","enableHttpsTrafficOnly":%s,"allowBlobPublicAccess":%s}\n' \
+            "$mock_state_account_id" \
+            "$account_location" \
+            "$account_kind" \
+            "$account_sku" \
+            "$account_tls" \
+            "$account_https" \
+            "$account_public_blob"
+          ;;
+        blob-service-properties)
+          case "$4" in
+            update)
+              test "$scenario" != "blob_protection_update_failure"
+              ;;
+            show)
+              test "$scenario" != "blob_protection_show_failure" || return 1
+              versioning="true"
+              blob_delete_enabled="true"
+              blob_delete_days="30"
+              permanent_delete="false"
+              container_delete_enabled="true"
+              container_delete_days="30"
+              case "$scenario" in
+                versioning_drift) versioning="false" ;;
+                blob_delete_disabled) blob_delete_enabled="false" ;;
+                blob_delete_too_short) blob_delete_days="29" ;;
+                permanent_delete_enabled) permanent_delete="true" ;;
+                container_delete_disabled) container_delete_enabled="false" ;;
+                container_delete_too_short) container_delete_days="29" ;;
+                resume_retention_preserved)
+                  blob_delete_days="90"
+                  container_delete_days="365"
+                  ;;
+              esac
+              mock_blob_service_properties_json \
+                "$versioning" "$blob_delete_enabled" "$permanent_delete" \
+                "$blob_delete_days" "$container_delete_enabled" "$container_delete_days"
+              ;;
+            *)
+              return 1
+              ;;
+          esac
+          ;;
+        *)
+          return 1
+          ;;
+      esac
+      ;;
+    "storage container")
+      case " $* " in
+        *" --auth-mode key "*) ;;
+        *) return 1 ;;
+      esac
+      case "$3" in
+        create)
+          test "$scenario" != "create_failure" || return 1
+          case " $* " in
+            *" --name tfstate "*) mock_state_mark state-container-created ;;
+            *" --name patchpage-operations "*) mock_state_mark operation-container-created ;;
+            *) return 1 ;;
+          esac
+          ;;
+        exists)
+          if test "$scenario" = "verification_failure"; then
+            return 1
+          elif test "$scenario" = "container_missing"; then
+            printf '%s\n' "false"
+          else
+            case " $* " in
+              *" --name tfstate "*)
+                if mock_state_exists state-container-created; then
+                  printf '%s\n' "true"
+                else
+                  printf '%s\n' "false"
+                fi
+                ;;
+              *" --name patchpage-operations "*)
+                if mock_state_exists operation-container-created; then
+                  printf '%s\n' "true"
+                else
+                  printf '%s\n' "false"
+                fi
+                ;;
+              *) return 1 ;;
+            esac
+          fi
+          ;;
+        list)
+          if test "$scenario" = "resume_foreign_container"; then
+            printf 'foreign\tfalse\n'
+          elif test "$scenario" = "resume_deleted_container"; then
+            printf 'tfstate\ttrue\n'
+          else
+            if mock_state_exists state-container-created; then
+              printf 'tfstate\t\n'
+            fi
+            if mock_state_exists operation-container-created; then
+              printf 'patchpage-operations\t\n'
+            fi
+          fi
+          ;;
+        metadata)
+          test "$4" = "show" || return 1
+          if test "$scenario" = "operation_container_foreign_metadata"; then
+            printf '%s\n' '{"foreign":"value"}'
+          else
+            printf '%s\n' '{}'
+          fi
+          ;;
+        *)
+          return 1
+          ;;
+      esac
+      ;;
+    "storage blob")
+      test "$3" = "list" || return 1
+      case " $* " in
+        *" --container-name patchpage-operations "*)
+          test "$scenario" != "operation_container_nonempty" ||
+            printf '%s\n' "unexpected"
+          ;;
+      esac
+      test "$scenario" != "state_key_history_check_failure" || return 1
+      if test "$scenario" = "state_key_history_exists" &&
+        case " $* " in *" --container-name tfstate "*) true ;; *) false ;; esac; then
+        printf '%s\n' "patchpage-prod.tfstate"
+      fi
+      ;;
+    "role assignment")
+      case "$3" in
+        list)
+          case " $* " in
+            *" --assignee-object-id $OPERATION_PRINCIPAL_ID --role $mock_contributor_role --scope $mock_operation_container_id --include-inherited --include-groups --fill-principal-name false --fill-role-definition-name false --output json "*)
+              role_assignment_scope="operation"
+              ;;
+            *" --assignee-object-id $OPERATION_PRINCIPAL_ID --scope $mock_state_account_id/blobServices/default/containers/tfstate --include-inherited --include-groups --fill-principal-name false --fill-role-definition-name false --output json "*)
+              role_assignment_scope="state"
+              ;;
+            *) return 1 ;;
+          esac
+          if test "$scenario" = "operation_role_inherited_broad"; then
+            mock_role_assignment_json "$OPERATION_PRINCIPAL_ID" \
+              "$mock_contributor_role" "$mock_state_account_id"
+          elif test "$role_assignment_scope" = "state"; then
+            if test "$scenario" = "operation_role_state_reader"; then
+              mock_role_assignment_json "$OPERATION_PRINCIPAL_ID" \
+                "$(mock_role_definition_id "$MOCK_BLOB_READER_ROLE_ID")" \
+                "$mock_state_account_id/blobServices/default/containers/tfstate"
+            else
+              printf '%s\n' '[]'
+            fi
+          elif mock_state_exists role-assignment-created; then
+            mock_role_assignment_json "$OPERATION_PRINCIPAL_ID" \
+              "$mock_contributor_role" "$mock_operation_container_id"
+          else
+            printf '%s\n' '[]'
+          fi
+          ;;
+        create)
+          test "$scenario" != "operation_role_create_failure" || return 1
+          case " $* " in
+            *" --role $mock_contributor_role --scope $mock_operation_container_id "*) ;;
+            *) return 1 ;;
+          esac
+          mock_state_mark role-assignment-created
+          ;;
+        *) return 1 ;;
+      esac
+      ;;
+    "lock list")
+      if test "$scenario" = "resume_stronger_state_lock"; then
+        printf 'ReadOnly\t%s/providers/Microsoft.Authorization/locks/protect-patchpage-tfstate\n' \
+          "$mock_state_account_id"
+      fi
+      ;;
+    "lock create")
+      test "$scenario" != "state_lock_create_failure"
+      ;;
+    "lock show")
+      test "$scenario" != "state_lock_show_failure" || return 1
+      if test "$scenario" = "state_lock_level_drift"; then
+        printf 'ReadOnly\t%s/providers/Microsoft.Authorization/locks/protect-patchpage-tfstate\n' \
+          "$mock_state_account_id"
+      else
+        printf 'CanNotDelete\t%s/providers/Microsoft.Authorization/locks/protect-patchpage-tfstate\n' \
+          "$mock_state_account_id"
+      fi
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+# ---------------------------------------------------------------------------
+# initial deployment
+# ---------------------------------------------------------------------------
+
+az_deploy() {
+  case "$1 $2" in
+    "account set")
+      test "$scenario" != "subscription_set_failure"
+      ;;
+    "account show")
+      test "$scenario" != "subscription_show_failure" || return 1
+      if test "$scenario" = "subscription_mismatch"; then
+        printf '%s\n' "22222222-2222-2222-2222-222222222222"
+      else
+        printf '%s\n' "$SUBSCRIPTION_ID"
+      fi
+      ;;
+    "group exists")
+      test "$scenario" != "workload_group_exists_check_failure" || return 1
+      case "$scenario" in
+        workload_group_exists | resume_*) printf '%s\n' "true" ;;
+        *) printf '%s\n' "false" ;;
+      esac
+      ;;
+    "group show")
+      printf '%s\n' \
+        "/subscriptions/$SUBSCRIPTION_ID/resourceGroups/rg-patchpage-workload"
+      ;;
+    "resource list")
+      case "$scenario" in
+        resume_target_complete_success)
+          printf '%s\n' \
+            "/subscriptions/$SUBSCRIPTION_ID/resourceGroups/rg-patchpage-workload/providers/Microsoft.ContainerRegistry/registries/acrpatchpageabc123"
+          ;;
+        resume_live_foreign_resource)
+          printf '%s\n' \
+            "/subscriptions/$SUBSCRIPTION_ID/resourceGroups/rg-patchpage-workload/providers/Microsoft.Storage/storageAccounts/foreign"
+          ;;
+      esac
+      ;;
+    "storage container-rm")
+      test "$3" = "show" || return 1
+      if test "$scenario" = "operation_container_id_mismatch"; then
+        printf '%s\n' "/subscriptions/$SUBSCRIPTION_ID/resourceGroups/rg-patchpage-tfstate/providers/Microsoft.Storage/storageAccounts/foreign/blobServices/default/containers/patchpage-operations"
+      else
+        mock_expected_operation_container_id
+      fi
+      ;;
+    "storage container")
+      case "$3 $4" in
+        "exists --account-name") printf '%s\n' "true" ;;
+        "metadata show")
+          operation_metadata_count="$(mock_state_count operation-metadata-count)"
+          if test "$scenario" = "operation_binding_foreign" ||
+            { test "$scenario" = "operation_binding_concurrent_metadata" &&
+              test "$operation_metadata_count" -gt 1; }; then
+            printf '%s\n' '{"foreign":"binding"}'
+          elif mock_state_exists operation-binding; then
+            printf '{"patchpage_workload_binding_sha256":"%s"}\n' \
+              "$(mock_state_read operation-binding)"
+          else
+            printf '%s\n' '{}'
+          fi
+          ;;
+        "metadata update")
+          test "$scenario" != "operation_binding_update_failure" || return 1
+          az_store_operation_binding "$@"
+          ;;
+        "lease acquire" | "lease renew" | "lease release")
+          mock_operation_lease "$@"
+          ;;
+        *) return 1 ;;
+      esac
+      ;;
+    "storage blob")
+      test "$3" = "list" || return 1
+      test "$scenario" != "operation_container_nonempty" ||
+        printf '%s\n' "foreign"
+      ;;
+    "lock list")
+      protected_resource="$(mock_flag_value --resource "$@")" || return 1
+      test -n "$protected_resource" || return 1
+      protected_name="protect-patchpage-drafts"
+      case "$protected_resource" in
+        *"/Microsoft.DBforPostgreSQL/flexibleServers/"*) protected_name="protect-patchpage-postgres" ;;
+      esac
+      if test "$scenario" = "foreign_workload_lock"; then
+        printf 'foreign-lock\tReadOnly\t%s/providers/Microsoft.Authorization/locks/foreign-lock\n' "$protected_resource"
+      elif mock_state_exists "$protected_name"; then
+        printf '%s\tCanNotDelete\t%s/providers/Microsoft.Authorization/locks/%s\n' \
+          "$protected_name" "$protected_resource" "$protected_name"
+      fi
+      ;;
+    "lock create")
+      test "$scenario" != "workload_lock_create_failure" || return 1
+      case " $MOCK_AZ_ARGS " in
+        *" --name protect-patchpage-drafts "*) mock_state_mark protect-patchpage-drafts ;;
+        *" --name protect-patchpage-postgres "*) mock_state_mark protect-patchpage-postgres ;;
+        *) return 1 ;;
+      esac
+      ;;
+    "lock show")
+      test "$scenario" != "workload_lock_show_failure" || return 1
+      lock_id="$(mock_flag_value --ids "$@")" || return 1
+      test -n "$lock_id" || return 1
+      if test "$scenario" = "workload_lock_level_drift"; then
+        printf 'ReadOnly\t%s\n' "$lock_id"
+      else
+        printf 'CanNotDelete\t%s\n' "$lock_id"
+      fi
+      ;;
+    "acr show")
+      if test "$scenario" = "resume_acr_id_mismatch"; then
+        printf '%s\n' \
+          "/subscriptions/$SUBSCRIPTION_ID/resourceGroups/rg-patchpage-workload/providers/Microsoft.ContainerRegistry/registries/other"
+      else
+        printf '%s\n' \
+          "/subscriptions/$SUBSCRIPTION_ID/resourceGroups/rg-patchpage-workload/providers/Microsoft.ContainerRegistry/registries/acrpatchpageabc123"
+      fi
+      ;;
+    "acr build")
+      test "$scenario" != "build_failure"
+      ;;
+    "acr manifest")
+      test "$3" = "show-metadata" || return 1
+      test "$scenario" != "digest_resolution_failure" || return 1
+      if test "$scenario" = "invalid_digest"; then
+        printf '%s\n' "sha256:not-a-digest"
+      else
+        printf '%s\n' "$IMAGE_DIGEST_VALUE"
+      fi
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+# Shared by the deploy and infrastructure flows: a metadata update may only
+# seal the binding while holding the exact lease the mock handed out.
+az_store_operation_binding() {
+  operation_metadata_lease_id=
+  operation_binding=
+  while test "$#" -gt 0; do
+    case "$1" in
+      --lease-id)
+        operation_metadata_lease_id="$2"
+        shift 2
+        ;;
+      patchpage_workload_binding_sha256=*)
+        operation_binding="${1#*=}"
+        shift
+        ;;
+      *) shift ;;
+    esac
+  done
+  test -f "$state_dir/operation-lease-id" || return 1
+  test "$operation_metadata_lease_id" = "$(cat "$state_dir/operation-lease-id")" || return 1
+  test -n "$operation_binding" || return 1
+  mock_state_write operation-binding "$operation_binding"
+}
+
+# ---------------------------------------------------------------------------
+# app release and rollback (one implementation, two parameterizations)
+# ---------------------------------------------------------------------------
+
+az_release_rollback() {
+  case "$1 $2" in
+    "account set")
+      test "$scenario" != "subscription_set_failure"
+      ;;
+    "account show")
+      test "$scenario" != "subscription_show_failure" || return 1
+      if test "$scenario" = "subscription_mismatch"; then
+        printf '%s\n' "22222222-2222-2222-2222-222222222222"
+      else
+        printf '%s\n' "$SUBSCRIPTION_ID"
+      fi
+      ;;
+    "lock show")
+      test "$scenario" != "workload_lock_show_failure" || return 1
+      lock_id="$(mock_flag_value --ids "$@")" || return 1
+      test -n "$lock_id" || return 1
+      case "$scenario" in
+        workload_lock_level_drift | lock_drift) printf 'ReadOnly\t%s\n' "$lock_id" ;;
+        *) printf 'CanNotDelete\t%s\n' "$lock_id" ;;
+      esac
+      ;;
+    "storage account")
+      return 1
+      ;;
+    "storage container-rm")
+      test "$3" = "show" || return 1
+      if test "$scenario" = "operation_container_id_mismatch"; then
+        printf '%s\n' "/subscriptions/$SUBSCRIPTION_ID/resourceGroups/rg-patchpage-tfstate/providers/Microsoft.Storage/storageAccounts/foreign/blobServices/default/containers/patchpage-operations"
+      else
+        mock_expected_operation_container_id
+      fi
+      ;;
+    "storage container")
+      case "$3" in
+        exists)
+          if test "$scenario" = "operation_container_missing"; then
+            printf '%s\n' "false"
+          else
+            printf '%s\n' "true"
+          fi
+          ;;
+        metadata)
+          test "$4" = "show" || return 1
+          if test "$scenario" = "operation_binding_mismatch"; then
+            printf '%s\n' '{"patchpage_workload_binding_sha256":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"}'
+          elif test "$scenario" = "operation_binding_foreign_metadata"; then
+            printf '%s\n' '{"foreign":"value"}'
+          else
+            printf '{"patchpage_workload_binding_sha256":"%s"}\n' \
+              "$EXPECTED_OPERATION_BINDING_SHA256"
+          fi
+          ;;
+        lease) mock_operation_lease "$@" ;;
+        *) return 1 ;;
+      esac
+      ;;
+    "storage blob")
+      test "$3" = "list" || return 1
+      test "$scenario" != "operation_container_nonempty" ||
+        printf '%s\n' "unexpected"
+      ;;
+    "acr show")
+      case " $* " in
+        *" --query id "*)
+          if test "$scenario" = "wrong_acr_id"; then
+            printf '%s\n' "/subscriptions/$SUBSCRIPTION_ID/resourceGroups/$RESOURCE_GROUP/providers/Microsoft.ContainerRegistry/registries/otherregistry"
+          else
+            mock_expected_acr_id
+          fi
+          ;;
+        *" --query loginServer "*)
+          if test "$scenario" = "wrong_live_login_server"; then
+            printf '%s\n' "otherregistry.azurecr.io"
+          else
+            printf '%s\n' "acrpatchpageabc123.azurecr.io"
+          fi
+          ;;
+        *) return 1 ;;
+      esac
+      ;;
+    "containerapp show")
+      case " $* " in
+        *" --ids "*" --output json "*) az_containerapp_show ;;
+        *) return 1 ;;
+      esac
+      ;;
+    "containerapp revision")
+      az_containerapp_revision "$@"
+      ;;
+    "containerapp update")
+      test "$scenario" != "containerapp_update_failure" || return 1
+      test "$scenario" != "update_failure" || return 1
+      mock_state_mark "$PP_MOCK_APP_UPDATED_FLAG"
+      case "$scenario" in
+        update_empty_revision) ;;
+        update_same_revision) printf '%s\n' "$OLD_REVISION_NAME" ;;
+        *) printf '%s\n' "$NEW_REVISION_NAME" ;;
+      esac
+      ;;
+    "acr build")
+      test "$scenario" != "build_failure"
+      ;;
+    "acr manifest")
+      case "$PP_MOCK_GROUP" in
+        release) az_release_manifest "$@" ;;
+        *)
+          if test "$scenario" = "manifest_mismatch"; then
+            printf '%s\n' "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+          else
+            printf '%s\n' "$ROLLBACK_DIGEST_VALUE"
+          fi
+          ;;
+      esac
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+az_release_manifest() {
+  test "$3" = "show-metadata" || return 1
+  case " $* " in
+    *" patchpage-server@$ROLLBACK_DIGEST_VALUE "*)
+      test "$scenario" != "rollback_manifest_failure" || return 1
+      if test "$scenario" = "rollback_manifest_mismatch"; then
+        printf '%s\n' "$RELEASE_DIGEST_VALUE"
+      else
+        printf '%s\n' "$ROLLBACK_DIGEST_VALUE"
+      fi
+      ;;
+    *" patchpage-server:$FULL_SHA-"*)
+      test "$scenario" != "release_manifest_failure" || return 1
+      if test "$scenario" = "release_digest_invalid"; then
+        printf '%s\n' "sha256:invalid"
+      else
+        printf '%s\n' "$RELEASE_DIGEST_VALUE"
+      fi
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+# The release and rollback flows share the next two functions. That merge is
+# only sound under one invariant: no scenario name may mean different things to
+# the two flows. The two lists are not disjoint -- 58 of the release flow's 84
+# names also appear in the rollback flow's 66 -- but every shared name drives an
+# assertion both flows make, so one implementation is the right answer for it.
+# The names the case arms below special-case are the ones that must never appear
+# in the other flow's list: adding one there would silently fire an arm written
+# for a different flow.
+#
+# test_public_safe_runbook_static enforces this mechanically, through
+# merged_containerapp_scenarios_are_flow_exclusive in the harness: it reads both
+# scenario lists and this file, and requires each flow-specific name below to be
+# used by exactly one flow and to still be referenced here.
+az_containerapp_show() {
+  app_show_count="$(mock_state_count "$PP_MOCK_APP_SHOW_COUNT_FILE")"
+  app_id="$(mock_expected_container_app_id)"
+  app_fqdn="$CONTAINER_APP_FQDN"
+  app_public_base_url="$PUBLIC_BASE_URL"
+  app_public_hostname="$(
+    printf '%s' "${PUBLIC_BASE_URL#https://}" |
+      tr '[:upper:]' '[:lower:]'
+  )"
+  app_custom_domains="[{\"name\":\"$app_public_hostname\",\"bindingType\":\"SniEnabled\",\"certificateId\":\"managed-cert-id\"}]"
+  app_env='[{"name":"PATCHPAGE_PUBLIC_BASE_URL","value":"PLACEHOLDER"}]'
+  app_image="$PP_MOCK_APP_CURRENT_IMAGE"
+  app_latest_revision="$OLD_REVISION_NAME"
+  app_ready_revision="$OLD_REVISION_NAME"
+  if mock_state_exists "$PP_MOCK_APP_UPDATED_FLAG"; then
+    app_image="$PP_MOCK_APP_UPDATED_IMAGE"
+    app_latest_revision="$NEW_REVISION_NAME"
+    app_ready_revision="$NEW_REVISION_NAME"
+    updated_app_show_count="$(mock_state_count updated-app-show-count)"
+    if test "$scenario" = "final_pinned_drift" &&
+      test "$updated_app_show_count" -ge 3; then
+      app_latest_revision="$LATER_REVISION_NAME"
+      app_ready_revision="$LATER_REVISION_NAME"
+    fi
+  else
+    case "$scenario" in
+      preexisting_pending_revision)
+        app_latest_revision="patchpage-app--pending"
+        ;;
+      preexisting_failed_revision)
+        app_latest_revision="patchpage-app--failed"
+        ;;
+      stale_current_image)
+        if test "$app_show_count" -ge 2; then
+          app_image="$PP_MOCK_APP_UPDATED_IMAGE"
+        fi
+        ;;
+    esac
+  fi
+  case "$scenario" in
+    container_app_id_mismatch) app_id="${app_id%/*}/foreign" ;;
+    fqdn_mismatch) app_fqdn="foreign.example.invalid" ;;
+    public_env_mismatch) app_public_base_url="https://foreign.example.invalid" ;;
+    public_env_missing) app_env='[]' ;;
+    public_env_duplicate) app_env='[{"name":"PATCHPAGE_PUBLIC_BASE_URL","value":"PLACEHOLDER"},{"name":"PATCHPAGE_PUBLIC_BASE_URL","value":"PLACEHOLDER"}]' ;;
+    custom_domain_missing) app_custom_domains='[]' ;;
+    custom_domain_duplicate) app_custom_domains="[{\"name\":\"$app_public_hostname\",\"bindingType\":\"SniEnabled\",\"certificateId\":\"managed-cert-id\"},{\"name\":\"$app_public_hostname\",\"bindingType\":\"SniEnabled\",\"certificateId\":\"managed-cert-id\"}]" ;;
+    custom_domain_mismatch) app_custom_domains='[{"name":"foreign.example.invalid","bindingType":"SniEnabled","certificateId":"managed-cert-id"}]' ;;
+    custom_domain_binding_invalid) app_custom_domains="[{\"name\":\"$app_public_hostname\",\"bindingType\":\"Disabled\",\"certificateId\":\"managed-cert-id\"}]" ;;
+    custom_domain_certificate_missing) app_custom_domains="[{\"name\":\"$app_public_hostname\",\"bindingType\":\"SniEnabled\"}]" ;;
+    rollback_image_show_failure) app_image="" ;;
+    rollback_image_invalid) app_image="$LOGIN_SERVER/patchpage-server:mutable" ;;
+    rollback_digest_invalid) app_image="$LOGIN_SERVER/patchpage-server@sha256:invalid" ;;
+    prelease_locked_image_mismatch)
+      if test "$app_show_count" -ge 2; then
+        app_image="$PP_MOCK_APP_UPDATED_IMAGE"
+      fi
+      ;;
+    preupdate_image_mismatch)
+      if test "$app_show_count" -ge 4; then
+        app_image="$PP_MOCK_APP_UPDATED_IMAGE"
+      fi
+      ;;
+  esac
+  app_env="$(printf '%s\n' "$app_env" | sed "s|PLACEHOLDER|$app_public_base_url|g")"
+  mock_containerapp_json "$app_id" "$app_latest_revision" "$app_ready_revision" \
+    "$app_fqdn" "$app_custom_domains" "$app_image" "$app_env"
+}
+
+az_containerapp_revision() {
+  revision_action="$3"
+  revision_name="$(mock_flag_value --revision "$@")" || revision_name=
+  case "$revision_action" in
+    show)
+      revision_image="$PP_MOCK_APP_CURRENT_IMAGE"
+      revision_active=true
+      revision_provisioning="Provisioned"
+      revision_health="Healthy"
+      revision_running="Running"
+      revision_weight=100
+      case "$revision_name" in
+        "$NEW_REVISION_NAME")
+          revision_image="$PP_MOCK_APP_UPDATED_IMAGE"
+          new_revision_show_count="$(mock_state_count new-revision-show-count)"
+          if test "$new_revision_show_count" -eq 1 ||
+            test "$scenario" = "never_ready_revision" ||
+            test "$scenario" = "deployed_image_show_failure"; then
+            revision_active=false
+            revision_provisioning="Provisioning"
+            revision_health="Unknown"
+            revision_running="Processing"
+            revision_weight=0
+          fi
+          case "$scenario" in
+            wrong_revision_image | deployed_image_mismatch | postupdate_image_mismatch)
+              revision_image="$PP_MOCK_APP_CURRENT_IMAGE"
+              ;;
+            final_image_show_failure)
+              test "$new_revision_show_count" -lt 3 || return 1
+              ;;
+            final_image_mismatch)
+              if test "$new_revision_show_count" -ge 3; then
+                revision_image="$PP_MOCK_APP_CURRENT_IMAGE"
+              fi
+              ;;
+          esac
+          ;;
+        patchpage-app--pending)
+          revision_active=false
+          revision_provisioning="Provisioning"
+          revision_health="Unknown"
+          revision_running="Processing"
+          revision_weight=0
+          ;;
+        patchpage-app--failed)
+          revision_active=false
+          revision_provisioning="Failed"
+          revision_health="Unhealthy"
+          revision_running="Stopped"
+          revision_weight=0
+          ;;
+        "$OLD_REVISION_NAME") ;;
+        *) return 1 ;;
+      esac
+      if test "$scenario" = "scale_to_zero_revision"; then
+        revision_health="None"
+        revision_running="ScaleToZero"
+      fi
+      mock_revision_json "$revision_name" "$revision_active" "$revision_provisioning" \
+        "$revision_health" "$revision_running" "$revision_weight" "$revision_image"
+      ;;
+    list)
+      if mock_state_exists "$PP_MOCK_APP_UPDATED_FLAG"; then
+        if test "$scenario" = "multiple_active_revisions"; then
+          mock_active_revision_list_json "$OLD_REVISION_NAME" "$NEW_REVISION_NAME"
+        else
+          mock_active_revision_list_json "$NEW_REVISION_NAME"
+        fi
+      else
+        mock_active_revision_list_json "$OLD_REVISION_NAME"
+      fi
+      ;;
+    *) return 1 ;;
+  esac
+}
+
+# ---------------------------------------------------------------------------
+# infrastructure change (including safety adoption)
+# ---------------------------------------------------------------------------
+
+az_infrastructure() {
+  mock_state_account_id="$(mock_expected_state_storage_account_id)"
+  mock_operation_container_id="$(mock_expected_operation_container_id)"
+  mock_contributor_role="$(mock_role_definition_id "$MOCK_BLOB_CONTRIBUTOR_ROLE_ID")"
+  case "$1 $2" in
+    "account set")
+      test "$scenario" != "subscription_set_failure"
+      ;;
+    "account show")
+      test "$scenario" != "subscription_show_failure" || return 1
+      if test "$scenario" = "subscription_mismatch"; then
+        printf '%s\n' "33333333-3333-3333-3333-333333333333"
+      else
+        printf '%s\n' "$SUBSCRIPTION_ID"
+      fi
+      ;;
+    "storage blob")
+      case "$3" in
+        exists)
+          case " $* " in
+            *" --account-name $STATE_STORAGE_ACCOUNT --container-name $STATE_CONTAINER --name $STATE_KEY --auth-mode key --query exists --output tsv "*) ;;
+            *) return 1 ;;
+          esac
+          test "$scenario" != "state_blob_check_failure" || return 1
+          if test "$scenario" = "missing_state_blob"; then
+            printf '%s\n' "false"
+          else
+            printf '%s\n' "true"
+          fi
+          ;;
+        list)
+          case " $* " in
+            *" --account-name $STATE_STORAGE_ACCOUNT --container-name patchpage-operations --auth-mode key --include d v --num-results * --query [].name --output tsv "*)
+              test "$scenario" != "operation_container_nonempty" ||
+                printf '%s\n' "unexpected"
+              ;;
+            *) return 1 ;;
+          esac
+          ;;
+        *) return 1 ;;
+      esac
+      ;;
+    "storage account")
+      if test "$3" = "show"; then
+        if test "$scenario" = "state_account_identity_mismatch"; then
+          printf '%s\n' "/subscriptions/$SUBSCRIPTION_ID/resourceGroups/rg-patchpage-tfstate/providers/Microsoft.Storage/storageAccounts/otherstate"
+        else
+          mock_expected_state_storage_account_id
+        fi
+      else
+        case "$3 $4" in
+          "blob-service-properties update")
+            test "$scenario" != "adoption_retention_update_failure"
+            ;;
+          "blob-service-properties show")
+            test "$scenario" != "retention_show_failure" || return 1
+            versioning="true"
+            blob_delete_enabled="true"
+            blob_delete_days="30"
+            permanent_delete="false"
+            container_delete_enabled="true"
+            container_delete_days="30"
+            case " $* " in
+              *" --account-name patchpagedrafts "*)
+                if test "$scenario" = "workload_retention_too_low"; then
+                  blob_delete_days="90"
+                  container_delete_days="365"
+                fi
+                ;;
+              *)
+                case "$scenario" in
+                  versioning_missing) versioning="false" ;;
+                  blob_retention_missing) blob_delete_enabled="false" ;;
+                  state_permanent_delete_enabled) permanent_delete="true" ;;
+                  blob_retention_too_short) blob_delete_days="29" ;;
+                  container_retention_missing) container_delete_enabled="false" ;;
+                  container_retention_too_short) container_delete_days="29" ;;
+                  adoption_preserves_state_retention)
+                    blob_delete_days="90"
+                    container_delete_days="365"
+                    ;;
+                esac
+                ;;
+            esac
+            mock_blob_service_properties_json \
+              "$versioning" "$blob_delete_enabled" "$permanent_delete" \
+              "$blob_delete_days" "$container_delete_enabled" "$container_delete_days"
+            ;;
+          *)
+            return 1
+            ;;
+        esac
+      fi
+      ;;
+    "storage container-rm")
+      test "$3" = "show" || return 1
+      if test "$scenario" = "operation_container_id_mismatch"; then
+        printf '%s/blobServices/default/containers/foreign\n' "$mock_state_account_id"
+      else
+        printf '%s\n' "$mock_operation_container_id"
+      fi
+      ;;
+    "storage container")
+      case "$3" in
+        create)
+          case " $* " in
+            *" --name patchpage-operations --account-name $STATE_STORAGE_ACCOUNT --public-access off --auth-mode key --fail-on-exist --metadata patchpage_workload_binding_sha256=$EXPECTED_OPERATION_BINDING_SHA256 "*) ;;
+            *) return 1 ;;
+          esac
+          test "$scenario" != "adoption_operation_container_create_failure" || return 1
+          mock_state_mark operation-container-created
+          mock_state_write operation-binding "$EXPECTED_OPERATION_BINDING_SHA256"
+          ;;
+        exists)
+          case " $* " in
+            *" --name $STATE_CONTAINER --account-name $STATE_STORAGE_ACCOUNT --auth-mode key --query exists --output tsv "*)
+              printf '%s\n' "true"
+              ;;
+            *" --name patchpage-operations --account-name $STATE_STORAGE_ACCOUNT --auth-mode key --query exists --output tsv "*)
+              az_infrastructure_operation_container_exists
+              ;;
+            *" --account-name $STATE_STORAGE_ACCOUNT --name patchpage-operations --auth-mode key --query exists --output tsv "*)
+              az_infrastructure_operation_container_exists
+              ;;
+            *) return 1 ;;
+          esac
+          ;;
+        metadata)
+          case "$4" in
+            show)
+              operation_metadata_count="$(mock_state_count operation-metadata-count)"
+              if test "$scenario" = "adoption_foreign_binding" ||
+                { test "$scenario" = "adoption_binding_concurrent_metadata" &&
+                  test "$operation_metadata_count" -gt 1; }; then
+                printf '%s\n' '{"foreign":"binding"}'
+              elif mock_state_exists operation-binding; then
+                printf '{"patchpage_workload_binding_sha256":"%s"}\n' \
+                  "$(mock_state_read operation-binding)"
+              elif test "$scenario" = "adoption_existing_unbound_success" ||
+                test "$scenario" = "adoption_binding_update_failure" ||
+                test "$scenario" = "adoption_binding_concurrent_metadata"; then
+                printf '%s\n' '{}'
+              else
+                printf '{"patchpage_workload_binding_sha256":"%s"}\n' \
+                  "$EXPECTED_OPERATION_BINDING_SHA256"
+              fi
+              ;;
+            update)
+              test "$scenario" != "adoption_binding_update_failure" || return 1
+              az_store_operation_binding "$@"
+              ;;
+            *) return 1 ;;
+          esac
+          ;;
+        list)
+          case " $* " in
+            *" --account-name $STATE_STORAGE_ACCOUNT --auth-mode key --include-deleted true --num-results * --query [].[name,deleted] --output tsv "*) ;;
+            *) return 1 ;;
+          esac
+          case "$scenario" in
+            adoption_foreign_container)
+              printf 'tfstate\tfalse\nforeign\tfalse\n'
+              ;;
+            adoption_recoverable_container)
+              printf 'tfstate\tfalse\npatchpage-operations\ttrue\n'
+              ;;
+            adoption_duplicate_container)
+              printf 'tfstate\tfalse\ntfstate\tfalse\n'
+              ;;
+            adoption_container_inventory_inconsistent)
+              printf 'tfstate\tfalse\npatchpage-operations\tfalse\n'
+              ;;
+            *)
+              printf 'tfstate\tfalse\n'
+              if mock_state_exists operation-container-created; then
+                printf 'patchpage-operations\tfalse\n'
+              fi
+              ;;
+          esac
+          ;;
+        lease) mock_operation_lease "$@" ;;
+        *) return 1 ;;
+      esac
+      ;;
+    "role assignment")
+      az_infrastructure_role "$@"
+      ;;
+    "lock list")
+      lock_resource="$(mock_flag_value --resource "$@")" || lock_resource=""
+      case "$lock_resource" in
+        "$mock_state_account_id")
+          lock_name="protect-patchpage-tfstate"
+          stronger_scenario="adoption_state_stronger_lock"
+          ;;
+        "$EXPECTED_STORAGE_ACCOUNT_ID")
+          lock_name="protect-patchpage-drafts"
+          stronger_scenario="adoption_workload_stronger_lock"
+          ;;
+        "$EXPECTED_POSTGRES_SERVER_ID")
+          lock_name="protect-patchpage-postgres"
+          stronger_scenario="adoption_postgres_foreign_lock"
+          ;;
+        *) return 1 ;;
+      esac
+      if test "$scenario" = "$stronger_scenario"; then
+        printf '%s\tReadOnly\t%s/providers/Microsoft.Authorization/locks/%s\n' \
+          "$lock_name" "$lock_resource" "$lock_name"
+      elif test "${ADOPT_SAFETY_GUARDS:-false}" != "true"; then
+        printf '%s\tCanNotDelete\t%s/providers/Microsoft.Authorization/locks/%s\n' \
+          "$lock_name" "$lock_resource" "$lock_name"
+      fi
+      ;;
+    "lock create")
+      case " $* " in
+        *" --name protect-patchpage-tfstate "*)
+          test "$scenario" != "adoption_state_lock_create_failure"
+          ;;
+        *" --name protect-patchpage-drafts "*)
+          test "$scenario" != "adoption_workload_lock_create_failure"
+          ;;
+        *" --name protect-patchpage-postgres "*)
+          test "$scenario" != "adoption_postgres_lock_create_failure"
+          ;;
+        *)
+          return 1
+          ;;
+      esac
+      ;;
+    "lock show")
+      case " $* " in
+        *" --ids $mock_state_account_id/providers/Microsoft.Authorization/locks/protect-patchpage-tfstate "*)
+          test "$scenario" != "state_lock_show_failure" || return 1
+          if test "$scenario" = "state_lock_missing"; then
+            printf 'ReadOnly\t%s/providers/Microsoft.Authorization/locks/protect-patchpage-tfstate\n' \
+              "$mock_state_account_id"
+          else
+            printf 'CanNotDelete\t%s/providers/Microsoft.Authorization/locks/protect-patchpage-tfstate\n' \
+              "$mock_state_account_id"
+          fi
+          ;;
+        *" --ids $EXPECTED_STORAGE_ACCOUNT_ID/providers/Microsoft.Authorization/locks/protect-patchpage-drafts "*)
+          test "$scenario" != "workload_lock_show_failure" || return 1
+          if test "$scenario" = "workload_lock_missing"; then
+            printf 'ReadOnly\t%s/providers/Microsoft.Authorization/locks/protect-patchpage-drafts\n' "$EXPECTED_STORAGE_ACCOUNT_ID"
+          else
+            printf 'CanNotDelete\t%s/providers/Microsoft.Authorization/locks/protect-patchpage-drafts\n' "$EXPECTED_STORAGE_ACCOUNT_ID"
+          fi
+          ;;
+        *" --ids $EXPECTED_POSTGRES_SERVER_ID/providers/Microsoft.Authorization/locks/protect-patchpage-postgres "*)
+          printf 'CanNotDelete\t%s/providers/Microsoft.Authorization/locks/protect-patchpage-postgres\n' "$EXPECTED_POSTGRES_SERVER_ID"
+          ;;
+        *)
+          return 1
+          ;;
+      esac
+      ;;
+    "resource show")
+      test "$3" = "--ids" || return 1
+      case "$4" in
+        "$EXPECTED_STORAGE_ACCOUNT_ID")
+          test "$scenario" != "storage_resource_missing"
+          ;;
+        "$EXPECTED_POSTGRES_SERVER_ID")
+          test "$scenario" != "postgres_resource_missing"
+          ;;
+        "$EXPECTED_ACR_ID")
+          test "$scenario" != "acr_resource_missing"
+          ;;
+        "$EXPECTED_CONTAINER_APP_ID")
+          test "$scenario" != "container_app_resource_missing"
+          ;;
+        *)
+          return 1
+          ;;
+      esac
+      ;;
+    "acr show")
+      printf '%s\n' "acrpatchpageabc123.azurecr.io"
+      ;;
+    "acr manifest")
+      test "$3" = "show-metadata" || return 1
+      test "$scenario" != "adoption_manifest_failure" || return 1
+      printf '%s\n' "$LEGACY_IMAGE_DIGEST"
+      ;;
+    "containerapp show")
+      case " $* " in
+        *" --ids $EXPECTED_CONTAINER_APP_ID --output json "*) ;;
+        *) return 1 ;;
+      esac
+      az_infrastructure_containerapp_show
+      ;;
+    "containerapp revision")
+      az_infrastructure_revision "$@"
+      ;;
+    "containerapp update")
+      test "$scenario" != "adoption_image_update_failure" || return 1
+      mock_state_mark legacy-image-updated
+      printf '%s\n' "$ADOPTION_REVISION_NAME"
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+az_infrastructure_operation_container_exists() {
+  if test "$scenario" = "operation_container_missing"; then
+    printf '%s\n' "false"
+  elif mock_state_exists operation-container-created; then
+    printf '%s\n' "true"
+  else
+    printf '%s\n' "false"
+  fi
+}
+
+az_infrastructure_role() {
+  case "$3" in
+    list)
+      case " $* " in
+        *" --assignee-object-id ${OPERATION_PRINCIPAL_ID:-} --role $mock_contributor_role --scope $mock_operation_container_id --include-inherited --include-groups --fill-principal-name false --fill-role-definition-name false --output json "*)
+          role_assignment_scope="operation"
+          ;;
+        *" --assignee-object-id ${OPERATION_PRINCIPAL_ID:-} --scope $mock_state_account_id/blobServices/default/containers/tfstate --include-inherited --include-groups --fill-principal-name false --fill-role-definition-name false --output json "*)
+          role_assignment_scope="state"
+          ;;
+        *) return 1 ;;
+      esac
+      if test "$scenario" = "adoption_operation_role_broad"; then
+        mock_role_assignment_json "$OPERATION_PRINCIPAL_ID" \
+          "$mock_contributor_role" "$mock_state_account_id"
+      elif test "$role_assignment_scope" = "state"; then
+        if test "$scenario" = "adoption_state_role_reader"; then
+          mock_role_assignment_json "$OPERATION_PRINCIPAL_ID" \
+            "$(mock_role_definition_id "$MOCK_BLOB_READER_ROLE_ID")" \
+            "$mock_state_account_id/blobServices/default/containers/tfstate"
+        elif test "$scenario" = "adoption_operation_role_ambiguous"; then
+          mock_role_assignment_json "$OPERATION_PRINCIPAL_ID" \
+            "$mock_contributor_role" "$mock_state_account_id"
+        else
+          printf '%s\n' '[]'
+        fi
+      else
+        case "$scenario" in
+          adoption_operation_role_wrong)
+            mock_role_assignment_json "$OPERATION_PRINCIPAL_ID" \
+              "$(mock_role_definition_id "$MOCK_BLOB_OWNER_ROLE_ID")" \
+              "$mock_operation_container_id"
+            ;;
+          adoption_operation_role_ambiguous)
+            printf '[{"principalId":"%s","roleDefinitionId":"%s","scope":"%s"},{"principalId":"%s","roleDefinitionId":"%s","scope":"%s"}]\n' \
+              "$OPERATION_PRINCIPAL_ID" "$mock_contributor_role" "$mock_operation_container_id" \
+              "$OPERATION_PRINCIPAL_ID" "$mock_contributor_role" "$mock_state_account_id"
+            ;;
+          *)
+            if mock_state_exists role-assignment-created; then
+              mock_role_assignment_json "$OPERATION_PRINCIPAL_ID" \
+                "$mock_contributor_role" "$mock_operation_container_id"
+            else
+              printf '%s\n' '[]'
+            fi
+            ;;
+        esac
+      fi
+      ;;
+    create)
+      case " $* " in
+        *" --assignee-object-id ${OPERATION_PRINCIPAL_ID:-} --assignee-principal-type ${OPERATION_PRINCIPAL_TYPE:-} --role $mock_contributor_role --scope $mock_operation_container_id --output none "*) ;;
+        *) return 1 ;;
+      esac
+      test "$scenario" != "adoption_operation_role_create_failure" || return 1
+      mock_state_mark role-assignment-created
+      ;;
+    *) return 1 ;;
+  esac
+}
+
+az_infrastructure_containerapp_show() {
+  if test "$scenario" = "postapply_app_show_failure" &&
+    mock_state_exists infra-apply-completed; then
+    return 1
+  fi
+  app_image="$IMMUTABLE_IMAGE"
+  app_latest_revision="$OLD_REVISION_NAME"
+  app_ready_revision="$OLD_REVISION_NAME"
+  if mock_state_exists infra-apply-completed; then
+    case "$scenario" in
+      nonrevision_apply_success)
+        if mock_state_exists legacy-image-updated; then
+          app_latest_revision="$ADOPTION_REVISION_NAME"
+        else
+          app_latest_revision="$OLD_REVISION_NAME"
+        fi
+        app_ready_revision="$app_latest_revision"
+        ;;
+      *)
+        app_latest_revision="$POSTAPPLY_REVISION_NAME"
+        app_ready_revision="$POSTAPPLY_REVISION_NAME"
+        ;;
+    esac
+    postapply_app_show_count="$(mock_state_count postapply-app-show-count)"
+    if test "$scenario" = "final_pinned_drift" &&
+      test "$postapply_app_show_count" -ge 4; then
+      app_latest_revision="$LATER_REVISION_NAME"
+      app_ready_revision="$LATER_REVISION_NAME"
+    fi
+  elif mock_state_exists legacy-image-updated; then
+    app_latest_revision="$ADOPTION_REVISION_NAME"
+    app_ready_revision="$ADOPTION_REVISION_NAME"
+  elif test "${ADOPT_SAFETY_GUARDS:-false}" = "true"; then
+    if test "$scenario" = "adoption_invalid_legacy_tag"; then
+      app_image="acrpatchpageabc123.azurecr.io/patchpage-server:latest"
+    elif test "$scenario" != "adoption_digest_current"; then
+      app_image="acrpatchpageabc123.azurecr.io/patchpage-server:$LEGACY_IMAGE_TAG"
+    fi
+  else
+    case "$scenario" in
+      preexisting_pending_revision)
+        app_latest_revision="patchpage-app--pending"
+        ;;
+      preexisting_failed_revision)
+        app_latest_revision="patchpage-app--failed"
+        ;;
+    esac
+  fi
+  if mock_state_exists infra-plan-created &&
+    ! mock_state_exists infra-apply-completed &&
+    test "$scenario" = "preapply_image_mismatch"; then
+    app_image="acrpatchpageabc123.azurecr.io/patchpage-server@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+  fi
+  mock_containerapp_plain_json "$EXPECTED_CONTAINER_APP_ID" \
+    "$app_latest_revision" "$app_ready_revision" "$app_image"
+}
+
+az_infrastructure_revision() {
+  revision_action="$3"
+  revision_name="$(mock_flag_value --revision "$@")" || revision_name=
+  case "$revision_action" in
+    show)
+      revision_image="$IMMUTABLE_IMAGE"
+      revision_active=true
+      revision_provisioning="Provisioned"
+      revision_health="Healthy"
+      revision_running="Running"
+      revision_weight=100
+      case "$revision_name" in
+        "$OLD_REVISION_NAME") ;;
+        "$ADOPTION_REVISION_NAME")
+          adoption_revision_show_count="$(mock_state_count adoption-revision-show-count)"
+          if test "$adoption_revision_show_count" -eq 1; then
+            revision_active=false
+            revision_provisioning="Provisioning"
+            revision_health="Unknown"
+            revision_running="Processing"
+            revision_weight=0
+          fi
+          if test "$scenario" = "adoption_image_verification_failure"; then
+            revision_image="acrpatchpageabc123.azurecr.io/patchpage-server@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+          fi
+          ;;
+        "$POSTAPPLY_REVISION_NAME")
+          postapply_revision_show_count="$(mock_state_count postapply-revision-show-count)"
+          if test "$postapply_revision_show_count" -eq 1 ||
+            test "$scenario" = "postapply_never_ready"; then
+            revision_active=false
+            revision_provisioning="Provisioning"
+            revision_health="Unknown"
+            revision_running="Processing"
+            revision_weight=0
+          fi
+          if test "$scenario" = "postapply_image_mismatch"; then
+            revision_image="acrpatchpageabc123.azurecr.io/patchpage-server@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+          fi
+          ;;
+        patchpage-app--pending)
+          revision_active=false
+          revision_provisioning="Provisioning"
+          revision_health="Unknown"
+          revision_running="Processing"
+          revision_weight=0
+          ;;
+        patchpage-app--failed)
+          revision_active=false
+          revision_provisioning="Failed"
+          revision_health="Unhealthy"
+          revision_running="Stopped"
+          revision_weight=0
+          ;;
+        *) return 1 ;;
+      esac
+      if test "$scenario" = "scale_to_zero_success"; then
+        revision_health="None"
+        revision_running="ScaleToZero"
+      fi
+      mock_revision_json "$revision_name" "$revision_active" "$revision_provisioning" \
+        "$revision_health" "$revision_running" "$revision_weight" "$revision_image"
+      ;;
+    list)
+      active_revision="$OLD_REVISION_NAME"
+      if mock_state_exists infra-apply-completed; then
+        if test "$scenario" = "nonrevision_apply_success"; then
+          if mock_state_exists legacy-image-updated; then
+            active_revision="$ADOPTION_REVISION_NAME"
+          fi
+        else
+          active_revision="$POSTAPPLY_REVISION_NAME"
+        fi
+        if test "$scenario" = "postapply_multiple_active"; then
+          mock_active_revision_list_json "$OLD_REVISION_NAME" "$POSTAPPLY_REVISION_NAME"
+          return
+        fi
+      elif mock_state_exists legacy-image-updated; then
+        active_revision="$ADOPTION_REVISION_NAME"
+      fi
+      mock_active_revision_list_json "$active_revision"
+      ;;
+    *) return 1 ;;
+  esac
+}
+
+# ---------------------------------------------------------------------------
+# stale operation-lease recovery
+# ---------------------------------------------------------------------------
+
+az_stale_lease() {
+  case "$1 $2" in
+    "account set") ;;
+    "account show") printf '%s\n' "$SUBSCRIPTION_ID" ;;
+    "storage container-rm")
+      test "$3" = "show" || return 1
+      test "$MOCK_AZ_ARGS" = \
+        "storage container-rm show --ids $(mock_expected_operation_container_id) --query id --output tsv" ||
+        return 1
+      test "$scenario" != "operation_container_lookup_failure" || return 1
+      if test "$scenario" = "operation_container_identity_mismatch"; then
+        printf '%s/blobServices/default/containers/foreign\n' \
+          "$(mock_expected_state_storage_account_id)"
+      else
+        mock_expected_operation_container_id
+      fi
+      ;;
+    "storage container")
+      case "$3" in
+        exists)
+          if test "$scenario" = "container_missing"; then
+            printf '%s\n' "false"
+          else
+            printf '%s\n' "true"
+          fi
+          ;;
+        metadata)
+          test "$4" = "show" || return 1
+          test "$scenario" != "binding_lookup_failure" || return 1
+          if test "$scenario" = "foreign_binding"; then
+            printf '%s\n' '{"patchpage_workload_binding_sha256":"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"}'
+          else
+            printf '{"patchpage_workload_binding_sha256":"%s"}\n' \
+              "$PP_MOCK_OPERATION_BINDING_SHA256"
+          fi
+          ;;
+        lease) mock_operation_lease "$@" ;;
+        *) return 1 ;;
+      esac
+      ;;
+    "storage blob")
+      test "$3" = "list" || return 1
+      test "$scenario" != "container_nonempty" || printf '%s\n' "unexpected"
+      ;;
+    *) return 1 ;;
+  esac
+}
+
+# ---------------------------------------------------------------------------
+# custom-domain context, ingress, hostname mutation, certificate binding
+# ---------------------------------------------------------------------------
+
+az_custom_domain() {
+  case "$1 $2" in
+    "account set") return 0 ;;
+    "account show") printf '%s\n' "$PP_MOCK_EXPECTED_SUBSCRIPTION" ;;
+    *) return 1 ;;
+  esac
+}
+
+az_custom_domain_guard() {
+  case "$1 $2" in
+    "account set")
+      test "$scenario" != "account_set_failure"
+      ;;
+    "account show")
+      test "$scenario" != "account_show_failure" || return 1
+      if test "$scenario" = "subscription_mismatch"; then
+        printf '%s\n' "11111111-1111-1111-1111-111111111111"
+      else
+        printf '%s\n' "$PP_MOCK_EXPECTED_SUBSCRIPTION"
+      fi
+      ;;
+    *) return 1 ;;
+  esac
+}
+
+az_ingress() {
+  test "$scenario" != "command_failure" || return 1
+  test "$MOCK_AZ_ARGS" = \
+    "containerapp ingress show --resource-group rg-test --name app-test --output json" ||
+    return 1
+
+  external="true"
+  allow_insecure="false"
+  target_port="3000"
+  transport='"Auto"'
+  traffic='[{"latestRevision":true,"weight":100}]'
+  client_certificate_mode='"Ignore"'
+  cors_policy="null"
+  exposed_port="null"
+  ip_security_restrictions="null"
+  additional_port_mappings="null"
+  sticky_sessions="null"
+  case "$scenario" in
+    malformed_json)
+      printf '%s\n' '{not-json'
+      return 0
+      ;;
+    external_drift) external="false" ;;
+    insecure_drift) allow_insecure="true" ;;
+    target_port_drift) target_port="8080" ;;
+    transport_drift) transport='"http2"' ;;
+    missing_transport) transport="null" ;;
+    client_certificate_accept_drift) client_certificate_mode='"Accept"' ;;
+    client_certificate_require_drift) client_certificate_mode='"Require"' ;;
+    null_client_certificate) client_certificate_mode="null" ;;
+    cors_drift) cors_policy='{"allowedOrigins":["https://other.example"]}' ;;
+    exposed_port_drift) exposed_port="8443" ;;
+    additional_port_drift)
+      additional_port_mappings='[{"external":true,"targetPort":9000,"exposedPort":9000}]'
+      ;;
+    sticky_session_drift) sticky_sessions='{"affinity":"sticky"}' ;;
+    ip_restriction_drift)
+      ip_security_restrictions='[{"action":"Allow","ipAddressRange":"192.0.2.0/24","name":"unexpected"}]'
+      ;;
+    empty_traffic) traffic='[]' ;;
+    multiple_traffic)
+      traffic='[{"latestRevision":true,"weight":50},{"latestRevision":false,"weight":50}]'
+      ;;
+    empty_label_dynamic)
+      traffic='[{"label":"","latestRevision":true,"revisionName":"","weight":100}]'
+      ;;
+    pinned_revision)
+      traffic='[{"latestRevision":false,"revisionName":"app-test--old","weight":100}]'
+      ;;
+    label_drift)
+      traffic='[{"label":"canary","latestRevision":true,"weight":100}]'
+      ;;
+    weight_drift) traffic='[{"latestRevision":true,"weight":90}]' ;;
+  esac
+  printf \
+    '{"external":%s,"allowInsecure":%s,"targetPort":%s,"transport":%s,"clientCertificateMode":%s,"corsPolicy":%s,"exposedPort":%s,"additionalPortMappings":%s,"stickySessions":%s,"ipSecurityRestrictions":%s,"traffic":%s}\n' \
+    "$external" "$allow_insecure" "$target_port" "$transport" \
+    "$client_certificate_mode" "$cors_policy" "$exposed_port" \
+    "$additional_port_mappings" "$sticky_sessions" \
+    "$ip_security_restrictions" "$traffic"
+}
+
+az_hostname() {
+  case "$1 $2" in
+    "account set")
+      test "$scenario" != "set_failure"
+      ;;
+    "account show")
+      if test "$scenario" = "wrong_selection"; then
+        printf '%s\n' "11111111-1111-1111-1111-111111111111"
+      else
+        printf '%s\n' "$PP_MOCK_EXPECTED_SUBSCRIPTION"
+      fi
+      ;;
+    "containerapp hostname")
+      case "$3" in
+        add)
+          test "$scenario" != "hostname_add_failure"
+          ;;
+        bind)
+          test "$scenario" != "hostname_bind_failure" || return 1
+          test "$scenario" != "empty_certificate_id" || return 0
+          printf '%s\n' "$PP_MOCK_EXPECTED_CERTIFICATE_ID"
+          ;;
+        *)
+          return 1
+          ;;
+      esac
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+az_certificate() {
+  case "$*" in
+    *"env certificate list"*)
+      case " $* " in
+        *" --managed-certificates-only --certificate $MANAGED_CERTIFICATE_ID --query [].[id,properties.subjectName,properties.provisioningState] --output tsv "*) ;;
+        *) return 1 ;;
+      esac
+      printf '%s\t%s\t%s\n' \
+        "$PP_MOCK_CERTIFICATE_ID" "$PP_MOCK_CERTIFICATE_SUBJECT" \
+        "$PP_MOCK_CERTIFICATE_PROVISIONING_STATE"
+      ;;
+    *"hostname list"*)
+      printf 'Drafts.Self-Hoster.Dev.\tSniEnabled\t%s\n' "$PP_MOCK_CERTIFICATE_BINDING_ID"
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+# ---------------------------------------------------------------------------
+
+mock_az_normalize "$@" || exit 1
+
+case "$PP_MOCK_GROUP" in
+  state)
+    mock_log "$MOCK_AZ_ARGS"
+    printf 'private-az-diagnostic %s\n' "$MOCK_AZ_ARGS" >&2
+    az_state "$@"
+    ;;
+  deploy)
+    mock_log "az $MOCK_AZ_ARGS"
+    printf 'private-az-diagnostic %s\n' "$MOCK_AZ_ARGS" >&2
+    az_deploy "$@"
+    ;;
+  release)
+    mock_log "az $MOCK_AZ_ARGS"
+    az_release_rollback "$@"
+    ;;
+  rollback)
+    mock_log "az $MOCK_AZ_ARGS"
+    printf 'private-rollback-diagnostic %s\n' "$*" >&2
+    az_release_rollback "$@"
+    ;;
+  infrastructure)
+    mock_log "az $MOCK_AZ_ARGS"
+    printf 'private-infra-az-diagnostic %s\n' "$*" >&2
+    az_infrastructure "$@"
+    ;;
+  stale-lease)
+    mock_log "az $MOCK_AZ_ARGS"
+    az_stale_lease "$@"
+    ;;
+  custom-domain)
+    az_custom_domain "$@"
+    ;;
+  custom-domain-guard)
+    mock_log "az $MOCK_AZ_ARGS"
+    az_custom_domain_guard "$@"
+    ;;
+  ingress)
+    mock_log "$MOCK_AZ_ARGS"
+    az_ingress "$@"
+    ;;
+  hostname)
+    mock_log "$MOCK_AZ_ARGS"
+    az_hostname "$@"
+    ;;
+  certificate)
+    az_certificate "$@"
+    ;;
+  *)
+    exit 1
+    ;;
+esac

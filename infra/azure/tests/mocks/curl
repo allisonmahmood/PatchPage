@@ -1,0 +1,238 @@
+#!/bin/sh
+# curl shim for the guide harness. Reached only through PATH.
+
+set -u
+
+. "${PP_MOCK_DIR:-${0%/*}}/mocklib.sh"
+
+# ---------------------------------------------------------------------------
+# deployed smoke: this mock is an argv contract, not an endpoint stub. It
+# rejects any invocation that leaks the bootstrap token, supplies more than one
+# body source, repeats a single-valued option, or names more than one URL.
+# ---------------------------------------------------------------------------
+
+curl_smoke() {
+  output_file=""
+  header_file=""
+  authorization_header_file=""
+  url=""
+  url_count=0
+  request=""
+  content_type=""
+  data=""
+  body_source_count=0
+  for curl_arg do
+    printf '%s\n' "$curl_arg" >> "$PP_MOCK_CURL_ARGV_LOG"
+    case "$curl_arg" in
+      *test-token*) return 1 ;;
+    esac
+  done
+  while test "$#" -gt 0; do
+    case "$1" in
+      --output)
+        test -z "$output_file" || return 1
+        shift
+        test "$#" -gt 0 || return 1
+        output_file="$1"
+        ;;
+      --dump-header)
+        test -z "$header_file" || return 1
+        shift
+        test "$#" -gt 0 || return 1
+        header_file="$1"
+        ;;
+      --request)
+        test -z "$request" || return 1
+        shift
+        test "$#" -gt 0 || return 1
+        request="$1"
+        ;;
+      --header)
+        shift
+        test "$#" -gt 0 || return 1
+        case "$1" in
+          @*)
+            test -z "$authorization_header_file" || return 1
+            authorization_header_file="${1#@}"
+            ;;
+          "Authorization: "*) return 1 ;;
+          "Content-Type: "*)
+            test -z "$content_type" || return 1
+            content_type="$1"
+            ;;
+          *) return 1 ;;
+        esac
+        ;;
+      --data)
+        body_source_count=$((body_source_count + 1))
+        test "$body_source_count" -eq 1 || return 1
+        shift
+        test "$#" -gt 0 || return 1
+        data="$1"
+        ;;
+      --write-out)
+        shift
+        test "$#" -gt 0 || return 1
+        test "$1" = '%{http_code}' || return 1
+        ;;
+      --proto)
+        shift
+        test "$#" -gt 0 || return 1
+        test "$1" = '=https' || return 1
+        ;;
+      --silent | --show-error | --tlsv1.2) ;;
+      http://* | https://*)
+        test "$url_count" -eq 0 || return 1
+        url="$1"
+        url_count=1
+        ;;
+      *)
+        return 1
+        ;;
+    esac
+    shift
+  done
+  test "$url_count" -eq 1 || return 1
+  case "$url" in
+    */api/uploads)
+      test "$body_source_count" -eq 1 || return 1
+      ;;
+    *)
+      test "$body_source_count" -eq 0 || return 1
+      ;;
+  esac
+
+  case "$url" in
+    http://drafts.self-hoster.dev/healthz)
+      test "$scenario" != "http_command_failure" || return 1
+      test -n "$header_file" || return 1
+      case "$scenario" in
+        redirect_missing)
+          printf 'HTTP/1.1 301 Moved Permanently\r\n\r\n' > "$header_file"
+          ;;
+        redirect_ambiguous)
+          printf \
+            'HTTP/1.1 301 Moved Permanently\r\nLocation: https://drafts.self-hoster.dev/healthz\r\nLocation: https://other.example/healthz\r\n\r\n' \
+            > "$header_file"
+          ;;
+        redirect_mismatch)
+          printf \
+            'HTTP/1.1 301 Moved Permanently\r\nLocation: https://drafts.self-hoster.dev/other\r\n\r\n' \
+            > "$header_file"
+          ;;
+        *)
+          printf \
+            'HTTP/1.1 301 Moved Permanently\r\nLocation: https://drafts.self-hoster.dev/healthz\r\n\r\n' \
+            > "$header_file"
+          ;;
+      esac
+      case "$scenario" in
+        http_status_mismatch) printf '%s' "200" ;;
+        redirect_status_302) printf '%s' "302" ;;
+        redirect_status_307) printf '%s' "307" ;;
+        redirect_status_308) printf '%s' "308" ;;
+        *) printf '%s' "301" ;;
+      esac
+      ;;
+    https://drafts.self-hoster.dev/healthz)
+      test "$scenario" != "health_command_failure" || return 1
+      test -n "$output_file" || return 1
+      if test "$scenario" = "health_body_mismatch"; then
+        printf '%s' '{"ok":false}' > "$output_file"
+      else
+        printf '%s' '{"ok":true}' > "$output_file"
+      fi
+      if test "$scenario" = "health_status_mismatch"; then
+        printf '%s' "503"
+      else
+        printf '%s' "200"
+      fi
+      ;;
+    https://drafts.self-hoster.dev/api/uploads | https://Drafts.Self-Hoster.Dev/api/uploads)
+      test "$scenario" != "upload_command_failure" || return 1
+      test -n "$output_file" || return 1
+      test "$request" = "POST" || return 1
+      test -f "$authorization_header_file" || return 1
+      test "$(LC_ALL=C ls -l "$authorization_header_file" | cut -c1-10)" = \
+        "-rw-------" || return 1
+      test "$(cat "$authorization_header_file")" = \
+        "Authorization: Bearer test-token" || return 1
+      test "$content_type" = "Content-Type: application/json" || return 1
+      printf '%s\n' "$data" |
+        jq -e --arg marker "$PP_MOCK_SMOKE_MARKER" '
+          type == "object" and
+          (keys == ["filename", "html"]) and
+          .filename == "azure-smoke.html" and
+          .html == (
+            "<!doctype html><html><head><title>Azure smoke test</title></head><body><h1>" +
+            $marker +
+            "</h1></body></html>"
+          )
+        ' >/dev/null ||
+        return 1
+      case "$scenario" in
+        upload_invalid_json)
+          printf '%s' '{not-json' > "$output_file"
+          ;;
+        upload_ok_mismatch)
+          printf '%s' \
+            '{"ok":false,"draftId":"abc123def456","publicUrl":"https://drafts.self-hoster.dev/d/abc123def456"}' \
+            > "$output_file"
+          ;;
+        upload_draft_id_mismatch)
+          printf '%s' \
+            '{"ok":true,"draftId":"bad/id","publicUrl":"https://drafts.self-hoster.dev/d/bad/id"}' \
+            > "$output_file"
+          ;;
+        upload_url_mismatch)
+          printf '%s' \
+            '{"ok":true,"draftId":"abc123def456","publicUrl":"https://other.example/d/abc123def456"}' \
+            > "$output_file"
+          ;;
+        *)
+          printf \
+            '{"ok":true,"draftId":"abc123def456","publicUrl":"%s/d/abc123def456"}' \
+            "$PUBLIC_BASE_URL" > "$output_file"
+          ;;
+      esac
+      if test "$scenario" = "upload_status_mismatch"; then
+        printf '%s' "200"
+      else
+        printf '%s' "201"
+      fi
+      ;;
+    https://drafts.self-hoster.dev/d/abc123def456 | https://Drafts.Self-Hoster.Dev/d/abc123def456)
+      test "$scenario" != "fetch_command_failure" || return 1
+      test -n "$output_file" || return 1
+      case "$scenario" in
+        fetch_body_mismatch)
+          printf '%s' '<html><body>wrong draft</body></html>' > "$output_file"
+          ;;
+        fetch_stale_marker)
+          printf '%s' \
+            '<html><iframe srcdoc="&lt;h1&gt;PATCHPAGE_AZURE_SMOKE_STALE&lt;/h1&gt;"></iframe></html>' \
+            > "$output_file"
+          ;;
+        *)
+          printf \
+            '<html><iframe srcdoc="&lt;h1&gt;%s&lt;/h1&gt;"></iframe></html>' \
+            "$PP_MOCK_SMOKE_MARKER" > "$output_file"
+          ;;
+      esac
+      if test "$scenario" = "fetch_status_mismatch"; then
+        printf '%s' "404"
+      else
+        printf '%s' "200"
+      fi
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+case "$PP_MOCK_GROUP" in
+  release | rollback) mock_release_curl "$@" ;;
+  smoke) curl_smoke "$@" ;;
+  *) exit 1 ;;
+esac
