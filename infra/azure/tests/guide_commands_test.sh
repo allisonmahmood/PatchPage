@@ -78,6 +78,7 @@ fi
 
 GUIDE_OPS="$ROOT/infra/azure/ops.sh"
 GUIDE_CMD_DIR="$ROOT/infra/azure/cmd"
+GUIDE_LIB_DIR="$ROOT/infra/azure/lib"
 GUIDE_COMMANDS="state-bootstrap deploy-resources app-release app-rollback
 infrastructure-change stale-lease-recovery custom-domain-context
 ingress-verification apex-dns caa-policy hostname-mutation certificate-binding
@@ -2904,6 +2905,417 @@ server_image_precondition_is_pinned() {
   ' "$1/container_app.tf"
 }
 
+# --- the operation-binding wire format ---------------------------------------
+#
+# `patchpage-operation-binding-v1` is the tuple whose SHA-256 is written into
+# the operation container's metadata when a deployment seals it, and re-derived
+# and compared on every later flow that takes the operation lease. It is a wire
+# format in the strict sense: the digest recorded against a live environment was
+# produced by whatever the tuple looked like on the day that environment was
+# sealed. Change the field order, a label spelling, or the separator, and every
+# already-sealed environment stops matching its own binding -- the flows fail
+# closed, which is the safe direction, but they fail closed permanently and no
+# rerun fixes it. Recovery means hand-editing production blob metadata.
+#
+# So the tuple is pinned to a literal digest computed from fixed inputs, and the
+# pin is checked against every source that builds the tuple. The inputs are
+# spelled out in GUIDE_BINDING_FIXTURE_* below and are exactly the values the
+# release scenario already uses, so the constant can be recomputed by hand:
+#
+#   printf '%s\n' 'patchpage-operation-binding-v1' subscription_id=... |
+#     openssl dgst -sha256 -r | cut -d ' ' -f1
+#
+# This is deliberately a golden constant rather than a cross-comparison between
+# the copies. Copies agreeing with each other is what a mechanical edit across
+# all of them produces; agreeing with a number written down before the edit is
+# what a mechanical edit cannot produce.
+GUIDE_OPERATION_BINDING_GOLDEN_SHA256=a753a80055615fc8c9f0ec837982c6221142b0bf52a1516189a33436d5552a05
+
+# The fixture inputs the golden digest above was computed from. Every field of
+# the tuple is fed by one of these, so no field can change spelling or position
+# without moving the digest.
+GUIDE_BINDING_FIXTURE_SUBSCRIPTION_ID="00000000-0000-0000-0000-000000000000"
+GUIDE_BINDING_FIXTURE_STATE_STORAGE_ACCOUNT="patchpagestate"
+GUIDE_BINDING_FIXTURE_STATE_KEY="patchpage-prod.tfstate"
+GUIDE_BINDING_FIXTURE_RESOURCE_GROUP="rg-patchpage-workload"
+GUIDE_BINDING_FIXTURE_CONTAINER_APP="patchpage-app"
+GUIDE_BINDING_FIXTURE_ACR="acrpatchpageabc123"
+
+# Prints the tuple-building pipeline as it appears in one shell source: the
+# `printf` line that opens it, the tuple lines, and the hashing tail. Extracting
+# and evaluating the real text is the point -- a test that rebuilt the tuple
+# itself would only pin its own copy, and would stay green while every shipped
+# copy drifted. The pipeline is located by the version marker rather than by a
+# function name, so it is found wherever it lives: inline in a cmd file today,
+# inside a lib function tomorrow.
+#
+# A tuple line is recognised by its exact source form -- the version marker
+# alone on a continued line, single-quoted -- not by the marker appearing
+# anywhere. Prose that names the marker, including the comment above, must not
+# register as a copy of the tuple.
+GUIDE_BINDING_TUPLE_MARKER="patchpage-operation-binding-v1"
+
+guide_binding_tuple_pipeline() {
+  awk -v marker="$GUIDE_BINDING_TUPLE_MARKER" '
+    BEGIN { opening = sprintf("%c", 39) marker sprintf("%c", 39) " \\" }
+    capturing {
+      print
+      if (index($0, "cut -d") > 0) { exit }
+      next
+    }
+    {
+      trimmed = $0
+      sub(/^[[:space:]]+/, "", trimmed)
+    }
+    trimmed == opening {
+      print previous_line
+      print
+      capturing = 1
+      next
+    }
+    { previous_line = $0 }
+  ' "$1"
+}
+
+# Counts the tuple-opening lines in one source, using the same strict form.
+guide_binding_tuple_count() {
+  awk -v marker="$GUIDE_BINDING_TUPLE_MARKER" '
+    BEGIN { opening = sprintf("%c", 39) marker sprintf("%c", 39) " \\" }
+    {
+      trimmed = $0
+      sub(/^[[:space:]]+/, "", trimmed)
+      if (trimmed == opening) { found++ }
+    }
+    END { print found + 0 }
+  ' "$1"
+}
+
+# Evaluates an extracted pipeline against the fixture inputs and prints the
+# digest. Run inside a command substitution, so the fixture assignments cannot
+# leak into the harness. $1 is bound too: the harness's own copy takes the state
+# key as a positional parameter, and the cmd copies ignore it.
+guide_binding_digest_of_pipeline() {
+  (
+    guide_binding_pipeline_text="$1"
+    SUBSCRIPTION_ID="$GUIDE_BINDING_FIXTURE_SUBSCRIPTION_ID"
+    STATE_STORAGE_ACCOUNT="$GUIDE_BINDING_FIXTURE_STATE_STORAGE_ACCOUNT"
+    STATE_KEY="$GUIDE_BINDING_FIXTURE_STATE_KEY"
+    RESOURCE_GROUP="$GUIDE_BINDING_FIXTURE_RESOURCE_GROUP"
+    CONTAINER_APP="$GUIDE_BINDING_FIXTURE_CONTAINER_APP"
+    ACR="$GUIDE_BINDING_FIXTURE_ACR"
+    EXPECTED_OPERATION_CONTAINER_ID="/subscriptions/$SUBSCRIPTION_ID/resourceGroups/rg-patchpage-tfstate/providers/Microsoft.Storage/storageAccounts/$STATE_STORAGE_ACCOUNT/blobServices/default/containers/patchpage-operations"
+    EXPECTED_CONTAINER_APP_ID="/subscriptions/$SUBSCRIPTION_ID/resourceGroups/$RESOURCE_GROUP/providers/Microsoft.App/containerApps/$CONTAINER_APP"
+    EXPECTED_ACR_ID="/subscriptions/$SUBSCRIPTION_ID/resourceGroups/$RESOURCE_GROUP/providers/Microsoft.ContainerRegistry/registries/$ACR"
+    EXPECTED_STORAGE_ACCOUNT_ID="/subscriptions/$SUBSCRIPTION_ID/resourceGroups/$RESOURCE_GROUP/providers/Microsoft.Storage/storageAccounts/patchpagedrafts"
+    EXPECTED_POSTGRES_SERVER_ID="/subscriptions/$SUBSCRIPTION_ID/resourceGroups/$RESOURCE_GROUP/providers/Microsoft.DBforPostgreSQL/flexibleServers/patchpage-postgres"
+    set -- "$STATE_KEY"
+    eval "$guide_binding_pipeline_text" 2>/dev/null
+  )
+}
+
+# --- the plan gate as a pure filter ------------------------------------------
+#
+# lib/plan_gate.sh is the one piece of the operations CLI with no environment,
+# no network and no Azure in it: a Terraform plan rendering goes in on stdin,
+# a verdict comes out as an exit status. That is what makes it testable the way
+# the rest of this file cannot be -- directly, on fixtures, one verdict at a
+# time, without driving a deployment to reach it.
+#
+# It is run here the documented standalone way, as `sh lib/plan_gate.sh`, with
+# the harness's own PATH rather than the mock PATH. Nothing is mocked because
+# nothing needs to be: if this ever required a shim, it would have stopped being
+# a pure filter.
+GUIDE_PLAN_GATE_PROTECTED="azurerm_storage_account.drafts azurerm_storage_container.drafts azurerm_postgresql_flexible_server.patchpage azurerm_postgresql_flexible_server_database.patchpage"
+
+# plan_gate_verdict <fixture-path> [protected-address...]
+plan_gate_verdict() {
+  plan_gate_fixture="$1"
+  shift
+  sh "$GUIDE_LIB_DIR/plan_gate.sh" "$@" < "$plan_gate_fixture"
+}
+
+test_plan_gate_filter() {
+  plan_gate_fixture_dir="$ROOT/infra/azure/tests/fixtures/plan_gate"
+  test -d "$plan_gate_fixture_dir" ||
+    fail "the plan-gate fixtures are missing"
+
+  # fixture|protected-list-applies|expected-verdict
+  #
+  # Both columns of the protected question are exercised on the same fixture,
+  # because the difference between them is the whole reason the address list is
+  # an argument: the initial deployment is supposed to create the protected
+  # resources, and every later change must never.
+  plan_gate_cases_checked=0
+  for plan_gate_case in \
+    'clean.json|protected|accept' \
+    'clean.json|none|accept' \
+    'delete.json|protected|reject' \
+    'delete.json|none|reject' \
+    'replace.json|protected|reject' \
+    'replace.json|none|reject' \
+    'replace_create_before_destroy.json|protected|reject' \
+    'replace_create_before_destroy.json|none|reject' \
+    'create_on_protected.json|protected|reject' \
+    'create_on_protected.json|none|accept' \
+    'create_on_unprotected.json|protected|accept' \
+    'create_on_unprotected.json|none|accept' \
+    'malformed.json|protected|reject' \
+    'malformed.json|none|reject'; do
+    plan_gate_fixture_name="${plan_gate_case%%|*}"
+    plan_gate_rest="${plan_gate_case#*|}"
+    plan_gate_scope="${plan_gate_rest%%|*}"
+    plan_gate_expected="${plan_gate_rest#*|}"
+    plan_gate_path="$plan_gate_fixture_dir/$plan_gate_fixture_name"
+    test -f "$plan_gate_path" ||
+      fail "plan-gate fixture $plan_gate_fixture_name is missing"
+
+    plan_gate_status=0
+    if test "$plan_gate_scope" = "protected"; then
+      plan_gate_verdict "$plan_gate_path" $GUIDE_PLAN_GATE_PROTECTED ||
+        plan_gate_status=$?
+    else
+      plan_gate_verdict "$plan_gate_path" || plan_gate_status=$?
+    fi
+
+    case "$plan_gate_expected" in
+      accept)
+        test "$plan_gate_status" -eq 0 ||
+          fail "the plan gate rejected $plan_gate_fixture_name with the $plan_gate_scope address list; it should accept it"
+        ;;
+      reject)
+        test "$plan_gate_status" -eq 1 ||
+          fail "the plan gate answered $plan_gate_status for $plan_gate_fixture_name with the $plan_gate_scope address list; it should reject it with 1"
+        ;;
+    esac
+    plan_gate_cases_checked=$((plan_gate_cases_checked + 1))
+  done
+  test "$plan_gate_cases_checked" -eq 14 ||
+    fail "the plan-gate fixture table did not run every case"
+
+  # Sabotage each fixture in the direction that should flip its verdict. A gate
+  # that answered by ignoring its input would satisfy the table above as long as
+  # the table happened to agree with its fixed answer; these prove each verdict
+  # is actually being read out of the plan.
+  plan_gate_probe_dir="$TMP_DIR/plan-gate-probe"
+  rm -rf "$plan_gate_probe_dir"
+  mkdir -p "$plan_gate_probe_dir" ||
+    fail "could not create the plan-gate probe directory"
+
+  # A clean plan turned destructive must flip accept -> reject.
+  sed 's/"update"/"delete"/' "$plan_gate_fixture_dir/clean.json" \
+    > "$plan_gate_probe_dir/clean-turned-destructive.json" ||
+    fail "could not build the destructive plan-gate probe"
+  if cmp -s "$plan_gate_fixture_dir/clean.json" \
+    "$plan_gate_probe_dir/clean-turned-destructive.json"; then
+    fail "the destructive plan-gate probe did not change any action"
+  fi
+  if plan_gate_verdict "$plan_gate_probe_dir/clean-turned-destructive.json" \
+    $GUIDE_PLAN_GATE_PROTECTED; then
+    fail "the plan gate accepts a plan whose only edit was to introduce a delete"
+  fi
+
+  # A destructive plan made harmless must flip reject -> accept, or the gate is
+  # rejecting for some reason other than the delete.
+  sed 's/"delete"/"update"/' "$plan_gate_fixture_dir/delete.json" \
+    > "$plan_gate_probe_dir/delete-defused.json" ||
+    fail "could not build the defused plan-gate probe"
+  if cmp -s "$plan_gate_fixture_dir/delete.json" \
+    "$plan_gate_probe_dir/delete-defused.json"; then
+    fail "the defused plan-gate probe did not change any action"
+  fi
+  plan_gate_verdict "$plan_gate_probe_dir/delete-defused.json" \
+    $GUIDE_PLAN_GATE_PROTECTED ||
+    fail "the plan gate rejects a plan with no delete and no protected create"
+
+  # A protected create moved onto an unprotected address must flip
+  # reject -> accept, or the gate is not reading the address at all.
+  sed 's/azurerm_postgresql_flexible_server\.patchpage/azurerm_container_registry.patchpage/' \
+    "$plan_gate_fixture_dir/create_on_protected.json" \
+    > "$plan_gate_probe_dir/create-moved.json" ||
+    fail "could not build the relocated protected-create plan-gate probe"
+  if cmp -s "$plan_gate_fixture_dir/create_on_protected.json" \
+    "$plan_gate_probe_dir/create-moved.json"; then
+    fail "the relocated protected-create probe did not change any address"
+  fi
+  plan_gate_verdict "$plan_gate_probe_dir/create-moved.json" \
+    $GUIDE_PLAN_GATE_PROTECTED ||
+    fail "the plan gate rejects a create on an address that is not protected"
+
+  # An unprotected create moved onto a protected address must flip
+  # accept -> reject.
+  sed 's/azurerm_container_registry\.patchpage/azurerm_storage_container.drafts/' \
+    "$plan_gate_fixture_dir/create_on_unprotected.json" \
+    > "$plan_gate_probe_dir/create-protected.json" ||
+    fail "could not build the promoted protected-create plan-gate probe"
+  if cmp -s "$plan_gate_fixture_dir/create_on_unprotected.json" \
+    "$plan_gate_probe_dir/create-protected.json"; then
+    fail "the promoted protected-create probe did not change any address"
+  fi
+  if plan_gate_verdict "$plan_gate_probe_dir/create-protected.json" \
+    $GUIDE_PLAN_GATE_PROTECTED; then
+    fail "the plan gate accepts a create on a protected address"
+  fi
+
+  # The gate must be pure: the same fixture must get the same verdict with the
+  # environment the runbooks rely on stripped out entirely. Anything that read
+  # the environment would answer differently here, or fail.
+  plan_gate_stripped_status=0
+  env -i "PATH=$PATH" sh "$GUIDE_LIB_DIR/plan_gate.sh" $GUIDE_PLAN_GATE_PROTECTED \
+    < "$plan_gate_fixture_dir/clean.json" || plan_gate_stripped_status=$?
+  test "$plan_gate_stripped_status" -eq 0 ||
+    fail "the plan gate needs the environment: it answered $plan_gate_stripped_status for a clean plan with an empty environment"
+  plan_gate_stripped_status=0
+  env -i "PATH=$PATH" sh "$GUIDE_LIB_DIR/plan_gate.sh" $GUIDE_PLAN_GATE_PROTECTED \
+    < "$plan_gate_fixture_dir/delete.json" || plan_gate_stripped_status=$?
+  test "$plan_gate_stripped_status" -eq 1 ||
+    fail "the plan gate needs the environment: it answered $plan_gate_stripped_status for a destructive plan with an empty environment"
+
+  rm -rf "$plan_gate_probe_dir"
+}
+
+test_operation_binding_wire_format() {
+  binding_fixture_dir="$TMP_DIR/operation-binding-wire-format"
+  rm -rf "$binding_fixture_dir"
+  mkdir -p "$binding_fixture_dir" ||
+    fail "could not create the operation-binding fixture directory"
+
+  # Every executable source, plus the harness itself: the harness carries its
+  # own independent copy of the tuple, and that copy is held to the same wire
+  # format even though it is deliberately not shared with the runbooks.
+  set -- "$GUIDE_OPS"
+  for guide_command in $GUIDE_COMMANDS; do
+    set -- "$@" "$GUIDE_CMD_DIR/$guide_command.sh"
+  done
+  for guide_lib_file in "$GUIDE_LIB_DIR"/*.sh; do
+    test -f "$guide_lib_file" || continue
+    set -- "$@" "$guide_lib_file"
+  done
+  set -- "$@" "$ROOT/infra/azure/tests/guide_commands_test.sh"
+
+  binding_sources=0
+  for binding_source do
+    # One tuple per source. Two would mean the extraction below silently checked
+    # the first and ignored a second that could say something different.
+    binding_marker_count="$(guide_binding_tuple_count "$binding_source")"
+    test "$binding_marker_count" -ne 0 || continue
+    binding_sources=$((binding_sources + 1))
+    test "$binding_marker_count" -eq 1 ||
+      fail "${binding_source##*/} builds the operation-binding tuple $binding_marker_count times; there must be exactly one"
+
+    binding_pipeline="$(guide_binding_tuple_pipeline "$binding_source")" ||
+      fail "could not extract the operation-binding tuple from ${binding_source##*/}"
+    case "$binding_pipeline" in
+      *"cut -d"*) ;;
+      *)
+        fail "the operation-binding tuple in ${binding_source##*/} does not end in the documented hashing tail"
+        ;;
+    esac
+
+    binding_digest="$(
+      guide_binding_digest_of_pipeline "$binding_pipeline"
+    )" ||
+      fail "could not evaluate the operation-binding tuple from ${binding_source##*/}"
+    test "$binding_digest" = "$GUIDE_OPERATION_BINDING_GOLDEN_SHA256" ||
+      fail "${binding_source##*/} builds an operation-binding tuple whose digest is $binding_digest, not the pinned $GUIDE_OPERATION_BINDING_GOLDEN_SHA256"
+  done
+
+  # The scan must have found something, or every assertion above is vacuous.
+  test "$binding_sources" -ge 2 ||
+    fail "the operation-binding wire-format pin found only $binding_sources source(s); the runbooks and the harness both build the tuple"
+
+  # The harness's own copy is reached the way the flows reach it -- by calling
+  # it -- as well as by extraction, so a copy that was edited into something the
+  # extractor cannot see still has to produce the pinned digest.
+  binding_called_digest="$(
+    SUBSCRIPTION_ID="$GUIDE_BINDING_FIXTURE_SUBSCRIPTION_ID" \
+      STATE_STORAGE_ACCOUNT="$GUIDE_BINDING_FIXTURE_STATE_STORAGE_ACCOUNT" \
+      RESOURCE_GROUP="$GUIDE_BINDING_FIXTURE_RESOURCE_GROUP" \
+      CONTAINER_APP="$GUIDE_BINDING_FIXTURE_CONTAINER_APP" \
+      ACR="$GUIDE_BINDING_FIXTURE_ACR" \
+      EXPECTED_STORAGE_ACCOUNT_ID="/subscriptions/$GUIDE_BINDING_FIXTURE_SUBSCRIPTION_ID/resourceGroups/$GUIDE_BINDING_FIXTURE_RESOURCE_GROUP/providers/Microsoft.Storage/storageAccounts/patchpagedrafts" \
+      EXPECTED_POSTGRES_SERVER_ID="/subscriptions/$GUIDE_BINDING_FIXTURE_SUBSCRIPTION_ID/resourceGroups/$GUIDE_BINDING_FIXTURE_RESOURCE_GROUP/providers/Microsoft.DBforPostgreSQL/flexibleServers/patchpage-postgres" \
+      guide_operation_binding_sha256 "$GUIDE_BINDING_FIXTURE_STATE_KEY"
+  )" ||
+    fail "could not call the harness's own operation-binding tuple builder"
+  test "$binding_called_digest" = "$GUIDE_OPERATION_BINDING_GOLDEN_SHA256" ||
+    fail "the harness's operation-binding tuple builder returns $binding_called_digest, not the pinned $GUIDE_OPERATION_BINDING_GOLDEN_SHA256"
+
+  # Sabotage the pin in three independent directions. A golden hash that no
+  # mutation can move is a constant the test is comparing against itself.
+  binding_probe_source="$GUIDE_CMD_DIR/app-release.sh"
+  test "$(guide_binding_tuple_count "$binding_probe_source")" -eq 1 ||
+    fail "the operation-binding sabotage probe source no longer builds the tuple"
+
+  # 1. A relabelled field. Same values, same order, different wire format.
+  sed 's/state_key=/state_key_v2=/' "$binding_probe_source" \
+    > "$binding_fixture_dir/relabelled.sh" ||
+    fail "could not build the relabelled operation-binding probe"
+  if cmp -s "$binding_probe_source" "$binding_fixture_dir/relabelled.sh"; then
+    fail "the relabelled operation-binding probe did not change any label"
+  fi
+  binding_probe_digest="$(
+    guide_binding_digest_of_pipeline \
+      "$(guide_binding_tuple_pipeline "$binding_fixture_dir/relabelled.sh")"
+  )"
+  test "$binding_probe_digest" != "$GUIDE_OPERATION_BINDING_GOLDEN_SHA256" ||
+    fail "the operation-binding pin accepts a relabelled tuple field"
+
+  # 2. Two fields transposed. Same labels, same values, different order.
+  awk '
+    !done && index($0, "container_app=") > 0 { held = $0; next }
+    !done && held != "" && index($0, "acr=") > 0 {
+      print
+      print held
+      held = ""
+      done = 1
+      next
+    }
+    { print }
+    END { if (!done) exit 1 }
+  ' "$binding_probe_source" > "$binding_fixture_dir/transposed.sh" ||
+    fail "could not build the transposed operation-binding probe"
+  if cmp -s "$binding_probe_source" "$binding_fixture_dir/transposed.sh"; then
+    fail "the transposed operation-binding probe did not reorder any field"
+  fi
+  binding_probe_digest="$(
+    guide_binding_digest_of_pipeline \
+      "$(guide_binding_tuple_pipeline "$binding_fixture_dir/transposed.sh")"
+  )"
+  test "$binding_probe_digest" != "$GUIDE_OPERATION_BINDING_GOLDEN_SHA256" ||
+    fail "the operation-binding pin accepts a transposed tuple field order"
+
+  # 3. A changed record separator. Same fields in the same order, joined
+  # differently -- the drift a reader is least likely to notice in a diff.
+  awk '
+    BEGIN {
+      quote = sprintf("%c", 39)
+      from = "printf " quote "%s\\n" quote
+      to = "printf " quote "%s " quote
+    }
+    {
+      at = index($0, from)
+      if (at > 0) {
+        $0 = substr($0, 1, at - 1) to substr($0, at + length(from))
+        changed = 1
+      }
+      print
+    }
+    END { if (!changed) exit 1 }
+  ' "$binding_probe_source" > "$binding_fixture_dir/separator.sh" ||
+    fail "could not build the separator operation-binding probe"
+  if cmp -s "$binding_probe_source" "$binding_fixture_dir/separator.sh"; then
+    fail "the separator operation-binding probe did not change the separator"
+  fi
+  binding_probe_digest="$(
+    guide_binding_digest_of_pipeline \
+      "$(guide_binding_tuple_pipeline "$binding_fixture_dir/separator.sh")"
+  )"
+  test "$binding_probe_digest" != "$GUIDE_OPERATION_BINDING_GOLDEN_SHA256" ||
+    fail "the operation-binding pin accepts a changed tuple record separator"
+
+  rm -rf "$binding_fixture_dir"
+}
+
 test_public_safe_runbook_static() {
   # The runbooks are files under cmd/ now, so every check that is really about
   # the shell reads those files; the checks that are about what the guide says
@@ -3970,6 +4382,7 @@ set -- \
   test_app_rollback \
   test_infrastructure_change \
   test_stale_lease_recovery \
+  test_operation_binding_wire_format \
   test_public_safe_runbook_static \
   test_custom_domain_context \
   test_custom_domain_output_guards \

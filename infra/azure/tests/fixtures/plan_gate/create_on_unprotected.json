@@ -1,0 +1,9 @@
+{
+  "format_version": "1.2",
+  "resource_changes": [
+    {
+      "address": "azurerm_container_registry.patchpage",
+      "change": { "actions": ["create"] }
+    }
+  ]
+}
