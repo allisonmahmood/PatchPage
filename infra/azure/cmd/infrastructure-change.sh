@@ -322,8 +322,21 @@ operation_lease_exit() {
       OPERATION_LEASE_ACTIVE=false
       printf 'The operation lease remains held for second-operator recovery.\n' >&2
     elif ! release_operation_lease; then
+      OPERATION_LEASE_RETAINED=true
       printf 'Operation lease cleanup requires second-operator review.\n' >&2
     fi
+  fi
+}
+# Whether the lease outlived the process is not known at any exit site: a site
+# that fails while holding it may still get it back from the trap's own release,
+# and a site that never acquired it must not claim otherwise. Only the trap
+# knows, so only the trap sets the exit status for that case. An exit inside an
+# EXIT handler replaces the pending status; it also ends the handler list, so
+# this is the last handler in the list and the change-directory and diagnostic
+# cleanups before it still finish first.
+operation_lease_retention_exit() {
+  if test "${OPERATION_LEASE_RETAINED:-false}" = "true"; then
+    exit 75
   fi
 }
 RESOURCE_GROUP="${RESOURCE_GROUP:?Set the expected workload resource-group name}"
@@ -866,8 +879,9 @@ if ! OPERATION_LEASE_HEX="$(
 fi
 unset OPERATION_LEASE_HEX
 OPERATION_LEASE_ACTIVE=false
+OPERATION_LEASE_RETAINED=false
 OPERATION_MUTATION_UNCERTAIN=false
-trap 'operation_lease_exit; cleanup_infrastructure_change; terraform_diagnostic_exit' 0
+trap 'operation_lease_exit; cleanup_infrastructure_change; terraform_diagnostic_exit; operation_lease_retention_exit' 0
 trap 'exit 129' HUP
 trap 'exit 130' INT
 trap 'exit 143' TERM
@@ -1325,15 +1339,69 @@ if ! jq -e \
   printf 'The infrastructure plan deletes a resource or recreates protected persistent data.\n' >&2
   exit 1
 fi
-if ! jq -r \
-  '.resource_changes[] |
-   select(.change.actions != ["no-op"]) |
-   "\(.address): \(.change.actions | join(","))"' \
-  "$INFRA_PLAN_JSON" 2>/dev/null; then
+if ! INFRA_ACTION_SUMMARY="$(
+  jq -r \
+    '.resource_changes[] |
+     select(.change.actions != ["no-op"]) |
+     "\(.address): \(.change.actions | join(","))"' \
+    "$INFRA_PLAN_JSON" 2>/dev/null
+)"; then
   printf 'Could not render the infrastructure action summary.\n' >&2
   exit 1
 fi
+test -z "$INFRA_ACTION_SUMMARY" || printf '%s\n' "$INFRA_ACTION_SUMMARY"
 set +x
+
+# The second-operator plan review. It cannot be a prompt: this is one
+# non-interactive command, and the operator who runs it is the one who must not
+# be the one who approves it. It is a content address instead. The token below
+# is the SHA-256 digest of exactly the action inventory just printed, so an
+# approval names the actions it approves and nothing else.
+#
+# A rerun replans against current state and recomputes the token from the new
+# inventory. If the actions changed in between, the recorded approval no longer
+# matches and this fails closed asking for a fresh review -- which is stronger
+# than the same-shell pause it replaces, because that pause could not tell that
+# the world had moved under the saved plan.
+#
+# The token is printed and nothing else is. It is computed over Terraform
+# resource addresses and action words, which carry no subscription, tenant or
+# resource identifier, and a digest would not give them back if they did.
+if ! INFRA_CHANGE_REVIEW_SHA256="$(
+  printf '%s\n' "$INFRA_ACTION_SUMMARY" |
+    openssl dgst -sha256 -r 2>/dev/null |
+    cut -d ' ' -f1
+)" ||
+  ! printf '%s\n' "$INFRA_CHANGE_REVIEW_SHA256" | grep -Eq '^[0-9a-f]{64}$'; then
+  printf 'Could not compute the second-operator review token.\n' >&2
+  exit 1
+fi
+if test "${INFRA_CHANGE_APPROVAL_SHA256:-}" != "$INFRA_CHANGE_REVIEW_SHA256"; then
+  if test -n "${INFRA_CHANGE_APPROVAL_SHA256:-}"; then
+    printf 'The second-operator approval does not match this plan: the actions changed since that review, or the recorded token is not the one that review printed.\n' >&2
+  fi
+  printf 'Second operator: review the action inventory above against the private environment record and the backup/restore evidence, then rerun this command with INFRA_CHANGE_APPROVAL_SHA256 set to the token below.\n'
+  printf 'INFRA_CHANGE_APPROVAL_SHA256=%s\n' "$INFRA_CHANGE_REVIEW_SHA256"
+  if test -n "${INFRA_CHANGE_APPROVAL_SHA256:-}"; then
+    exit 1
+  fi
+  # Nothing was applied and nothing is owed: this run planned and reported,
+  # which is the whole of what an unapproved run is allowed to do, so it gives
+  # the lease back and completes the same way a successful run does.
+  if ! release_operation_lease; then
+    printf 'Operation lease release failed; second-operator review is required.\n' >&2
+    exit 1
+  fi
+  if ! cleanup_infrastructure_change; then
+    exit 1
+  fi
+  SECURE_CHANGE_DIR=''
+  TERRAFORM_DIAGNOSTICS_COMPLETE=true
+  terraform_diagnostic_exit
+  trap - 0 HUP INT TERM
+  exit 0
+fi
+unset INFRA_ACTION_SUMMARY INFRA_CHANGE_REVIEW_SHA256
 PREAPPLY_CONTAINER_APP_NAME="${EXPECTED_CONTAINER_APP_ID##*/}"
 if ! verify_operation_lease ||
   ! verify_pinned_revision_stable \
@@ -1387,6 +1455,7 @@ unset TERRAFORM_DIAGNOSTIC_DIR TERRAFORM_DIAGNOSTIC_LOG
 unset TERRAFORM_DIAGNOSTICS_COMPLETE TERRAFORM_DIAGNOSTIC_FD_OPEN
 unset -f cleanup_infrastructure_change terraform_diagnostic_exit
 unset -f acquire_operation_lease operation_lease_exit release_operation_lease
+unset -f operation_lease_retention_exit
 unset -f verify_operation_container verify_operation_lease
 unset -f container_app_readiness_recovery_required
 unset -f poll_pinned_revision_stable verify_pinned_revision_stable

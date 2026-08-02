@@ -185,8 +185,20 @@ operation_lease_exit() {
       OPERATION_LEASE_ACTIVE=false
       printf 'The operation lease remains held for second-operator recovery.\n' >&2
     elif ! release_operation_lease; then
+      OPERATION_LEASE_RETAINED=true
       printf 'Operation lease cleanup requires second-operator review.\n' >&2
     fi
+  fi
+}
+# Whether the lease outlived the process is not known at any exit site: a site
+# that fails while holding it may still get it back from the trap's own release,
+# and a site that never acquired it must not claim otherwise. Only the trap
+# knows, so only the trap sets the exit status for that case. An exit inside an
+# EXIT handler replaces the pending status; it also ends the handler list, so
+# this runs last and any cleanup before it still finishes first.
+operation_lease_retention_exit() {
+  if test "${OPERATION_LEASE_RETAINED:-false}" = "true"; then
+    exit 75
   fi
 }
 : "${SUBSCRIPTION_ID:?Set SUBSCRIPTION_ID from the private verified deployment record}"
@@ -420,8 +432,9 @@ if ! OPERATION_LEASE_HEX="$(
 fi
 unset OPERATION_LEASE_HEX
 OPERATION_LEASE_ACTIVE=false
+OPERATION_LEASE_RETAINED=false
 OPERATION_MUTATION_UNCERTAIN=false
-trap 'operation_lease_exit' 0
+trap 'operation_lease_exit; operation_lease_retention_exit' 0
 trap 'exit 129' HUP
 trap 'exit 130' INT
 trap 'exit 143' TERM
@@ -627,6 +640,7 @@ if ! release_operation_lease; then
 fi
 trap - 0 HUP INT TERM
 unset -f acquire_operation_lease operation_lease_exit release_operation_lease
+unset -f operation_lease_retention_exit
 unset -f verify_operation_container verify_operation_lease
 unset -f container_app_readiness_recovery_required
 unset -f poll_pinned_revision_stable verify_pinned_revision_stable

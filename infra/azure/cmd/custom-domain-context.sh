@@ -1,3 +1,13 @@
+# The guide has the operator source this file, because the whole point of it is
+# the values it leaves behind for the later custom-domain commands and a child
+# process cannot hand a variable back. That makes the caller's shell options
+# part of what this file borrows and must return: leaving `set -u` on turns the
+# operator's next unset variable into a dead session. `set +x` is deliberately
+# not restored -- keeping tracing off is the point of setting it.
+case $- in
+  *u*) custom_domain_context_saved_nounset=on ;;
+  *) custom_domain_context_saved_nounset=off ;;
+esac
 set -u
 set +x
 private_terraform() {
@@ -64,5 +74,10 @@ if test "$NORMALIZED_PUBLIC_BASE_URL" != "https://$CUSTOM_DOMAIN"; then
   printf 'The public origin does not match the normalized custom hostname.\n' >&2
   exit 1
 fi
+
+if test "$custom_domain_context_saved_nounset" = "off"; then
+  set +u
+fi
+unset custom_domain_context_saved_nounset
 
 printf 'Azure deployment context verified privately.\n'

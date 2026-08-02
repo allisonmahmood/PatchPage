@@ -38,10 +38,18 @@ file_mode() {
 # not from a hand-kept list of scenario names, so a new retaining path is held
 # to the contract the moment it is written. Both directions are checked: a
 # retained lease must exit 75, and 75 must mean a retained lease.
+#
+# Two distinct messages mean "the lease is still held". The first is the
+# deliberate hand-off after a mutation whose result could not be proved. The
+# second is the EXIT trap reporting that its own release attempt failed: the
+# lease is just as held, and the process must not claim otherwise by exiting 1.
+# Only the trap can tell the two apart from a plain failure, because only the
+# trap knows whether the final release succeeded.
 GUIDE_RETAINED_LEASE_EXITS=0
 assert_retained_lease_exit_code() {
   # flow scenario status output-file
-  if grep -Fq 'The operation lease remains held for second-operator recovery.' "$4"; then
+  if grep -Fq 'The operation lease remains held for second-operator recovery.' "$4" ||
+    grep -Fq 'Operation lease cleanup requires second-operator review.' "$4"; then
     GUIDE_RETAINED_LEASE_EXITS=$((GUIDE_RETAINED_LEASE_EXITS + 1))
     test "$3" -eq 75 ||
       fail "$1 kept the operation lease after $2 but exited $3 instead of 75"
@@ -247,6 +255,47 @@ GUIDE_WRAPPER_PART
 
 write_wrapper_part custom-domain-context-source \
   ". \"$GUIDE_CMD_DIR/custom-domain-context.sh\""
+write_wrapper_part hostname-mutation-source \
+  ". \"$GUIDE_CMD_DIR/hostname-mutation.sh\""
+
+# The two sourced commands run in the operator's own shell, so the options they
+# set for themselves are borrowed and have to be given back. Driving both
+# directions matters: a file that restored nothing would still pass a test that
+# only ever sources it from a shell that already had `set -u` on.
+write_wrapper_part caller-nounset-off 'set +u'
+write_wrapper_part caller-nounset-on 'set -u'
+
+cat > "$GUIDE_PART_DIR/sourced-status" <<'GUIDE_WRAPPER_PART'
+sourced_status=$?
+test "$sourced_status" -eq 0 || exit 1
+GUIDE_WRAPPER_PART
+
+cat > "$GUIDE_PART_DIR/sourced-trailer-nounset-off" <<'GUIDE_WRAPPER_PART'
+case $- in
+  *u*) exit 1 ;;
+esac
+exit 0
+GUIDE_WRAPPER_PART
+
+cat > "$GUIDE_PART_DIR/sourced-trailer-nounset-on" <<'GUIDE_WRAPPER_PART'
+case $- in
+  *u*) ;;
+  *) exit 1 ;;
+esac
+exit 0
+GUIDE_WRAPPER_PART
+
+# hostname-mutation's whole reason for being sourced: the certificate ID the
+# bind returned has to be in the caller when the certificate-binding command
+# reads it. Checked before the option check so a file that handed nothing
+# forward cannot pass by restoring options tidily.
+cat > "$GUIDE_PART_DIR/hostname-mutation-forwarded-value" <<'GUIDE_WRAPPER_PART'
+test "$MANAGED_CERTIFICATE_ID" = "$PP_MOCK_EXPECTED_CERTIFICATE_ID" || exit 1
+GUIDE_WRAPPER_PART
+
+cat > "$GUIDE_PART_DIR/custom-domain-context-forwarded-value" <<'GUIDE_WRAPPER_PART'
+test "$CUSTOM_DOMAIN" = "drafts.self-hoster.dev" || exit 1
+GUIDE_WRAPPER_PART
 
 run_state_bootstrap_block() {
   scenario="$1"
@@ -887,6 +936,15 @@ key                  = "patchpage-prod.tfstate"' ||
       fail "deployment exposed the private Terraform diagnostic path"
     fi
     if test "$scenario" = "final_apply_failure"; then
+      # A half-applied deployment is the same "stop, a second operator must
+      # act" state the retained-lease paths report, and it gets the same exit
+      # code for the same reason: rerunning is exactly the wrong response, so
+      # the one code a nonzero-is-retryable caller has to special-case is the
+      # one this has to use.
+      test "$status" -eq 75 ||
+        fail "deployment partial-apply freeze exited $status instead of 75"
+      grep -Fq 'Stop: do not rerun either automated flow' "$output" ||
+        fail "deployment partial-apply freeze omitted its stop instruction"
       test -f "$diagnostic_path_file" ||
         fail "failed deployment lost its private diagnostic location"
       diagnostic_log="$(cat "$diagnostic_path_file")/terraform.log"
@@ -1791,6 +1849,10 @@ test_app_rollback() {
 
 run_infrastructure_change_block() {
   scenario="$1"
+  # The second-operator review token this run is replaying an approval for.
+  # Empty is the state every first run is in: nothing has been reviewed yet, so
+  # the command may plan and report but must not apply.
+  infrastructure_approval="${2:-}"
   scenario_root="$TMP_DIR/infrastructure-$scenario"
   log="$TMP_DIR/infrastructure-$scenario.log"
   output="$TMP_DIR/infrastructure-$scenario.out"
@@ -1877,6 +1939,22 @@ run_infrastructure_change_block() {
       adoption_operation_principal_group)
         OPERATION_PRINCIPAL_TYPE="Group"
         export OPERATION_PRINCIPAL_TYPE
+        ;;
+    esac
+
+    case "$scenario" in
+      plan_review_stale_token)
+        # A well-formed token that no plan of this state ever produced: the
+        # approval an operator would carry over from a plan that has since
+        # drifted.
+        INFRA_CHANGE_APPROVAL_SHA256="0000000000000000000000000000000000000000000000000000000000000000"
+        export INFRA_CHANGE_APPROVAL_SHA256
+        ;;
+      *)
+        if test -n "$infrastructure_approval"; then
+          INFRA_CHANGE_APPROVAL_SHA256="$infrastructure_approval"
+          export INFRA_CHANGE_APPROVAL_SHA256
+        fi
         ;;
     esac
 
@@ -2030,6 +2108,8 @@ azurerm_container_app.server'
     final_apply_failure \
     secure_change_cleanup_failure \
     infra_diagnostic_cleanup_failure \
+    plan_review_unapproved \
+    plan_review_stale_token \
     success; do
     if run_infrastructure_change_block "$scenario"; then
       status=0
@@ -2039,10 +2119,77 @@ azurerm_container_app.server'
 
     log="$TMP_DIR/infrastructure-$scenario.log"
     output="$TMP_DIR/infrastructure-$scenario.out"
+
+    # Every scenario that gets past the plan now stops at the second-operator
+    # review gate, so the scenarios below -- all written against a flow that ran
+    # through to apply -- are replayed with the approval that run printed. The
+    # token is read back from the run that produced it rather than hardcoded,
+    # which is also what pins the property the gate depends on: two plans of the
+    # same state render the same inventory and therefore the same token, so an
+    # approval survives exactly one replay of an unchanged plan.
+    case "$scenario" in
+      plan_review_unapproved | plan_review_stale_token) ;;
+      *)
+        infrastructure_review_token="$(
+          sed -n 's/^INFRA_CHANGE_APPROVAL_SHA256=//p' "$output"
+        )"
+        if test -n "$infrastructure_review_token"; then
+          if run_infrastructure_change_block "$scenario" "$infrastructure_review_token"; then
+            status=0
+          else
+            status=$?
+          fi
+        fi
+        ;;
+    esac
+
     assert_retained_lease_exit_code "infrastructure change" "$scenario" "$status" \
       "$output"
     diagnostic_path_file="$TMP_DIR/infrastructure-$scenario/diagnostic-dir"
-    if test "$scenario" = "success" ||
+    if test "$scenario" = "plan_review_unapproved" ||
+      test "$scenario" = "plan_review_stale_token"; then
+      infrastructure_review_token="$(
+        sed -n 's/^INFRA_CHANGE_APPROVAL_SHA256=//p' "$output"
+      )"
+      printf '%s\n' "$infrastructure_review_token" | grep -Eq '^[0-9a-f]{64}$' ||
+        fail "infrastructure change did not print a review token after $scenario"
+      if grep -Eq '^terraform apply ' "$log"; then
+        fail "infrastructure change applied without a matching approval after $scenario"
+      fi
+      grep -Eq '^az storage container lease release ' "$log" ||
+        fail "infrastructure change kept the operation lease at the review gate after $scenario"
+      if test "$scenario" = "plan_review_unapproved"; then
+        test "$status" -eq 0 ||
+          fail "infrastructure change plan-and-report exited $status instead of 0"
+        grep -Fqx completed "$log" ||
+          fail "infrastructure change plan-and-report did not complete"
+        test ! -d "$(cat "$diagnostic_path_file")" ||
+          fail "infrastructure change plan-and-report retained private Terraform diagnostics"
+        # What makes the approval an approval of *these* actions: the token is
+        # the digest of exactly the inventory text printed above it, recomputed
+        # here from that text rather than taken on trust. A token that were a
+        # constant, a nonce, or a digest of anything else fails this.
+        infrastructure_reviewed_actions="$(
+          sed -n '/^Second operator:/q;p' "$output"
+        )"
+        test -n "$infrastructure_reviewed_actions" ||
+          fail "infrastructure change asked for approval without rendering an action inventory"
+        test "$infrastructure_review_token" = "$(
+          printf '%s\n' "$infrastructure_reviewed_actions" |
+            openssl dgst -sha256 -r |
+            cut -d ' ' -f1
+        )" ||
+          fail "the infrastructure review token is not the digest of the reviewed action inventory"
+      else
+        test "$status" -eq 1 ||
+          fail "infrastructure change stale approval exited $status instead of 1"
+        grep -Fq 'The second-operator approval does not match this plan' "$output" ||
+          fail "infrastructure change did not report the approval/plan mismatch"
+        if grep -q '^completed$' "$log"; then
+          fail "infrastructure change continued after $scenario"
+        fi
+      fi
+    elif test "$scenario" = "success" ||
       test "$scenario" = "infra_diagnostic_cleanup_failure" ||
       test "$scenario" = "nonrevision_apply_success" ||
       test "$scenario" = "scale_to_zero_success" ||
@@ -2497,6 +2644,7 @@ run_stale_lease_recovery_block() {
 }
 
 test_stale_lease_recovery() {
+  stale_lease_retained_start="$GUIDE_RETAINED_LEASE_EXITS"
   for scenario in \
     confirmation_missing \
     operation_container_lookup_failure \
@@ -2517,6 +2665,12 @@ test_stale_lease_recovery() {
     fi
     log="$TMP_DIR/stale-lease-$scenario.log"
     output="$TMP_DIR/stale-lease-$scenario.out"
+    # Recovery holds a lease of its own between acquire and release, so it is
+    # held to the same contract as the flows it recovers: if its own release
+    # fails, the container is left leased and the caller must be told to stop
+    # rather than to retry.
+    assert_retained_lease_exit_code "stale lease recovery" "$scenario" "$status" \
+      "$output"
     if test "$scenario" = "success"; then
       test "$status" -eq 0 || fail "stale operation lease recovery rejected success"
       test "$(cat "$output")" = "Operation lease recovery completed." ||
@@ -2571,6 +2725,8 @@ test_stale_lease_recovery() {
       esac
     fi
   done
+  test "$((GUIDE_RETAINED_LEASE_EXITS - stale_lease_retained_start))" -ge 1 ||
+    fail "stale lease recovery never exercised a lease it could not give back"
   grep -Fq 'A second authorized operator must independently verify' "$README" ||
     fail "stale operation lease guidance omitted second-operator verification"
   grep -Fq 'An infinite lease survives `SIGKILL`' "$README" ||
@@ -2618,6 +2774,23 @@ ops_sources_reach_tools_through_path() {
 # cannot be satisfied by a re-inlined runbook. Takes the guide file so the check
 # itself can be meta-tested against a sabotaged copy.
 # Deliberately reports status instead of calling fail.
+# Returns 0 when none of the given files mentions `trap`, 1 when one does. Two
+# of the commands are documented as `. cmd/<name>.sh`, so they run in the
+# operator's own shell. A trap installed there is installed on that shell: no
+# process ends to take it down, and it would fire on whatever the operator ran
+# next, or silently replace a handler they were relying on. Nothing in either
+# file needs one -- neither creates anything to clean up -- so the rule is that
+# the word does not appear in them at all, in code or in prose, which is the
+# version of it that cannot be argued with. Takes the files so the check itself
+# can be meta-tested against a sabotaged copy.
+# Deliberately reports status instead of calling fail.
+sourced_commands_install_no_trap() {
+  awk '
+    $0 ~ "(^|[^[:alnum:]_])trap([^[:alnum:]_]|$)" { installs_trap = 1 }
+    END { exit installs_trap ? 1 : 0 }
+  ' "$@"
+}
+
 guide_carries_no_moved_runbook() {
   awk '
     /^<!-- guide-test:/ { marker = 1 }
@@ -2839,6 +3012,30 @@ test_public_safe_runbook_static() {
   rm -rf "$moved_runbook_probe_dir"
   rm -rf "$restricted_path_probe_dir"
 
+  # The two sourced commands run in the operator's shell, where a trap would
+  # outlive the command instead of being torn down with a process.
+  sourced_commands_install_no_trap \
+    "$GUIDE_CMD_DIR/custom-domain-context.sh" \
+    "$GUIDE_CMD_DIR/hostname-mutation.sh" ||
+    fail "a command the guide has the operator source installs a trap in their shell"
+
+  sourced_trap_probe_dir="$TMP_DIR/sourced-trap-probe"
+  rm -rf "$sourced_trap_probe_dir"
+  mkdir -p "$sourced_trap_probe_dir" ||
+    fail "could not create the sourced-trap probe directory"
+  cp "$GUIDE_CMD_DIR/hostname-mutation.sh" \
+    "$sourced_trap_probe_dir/hostname-mutation.sh" ||
+    fail "could not build the sourced-trap probe"
+  sourced_commands_install_no_trap "$sourced_trap_probe_dir/hostname-mutation.sh" ||
+    fail "the sourced-trap check rejects an unmodified sourced command"
+  printf '%s\n' "trap 'printf leaked' 0" \
+    >> "$sourced_trap_probe_dir/hostname-mutation.sh" ||
+    fail "could not sabotage the sourced-trap probe"
+  if sourced_commands_install_no_trap "$sourced_trap_probe_dir/hostname-mutation.sh"; then
+    fail "the sourced-trap check accepts a sourced command that installs a trap"
+  fi
+  rm -rf "$sourced_trap_probe_dir"
+
   guide_harness_file="$ROOT/infra/azure/tests/guide_commands_test.sh"
   merged_containerapp_scenarios_are_flow_exclusive \
     "$guide_harness_file" "$GUIDE_MOCK_DIR/az" ||
@@ -3028,6 +3225,33 @@ test_custom_domain_context() {
   fi
   test "$(cat "$context_output")" = "Azure deployment context verified privately." ||
     fail "custom-domain context exposed deployment details instead of generic success"
+
+  # The run above sources it from a shell that already has `set -u` on, which
+  # cannot tell "restored it" from "never touched it". This one sources it from
+  # a shell that does not, where leaving the option on would be the operator's
+  # next unset variable killing their session.
+  for caller_nounset in off on; do
+    context_output="$TMP_DIR/custom-domain-context-nounset-$caller_nounset.out"
+    if ! (
+      PP_MOCK_GROUP="custom-domain"
+      PP_MOCK_SCENARIO=""
+      PP_MOCK_LOG=""
+      PP_MOCK_EXPECTED_SUBSCRIPTION="00000000-0000-0000-0000-000000000000"
+      PP_MOCK_SUBSCRIPTION_ID="$PP_MOCK_EXPECTED_SUBSCRIPTION"
+      export PP_MOCK_GROUP PP_MOCK_SCENARIO PP_MOCK_LOG \
+        PP_MOCK_EXPECTED_SUBSCRIPTION PP_MOCK_SUBSCRIPTION_ID
+      prepare_mock_state "$TMP_DIR/custom-domain-context-nounset-$caller_nounset.mockstate"
+
+      run_ops_wrapper "custom-domain-context-nounset-$caller_nounset" \
+        "caller-nounset-$caller_nounset" \
+        custom-domain-context-source \
+        sourced-status \
+        custom-domain-context-forwarded-value \
+        "sourced-trailer-nounset-$caller_nounset"
+    ) >"$context_output" 2>&1; then
+      fail "sourcing custom-domain-context left the caller's set -u $caller_nounset state changed or lost its values"
+    fi
+  done
 }
 
 run_custom_domain_output_guard_block() {
@@ -3232,6 +3456,47 @@ test_hostname_mutation_guard() {
       '00000000-0000-0000-0000-000000000000|11111111-1111-1111-1111-111111111111|drafts\.self-hoster\.dev|managedCertificates/cert-one' \
       "$output"; then
       fail "hostname mutation exposed a subscription, hostname, or certificate ID after $scenario"
+    fi
+  done
+
+  # The guide documents this one as `. cmd/hostname-mutation.sh`, so the calling
+  # shell is part of its contract in two ways: MANAGED_CERTIFICATE_ID has to
+  # arrive there for the certificate-binding command to read, and the options
+  # the file set for its own use have to be handed back. The dispatched runs
+  # above cannot see either, because a child process shares neither.
+  for caller_nounset in off on; do
+    log="$TMP_DIR/hostname-sourced-$caller_nounset.log"
+    : > "$log"
+    output="$TMP_DIR/hostname-sourced-$caller_nounset.out"
+
+    if ! (
+      SUBSCRIPTION_ID="$expected_subscription"
+      ACTIVE_SUBSCRIPTION_ID=""
+      RESOURCE_GROUP="rg-test"
+      CONTAINER_APP="app-test"
+      CONTAINER_APP_ENVIRONMENT="env-test"
+      CUSTOM_DOMAIN="drafts.self-hoster.dev"
+      VALIDATION_METHOD="CNAME"
+      export SUBSCRIPTION_ID ACTIVE_SUBSCRIPTION_ID RESOURCE_GROUP \
+        CONTAINER_APP CONTAINER_APP_ENVIRONMENT CUSTOM_DOMAIN VALIDATION_METHOD
+
+      PP_MOCK_GROUP="hostname"
+      PP_MOCK_SCENARIO="success"
+      PP_MOCK_LOG="$log"
+      PP_MOCK_EXPECTED_SUBSCRIPTION="$expected_subscription"
+      PP_MOCK_EXPECTED_CERTIFICATE_ID="$expected_certificate_id"
+      export PP_MOCK_GROUP PP_MOCK_SCENARIO PP_MOCK_LOG \
+        PP_MOCK_EXPECTED_SUBSCRIPTION PP_MOCK_EXPECTED_CERTIFICATE_ID
+      prepare_mock_state "$TMP_DIR/hostname-sourced-$caller_nounset.mockstate"
+
+      run_ops_wrapper "hostname-sourced-$caller_nounset" \
+        "caller-nounset-$caller_nounset" \
+        hostname-mutation-source \
+        sourced-status \
+        hostname-mutation-forwarded-value \
+        "sourced-trailer-nounset-$caller_nounset"
+    ) >"$output" 2>&1; then
+      fail "sourcing hostname-mutation lost MANAGED_CERTIFICATE_ID or left the caller's set -u $caller_nounset state changed"
     fi
   done
 }

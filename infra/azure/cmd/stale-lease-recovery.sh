@@ -132,15 +132,26 @@ if ! RECOVERY_LEASE_HEX="$(
   exit 1
 fi
 RECOVERY_LEASE_ACTIVE=true
+# RECOVERY_LEASE_ACTIVE stays optimistic on purpose: an acquire whose result is
+# unknown may still have been granted, so the exit trap always offers the lease
+# back. RECOVERY_LEASE_ACQUIRED is the narrower fact -- Azure confirmed the
+# acquire -- and only that fact turns a failed release into the exit-75 stop.
+# Without it an acquire that was refused outright would report a lease this
+# recovery never held.
+RECOVERY_LEASE_ACQUIRED=false
 release_recovery_lease() {
-  if test "${RECOVERY_LEASE_ACTIVE:-false}" = "true" &&
-    private_az storage container lease release \
+  if test "${RECOVERY_LEASE_ACTIVE:-false}" = "true"; then
+    if private_az storage container lease release \
       --account-name "$STATE_STORAGE_ACCOUNT" \
       --container-name "$OPERATION_CONTAINER" \
       --auth-mode login \
       --lease-id "$RECOVERY_LEASE_ID" \
       --output none >/dev/null; then
-    RECOVERY_LEASE_ACTIVE=false
+      RECOVERY_LEASE_ACTIVE=false
+    elif test "${RECOVERY_LEASE_ACQUIRED:-false}" = "true"; then
+      printf 'The operation lease remains held for second-operator recovery.\n' >&2
+      exit 75
+    fi
   fi
 }
 trap 'release_recovery_lease' 0
@@ -153,13 +164,17 @@ if ! private_az storage container lease acquire \
   --auth-mode login \
   --lease-duration -1 \
   --proposed-lease-id "$RECOVERY_LEASE_ID" \
+  --output none >/dev/null; then
+  printf 'Operation lease recovery failed closed.\n' >&2
+  exit 1
+fi
+RECOVERY_LEASE_ACQUIRED=true
+if ! private_az storage container lease renew \
+  --account-name "$STATE_STORAGE_ACCOUNT" \
+  --container-name "$OPERATION_CONTAINER" \
+  --auth-mode login \
+  --lease-id "$RECOVERY_LEASE_ID" \
   --output none >/dev/null ||
-  ! private_az storage container lease renew \
-    --account-name "$STATE_STORAGE_ACCOUNT" \
-    --container-name "$OPERATION_CONTAINER" \
-    --auth-mode login \
-    --lease-id "$RECOVERY_LEASE_ID" \
-    --output none >/dev/null ||
   ! private_az storage container lease release \
     --account-name "$STATE_STORAGE_ACCOUNT" \
     --container-name "$OPERATION_CONTAINER" \

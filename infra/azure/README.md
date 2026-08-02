@@ -34,7 +34,7 @@ The bootstrap creates exactly two private containers in the state account: `tfst
 A normal run leaves `RESUME_STATE_BOOTSTRAP=false`. If this exact block failed after creating part of the dedicated state resource group, set it to `true`; the block accepts only the exact state account and a subset of those two intended containers, rejects foreign resources plus any unexpected active or recoverable container and any used or recoverable state key, then continues idempotently. It inventories immediately after resource-group creation and again immediately before the storage-account lock, so a concurrent foreign resource causes a fail-closed stop without locking that resource. Never use resume to adopt an unrelated state account. Do not commit the generated backend config. The bootstrap deliberately uses storage-account-key authorization for initial container provisioning because an Azure account with management-plane access does not automatically have Blob data-plane OAuth access. Azure CLI retrieves the key without writing it to the backend config; do not enable shell tracing or CLI debug output for this block.
 
 
-Every runbook in this guide is a command of the Azure operations CLI at `infra/azure/ops.sh`, and `sh infra/azure/ops.sh --help` lists all of them with the exit-code contract. A command exits `0` on success; `1` when the step failed and is safe to retry after you fix the reported problem, because no operation lease is still held; and `75` when the operation lease is **deliberately retained**. On `75` stop: do not retry, do not rerun any flow, and do not break the lease. A mutation may still be in flight, so a second authorized operator must first prove the original process is gone and then run [the stale-lease recovery](#recover-an-abandoned-operation-lease).
+Every runbook in this guide is a command of the Azure operations CLI at `infra/azure/ops.sh`, and `sh infra/azure/ops.sh --help` lists all of them with the exit-code contract. A command exits `0` on success; `1` when the step failed safely and is safe to retry after you fix the reported problem, because nothing is still held; and `75` when it **stopped and a second authorized operator has to act**. On `75` stop: do not retry and do not rerun any flow. Usually the operation lease is deliberately retained, so do not break it either — a mutation may still be in flight, and that second operator must first prove the original process is gone and then run [the stale-lease recovery](#recover-an-abandoned-operation-lease). The initial deployment also exits `75` when an apply may have half landed, where nothing is leased but the same stop-and-escalate rule applies.
 
 Export the inputs this command requires, then run it:
 
@@ -85,7 +85,7 @@ Export the inputs this command requires, then run it:
 ```sh
 sh infra/azure/ops.sh deploy-resources
 ```
-If the final saved-plan apply reports a partial deployment, `RESUME_INITIAL_DEPLOY` is intentionally not a recovery mechanism: it accepts only registry-target state. Freeze mutations, preserve the remote state and private provider diagnostics, and have a second operator reconcile every state address to its exact live Azure resource ID before reviewing a new no-delete completion plan. Do not remove, forget, import over, or replace a persistent resource to make a plan pass.
+If the final saved-plan apply reports a partial deployment the command exits `75`, and `RESUME_INITIAL_DEPLOY` is intentionally not a recovery mechanism: it accepts only registry-target state. Freeze mutations, preserve the remote state and private provider diagnostics, and have a second operator reconcile every state address to its exact live Azure resource ID before reviewing a new no-delete completion plan. Do not remove, forget, import over, or replace a persistent resource to make a plan pass.
 
 
 At this point Azure's generated Container App hostname is live over HTTPS, but the deployer-owned hostname and certificate are not configured yet.
@@ -163,7 +163,7 @@ The rollback block completes the deployed-image, native/public health, and pre-e
 An image release is not an infrastructure change. PostgreSQL, Blob Storage, identities, networking, state, backup, locks, DNS, and certificates require a separate reviewed maintenance window. Before planning, privately set the expected subscription, backend key, state lineage, resource-group ID, Storage account ID, PostgreSQL server ID, registry ID, and Container App ID. The infrastructure operator must already be authorized to retrieve the state-account key for backend/state verification; this block uses that same key authorization to recompute and verify the operation-container workload binding and use the shared lease. Stop on any mismatch; never repair state by deleting the live resource.
 
 Deployments created before these safety guards exist can use this same flow without replacing state or infrastructure. Set `ADOPT_SAFETY_GUARDS=true` only for that first reviewed run. For that adoption run only, privately set `OPERATION_PRINCIPAL_ID` and `OPERATION_PRINCIPAL_TYPE` for the least-privileged identity that will run release and rollback operations; it does not have to be the infrastructure caller. Before any adoption mutation, the block proves the existing state lineage and every exact live resource ID and rejects foreign locks. It creates a missing private operation container with its workload-binding metadata atomically, or seals an existing empty container only when it has no metadata; it never overwrites foreign metadata or container data. It grants only exact-container Blob access, raises state retention without shortening any longer live setting, creates only the two exact persistent-resource locks plus the separate state-account lock, and imports the two Terraform-managed workload locks at their deterministic IDs before planning. A partially completed adoption can be rerun: already imported exact lock addresses are verified rather than re-imported. It also resolves a legacy image tag to a separately verified registry digest, updates only the exact Container App under the shared lease, and atomically writes `server-image.auto.tfvars` as mode `0600` so Terraform agrees before planning.
-Before running this flow, set `TERRAFORM_DIAGNOSTIC_ROOT` to an existing private directory outside the repository. Provider output remains in a randomized mode-0600 log below that root across the review pause. Failure or abort preserves it and emits only a generic reminder; a successful saved-plan apply removes it.
+Before running this flow, set `TERRAFORM_DIAGNOSTIC_ROOT` to an existing private directory outside the repository. Provider output remains in a randomized mode-0600 log below that root for the duration of each run. Failure or abort preserves it and emits only a generic reminder; a successful saved-plan apply removes it, as does the plan-and-report run that stops at the review gate below.
 
 Required base state addresses before the first safety-guard adoption:
 
@@ -200,6 +200,7 @@ Export the inputs this command requires, then run it:
 | `EXPECTED_LEGACY_IMAGE_DIGEST` | from a separately verified legacy release record; required only for a legacy adoption |
 | `TERRAFORM_DIAGNOSTIC_ROOT` | an existing private diagnostic directory outside the repository |
 | `ADOPT_SAFETY_GUARDS` | optional; `true` only to adopt an existing environment's safety guards |
+| `INFRA_CHANGE_APPROVAL_SHA256` | optional; the review token a first run printed, set only on the approved rerun |
 
 ```sh
 sh infra/azure/ops.sh infrastructure-change
@@ -207,9 +208,15 @@ sh infra/azure/ops.sh infrastructure-change
 
 This command exits `75` if it cannot prove the result of its apply or the readiness that follows it: the infinite lease stays held on purpose and only the documented second-operator recovery may clear it.
 
-Require a second operator to compare the private environment record, backup/restore evidence, and exact address/action inventory. Apply only the saved plan from the same shell after approval:
+That first run does not apply anything. It plans, prints the exact address/action inventory, releases the operation lease, and stops at the second-operator review gate with exit `0`, after printing a review token: the SHA-256 digest of exactly the inventory it just printed.
 
-There is no second command to run. The saved-plan gate and the apply above are the second half of `sh infra/azure/ops.sh infrastructure-change`, in the same process and the same shell state, exactly as the two fences here always were. Complete the second-operator review **before** starting the command; splitting the plan and the apply into separate commands is tracked separately.
+Require a second operator to compare the private environment record, backup/restore evidence, and that exact address/action inventory. Then rerun the same command with the token they approved:
+
+```sh
+INFRA_CHANGE_APPROVAL_SHA256=<the token the first run printed> sh infra/azure/ops.sh infrastructure-change
+```
+
+The rerun replans against current state and recomputes the token from the new inventory. Because the approval is the digest of the actions it approves, it can only ever apply those actions: if the state drifted so the plan changed in between, the recorded token no longer matches and the command stops with exit `1` and a fresh token to review. Never carry a token over from a different environment or an earlier plan. Splitting the plan and the apply into two named commands is tracked separately; until then this token is what carries the second-operator review between the two runs.
 
 ### Recover an abandoned operation lease
 
@@ -360,7 +367,11 @@ Run this in the shell that sourced the context above; it reads `SUBSCRIPTION_ID`
 Certificate issuance can take several minutes. The bind command captured the exact managed-certificate resource ID selected by Azure. After issuance, confirm that this exact resource succeeded for the normalized hostname and that the SNI binding still points to the same ID:
 
 
-Run this in the shell that sourced the context and the hostname mutation above; it reads `SUBSCRIPTION_ID`, `RESOURCE_GROUP`, `CONTAINER_APP`, `CONTAINER_APP_ENVIRONMENT`, `CUSTOM_DOMAIN` and `MANAGED_CERTIFICATE_ID` from there.
+Run this in the shell that sourced the context and the hostname mutation above; it reads `SUBSCRIPTION_ID`, `RESOURCE_GROUP`, `CONTAINER_APP`, `CONTAINER_APP_ENVIRONMENT` and `CUSTOM_DOMAIN` from there. The one value it names as its own required input is the certificate ID the hostname mutation handed forward:
+
+| Variable | Value |
+| --- | --- |
+| `MANAGED_CERTIFICATE_ID` | the managed-certificate resource ID `. infra/azure/cmd/hostname-mutation.sh` left in the shell |
 
 ```sh
 sh infra/azure/ops.sh certificate-binding

@@ -8,12 +8,13 @@
 # shell function inside the block script, keyed off a per-scenario call counter;
 # the counter now lives in the scenario state directory instead of a variable.
 #
-# It also records the path it handed back for every call, in call order, so the
-# cat, rm and jq shims can recognise the block's own TERRAFORM_DIAGNOSTIC_DIR,
-# STATE_LIST_ERROR, SECURE_TARGET_DIR, SECURE_PLAN_DIR and SECURE_CHANGE_DIR
-# without being able to read the block's variables. The terraform shim already
-# does this for the saved plan paths; see mock_mktemp_recall in mocklib.sh for
-# the call-order map.
+# It also records the template it was called with and the path it handed back,
+# for every call, so the cat, rm and jq shims can recognise the block's own
+# TERRAFORM_DIAGNOSTIC_DIR, STATE_LIST_ERROR, SECURE_TARGET_DIR, SECURE_PLAN_DIR
+# and SECURE_CHANGE_DIR without being able to read the block's variables. The
+# terraform shim already does this for the saved plan paths; see
+# mock_mktemp_recall in mocklib.sh for why the template, and not the call
+# ordinal, is what a consumer looks a path up by.
 
 set -u
 
@@ -70,7 +71,7 @@ case "$group" in
 esac
 
 mktemp_result="$(mktemp_real "$@")" || exit 1
-mock_state_write "mktemp-path-$mktemp_count" "$mktemp_result"
+mock_mktemp_record "$*" "$mktemp_result"
 
 if test "$mktemp_count" -eq 1; then
   # The harness reads the diagnostic directory back from the scenario root, so

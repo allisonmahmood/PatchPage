@@ -5,8 +5,9 @@
 # plan's JSON rendering fails, so the block has to report that it could not
 # render the action summary. The plan JSON sits inside the secure plan directory
 # the block got from mktemp, so the path is recovered from the mktemp shim's
-# call-order recording. Every other invocation -- including the smoke flow's
-# real JSON assertions in the curl shim -- falls through to the real jq.
+# recording by the template that created it. Every other invocation -- including
+# the smoke flow's real JSON assertions in the curl shim -- falls through to the
+# real jq.
 
 set -u
 
@@ -15,12 +16,18 @@ set -u
 jq_plan_json=''
 case "$group" in
   deploy)
-    jq_plan_dir="$(mock_mktemp_recall 4)"
+    jq_plan_dir="$(
+      mock_mktemp_recall \
+        "-d $TERRAFORM_DIAGNOSTIC_ROOT/patchpage-initial-plan.XXXXXX"
+    )"
     test -z "$jq_plan_dir" || jq_plan_json="$jq_plan_dir/initial.json"
     jq_seen_name="initial-plan-jq-seen"
     ;;
   infrastructure)
-    jq_plan_dir="$(mock_mktemp_recall 2)"
+    jq_plan_dir="$(
+      mock_mktemp_recall \
+        "-d $TERRAFORM_DIAGNOSTIC_ROOT/patchpage-infrastructure-change.XXXXXX"
+    )"
     test -z "$jq_plan_dir" || jq_plan_json="$jq_plan_dir/infrastructure-plan.json"
     jq_seen_name="infrastructure-plan-jq-seen"
     ;;

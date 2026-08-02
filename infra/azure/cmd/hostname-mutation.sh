@@ -1,3 +1,13 @@
+# The guide has the operator source this file, because MANAGED_CERTIFICATE_ID
+# has to survive into the shell the certificate binding runs in and a child
+# process cannot hand a variable back. That makes the caller's shell options
+# part of what this file borrows and must return: leaving `set -u` on turns the
+# operator's next unset variable into a dead session. `set +x` is deliberately
+# not restored -- keeping tracing off is the point of setting it.
+case $- in
+  *u*) hostname_mutation_saved_nounset=on ;;
+  *) hostname_mutation_saved_nounset=off ;;
+esac
 set -u
 set +x
 private_az() {
@@ -44,3 +54,7 @@ if test -z "$MANAGED_CERTIFICATE_ID"; then
   printf 'Azure did not return the bound managed-certificate resource ID.\n' >&2
   exit 1
 fi
+if test "$hostname_mutation_saved_nounset" = "off"; then
+  set +u
+fi
+unset hostname_mutation_saved_nounset

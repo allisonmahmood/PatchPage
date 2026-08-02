@@ -530,7 +530,7 @@ if ! jq -r \
 fi
 if ! private_terraform apply -input=false "$INITIAL_PLAN" >&3; then
   printf 'Terraform may have persisted a partial deployment. Stop: do not rerun either automated flow, delete resources, or replace state; preserve private diagnostics for second-operator recovery.\n' >&2
-  exit 1
+  exit 75
 fi
 terraform_resource_id() {
   printf '%s\n' "$1" |
