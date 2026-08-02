@@ -619,6 +619,19 @@ az_release_manifest() {
   esac
 }
 
+# The release and rollback flows share the next two functions. That merge is
+# only sound under one invariant: no scenario name may mean different things to
+# the two flows. The two lists are not disjoint -- 58 of the release flow's 84
+# names also appear in the rollback flow's 66 -- but every shared name drives an
+# assertion both flows make, so one implementation is the right answer for it.
+# The names the case arms below special-case are the ones that must never appear
+# in the other flow's list: adding one there would silently fire an arm written
+# for a different flow.
+#
+# test_public_safe_runbook_static enforces this mechanically, through
+# merged_containerapp_scenarios_are_flow_exclusive in the harness: it reads both
+# scenario lists and this file, and requires each flow-specific name below to be
+# used by exactly one flow and to still be referenced here.
 az_containerapp_show() {
   app_show_count="$(mock_state_count "$PP_MOCK_APP_SHOW_COUNT_FILE")"
   app_id="$(mock_expected_container_app_id)"

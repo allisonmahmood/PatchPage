@@ -7,7 +7,18 @@ README="$ROOT/infra/azure/README.md"
 TMP_ROOT="$(mktemp -d)"
 TMP_DIR="$TMP_ROOT/guide commands"
 mkdir -p "$TMP_DIR"
-trap 'rm -rf "$TMP_ROOT"' 0 HUP INT TERM
+
+# Set PP_KEEP_TMP=1 to keep the scenario command logs, stdout/stderr captures
+# and mock state for inspection; tests/canonicalize_guide_logs.sh turns what is
+# left behind into a diffable form.
+guide_cleanup() {
+  if test -n "${PP_KEEP_TMP:-}"; then
+    printf 'guide_commands_test: PP_KEEP_TMP set, preserving %s\n' "$TMP_ROOT" >&2
+    return 0
+  fi
+  rm -rf "$TMP_ROOT"
+}
+trap guide_cleanup 0 HUP INT TERM
 
 fail() {
   printf 'guide_commands_test: %s\n' "$1" >&2
@@ -58,6 +69,14 @@ for guide_mock in mocklib.sh az terraform git curl dig; do
   sh -n "$GUIDE_MOCK_DIR/$guide_mock" ||
     fail "guide harness mock $guide_mock is not valid POSIX shell"
 done
+
+# The log canonicalizer is developer tooling rather than a shim, but CI runs
+# only this harness, so syntax-check it here for the same reason.
+GUIDE_CANONICALIZER="$ROOT/infra/azure/tests/canonicalize_guide_logs.sh"
+test -f "$GUIDE_CANONICALIZER" ||
+  fail "guide log canonicalizer is missing"
+sh -n "$GUIDE_CANONICALIZER" ||
+  fail "guide log canonicalizer is not valid POSIX shell"
 
 # Block scripts are assembled from parts on disk rather than from shell
 # variables: bash 3.2 mis-parses a quoted here-document inside a command
@@ -2757,14 +2776,6 @@ test_stale_lease_recovery() {
     fail "stale operation lease guidance omitted uncatchable-kill behavior"
 }
 
-# Returns 0 when the Container App create-time image gate delegates to
-# local.server_image_is_managed_digest, 1 otherwise. Takes the directory holding
-# container_app.tf so the check itself can be meta-tested against a sabotaged copy.
-# Deliberately reports status instead of calling fail.
-#
-# Only preconditions inside resource "azurerm_container_app" "server" count: an
-# unscoped scan would accept a neutered real gate as long as some other resource
-# carried the pinned line.
 # Returns 0 when every ```sh block in the given guide reaches its tools through
 # PATH, 1 when one of them names a tool by absolute path. The harness only
 # proves a documented command because that command resolves to a shim in
@@ -2772,6 +2783,20 @@ test_stale_lease_recovery() {
 # silently take the step out of the harness's reach. Takes the guide file so
 # the check itself can be meta-tested against a sabotaged copy.
 # Deliberately reports status instead of calling fail.
+#
+# Exactly what this guarantees: inside a ```sh block, none of the 13 tools the
+# harness mocks -- az, terraform, tofu, git, curl, dig, jq, openssl, mktemp,
+# chmod, sleep, cat, rm -- is named by an absolute path. That is the one bypass
+# that would fail silently, because the real tool would answer and the block
+# would still look like it passed.
+#
+# What it deliberately does not catch: `command -p az`, which resolves against
+# the implementation-defined default PATH, and a `PATH=/usr/bin az ...`
+# assignment prefix. Both are left to CI rather than pattern-matched here: no
+# real az, terraform or dig exists on the runner, so either construct fails
+# loudly on the very first documented command instead of quietly passing. A
+# regex for them would also have to model shell quoting to avoid false
+# positives on prose and on the guide's own PATH-setting examples.
 readme_sh_blocks_reach_tools_through_path() {
   awk '
     $0 == "```sh" { in_block = 1; next }
@@ -2783,6 +2808,75 @@ readme_sh_blocks_reach_tools_through_path() {
   ' "$1"
 }
 
+# Returns 0 when every scenario name the merged release/rollback Container App
+# mocks treat as flow-specific is used by exactly one of the two flows, 1
+# otherwise. Takes the harness file and the az shim so the check itself can be
+# meta-tested against a sabotaged copy.
+# Deliberately reports status instead of calling fail.
+#
+# az_containerapp_show and az_containerapp_revision in tests/mocks/az serve both
+# flows from one implementation. The two scenario lists overlap heavily, and
+# that is fine: a shared name drives an assertion both flows make. What would
+# not be fine is a name that means one thing to release and another to rollback,
+# because the merged case arm would fire in a flow it was never written for. The
+# names below are the ones those arms special-case, so each must stay exclusive
+# to its flow -- and must still be referenced in the merged functions, so the
+# pin cannot rot into a check of names nothing reads any more.
+merged_containerapp_scenarios_are_flow_exclusive() {
+  awk -v harness="$1" -v az_mock="$2" \
+    -v release_only_names="deployed_image_mismatch deployed_image_show_failure prelease_locked_image_mismatch preupdate_image_mismatch rollback_image_show_failure rollback_image_invalid rollback_digest_invalid" \
+    -v rollback_only_names="stale_current_image postupdate_image_mismatch" '
+    BEGIN {
+      release_only_count = split(release_only_names, release_only, " ")
+      rollback_only_count = split(rollback_only_names, rollback_only, " ")
+    }
+    FILENAME == harness {
+      if ($0 == "test_app_release() {") { flow = "release"; next }
+      if ($0 == "test_app_rollback() {") { flow = "rollback"; next }
+      if (flow != "" && $0 == "  for scenario in \\") { collecting = 1; next }
+      if (collecting) {
+        gsub(/\\/, " ")
+        gsub(/;/, " ")
+        for (i = 1; i <= NF; i++) {
+          if ($i == "do") { collecting = 0; flow = ""; break }
+          used[flow " " $i] = 1
+        }
+      }
+      next
+    }
+    FILENAME == az_mock {
+      if ($0 == "az_containerapp_show() {") { in_merged = 1 }
+      else if (in_merged && $0 ~ /^# -----/) { in_merged = 0 }
+      if (in_merged) { merged = merged " " $0 }
+      next
+    }
+    END {
+      broken = 0
+      # Both lists must have been found at all, or every check below is vacuous.
+      if (!used["release success"] || !used["rollback success"]) { broken = 1 }
+      for (i = 1; i <= release_only_count; i++) {
+        name = release_only[i]
+        if (!used["release " name] || used["rollback " name]) { broken = 1 }
+        if (merged !~ ("[^[:alnum:]_]" name "[^[:alnum:]_]")) { broken = 1 }
+      }
+      for (i = 1; i <= rollback_only_count; i++) {
+        name = rollback_only[i]
+        if (!used["rollback " name] || used["release " name]) { broken = 1 }
+        if (merged !~ ("[^[:alnum:]_]" name "[^[:alnum:]_]")) { broken = 1 }
+      }
+      exit broken ? 1 : 0
+    }
+  ' "$1" "$2"
+}
+
+# Returns 0 when the Container App create-time image gate delegates to
+# local.server_image_is_managed_digest, 1 otherwise. Takes the directory holding
+# container_app.tf so the check itself can be meta-tested against a sabotaged copy.
+# Deliberately reports status instead of calling fail.
+#
+# Only preconditions inside resource "azurerm_container_app" "server" count: an
+# unscoped scan would accept a neutered real gate as long as some other resource
+# carried the pinned line.
 server_image_precondition_is_pinned() {
   awk '
     $0 == "resource \"azurerm_container_app\" \"server\" {" {
@@ -2853,14 +2947,6 @@ test_public_safe_runbook_static() {
     "$README"; then
     fail "Azure guide retains a verbose hostname or certificate error that exposes private values"
   fi
-  # Lifecycle prevent_destroy is a meta-argument and is invisible to plan-time
-  # terraform test assertions. Statically require the expected blocks.
-  #
-  # Management-lock scope equality against child resource IDs also cannot be
-  # evaluated under terraform test on the CI-pinned Terraform 1.9.8: plan leaves
-  # those IDs unknown, mock_resource.override_during was only added after 1.9.8,
-  # and apply-time mocks need full Azure ID shapes for every dependent resource.
-  # Statically require each lock's scope to reference the child resource id.
   readme_sh_blocks_reach_tools_through_path "$README" ||
     fail "an Azure guide shell block names a tool by absolute path and would bypass the harness shims"
 
@@ -2887,6 +2973,45 @@ test_public_safe_runbook_static() {
   fi
   rm -rf "$restricted_path_probe_dir"
 
+  guide_harness_file="$ROOT/infra/azure/tests/guide_commands_test.sh"
+  merged_containerapp_scenarios_are_flow_exclusive \
+    "$guide_harness_file" "$GUIDE_MOCK_DIR/az" ||
+    fail "a scenario name the merged release/rollback Container App mocks special-case is used by both flows"
+
+  # Meta-test the check above: a copy that adds a release-only scenario name to
+  # the rollback list must be rejected, otherwise the merged-dispatch invariant
+  # is decorative.
+  flow_exclusive_probe_dir="$TMP_DIR/flow-exclusive-probe"
+  rm -rf "$flow_exclusive_probe_dir"
+  mkdir -p "$flow_exclusive_probe_dir" ||
+    fail "could not create the merged-dispatch probe directory"
+  awk '
+    { print }
+    !sabotaged && in_rollback && $0 == "  for scenario in \\" {
+      sabotaged = 1
+      print "    rollback_digest_invalid \\"
+    }
+    $0 == "test_app_rollback() {" { in_rollback = 1 }
+    END { if (!sabotaged) exit 1 }
+  ' "$guide_harness_file" > "$flow_exclusive_probe_dir/guide_commands_test.sh" ||
+    fail "could not build the merged-dispatch probe"
+  if cmp -s "$guide_harness_file" "$flow_exclusive_probe_dir/guide_commands_test.sh"; then
+    fail "the merged-dispatch probe did not sabotage anything"
+  fi
+  if merged_containerapp_scenarios_are_flow_exclusive \
+    "$flow_exclusive_probe_dir/guide_commands_test.sh" "$GUIDE_MOCK_DIR/az"; then
+    fail "the merged-dispatch check accepts a release-only scenario name in the rollback list"
+  fi
+  rm -rf "$flow_exclusive_probe_dir"
+
+  # Lifecycle prevent_destroy is a meta-argument and is invisible to plan-time
+  # terraform test assertions. Statically require the expected blocks.
+  #
+  # Management-lock scope equality against child resource IDs also cannot be
+  # evaluated under terraform test on the CI-pinned Terraform 1.9.8: plan leaves
+  # those IDs unknown, mock_resource.override_during was only added after 1.9.8,
+  # and apply-time mocks need full Azure ID shapes for every dependent resource.
+  # Statically require each lock's scope to reference the child resource id.
   azure_tf_dir="$ROOT/infra/azure"
   for prevent_destroy_resource in \
     'azurerm_storage_account.drafts' \

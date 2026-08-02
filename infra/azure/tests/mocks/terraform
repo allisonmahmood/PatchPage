@@ -123,11 +123,15 @@ terraform_deploy() {
       ;;
     plan\ -target=azurerm_container_registry.patchpage\ -input=false\ -out=*)
       mock_state_write registry-target-plan "${4#-out=}"
-      test "$scenario" != "target_plan_failure"
+      test "$scenario" != "target_plan_failure" || return 1
+      # Marked only after the plan succeeds, so the apply dispatch below can
+      # refuse an apply of a plan this shim never produced.
+      mock_state_mark registry-target-plan-created
       ;;
     plan\ -input=false\ -out=*)
       mock_state_write initial-plan "${3#-out=}"
-      test "$scenario" != "plan_failure"
+      test "$scenario" != "plan_failure" || return 1
+      mock_state_mark initial-plan-created
       ;;
     show\ -json\ *)
       case "$3" in
@@ -163,11 +167,23 @@ terraform_deploy() {
     apply\ -input=false\ *)
       # The block holds the two saved plan paths in shell variables the shim
       # cannot see, so compare against the paths this shim itself handed out
-      # when the corresponding plan was created.
-      if mock_state_exists registry-target-plan &&
+      # when the corresponding plan was created. The gate is the post-success
+      # *-created marker, not the recorded path: an apply of a plan whose own
+      # plan run failed is refused here rather than only being caught by a log
+      # assertion afterwards.
+      #
+      # This dispatch is ordered, so the registry-target plan path and the
+      # full plan path must stay distinct: the guide gives each its own
+      # `mktemp -d` directory (patchpage-registry-target.XXXXXX and
+      # patchpage-initial-plan.XXXXXX) and its own basename
+      # (registry-target.tfplan and initial.tfplan). If either the directories
+      # or the basenames ever collide, the first branch would answer for the
+      # full apply too and the final_apply_failure scenario would silently
+      # become vacuous.
+      if mock_state_exists registry-target-plan-created &&
         test "$3" = "$(mock_state_read registry-target-plan)"; then
         test "$scenario" != "target_apply_failure"
-      elif mock_state_exists initial-plan &&
+      elif mock_state_exists initial-plan-created &&
         test "$3" = "$(mock_state_read initial-plan)"; then
         test "$scenario" != "final_apply_failure"
       else
@@ -337,7 +353,9 @@ terraform_infrastructure() {
       ;;
     apply\ *)
       test "$2" = "-input=false" || return 1
-      mock_state_exists infra-plan || return 1
+      # infra-plan-created is set only after a successful plan, so an apply
+      # that follows a failed plan is refused by the shim itself.
+      mock_state_exists infra-plan-created || return 1
       test "$3" = "$(mock_state_read infra-plan)" || return 1
       test "$scenario" != "final_apply_failure" || return 1
       mock_state_mark infra-apply-completed
