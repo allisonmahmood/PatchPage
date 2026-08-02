@@ -1,0 +1,80 @@
+#!/bin/sh
+# git shim for the guide harness. Reached only through PATH.
+
+set -u
+
+. "${PP_MOCK_DIR:-${0%/*}}/mocklib.sh"
+
+case "$PP_MOCK_GROUP" in
+  release | infrastructure) mock_log "git $*" ;;
+esac
+
+case "$PP_MOCK_GROUP" in
+  state | rollback)
+    test "$*" = "rev-parse --show-toplevel" || exit 1
+    printf '%s\n' "$PP_MOCK_REPO_ROOT"
+    ;;
+  smoke)
+    test "$*" = "rev-parse --show-toplevel" || exit 1
+    printf '%s\n' "$PP_MOCK_REPO_ROOT"
+    ;;
+  infrastructure)
+    test "$*" = "rev-parse --show-toplevel" || exit 1
+    test "$scenario" != "infra_repo_root_failure" || exit 1
+    printf '%s\n' "$PP_MOCK_REPO_ROOT"
+    ;;
+  deploy)
+    case "$*" in
+      "rev-parse --show-toplevel")
+        test "$scenario" != "repo_root_failure" || exit 1
+        printf '%s\n' "$PP_MOCK_REPO_ROOT"
+        ;;
+      "-C ../.. status --porcelain")
+        test "$scenario" != "git_status_failure" || exit 1
+        if test "$scenario" = "dirty_worktree"; then
+          printf '%s\n' " M apps/server/src/start.ts"
+        fi
+        ;;
+      "-C ../.. rev-parse HEAD")
+        test "$scenario" != "git_failure" || exit 1
+        test "$scenario" != "git_empty" || exit 0
+        if test "$scenario" = "git_short"; then
+          printf '%s\n' "1111111"
+        else
+          printf '%s\n' "$FULL_SHA"
+        fi
+        ;;
+      *)
+        exit 1
+        ;;
+    esac
+    ;;
+  release)
+    case "$*" in
+      "rev-parse --show-toplevel")
+        test "$scenario" != "repo_root_failure" || exit 1
+        printf '%s\n' "$PP_MOCK_REPO_ROOT"
+        ;;
+      "-C $PP_MOCK_REPO_ROOT_CANONICAL status --porcelain")
+        test "$scenario" != "git_status_failure" || exit 1
+        if test "$scenario" = "dirty_worktree"; then
+          printf '%s\n' " M apps/server/src/index.ts"
+        fi
+        ;;
+      "-C $PP_MOCK_REPO_ROOT_CANONICAL rev-parse HEAD")
+        test "$scenario" != "git_failure" || exit 1
+        if test "$scenario" = "git_short"; then
+          printf '%s\n' "1111111"
+        else
+          printf '%s\n' "$FULL_SHA"
+        fi
+        ;;
+      *)
+        exit 1
+        ;;
+    esac
+    ;;
+  *)
+    exit 1
+    ;;
+esac
