@@ -10,6 +10,12 @@ public_base_url = "https://patchpage.your-domain.invalid"
 # the trusted-proxy HITL verification in README.md.
 trust_proxy = null
 
+# Persistent-data recovery defaults. Geo-redundant replication and the
+# retention windows can be adjusted within the validated values.
+storage_replication_type       = "GRS"
+storage_delete_retention_days  = 30
+postgres_backup_retention_days = 35
+
 # Application safety defaults. These match the server defaults and may be
 # lowered or raised within the documented validation bounds.
 allow_anonymous_uploads                         = false
@@ -19,4 +25,4 @@ authenticated_upload_rate_limit_per_minute     = 20
 anonymous_create_rate_limit_per_minute         = 5
 
 # Fill after the first ACR build:
-# server_image = "acrpatchpageabc123.azurecr.io/patchpage-server:git-sha"
+# server_image = "acrpatchpageabc123.azurecr.io/patchpage-server@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"

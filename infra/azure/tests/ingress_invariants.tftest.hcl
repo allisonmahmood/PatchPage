@@ -5,6 +5,7 @@ mock_provider "random" {}
 variables {
   subscription_id = "00000000-0000-0000-0000-000000000000"
   public_base_url = "https://drafts.self-hoster.dev"
+  server_image    = "registry.invalid/patchpage-server@sha256:0000000000000000000000000000000000000000000000000000000000000000"
 }
 
 run "configures_every_ignored_ingress_invariant" {

@@ -294,9 +294,37 @@ variable "trust_proxy" {
 }
 
 variable "server_image" {
-  description = "Fully qualified PatchPage server image reference. Use the quickstart placeholder until ACR has a real image."
+  description = "Fully qualified immutable PatchPage server image digest reference. The default placeholder is accepted only by targeted bootstrap plans that exclude the Container App."
   type        = string
   default     = "mcr.microsoft.com/k8se/quickstart:latest"
+}
+
+variable "storage_replication_type" {
+  description = "Azure Storage account replication type."
+  type        = string
+  default     = "GRS"
+  nullable    = false
+
+  validation {
+    condition     = contains(["LRS", "ZRS", "GRS", "RAGRS", "GZRS", "RAGZRS"], var.storage_replication_type)
+    error_message = "storage_replication_type must be one of LRS, ZRS, GRS, RAGRS, GZRS, or RAGZRS."
+  }
+}
+
+variable "storage_delete_retention_days" {
+  description = "Number of days deleted blobs and containers remain recoverable."
+  type        = number
+  default     = 30
+  nullable    = false
+
+  validation {
+    condition = (
+      var.storage_delete_retention_days >= 1 &&
+      var.storage_delete_retention_days <= 365 &&
+      floor(var.storage_delete_retention_days) == var.storage_delete_retention_days
+    )
+    error_message = "storage_delete_retention_days must be an integer from 1 through 365."
+  }
 }
 
 variable "postgres_admin_login" {
@@ -321,6 +349,22 @@ variable "postgres_storage_mb" {
   description = "Azure PostgreSQL storage size in MB."
   type        = number
   default     = 32768
+}
+
+variable "postgres_backup_retention_days" {
+  description = "Number of days PostgreSQL backups remain available for point-in-time restore."
+  type        = number
+  default     = 35
+  nullable    = false
+
+  validation {
+    condition = (
+      var.postgres_backup_retention_days >= 7 &&
+      var.postgres_backup_retention_days <= 35 &&
+      floor(var.postgres_backup_retention_days) == var.postgres_backup_retention_days
+    )
+    error_message = "postgres_backup_retention_days must be an integer from 7 through 35."
+  }
 }
 
 variable "max_html_bytes" {

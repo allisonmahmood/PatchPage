@@ -31,6 +31,9 @@ locals {
 resource "azurerm_resource_group" "patchpage" {
   name     = "rg-patchpage-${var.environment_name}"
   location = var.location
+  lifecycle {
+    prevent_destroy = true
+  }
 }
 
 resource "azurerm_log_analytics_workspace" "patchpage" {
@@ -73,17 +76,49 @@ resource "azurerm_storage_account" "drafts" {
   resource_group_name             = azurerm_resource_group.patchpage.name
   location                        = azurerm_resource_group.patchpage.location
   account_tier                    = "Standard"
-  account_replication_type        = "LRS"
+  account_replication_type        = var.storage_replication_type
   account_kind                    = "StorageV2"
   min_tls_version                 = "TLS1_2"
   https_traffic_only_enabled      = true
   allow_nested_items_to_be_public = false
+
+  blob_properties {
+    versioning_enabled = true
+
+    delete_retention_policy {
+      days                     = var.storage_delete_retention_days
+      permanent_delete_enabled = false
+    }
+
+    container_delete_retention_policy {
+      days = var.storage_delete_retention_days
+    }
+  }
+
+  lifecycle {
+    prevent_destroy = true
+  }
+}
+
+resource "azurerm_management_lock" "drafts_storage" {
+  name       = "protect-patchpage-drafts"
+  scope      = azurerm_storage_account.drafts.id
+  lock_level = "CanNotDelete"
+  notes      = "Protects persistent blob data from accidental deletion."
+
+  lifecycle {
+    prevent_destroy = true
+  }
 }
 
 resource "azurerm_storage_container" "drafts" {
   name                  = local.storage_container
   storage_account_id    = azurerm_storage_account.drafts.id
   container_access_type = "private"
+
+  lifecycle {
+    prevent_destroy = true
+  }
 }
 
 resource "azurerm_role_assignment" "app_blob_contributor" {
@@ -101,10 +136,23 @@ resource "azurerm_postgresql_flexible_server" "patchpage" {
   administrator_password        = random_password.postgres_admin.result
   sku_name                      = var.postgres_sku_name
   storage_mb                    = var.postgres_storage_mb
+  backup_retention_days         = var.postgres_backup_retention_days
   public_network_access_enabled = true
 
   lifecycle {
-    ignore_changes = [zone]
+    ignore_changes  = [zone]
+    prevent_destroy = true
+  }
+}
+
+resource "azurerm_management_lock" "patchpage_postgres" {
+  name       = "protect-patchpage-postgres"
+  scope      = azurerm_postgresql_flexible_server.patchpage.id
+  lock_level = "CanNotDelete"
+  notes      = "Protects persistent database data from accidental deletion."
+
+  lifecycle {
+    prevent_destroy = true
   }
 }
 
@@ -113,6 +161,10 @@ resource "azurerm_postgresql_flexible_server_database" "patchpage" {
   server_id = azurerm_postgresql_flexible_server.patchpage.id
   charset   = "UTF8"
   collation = "en_US.utf8"
+
+  lifecycle {
+    prevent_destroy = true
+  }
 }
 
 # Allow Azure-hosted services, including the Container App, to reach the server.

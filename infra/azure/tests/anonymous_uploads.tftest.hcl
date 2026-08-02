@@ -1,5 +1,9 @@
 mock_provider "azurerm" {}
 
+variables {
+  server_image = "registry.invalid/patchpage-server@sha256:0000000000000000000000000000000000000000000000000000000000000000"
+}
+
 run "keeps_anonymous_uploads_disabled_by_default" {
   command = plan
 

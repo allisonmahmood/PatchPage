@@ -1,5 +1,9 @@
 mock_provider "azurerm" {}
 
+variables {
+  server_image = "registry.invalid/patchpage-server@sha256:0000000000000000000000000000000000000000000000000000000000000000"
+}
+
 run "accepts_deployer_owned_https_origin" {
   command = plan
 

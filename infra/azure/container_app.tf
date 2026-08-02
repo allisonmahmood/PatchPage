@@ -1,4 +1,50 @@
 locals {
+  managed_registry_login_server = "${azurerm_container_registry.patchpage.name}.azurecr.io"
+
+  # Create-time gate for the Container App image: managed ACR + patchpage-server +
+  # lowercase SHA-256 digest, and never the quickstart placeholder.
+  #
+  # This predicate is a named local rather than an inline precondition expression
+  # because plan-time `terraform test` cannot tell a precondition failure apart
+  # from a postcondition failure on the same resource: `expect_failures` for
+  # azurerm_container_app.server stays satisfied by the postcondition even if the
+  # precondition is deleted. Naming it lets the guide harness statically pin the
+  # precondition to this local, and lets server_image_invariants.tftest.hcl assert
+  # the predicate directly through the server_image_is_managed_digest output.
+  #
+  # Guard indexes with try() so malformed images fail the predicate instead of
+  # raising Invalid index during expression evaluation (Terraform 1.9.8).
+  #
+  # Conjunct-level coverage: the registry, repository, sha256-algorithm,
+  # digest-length and lowercase-hex conjuncts are each pinned by a dedicated
+  # predicate_rejects_* run in tests/server_image_invariants.tftest.hcl, so
+  # dropping any one of them turns exactly that run red. The remaining four are
+  # deliberately unpinnable and harmless, because none of them can widen what the
+  # predicate accepts:
+  #
+  #   * The three structural length(split(...)) guards only stop an Invalid index
+  #     from being raised while evaluating the branch below; try() would swallow
+  #     that error into the same false the guards produce. Dropping one therefore
+  #     cannot make a rejected image pass, only change which false it takes.
+  #   * The quickstart-placeholder literal is already excluded by the digest
+  #     structure the guards require (it carries no @digest), so it is a named
+  #     early-out that documents intent rather than an independent gate.
+  server_image_is_managed_digest = try(
+    (
+      var.server_image != "mcr.microsoft.com/k8se/quickstart:latest" &&
+      length(split("@", var.server_image)) == 2 &&
+      length(split("/", split("@", var.server_image)[0])) == 2 &&
+      length(split(":", split("@", var.server_image)[1])) == 2
+      ) ? (
+      split("/", split("@", var.server_image)[0])[0] == local.managed_registry_login_server &&
+      split("/", split("@", var.server_image)[0])[1] == "patchpage-server" &&
+      split(":", split("@", var.server_image)[1])[0] == "sha256" &&
+      length(split(":", split("@", var.server_image)[1])[1]) == 64 &&
+      length(regexall("[^0-9a-f]", split(":", split("@", var.server_image)[1])[1])) == 0
+    ) : false,
+    false
+  )
+
   app_secret_env = {
     DATABASE_URL                  = { secret = "database-url", value = local.database_url }
     PATCHPAGE_BOOTSTRAP_API_TOKEN = { secret = "bootstrap-token", value = local.bootstrap_api_token }
@@ -34,7 +80,41 @@ resource "azurerm_container_app" "server" {
   # that leaf is ineffective; ignoring ingress prevents a later update from
   # replacing the CLI-managed binding with Terraform's original ingress shape.
   lifecycle {
-    ignore_changes = [ingress]
+    ignore_changes = [
+      ingress,
+      template[0].container[0].image,
+    ]
+
+    precondition {
+      # Fail closed before create/update. Targeted bootstrap plans that exclude
+      # this resource may still use the quickstart placeholder default.
+      # The predicate lives in local.server_image_is_managed_digest so it stays
+      # independently assertable; guide_commands_test.sh statically requires this
+      # condition to be exactly that local.
+      condition     = local.server_image_is_managed_digest
+      error_message = "server_image must be an immutable patchpage-server digest in the managed Azure Container Registry; the quickstart placeholder cannot be deployed."
+    }
+
+    postcondition {
+      condition = try(
+        (
+          length(self.template) == 1 &&
+          length(self.template[0].container) == 1 &&
+          length(split("@", self.template[0].container[0].image)) == 2 &&
+          length(split("/", split("@", self.template[0].container[0].image)[0])) == 2 &&
+          length(split(":", split("@", self.template[0].container[0].image)[1])) == 2
+          ) ? (
+          split("/", split("@", self.template[0].container[0].image)[0])[1] == "patchpage-server" ? (
+            split("/", split("@", self.template[0].container[0].image)[0])[0] == local.managed_registry_login_server &&
+            split(":", split("@", self.template[0].container[0].image)[1])[0] == "sha256" &&
+            length(split(":", split("@", self.template[0].container[0].image)[1])[1]) == 64 &&
+            length(regexall("[^0-9a-f]", split(":", split("@", self.template[0].container[0].image)[1])[1])) == 0
+          ) : false
+        ) : false,
+        false
+      )
+      error_message = "The observed Container App image must remain an immutable patchpage-server digest in the managed Azure Container Registry."
+    }
 
     postcondition {
       condition     = length(self.ingress) == 1
