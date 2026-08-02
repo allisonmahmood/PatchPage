@@ -49,6 +49,15 @@ run "accepts_valid_observed_managed_digest" {
 # assert local.server_image_is_managed_digest directly instead. The registry target
 # keeps azurerm_container_app.server out of the plan so the precondition cannot be
 # the thing that fails, leaving the predicate itself under test.
+#
+# Each fixture below is chosen so the conjunct its run is named for is the one
+# that rejects it; reusing an unmanaged registry would short-circuit on the
+# registry conjunct instead and leave the named property unpinned. Dropping the
+# registry, repository, sha256-algorithm, digest-length or lowercase-hex conjunct
+# from local.server_image_is_managed_digest therefore turns exactly the matching
+# run red. The quickstart literal and the three structural length(split(...))
+# guards cannot be isolated this way; container_app.tf records why that is
+# harmless.
 run "predicate_rejects_quickstart_placeholder" {
   command = plan
 
@@ -74,7 +83,7 @@ run "predicate_rejects_mutable_release_tag" {
   }
 
   variables {
-    server_image = "registry.invalid/patchpage-server:release"
+    server_image = "acrpatchpageabc123.azurecr.io/patchpage-server:release"
   }
 
   assert {
@@ -91,12 +100,29 @@ run "predicate_rejects_uppercase_digest" {
   }
 
   variables {
-    server_image = "registry.invalid/patchpage-server@sha256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+    server_image = "acrpatchpageabc123.azurecr.io/patchpage-server@sha256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
   }
 
   assert {
     condition     = output.server_image_is_managed_digest == false
     error_message = "The create-time server_image predicate must reject an uppercase digest."
+  }
+}
+
+run "predicate_rejects_non_sha256_algorithm" {
+  command = plan
+
+  plan_options {
+    target = [azurerm_container_registry.patchpage]
+  }
+
+  variables {
+    server_image = "acrpatchpageabc123.azurecr.io/patchpage-server@sha512:5555555555555555555555555555555555555555555555555555555555555555"
+  }
+
+  assert {
+    condition     = output.server_image_is_managed_digest == false
+    error_message = "The create-time server_image predicate must reject a non-SHA-256 digest algorithm."
   }
 }
 
@@ -233,6 +259,32 @@ run "rejects_observed_wrong_format" {
 
   variables {
     server_image = "acrpatchpageabc123.azurecr.io/team/patchpage-server@sha256:3333333333333333333333333333333333333333333333333333333333333333"
+  }
+
+  expect_failures = [azurerm_container_app.server]
+}
+
+# Belt and braces for the two conjunct-pinning fixtures that had to move into the
+# managed registry above. Those runs target azurerm_container_registry.patchpage,
+# so they depend on the seeded registry name; these run the same images through an
+# untargeted plan and the real Container App gate instead. The quickstart
+# placeholder already has this untargeted counterpart in
+# rejects_quickstart_placeholder.
+run "rejects_managed_registry_mutable_release_tag" {
+  command = plan
+
+  variables {
+    server_image = "acrpatchpageabc123.azurecr.io/patchpage-server:release"
+  }
+
+  expect_failures = [azurerm_container_app.server]
+}
+
+run "rejects_managed_registry_uppercase_digest" {
+  command = plan
+
+  variables {
+    server_image = "acrpatchpageabc123.azurecr.io/patchpage-server@sha256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
   }
 
   expect_failures = [azurerm_container_app.server]

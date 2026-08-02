@@ -2336,8 +2336,19 @@ test_app_release() {
         if grep -Fq 'az containerapp update ' "$log"; then
           fail "app release updated the image after rejecting $scenario"
         fi
-        grep -Eq '^az storage container lease release ' "$log" ||
+        # Qualify the release against the infinite operation lease: a bare release
+        # line could otherwise be satisfied by an unrelated finite binding lease.
+        renew_blip_acquire_line="$(
+          grep -nE '^az storage container lease acquire .* --lease-duration -1 ' "$log" |
+            sed -n '1s/:.*//p'
+        )"
+        renew_blip_release_line="$(
+          grep -nE '^az storage container lease release ' "$log" | sed -n '$s/:.*//p'
+        )"
+        if test -z "$renew_blip_acquire_line" || test -z "$renew_blip_release_line" ||
+          test "$renew_blip_release_line" -le "$renew_blip_acquire_line"; then
           fail "app release orphaned the acquired operation lease after a renew blip"
+        fi
         ;;
       operation_container_missing | operation_container_nonempty | \
         operation_container_id_mismatch | operation_binding_mismatch | \
@@ -2990,8 +3001,19 @@ test_app_rollback() {
         if grep -Fq 'az containerapp update ' "$log"; then
           fail "rollback updated after fail-closed preflight $scenario"
         fi
-        grep -Eq '^az storage container lease release ' "$log" ||
+        # Qualify the release against the infinite operation lease: a bare release
+        # line could otherwise be satisfied by an unrelated finite binding lease.
+        renew_blip_acquire_line="$(
+          grep -nE '^az storage container lease acquire .* --lease-duration -1 ' "$log" |
+            sed -n '1s/:.*//p'
+        )"
+        renew_blip_release_line="$(
+          grep -nE '^az storage container lease release ' "$log" | sed -n '$s/:.*//p'
+        )"
+        if test -z "$renew_blip_acquire_line" || test -z "$renew_blip_release_line" ||
+          test "$renew_blip_release_line" -le "$renew_blip_acquire_line"; then
           fail "rollback orphaned the acquired operation lease after a renew blip"
+        fi
         ;;
       container_app_id_mismatch | fqdn_mismatch | public_env_missing | \
         public_env_duplicate | public_env_mismatch | custom_domain_missing | \
@@ -4399,8 +4421,20 @@ azurerm_container_app.server'
         if grep -Eq '^terraform (plan|apply) ' "$log"; then
           fail "infrastructure change planned or applied after rejecting $scenario"
         fi
-        grep -Eq '^az storage container lease release ' "$log" ||
+        # Qualify the release against the infinite operation lease: the finite
+        # binding lease in this flow also acquires and releases, so a bare release
+        # line could be satisfied by that one after a reordering.
+        renew_blip_acquire_line="$(
+          grep -nE '^az storage container lease acquire .* --lease-duration -1 ' "$log" |
+            sed -n '1s/:.*//p'
+        )"
+        renew_blip_release_line="$(
+          grep -nE '^az storage container lease release ' "$log" | sed -n '$s/:.*//p'
+        )"
+        if test -z "$renew_blip_acquire_line" || test -z "$renew_blip_release_line" ||
+          test "$renew_blip_release_line" -le "$renew_blip_acquire_line"; then
           fail "infrastructure change orphaned the acquired operation lease after a renew blip"
+        fi
         ;;
       operation_container_id_mismatch | operation_container_missing | operation_container_nonempty | operation_lease_held | \
         operation_lease_acquire_failure | operation_lease_renew_failure)
@@ -4692,9 +4726,22 @@ test_stale_lease_recovery() {
 # local.server_image_is_managed_digest, 1 otherwise. Takes the directory holding
 # container_app.tf so the check itself can be meta-tested against a sabotaged copy.
 # Deliberately reports status instead of calling fail.
+#
+# Only preconditions inside resource "azurerm_container_app" "server" count: an
+# unscoped scan would accept a neutered real gate as long as some other resource
+# carried the pinned line.
 server_image_precondition_is_pinned() {
   awk '
-    $0 ~ /^[[:space:]]*precondition \{[[:space:]]*$/ {
+    $0 == "resource \"azurerm_container_app\" \"server\" {" {
+      in_resource = 1
+      next
+    }
+    in_resource && $0 == "}" {
+      in_resource = 0
+      in_precondition = 0
+      next
+    }
+    in_resource && $0 ~ /^[[:space:]]*precondition \{[[:space:]]*$/ {
       in_precondition = 1
       depth = 1
       next
@@ -4859,6 +4906,31 @@ test_public_safe_runbook_static() {
   fi
   if server_image_precondition_is_pinned "$precondition_probe_dir"; then
     fail "the server_image precondition static check accepts a neutered precondition"
+  fi
+
+  # Meta-test the resource scoping too: neutering the real gate while a decoy
+  # resource elsewhere in the file carries the pinned line must still be rejected.
+  {
+    cat "$precondition_probe_dir/container_app.tf" &&
+      printf '%s\n' \
+        '' \
+        'resource "azurerm_container_app" "decoy" {' \
+        '  lifecycle {' \
+        '    precondition {' \
+        '      condition     = local.server_image_is_managed_digest' \
+        '      error_message = "decoy"' \
+        '    }' \
+        '  }' \
+        '}'
+  } > "$precondition_probe_dir/decoy.tf" ||
+    fail "could not build the decoyed server_image precondition probe"
+  mv "$precondition_probe_dir/decoy.tf" "$precondition_probe_dir/container_app.tf" ||
+    fail "could not install the decoyed server_image precondition probe"
+  grep -Fqx '      condition     = local.server_image_is_managed_digest' \
+    "$precondition_probe_dir/container_app.tf" ||
+    fail "the decoyed server_image precondition probe carries no decoy"
+  if server_image_precondition_is_pinned "$precondition_probe_dir"; then
+    fail "the server_image precondition static check accepts a decoy outside the Container App"
   fi
   rm -rf "$precondition_probe_dir"
 }

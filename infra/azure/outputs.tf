@@ -1,11 +1,3 @@
-# Exposes the Container App create-time image gate so tests/server_image_invariants.tftest.hcl
-# can assert the predicate itself. Plan-time expect_failures on the Container App
-# cannot distinguish the precondition from the postcondition, so without this the
-# precondition could be weakened silently. Derived from var.server_image only.
-output "server_image_is_managed_digest" {
-  value = local.server_image_is_managed_digest
-}
-
 output "acr_login_server" {
   value = azurerm_container_registry.patchpage.login_server
 }
@@ -70,4 +62,13 @@ output "app_identity_client_id" {
 output "bootstrap_api_token" {
   sensitive = true
   value     = local.bootstrap_api_token
+}
+
+# Test-only. Exposes the Container App create-time image gate so
+# tests/server_image_invariants.tftest.hcl can assert the predicate itself, one
+# conjunct at a time. Plan-time expect_failures on the Container App cannot
+# distinguish the precondition from the postcondition, so without this the
+# precondition could be weakened silently. Derived from var.server_image only.
+output "server_image_is_managed_digest" {
+  value = local.server_image_is_managed_digest
 }

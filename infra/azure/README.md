@@ -1871,7 +1871,7 @@ trap 'exit 129' HUP
 trap 'exit 130' INT
 trap 'exit 143' TERM
 if ! acquire_operation_lease; then
-  printf 'The operation lease is unavailable; second-operator review may be required.\n' >&2
+  printf 'The operation lease could not be established and verified; second-operator review may be required.\n' >&2
   exit 1
 fi
 if ! PREFLIGHT_CONTAINER_APP_PROPERTIES="$(
@@ -2553,7 +2553,7 @@ trap 'exit 129' HUP
 trap 'exit 130' INT
 trap 'exit 143' TERM
 if ! acquire_operation_lease; then
-  printf 'The operation lease is unavailable; second-operator review may be required.\n' >&2
+  printf 'The operation lease could not be established and verified; second-operator review may be required.\n' >&2
   exit 1
 fi
 if ! PREFLIGHT_CONTAINER_APP_PROPERTIES="$(
@@ -3575,7 +3575,7 @@ trap 'exit 129' HUP
 trap 'exit 130' INT
 trap 'exit 143' TERM
 if ! acquire_operation_lease; then
-  printf 'The operation lease is unavailable; second-operator review may be required.\n' >&2
+  printf 'The operation lease could not be established and verified; second-operator review may be required.\n' >&2
   exit 1
 fi
 WORKLOAD_STORAGE_ACCOUNT_NAME="${EXPECTED_STORAGE_ACCOUNT_ID##*/}"

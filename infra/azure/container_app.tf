@@ -14,6 +14,21 @@ locals {
   #
   # Guard indexes with try() so malformed images fail the predicate instead of
   # raising Invalid index during expression evaluation (Terraform 1.9.8).
+  #
+  # Conjunct-level coverage: the registry, repository, sha256-algorithm,
+  # digest-length and lowercase-hex conjuncts are each pinned by a dedicated
+  # predicate_rejects_* run in tests/server_image_invariants.tftest.hcl, so
+  # dropping any one of them turns exactly that run red. The remaining four are
+  # deliberately unpinnable and harmless, because none of them can widen what the
+  # predicate accepts:
+  #
+  #   * The three structural length(split(...)) guards only stop an Invalid index
+  #     from being raised while evaluating the branch below; try() would swallow
+  #     that error into the same false the guards produce. Dropping one therefore
+  #     cannot make a rejected image pass, only change which false it takes.
+  #   * The quickstart-placeholder literal is already excluded by the digest
+  #     structure the guards require (it carries no @digest), so it is a named
+  #     early-out that documents intent rather than an independent gate.
   server_image_is_managed_digest = try(
     (
       var.server_image != "mcr.microsoft.com/k8se/quickstart:latest" &&
