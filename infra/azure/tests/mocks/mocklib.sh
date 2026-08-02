@@ -312,7 +312,7 @@ mock_operation_lease() {
       test -f "$operation_lease_file" || return 1
       test "$operation_lease_id" = "$(mock_real cat "$operation_lease_file")" || return 1
       test "$scenario" != "${operation_lease_prefix}release_failure" || return 1
-      rm -f "$operation_lease_file"
+      mock_real rm -f "$operation_lease_file"
       ;;
     *) return 1 ;;
   esac
