@@ -12,6 +12,17 @@
 
 scenario="${PP_MOCK_SCENARIO:-}"
 state_dir="${PP_MOCK_STATE:-}"
+group="${PP_MOCK_GROUP:-}"
+
+# The shim directory is first on PATH, so a shim that has to fall through to the
+# real tool -- mktemp, cat, rm, chmod, jq -- would otherwise find itself again.
+# The harness exports the PATH it started from; delegating through it is the
+# only way those five shims can do their real work.
+mock_real() (
+  PATH="${PP_MOCK_REAL_PATH:?PP_MOCK_REAL_PATH must be exported by the harness}"
+  export PATH
+  "$@"
+)
 
 # The subscription every private_az wrapper is required to pin. Most flows take
 # it as a documented input the harness exports; the custom-domain context block
@@ -42,8 +53,13 @@ mock_state_mark() {
   : > "$state_dir/$1"
 }
 
+# These two read through mock_real rather than a bare `cat`. A bare one would
+# find the cat shim again -- the shim directory is first on PATH -- which would
+# source this file a second time and then have to be trusted not to fire its
+# injection on a read it was never written for. Going straight to the real tool
+# removes the re-entry instead of relying on the shim's guard to survive.
 mock_state_read() {
-  cat "$state_dir/$1"
+  mock_real cat "$state_dir/$1"
 }
 
 mock_state_write() {
@@ -56,11 +72,74 @@ mock_state_count() {
   mock_count_file="$state_dir/$1"
   mock_count=0
   if test -e "$mock_count_file"; then
-    mock_count="$(cat "$mock_count_file")"
+    mock_count="$(mock_real cat "$mock_count_file")"
   fi
   mock_count=$((mock_count + 1))
   printf '%s\n' "$mock_count" > "$mock_count_file"
   printf '%s\n' "$mock_count"
+}
+
+# --- mktemp path recording ---------------------------------------------------
+#
+# The mktemp shim records every call as <template><tab><path>, where the
+# template is the argument list the runbook passed. That recording is how the
+# cat, rm and jq shims recognise a path the runbook is holding in a variable
+# they cannot see.
+#
+# The key is the template, not the call ordinal. The six templates the runbooks
+# use are all distinct, so a consumer names the temporary it means:
+#
+#   deploy-resources        -d $ROOT/patchpage-terraform-diagnostics.XXXXXX
+#                           $TERRAFORM_DIAGNOSTIC_DIR/state-list.stderr.XXXXXX
+#                           -d $ROOT/patchpage-registry-target.XXXXXX
+#                           -d $ROOT/patchpage-initial-plan.XXXXXX
+#   infrastructure-change   -d $ROOT/patchpage-terraform-diagnostics.XXXXXX
+#                           -d $ROOT/patchpage-infrastructure-change.XXXXXX
+#
+# An ordinal would keep pointing at whatever the n'th call became, so moving a
+# mktemp call inside a runbook would silently repoint an injection at another
+# directory and the affected scenarios would keep passing while testing the
+# wrong thing. A template stops matching instead, and the scenario goes red.
+#
+# Recalling an unrecorded template yields the empty string, and every consumer
+# refuses to match on an empty recording: a shim must never fire a failure
+# injection just because a path has not been created yet.
+mock_mktemp_record() {
+  printf '%s\t%s\n' "$1" "$2" >> "$state_dir/mktemp-calls"
+}
+
+mock_mktemp_recall() {
+  mock_recall_value=''
+  if test -f "$state_dir/mktemp-calls"; then
+    while IFS="$(printf '\t')" read -r mock_recall_template mock_recall_path; do
+      test "$mock_recall_template" = "$1" || continue
+      mock_recall_value="$mock_recall_path"
+    done < "$state_dir/mktemp-calls"
+  fi
+  printf '%s\n' "$mock_recall_value"
+}
+
+# Returns 0 when $2 is a non-empty path and equals the path the mktemp call with
+# template $1 handed back.
+mock_is_mktemp_path() {
+  test -n "$2" || return 1
+  mock_recalled="$(mock_mktemp_recall "$1")"
+  test -n "$mock_recalled" || return 1
+  test "$2" = "$mock_recalled"
+}
+
+# The two Terraform flows create their private directories under the diagnostic
+# root they were given, so a consumer can spell those templates directly. The
+# deploy flow's state-list capture is created *inside* the directory an earlier
+# mktemp handed back, so its template is only knowable once that path is.
+mock_mktemp_diagnostics_template() {
+  printf -- '-d %s/patchpage-terraform-diagnostics.XXXXXX\n' \
+    "$TERRAFORM_DIAGNOSTIC_ROOT"
+}
+
+mock_mktemp_state_list_template() {
+  printf '%s/state-list.stderr.XXXXXX\n' \
+    "$(mock_mktemp_recall "$(mock_mktemp_diagnostics_template)")"
 }
 
 # --- argument helpers --------------------------------------------------------
@@ -218,7 +297,7 @@ mock_operation_lease() {
       ;;
     renew)
       test -f "$operation_lease_file" || return 1
-      test "$operation_lease_id" = "$(cat "$operation_lease_file")" || return 1
+      test "$operation_lease_id" = "$(mock_real cat "$operation_lease_file")" || return 1
       test "$scenario" != "${operation_lease_prefix}renew_failure" || return 1
       # Transient renew blip: acquire already succeeded and Azure holds the
       # infinite lease, but the first renew-as-proof fails. Later renews recover,
@@ -231,9 +310,9 @@ mock_operation_lease() {
       ;;
     release)
       test -f "$operation_lease_file" || return 1
-      test "$operation_lease_id" = "$(cat "$operation_lease_file")" || return 1
+      test "$operation_lease_id" = "$(mock_real cat "$operation_lease_file")" || return 1
       test "$scenario" != "${operation_lease_prefix}release_failure" || return 1
-      rm -f "$operation_lease_file"
+      mock_real rm -f "$operation_lease_file"
       ;;
     *) return 1 ;;
   esac

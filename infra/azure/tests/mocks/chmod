@@ -1,0 +1,29 @@
+#!/bin/sh
+# chmod shim for the guide harness. Reached only through PATH.
+#
+# Injects the "the private record could not be made unreadable to others"
+# failures. Each target is a documented input the harness exports (ROLLBACK_RECORD,
+# CANARY_RECORD) or a fixed repository-relative name (backend.hcl), so no
+# recorded state is needed. Everything else falls through to the real chmod.
+
+set -u
+
+. "${PP_MOCK_DIR:-${0%/*}}/mocklib.sh"
+
+case "$group:$scenario" in
+  release:rollback_record_chmod_failure)
+    case "${2:-}" in
+      "${ROLLBACK_RECORD:-}.tmp."*) exit 1 ;;
+    esac
+    ;;
+  smoke:canary_record_chmod_failure)
+    case "${2:-}" in
+      "${CANARY_RECORD:-}.tmp."*) exit 1 ;;
+    esac
+    ;;
+  infrastructure:backend_chmod_failure)
+    test "${2:-}" != "backend.hcl" || exit 1
+    ;;
+esac
+
+mock_real chmod "$@"
