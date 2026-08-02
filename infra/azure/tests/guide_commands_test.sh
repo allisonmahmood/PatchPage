@@ -84,6 +84,12 @@ infrastructure-change stale-lease-recovery custom-domain-context
 ingress-verification apex-dns caa-policy hostname-mutation certificate-binding
 deployed-smoke"
 
+# The shared safety mechanisms. Each of these was several copies inside cmd/*.sh
+# and is now one definition; they are part of the executable surface and are
+# held to the same rules as the commands, which is why they are named here
+# rather than discovered by globbing.
+GUIDE_LIBS="wrappers lease revision diag plan_gate state_inspect dns"
+
 test -f "$GUIDE_OPS" || fail "infra/azure/ops.sh is missing"
 sh -n "$GUIDE_OPS" || fail "infra/azure/ops.sh is not valid POSIX shell"
 for guide_command in $GUIDE_COMMANDS; do
@@ -105,6 +111,22 @@ for guide_cmd_file in "$GUIDE_CMD_DIR"/*.sh; do
   case " $(printf '%s' "$GUIDE_COMMANDS" | tr '\n' ' ') " in
     *" $guide_cmd_name "*) ;;
     *) fail "infra/azure/cmd/$guide_cmd_name.sh is not a dispatchable command" ;;
+  esac
+done
+
+for guide_lib in $GUIDE_LIBS; do
+  test -f "$GUIDE_LIB_DIR/$guide_lib.sh" ||
+    fail "infra/azure/lib/$guide_lib.sh is missing"
+  sh -n "$GUIDE_LIB_DIR/$guide_lib.sh" ||
+    fail "infra/azure/lib/$guide_lib.sh is not valid POSIX shell"
+done
+# Nothing may sit in lib/ that this harness is not holding to those rules.
+for guide_lib_file in "$GUIDE_LIB_DIR"/*.sh; do
+  guide_lib_name="${guide_lib_file##*/}"
+  guide_lib_name="${guide_lib_name%.sh}"
+  case " $GUIDE_LIBS " in
+    *" $guide_lib_name "*) ;;
+    *) fail "infra/azure/lib/$guide_lib_name.sh is not a declared shared library" ;;
   esac
 done
 
@@ -399,6 +421,7 @@ test_state_bootstrap() {
     create_failure \
     verification_failure \
     container_missing \
+    malformed_container_row \
     operation_container_nonempty \
     operation_container_foreign_metadata \
     operation_role_create_failure \
@@ -548,6 +571,40 @@ test_state_bootstrap() {
         )"
         test "$backend_mode" = "600" ||
           fail "state bootstrap resume backend config is not mode 0600"
+        ;;
+      malformed_container_row)
+        # A container-list row whose leading field is empty: `<tab>false`.
+        #
+        # This is the row the two copies of inspect_state_containers appeared to
+        # disagree about before they were collapsed into lib/state_inspect.sh.
+        # infrastructure-change carried an extra branch rejecting an empty name
+        # that still had a deleted flag; state-bootstrap skipped any empty name
+        # outright. Reading the two side by side, the second looks like a safety
+        # check that had quietly stopped being one.
+        #
+        # It is not, and this scenario is where that was settled. The loop reads
+        # with IFS set to a single tab, and tab is IFS white space, so a leading
+        # tab is absorbed rather than delimiting an empty first field: this row
+        # parses as name=false, deleted=empty, in every shell the harness runs
+        # under. An empty name therefore always arrives with an empty deleted
+        # column, the extra branch can never fire, and the two copies were
+        # already behaviourally identical. The strict text is what survived the
+        # merge, so the branch is kept as defence in depth against a future edit
+        # to the splitting -- and this scenario is what would notice such an
+        # edit, because the verdict below is reached through the unknown-name
+        # arm and would move if the row started parsing the other way.
+        test "$status" -ne 0 ||
+          fail "state bootstrap accepted a container inventory row it could not interpret"
+        test ! -e "$backend" ||
+          fail "state bootstrap wrote a backend config after an uninterpretable container inventory row"
+        grep -Fq 'Could not verify the dedicated state containers.' \
+          "$TMP_DIR/state-$scenario.out" ||
+          fail "state bootstrap did not reject the malformed container inventory row"
+        if grep -Eq \
+          '00000000-0000-0000-0000-000000000000|11111111-1111-1111-1111-111111111111|patchpagestate|rg-patchpage-tfstate|patchpage-prod\.tfstate' \
+          "$TMP_DIR/state-$scenario.out"; then
+          fail "state bootstrap exposed private identifiers after $scenario"
+        fi
         ;;
       *)
         test "$status" -ne 0 || fail "state bootstrap succeeded after $scenario"
@@ -2905,6 +2962,64 @@ server_image_precondition_is_pinned() {
   ' "$1/container_app.tf"
 }
 
+# Returns 0 when every command that loads the shared operation-lease library
+# declares its data-plane auth mode, and declares the one it is supposed to, 1
+# otherwise. Takes the cmd directory so the check itself can be meta-tested
+# against a sabotaged copy.
+# Deliberately reports status instead of calling fail.
+#
+# Collapsing four copies of the lease into one definition merged two different
+# privilege models into one code path, and the parameter that keeps them apart
+# is an ordinary shell variable. Left unpinned, a command could be edited to
+# take the lease with a storage account key where it used to require the
+# operator's own Entra principal -- a real widening of who can mutate the
+# environment -- and nothing in the flow tests would notice, because both modes
+# work. So the assignment each command makes is pinned here by name.
+#
+# The list is exact in both directions: a command that loads lease.sh and is not
+# named below fails too, so a new mutating command cannot quietly inherit
+# whichever mode happens to be convenient.
+operation_lease_auth_modes_are_pinned() {
+  awk -v cmd_dir="$1" \
+    -v all_commands="$(printf '%s' "$GUIDE_COMMANDS" | tr '\n' ' ')" \
+    -v expected="app-release=login app-rollback=login stale-lease-recovery=login infrastructure-change=key deploy-resources=key" '
+    BEGIN {
+      count = split(expected, pairs, " ")
+      for (i = 1; i <= count; i++) {
+        split(pairs[i], pair, "=")
+        want[pair[1]] = pair[2]
+      }
+      total = split(all_commands, names, " ")
+      for (i = 1; i <= total; i++) {
+        name = names[i]
+        if (name == "") { continue }
+        path = cmd_dir "/" name ".sh"
+        sources_lease = 0
+        declared = ""
+        while ((getline line < path) > 0) {
+          if (index(line, "/lease.sh\"") > 0) { sources_lease = 1 }
+          if (index(line, "OPERATION_LEASE_AUTH_MODE=") == 1) {
+            sub(/^OPERATION_LEASE_AUTH_MODE=/, "", line)
+            declared = line
+          }
+        }
+        close(path)
+        if (name in want) {
+          if (!sources_lease || declared != want[name]) { exit 1 }
+          seen[name] = 1
+        } else if (sources_lease) {
+          # A command loading the lease without being pinned above.
+          exit 1
+        }
+      }
+      for (name in want) {
+        if (!(name in seen)) { exit 1 }
+      }
+      exit 0
+    }
+  '
+}
+
 # --- the operation-binding wire format ---------------------------------------
 #
 # `patchpage-operation-binding-v1` is the tuple whose SHA-256 is written into
@@ -3242,7 +3357,7 @@ test_operation_binding_wire_format() {
 
   # Sabotage the pin in three independent directions. A golden hash that no
   # mutation can move is a constant the test is comparing against itself.
-  binding_probe_source="$GUIDE_CMD_DIR/app-release.sh"
+  binding_probe_source="$GUIDE_LIB_DIR/lease.sh"
   test "$(guide_binding_tuple_count "$binding_probe_source")" -eq 1 ||
     fail "the operation-binding sabotage probe source no longer builds the tuple"
 
@@ -3324,23 +3439,33 @@ test_public_safe_runbook_static() {
   for guide_command in $GUIDE_COMMANDS; do
     set -- "$@" "$GUIDE_CMD_DIR/$guide_command.sh"
   done
+  for guide_lib in $GUIDE_LIBS; do
+    set -- "$@" "$GUIDE_LIB_DIR/$guide_lib.sh"
+  done
   GUIDE_SHELL_SOURCES_COUNT="$#"
-  test "$GUIDE_SHELL_SOURCES_COUNT" -eq 14 ||
-    fail "the operations CLI is not ops.sh plus the 13 documented commands"
+  test "$GUIDE_SHELL_SOURCES_COUNT" -eq 21 ||
+    fail "the operations CLI is not ops.sh plus the 13 documented commands and the 7 shared libraries"
 
   if grep -Eiq 'If[-]Match|e[t]ag|patchpageOperation[L]ock|private_az r[e]st' \
     "$README" "$@"; then
     fail "Azure guide retains the unsupported Container App tag/conditional-REST mutex"
   fi
+  # Every private_az must pin the subscription, and there must be exactly three
+  # of them. lib/wrappers.sh holds the definition the dispatched commands share;
+  # custom-domain-context and hostname-mutation keep their own because the guide
+  # has the operator *source* them, so they run with the operator's $0 and
+  # cannot locate lib/ at all. Three is therefore the whole justified population,
+  # and a fourth means a command has grown a private copy again -- which is the
+  # shape of the divergence this library exists to prevent.
   if ! awk '
     $0 == "private_az() {" {
       getline
       wrappers++
       if ($0 != "  az \"$@\" --subscription \"$SUBSCRIPTION_ID\" 2>/dev/null") exit 1
     }
-    END { if (wrappers == 0) exit 1 }
+    END { if (wrappers != 3) exit 1 }
   ' "$@"; then
-    fail "a private_az wrapper does not pin every command to the explicit subscription"
+    fail "the private_az wrappers are not exactly the shared one plus the two sourced commands, each pinning the explicit subscription"
   fi
   if grep -Eq -- \
     'az account show[^|;]*(--query[ =]+['"'"'"]?(user|tenantId|environmentName)|--output json)' \
@@ -3356,7 +3481,15 @@ test_public_safe_runbook_static() {
     "$GUIDE_CMD_DIR/app-release.sh" "$GUIDE_CMD_DIR/infrastructure-change.sh"; then
     fail "new runbook commands directly echo a sensitive image or resource value"
   fi
-  if grep -Fq 'terraform ' "$GUIDE_CMD_DIR/app-release.sh"; then
+  # The release flow never runs Terraform. That has to be asserted over what it
+  # actually loads, not just its own file: the shared libraries it sources are
+  # as much a part of it as its own lines, and a private_terraform arriving in
+  # one of them would put Terraform back into the release path invisibly.
+  if grep -Fq 'terraform ' \
+    "$GUIDE_CMD_DIR/app-release.sh" \
+    "$GUIDE_LIB_DIR/wrappers.sh" \
+    "$GUIDE_LIB_DIR/lease.sh" \
+    "$GUIDE_LIB_DIR/revision.sh"; then
     fail "app release command contains a Terraform command"
   fi
   if grep -Eq \
@@ -3391,6 +3524,42 @@ test_public_safe_runbook_static() {
     "$restricted_path_probe_dir/state-bootstrap.sh"; then
     fail "the restricted-PATH check accepts an absolute tool path in an operations CLI source"
   fi
+
+  operation_lease_auth_modes_are_pinned "$GUIDE_CMD_DIR" ||
+    fail "a command that loads the shared operation lease does not declare the data-plane auth mode it is pinned to"
+
+  # Meta-test the check above in both directions: a command whose declared mode
+  # was widened from the operator's own principal to a storage key must be
+  # rejected, and so must one that loads the lease while declaring nothing.
+  auth_mode_probe_dir="$TMP_DIR/operation-lease-auth-mode-probe"
+  rm -rf "$auth_mode_probe_dir"
+  mkdir -p "$auth_mode_probe_dir" ||
+    fail "could not create the operation-lease auth-mode probe directory"
+  for auth_mode_probe_command in $GUIDE_COMMANDS; do
+    cp "$GUIDE_CMD_DIR/$auth_mode_probe_command.sh" \
+      "$auth_mode_probe_dir/$auth_mode_probe_command.sh" ||
+      fail "could not populate the operation-lease auth-mode probe"
+  done
+  operation_lease_auth_modes_are_pinned "$auth_mode_probe_dir" ||
+    fail "the operation-lease auth-mode check rejects an unmodified copy of the commands"
+
+  sed 's/^OPERATION_LEASE_AUTH_MODE=login$/OPERATION_LEASE_AUTH_MODE=key/' \
+    "$GUIDE_CMD_DIR/app-release.sh" > "$auth_mode_probe_dir/app-release.sh" ||
+    fail "could not build the widened operation-lease auth-mode probe"
+  if cmp -s "$GUIDE_CMD_DIR/app-release.sh" "$auth_mode_probe_dir/app-release.sh"; then
+    fail "the widened operation-lease auth-mode probe did not change the mode"
+  fi
+  if operation_lease_auth_modes_are_pinned "$auth_mode_probe_dir"; then
+    fail "the operation-lease auth-mode check accepts a release flow widened to storage-key auth"
+  fi
+
+  grep -v '^OPERATION_LEASE_AUTH_MODE=' "$GUIDE_CMD_DIR/app-release.sh" \
+    > "$auth_mode_probe_dir/app-release.sh" ||
+    fail "could not build the undeclared operation-lease auth-mode probe"
+  if operation_lease_auth_modes_are_pinned "$auth_mode_probe_dir"; then
+    fail "the operation-lease auth-mode check accepts a command that declares no auth mode"
+  fi
+  rm -rf "$auth_mode_probe_dir"
 
   # The runbooks left the guide in this change, and nothing may bring one back:
   # a re-inlined block would be documentation the harness never runs.
@@ -4238,8 +4407,17 @@ run_deployed_smoke_block() {
       upload_body_header_file_mutation | upload_duplicate_body_mutation)
         smoke_ops_root="$TMP_DIR/deployed-smoke-$scenario-ops"
         rm -rf "$smoke_ops_root"
-        mkdir -p "$smoke_ops_root/cmd" || return 1
+        mkdir -p "$smoke_ops_root/cmd" "$smoke_ops_root/lib" || return 1
         cp "$GUIDE_OPS" "$smoke_ops_root/ops.sh" || return 1
+        # ops.sh derives PP_OPS_LIB from its own location, so a scratch CLI is
+        # only self-consistent if the shared libraries come with it. Copying
+        # them rather than pointing at the real lib/ keeps the scratch tree
+        # genuinely standalone, which is what makes the sabotage below a
+        # sabotage of this CLI and not of the one under test everywhere else.
+        for smoke_lib in $GUIDE_LIBS; do
+          cp "$GUIDE_LIB_DIR/$smoke_lib.sh" "$smoke_ops_root/lib/$smoke_lib.sh" ||
+            return 1
+        done
         smoke_ops="$smoke_ops_root/ops.sh"
         ;;
     esac
@@ -4383,6 +4561,7 @@ set -- \
   test_infrastructure_change \
   test_stale_lease_recovery \
   test_operation_binding_wire_format \
+  test_plan_gate_filter \
   test_public_safe_runbook_static \
   test_custom_domain_context \
   test_custom_domain_output_guards \

@@ -1,8 +1,6 @@
 set -u
 set +x
-private_az() {
-  az "$@" --subscription "$SUBSCRIPTION_ID" 2>/dev/null
-}
+. "${PP_OPS_LIB:?run this through the dispatcher: sh infra/azure/ops.sh certificate-binding}/wrappers.sh"
 MANAGED_CERTIFICATE_ID="${MANAGED_CERTIFICATE_ID:?Run the hostname binding block first}"
 
 if ! MANAGED_CERTIFICATES="$(

@@ -1,13 +1,23 @@
 #!/bin/sh
 # jq shim for the guide harness. Reached only through PATH.
 #
-# One injection, shared by both Terraform flows: the second read of the saved
-# plan's JSON rendering fails, so the block has to report that it could not
-# render the action summary. The plan JSON sits inside the secure plan directory
-# the block got from mktemp, so the path is recovered from the mktemp shim's
-# recording by the template that created it. Every other invocation -- including
-# the smoke flow's real JSON assertions in the curl shim -- falls through to the
-# real jq.
+# One injection, shared by both Terraform flows: rendering the saved plan's
+# action summary fails, so the block has to report that it could not render it.
+# The plan JSON sits inside the secure plan directory the block got from mktemp,
+# so the path is recovered from the mktemp shim's recording by the template that
+# created it. Every other invocation -- including the smoke flow's real JSON
+# assertions in the curl shim -- falls through to the real jq.
+#
+# The action-summary invocation is identified by what it is: the `jq -r` over the
+# plan JSON whose filter joins the action words. It used to be identified by
+# being the second jq to name the plan JSON, which was only ever a proxy for the
+# same thing -- and a leaky one. In the infrastructure flow the planned-image
+# read got there first, so "the second read" was actually the delete gate, and
+# the scenario named plan_summary_failure exercised a message about deleted
+# resources. Now that the delete gate is a pure filter reading stdin
+# (lib/plan_gate.sh) it is not countable by argv at all, so the injection names
+# its target instead of counting up to it, and both flows report the summary
+# failure the scenario is named for.
 
 set -u
 
@@ -21,7 +31,6 @@ case "$group" in
         "-d $TERRAFORM_DIAGNOSTIC_ROOT/patchpage-initial-plan.XXXXXX"
     )"
     test -z "$jq_plan_dir" || jq_plan_json="$jq_plan_dir/initial.json"
-    jq_seen_name="initial-plan-jq-seen"
     ;;
   infrastructure)
     jq_plan_dir="$(
@@ -29,15 +38,15 @@ case "$group" in
         "-d $TERRAFORM_DIAGNOSTIC_ROOT/patchpage-infrastructure-change.XXXXXX"
     )"
     test -z "$jq_plan_dir" || jq_plan_json="$jq_plan_dir/infrastructure-plan.json"
-    jq_seen_name="infrastructure-plan-jq-seen"
     ;;
 esac
 
-if test -n "$jq_plan_json" && test "$(mock_last_arg "$@")" = "$jq_plan_json"; then
-  if test "$scenario" = "plan_summary_failure" && mock_state_exists "$jq_seen_name"; then
-    exit 1
-  fi
-  mock_state_mark "$jq_seen_name"
+if test "$scenario" = "plan_summary_failure" &&
+  test -n "$jq_plan_json" &&
+  test "$(mock_last_arg "$@")" = "$jq_plan_json"; then
+  case " $* " in
+    *'join(",")'*) exit 1 ;;
+  esac
 fi
 
 mock_real jq "$@"

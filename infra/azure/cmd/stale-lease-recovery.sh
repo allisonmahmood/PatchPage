@@ -1,8 +1,10 @@
 set -u
 set +x
-private_az() {
-  az "$@" --subscription "$SUBSCRIPTION_ID" 2>/dev/null
-}
+# Second-operator recovery authenticates as that operator's own principal: the
+# whole point of this command is that a *different* named human is now acting.
+OPERATION_LEASE_AUTH_MODE=login
+. "${PP_OPS_LIB:?run this through the dispatcher: sh infra/azure/ops.sh stale-lease-recovery}/wrappers.sh"
+. "$PP_OPS_LIB/lease.sh"
 : "${SUBSCRIPTION_ID:?Set SUBSCRIPTION_ID from the private verified deployment record}"
 : "${STATE_STORAGE_ACCOUNT:?Set STATE_STORAGE_ACCOUNT from the private verified state record}"
 : "${STATE_CONTAINER:?Set STATE_CONTAINER from the private verified state record}"
@@ -43,24 +45,7 @@ if ! printf '%s\n' "$WORKLOAD_STORAGE_ACCOUNT" | grep -Eq '^[a-z0-9]{3,24}$' ||
   printf 'Stale operation-lease recovery found an invalid workload identity.\n' >&2
   exit 1
 fi
-if ! OPERATION_BINDING_SHA256="$(
-  printf '%s\n' \
-    'patchpage-operation-binding-v1' \
-    "subscription_id=$SUBSCRIPTION_ID" \
-    "state_storage_account=$STATE_STORAGE_ACCOUNT" \
-    "state_key=$STATE_KEY" \
-    "resource_group=$RESOURCE_GROUP" \
-    "container_app=$CONTAINER_APP" \
-    "acr=$ACR" \
-    "operation_container_id=$EXPECTED_OPERATION_CONTAINER_ID" \
-    "container_app_id=$EXPECTED_CONTAINER_APP_ID" \
-    "acr_id=$EXPECTED_ACR_ID" \
-    "storage_account_id=$EXPECTED_STORAGE_ACCOUNT_ID" \
-    "postgres_server_id=$EXPECTED_POSTGRES_SERVER_ID" |
-    openssl dgst -sha256 -r 2>/dev/null |
-    cut -d ' ' -f1
-)" ||
-  ! printf '%s\n' "$OPERATION_BINDING_SHA256" | grep -Eq '^[0-9a-f]{64}$'; then
+if ! OPERATION_BINDING_SHA256="$(operation_binding_sha256)"; then
   printf 'Stale operation-lease recovery could not bind the expected workload.\n' >&2
   exit 1
 fi

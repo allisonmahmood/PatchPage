@@ -212,6 +212,14 @@ az_state() {
             if mock_state_exists operation-container-created; then
               printf 'patchpage-operations\t\n'
             fi
+            # A row the inventory cannot interpret: no name, but a deleted flag
+            # all the same. Injected only once the containers exist, so the
+            # first inspection passes and the run reaches the state where a
+            # silently-skipped row would have let it certify the account clean.
+            if test "$scenario" = "malformed_container_row" &&
+              mock_state_exists state-container-created; then
+              printf '\tfalse\n'
+            fi
           fi
           ;;
         metadata)

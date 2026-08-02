@@ -4,12 +4,7 @@ set +x
 private_terraform() {
   terraform "$@" 2>/dev/null
 }
-private_curl() {
-  curl "$@" 2>/dev/null
-}
-private_git() {
-  git "$@" 2>/dev/null
-}
+. "${PP_OPS_LIB:?run this through the dispatcher: sh infra/azure/ops.sh deployed-smoke}/wrappers.sh"
 if test -n "${CANARY_RECORD:-}"; then
   case "$CANARY_RECORD" in
     /*) ;;

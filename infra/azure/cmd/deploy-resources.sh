@@ -1,14 +1,15 @@
 set -u
 set +x
-private_az() {
-  az "$@" --subscription "$SUBSCRIPTION_ID" 2>/dev/null
-}
-private_terraform() {
-  terraform "$@" 2>&3
-}
-private_git() {
-  git "$@" 2>/dev/null
-}
+# The initial deployment creates the state account's key access alongside
+# everything else, and does all of its container work with that key. It never
+# takes the long-lived operation lease -- there is nothing to exclude yet -- but
+# it seals the workload binding the later flows compare against, so it needs the
+# same binding definition they use.
+OPERATION_LEASE_AUTH_MODE=key
+. "${PP_OPS_LIB:?run this through the dispatcher: sh infra/azure/ops.sh deploy-resources}/wrappers.sh"
+. "$PP_OPS_LIB/diag.sh"
+. "$PP_OPS_LIB/lease.sh"
+. "$PP_OPS_LIB/plan_gate.sh"
 if ! REPO_ROOT="$(private_git rev-parse --show-toplevel)" ||
   ! test -d "$REPO_ROOT/infra/azure" ||
   ! cd "$REPO_ROOT/infra/azure"; then
@@ -56,19 +57,6 @@ if ! { exec 3>>"$TERRAFORM_DIAGNOSTIC_LOG"; } 2>/dev/null ||
 fi
 TERRAFORM_DIAGNOSTICS_COMPLETE=false
 TERRAFORM_DIAGNOSTIC_FD_OPEN=true
-terraform_diagnostic_exit() {
-  if test "$TERRAFORM_DIAGNOSTIC_FD_OPEN" = "true"; then
-    { exec 3>&-; } 2>/dev/null || :
-    TERRAFORM_DIAGNOSTIC_FD_OPEN=false
-  fi
-  if test "$TERRAFORM_DIAGNOSTICS_COMPLETE" = "true"; then
-    if ! rm -rf -- "$TERRAFORM_DIAGNOSTIC_DIR" 2>/dev/null; then
-      printf 'Terraform succeeded, but private diagnostic cleanup failed.\n' >&2
-    fi
-  else
-    printf 'Private Terraform diagnostics were retained under the configured diagnostic root.\n' >&2
-  fi
-}
 trap 'terraform_diagnostic_exit' 0
 trap 'exit 129' HUP
 trap 'exit 130' INT
@@ -353,10 +341,7 @@ if ! private_terraform plan \
   printf 'Terraform could not create or inspect the registry-target plan.\n' >&2
   exit 1
 fi
-if ! jq -e \
-  '[.resource_changes[] |
-    select(.change.actions | index("delete"))] |
-   length == 0' "$REGISTRY_TARGET_PLAN_JSON" >/dev/null 2>&1; then
+if ! plan_gate_accepts < "$REGISTRY_TARGET_PLAN_JSON"; then
   printf 'The registry-target plan contains a delete or replacement action.\n' >&2
   exit 1
 fi
@@ -513,10 +498,10 @@ if ! { private_terraform show -json "$INITIAL_PLAN" > "$INITIAL_PLAN_JSON"; } 2>
   printf 'Could not inspect the saved initial deployment plan.\n' >&2
   exit 1
 fi
-if ! jq -e \
-  '[.resource_changes[] |
-    select(.change.actions | index("delete"))] |
-   length == 0' "$INITIAL_PLAN_JSON" >/dev/null 2>&1; then
+# No protected addresses: this is the one run that is supposed to create the
+# drafts Storage account and the PostgreSQL server, so creating them is the
+# expected outcome here rather than the sign of lost state it is everywhere else.
+if ! plan_gate_accepts < "$INITIAL_PLAN_JSON"; then
   printf 'The initial deployment plan contains a delete or replacement action.\n' >&2
   exit 1
 fi
@@ -609,24 +594,7 @@ then
   printf 'The operation-lease container is unavailable or invalid.\n' >&2
   exit 1
 fi
-if ! OPERATION_BINDING_SHA256="$(
-  printf '%s\n' \
-    'patchpage-operation-binding-v1' \
-    "subscription_id=$SUBSCRIPTION_ID" \
-    "state_storage_account=$STATE_STORAGE_ACCOUNT" \
-    "state_key=$STATE_KEY" \
-    "resource_group=$RESOURCE_GROUP" \
-    "container_app=$CONTAINER_APP" \
-    "acr=$ACR" \
-    "operation_container_id=$EXPECTED_OPERATION_CONTAINER_ID" \
-    "container_app_id=$EXPECTED_CONTAINER_APP_ID" \
-    "acr_id=$EXPECTED_ACR_ID" \
-    "storage_account_id=$EXPECTED_STORAGE_ACCOUNT_ID" \
-    "postgres_server_id=$EXPECTED_POSTGRES_SERVER_ID" |
-    openssl dgst -sha256 -r 2>/dev/null |
-    cut -d ' ' -f1
-)" ||
-  ! printf '%s\n' "$OPERATION_BINDING_SHA256" | grep -Eq '^[0-9a-f]{64}$' ||
+if ! OPERATION_BINDING_SHA256="$(operation_binding_sha256)" ||
   ! OPERATION_CONTAINER_METADATA="$(
     private_az storage container metadata show \
       --account-name "$STATE_STORAGE_ACCOUNT" \
