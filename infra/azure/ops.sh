@@ -48,7 +48,7 @@ ops_each_command() {
     test -n "$ops_name" || continue
     "$1" "$ops_name" "$ops_purpose"
   done <<'OPS_COMMANDS'
-state-bootstrap|Create and verify the Terraform state account, containers, operation RBAC and locks.
+state-bootstrap|Create and verify the OpenTofu state account, containers, operation RBAC and locks.
 deploy-resources|Plan and apply the first workload deployment, then seal the operation binding and locks.
 app-release|Build, push and roll a new immutable server image forward under the operation lease.
 app-rollback|Return the Container App to the recorded pre-release image under the operation lease.

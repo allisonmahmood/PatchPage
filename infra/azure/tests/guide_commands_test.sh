@@ -799,7 +799,7 @@ key                  = "patchpage-prod.tfstate"' ||
         grep -Fqx \
           'tofu init -input=false -reconfigure -backend-config=backend.hcl' \
           "$log" ||
-          fail "deployment did not reconfigure Terraform to the verified backend"
+          fail "deployment did not reconfigure OpenTofu to the verified backend"
         initial_build_tag="$(
           sed -n \
             's/^az acr build --registry acrpatchpageabc123 --image patchpage-server:\([^ ]*\) --build-arg REVISION=1111111111111111111111111111111111111111 --file apps\/server\/Dockerfile \.\.\/\.\.$/\1/p' \
@@ -875,7 +875,7 @@ key                  = "patchpage-prod.tfstate"' ||
             fail "deployment cleanup failure did not emit only its generic error"
         else
           test ! -d "$(cat "$diagnostic_path_file")" ||
-            fail "successful deployment retained private Terraform diagnostics"
+            fail "successful deployment retained private OpenTofu diagnostics"
         fi
         ;;
       resume_partial_rg_success | resume_target_complete_success)
@@ -916,7 +916,7 @@ key                  = "patchpage-prod.tfstate"' ||
         test -f "$diagnostic_path_file" ||
           fail "resumed deployment did not create a private diagnostic location"
         test ! -d "$(cat "$diagnostic_path_file")" ||
-          fail "resumed deployment retained private Terraform diagnostics"
+          fail "resumed deployment retained private OpenTofu diagnostics"
         ;;
       secure_plan_dir_failure | plan_failure | plan_gate_show_failure | \
         plan_delete | plan_replacement | plan_summary_failure | final_apply_failure | \
@@ -997,7 +997,7 @@ key                  = "patchpage-prod.tfstate"' ||
       fail "deployment exposed private identifiers or producer diagnostics after $scenario"
     fi
     if grep -Fq "$TMP_DIR/deploy-diagnostics-$scenario" "$output"; then
-      fail "deployment exposed the private Terraform diagnostic path"
+      fail "deployment exposed the private OpenTofu diagnostic path"
     fi
     if test "$scenario" = "final_apply_failure"; then
       # A half-applied deployment is the same "stop, a second operator must
@@ -1013,7 +1013,7 @@ key                  = "patchpage-prod.tfstate"' ||
         fail "failed deployment lost its private diagnostic location"
       diagnostic_log="$(cat "$diagnostic_path_file")/terraform.log"
       test -f "$diagnostic_log" ||
-        fail "failed deployment did not preserve Terraform diagnostics"
+        fail "failed deployment did not preserve OpenTofu diagnostics"
       diagnostic_mode="$(
         file_mode "$diagnostic_log"
       )"
@@ -1448,7 +1448,7 @@ test_app_release() {
     if grep -Eq \
       '^tofu |^az (network|postgres|resource delete|group delete|lock delete) ' \
       "$log"; then
-      fail "app release attempted Terraform, DNS, Storage, PostgreSQL, or destructive resource mutation"
+      fail "app release attempted OpenTofu, DNS, Storage, PostgreSQL, or destructive resource mutation"
     fi
     case "$scenario" in
       native_health_failure | public_health_failure | native_health_status_mismatch | \
@@ -2228,7 +2228,7 @@ azurerm_container_app.server'
         grep -Fqx completed "$log" ||
           fail "infrastructure change plan-and-report did not complete"
         test ! -d "$(cat "$diagnostic_path_file")" ||
-          fail "infrastructure change plan-and-report retained private Terraform diagnostics"
+          fail "infrastructure change plan-and-report retained private OpenTofu diagnostics"
         # What makes the approval an approval of *these* actions: the token is
         # the digest of exactly the inventory text printed above it, recomputed
         # here from that text rather than taken on trust. A token that were a
@@ -2289,7 +2289,7 @@ azurerm_container_app.server'
           fail "infrastructure cleanup failure did not emit only its generic error"
       else
         test ! -d "$(cat "$diagnostic_path_file")" ||
-          fail "successful infrastructure change retained private Terraform diagnostics"
+          fail "successful infrastructure change retained private OpenTofu diagnostics"
       fi
       grep -Fqx completed "$log" ||
         fail "successful infrastructure change did not complete"
@@ -2371,11 +2371,11 @@ azurerm_container_app.server'
           grep -Fqx \
             'tofu import -input=false azurerm_management_lock.drafts_storage /subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg-patchpage-workload/providers/Microsoft.Storage/storageAccounts/patchpagedrafts/providers/Microsoft.Authorization/locks/protect-patchpage-drafts' \
             "$log" ||
-            fail "safety adoption did not bind the Storage lock to Terraform state"
+            fail "safety adoption did not bind the Storage lock to OpenTofu state"
           grep -Fqx \
             'tofu import -input=false azurerm_management_lock.patchpage_postgres /subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg-patchpage-workload/providers/Microsoft.DBforPostgreSQL/flexibleServers/patchpage-db/providers/Microsoft.Authorization/locks/protect-patchpage-postgres' \
             "$log" ||
-            fail "safety adoption did not bind the PostgreSQL lock to Terraform state"
+            fail "safety adoption did not bind the PostgreSQL lock to OpenTofu state"
           if grep -Eq '^az lock .*--resource-group ' "$log"; then
             fail "safety adoption locked the mixed workload resource group"
           fi
@@ -2500,14 +2500,14 @@ azurerm_container_app.server'
         adoption_operation_role_broad | adoption_operation_role_wrong | \
         adoption_operation_role_ambiguous | adoption_state_role_reader)
         if grep -Eq '^az storage container lease acquire |^tofu (plan|apply) ' "$log"; then
-          fail "safety adoption reached the lease or Terraform after unsafe operation-storage preflight $scenario"
+          fail "safety adoption reached the lease or OpenTofu after unsafe operation-storage preflight $scenario"
         fi
         ;;
       adoption_binding_update_failure | adoption_binding_concurrent_metadata)
         if grep -Eq \
           '^az storage container lease acquire .* --lease-duration -1 |^tofu (plan|apply) ' \
           "$log"; then
-          fail "safety adoption reached the operation lease or Terraform after $scenario"
+          fail "safety adoption reached the operation lease or OpenTofu after $scenario"
         fi
         grep -Eq \
           '^az storage container lease acquire .* --auth-mode key --lease-duration 60 --proposed-lease-id [0-9a-f-]{36} --output none$' \
@@ -2545,7 +2545,7 @@ azurerm_container_app.server'
         ;;
       adoption_image_config_mismatch)
         if grep -Eq '^tofu (plan|apply) ' "$log"; then
-          fail "safety adoption planned after Terraform rejected the synchronized image"
+          fail "safety adoption planned after OpenTofu rejected the synchronized image"
         fi
         ;;
       operation_lease_acquire_ok_renew_fails)
@@ -2606,12 +2606,12 @@ azurerm_container_app.server'
     esac
     if test "$scenario" = "postapply_app_show_failure"; then
       test -f "$diagnostic_path_file" ||
-        fail "readiness recovery lost the private Terraform diagnostic location"
+        fail "readiness recovery lost the private OpenTofu diagnostic location"
       readiness_diagnostic_dir="$(cat "$diagnostic_path_file")"
       test -d "$readiness_diagnostic_dir" ||
-        fail "readiness recovery removed private Terraform diagnostics"
+        fail "readiness recovery removed private OpenTofu diagnostics"
       test -f "$readiness_diagnostic_dir/terraform.log" ||
-        fail "readiness recovery did not preserve the Terraform log"
+        fail "readiness recovery did not preserve the OpenTofu log"
     fi
     case "$scenario" in
       adoption_foreign_container | adoption_recoverable_container | \
@@ -2642,14 +2642,14 @@ azurerm_container_app.server'
         ;;
     esac
     if grep -Fq "$TMP_DIR/infrastructure-diagnostics-$scenario" "$output"; then
-      fail "infrastructure change exposed the private Terraform diagnostic path"
+      fail "infrastructure change exposed the private OpenTofu diagnostic path"
     fi
     if test "$scenario" = "plan_failure"; then
       test -f "$diagnostic_path_file" ||
         fail "failed infrastructure change lost its private diagnostic location"
       diagnostic_log="$(cat "$diagnostic_path_file")/terraform.log"
       test -f "$diagnostic_log" ||
-        fail "failed infrastructure change did not preserve Terraform diagnostics"
+        fail "failed infrastructure change did not preserve OpenTofu diagnostics"
       diagnostic_mode="$(
         file_mode "$diagnostic_log"
       )"
@@ -3149,7 +3149,7 @@ guide_binding_digest_of_pipeline() {
 # --- the plan gate as a pure filter ------------------------------------------
 #
 # lib/plan_gate.sh is the one piece of the operations CLI with no environment,
-# no network and no Azure in it: a Terraform plan rendering goes in on stdin,
+# no network and no Azure in it: an OpenTofu plan rendering goes in on stdin,
 # a verdict comes out as an exit status. That is what makes it testable the way
 # the rest of this file cannot be -- directly, on fixtures, one verdict at a
 # time, without driving a deployment to reach it.
@@ -3507,7 +3507,16 @@ test_public_safe_runbook_static() {
   # Both binary names are matched. `terraform` is no longer invoked anywhere, so
   # the alternation costs nothing -- and it is what keeps this assertion from
   # going quietly vacuous if a stale Terraform call is ever reintroduced here.
-  if grep -Eq '(^|[^[:alnum:]_])(tofu|terraform) ' \
+  #
+  # The excluded leading class deliberately keeps `_` out of it: the wrappers are
+  # named private_tofu/private_terraform, so treating `_` as a word character
+  # would let the exact call this assertion exists to catch -- a wrapper-form
+  # `private_tofu output` in the release path -- pass straight through. Excluding
+  # only alphanumerics still cannot match `tofu_diagnostic_exit` or
+  # `trap 'tofu_diagnostic_exit' 0`, because the required trailing space is what
+  # separates a command invocation from an identifier that merely starts with the
+  # binary's name.
+  if grep -Eq '(^|[^[:alnum:]])(tofu|terraform) ' \
     "$GUIDE_CMD_DIR/app-release.sh" \
     "$GUIDE_LIB_DIR/wrappers.sh" \
     "$GUIDE_LIB_DIR/lease.sh" \
@@ -3671,13 +3680,17 @@ test_public_safe_runbook_static() {
   rm -rf "$flow_exclusive_probe_dir"
 
   # Lifecycle prevent_destroy is a meta-argument and is invisible to plan-time
-  # terraform test assertions. Statically require the expected blocks.
+  # tofu test assertions. Statically require the expected blocks.
   #
-  # Management-lock scope equality against child resource IDs also cannot be
-  # evaluated under terraform test on the CI-pinned Terraform 1.9.8: plan leaves
-  # those IDs unknown, mock_resource.override_during was only added after 1.9.8,
-  # and apply-time mocks need full Azure ID shapes for every dependent resource.
-  # Statically require each lock's scope to reference the child resource id.
+  # Management-lock scope wiring also cannot be asserted behaviorally under
+  # `tofu test`. A lock's scope is another resource's computed `id`, and
+  # mock_resource defaults supply one constant id per resource type, not per
+  # instance: every azurerm_storage_account in the configuration mocks to the
+  # same id. An assertion that the lock's scope equals that id therefore holds
+  # for a lock wired to any storage account, so it pins the mock rather than the
+  # wiring -- which is the only thing worth pinning here. Statically require each
+  # lock's scope to name the intended resource id instead. See #73, which
+  # revisits how much of this can move to a behavioral guard test.
   azure_tf_dir="$ROOT/infra/azure"
   for prevent_destroy_resource in \
     'azurerm_storage_account.drafts' \
@@ -3755,7 +3768,7 @@ test_public_safe_runbook_static() {
   done
 
   # The Container App create-time server_image gate is invisible to plan-time
-  # terraform test: expect_failures on azurerm_container_app.server is satisfied by
+  # `tofu test`: expect_failures on azurerm_container_app.server is satisfied by
   # the postcondition, so deleting or neutering the precondition alone stays green.
   # Statically require the precondition to delegate to the named local that
   # server_image_invariants.tftest.hcl asserts through its output.
@@ -3812,7 +3825,7 @@ test_custom_domain_context() {
     PP_MOCK_SCENARIO=""
     PP_MOCK_LOG=""
     PP_MOCK_EXPECTED_SUBSCRIPTION="00000000-0000-0000-0000-000000000000"
-    # This block derives SUBSCRIPTION_ID from Terraform instead of taking it as
+    # This block derives SUBSCRIPTION_ID from OpenTofu instead of taking it as
     # an input, so the subscription guard needs the expected value separately.
     PP_MOCK_SUBSCRIPTION_ID="$PP_MOCK_EXPECTED_SUBSCRIPTION"
     export PP_MOCK_GROUP PP_MOCK_SCENARIO PP_MOCK_LOG \
@@ -3824,7 +3837,7 @@ test_custom_domain_context() {
     run_ops_wrapper custom-domain-context \
       custom-domain-context-source custom-domain-context-trailer
   ) >"$context_output" 2>&1; then
-    fail "Terraform hostnames were not normalized before DNS and certificate checks"
+    fail "OpenTofu hostnames were not normalized before DNS and certificate checks"
   fi
   test "$(cat "$context_output")" = "Azure deployment context verified privately." ||
     fail "custom-domain context exposed deployment details instead of generic success"
@@ -3868,7 +3881,7 @@ run_custom_domain_output_guard_block() {
     PP_MOCK_SCENARIO="$scenario"
     PP_MOCK_LOG="$log"
     PP_MOCK_EXPECTED_SUBSCRIPTION="00000000-0000-0000-0000-000000000000"
-    # This block derives SUBSCRIPTION_ID from Terraform instead of taking it as
+    # This block derives SUBSCRIPTION_ID from OpenTofu instead of taking it as
     # an input, so the subscription guard needs the expected value separately.
     PP_MOCK_SUBSCRIPTION_ID="$PP_MOCK_EXPECTED_SUBSCRIPTION"
     export PP_MOCK_GROUP PP_MOCK_SCENARIO PP_MOCK_LOG \

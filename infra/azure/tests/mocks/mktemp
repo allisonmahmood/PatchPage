@@ -12,7 +12,7 @@
 # for every call, so the cat, rm and jq shims can recognise the block's own
 # TERRAFORM_DIAGNOSTIC_DIR, STATE_LIST_ERROR, SECURE_TARGET_DIR, SECURE_PLAN_DIR
 # and SECURE_CHANGE_DIR without being able to read the block's variables. The
-# terraform shim already does this for the saved plan paths; see
+# tofu shim already does this for the saved plan paths; see
 # mock_mktemp_recall in mocklib.sh for why the template, and not the call
 # ordinal, is what a consumer looks a path up by.
 

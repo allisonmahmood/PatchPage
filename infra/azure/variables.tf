@@ -140,7 +140,7 @@ variable "trust_proxy" {
 
   validation {
     # Keep the range calculation inline: locals derived from var.trust_proxy
-    # create a validation cycle on Terraform 1.9.
+    # create a validation cycle.
     condition = var.trust_proxy == null ? true : (
       can(regex("^[1-9][0-9]*$", trimspace(var.trust_proxy))) ? true : alltrue([
         for range_keys in [sort([
@@ -202,7 +202,7 @@ variable "trust_proxy" {
 
   validation {
     # Keep this separate from the IPv4 union check: IPv6 needs 128-bit
-    # arithmetic and expansion of Terraform's compressed cidrhost output.
+    # arithmetic and expansion of OpenTofu's compressed cidrhost output.
     condition = var.trust_proxy == null ? true : (
       can(regex("^[1-9][0-9]*$", trimspace(var.trust_proxy))) ? true : alltrue([
         for range_keys in [sort([

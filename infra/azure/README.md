@@ -30,7 +30,7 @@ This directory used Terraform 1.9.8 until PatchPage moved to OpenTofu. There is 
 
 Provider addresses resolve through the OpenTofu registry, so the first `tofu init` rewrites `registry.terraform.io/...` to `registry.opentofu.org/...` in `.terraform.lock.hcl` and replaces the recorded hashes. Provider versions are preserved. The checked-in lock file in this repository is already in that form.
 
-Moving back to Terraform remains possible: reverse the same `init`, and the state reads back unchanged. That stays true only until this directory adopts an OpenTofu-only feature — state encryption being the obvious one — which it deliberately has not.
+Moving back to Terraform remains possible and the state itself reads back unchanged, but the `init` does not reverse symmetrically: the checked-in lock file records `registry.opentofu.org` addresses, so `terraform init -lockfile=readonly` stops with a provider-dependency-change error and the move needs a plain `terraform init` that regenerates the lock against `registry.terraform.io`. That regeneration re-resolves the `~>` constraints rather than reusing the recorded versions, so provider versions float unless they are pinned exactly first — moving back today takes `azurerm` from 4.80.0 to 4.81.0. Either direction stays available only until this directory adopts an OpenTofu-only feature — state encryption being the obvious one — which it deliberately has not.
 
 ## State bootstrap
 
