@@ -39,9 +39,15 @@
 # changes -- switching to `IFS=` with explicit parsing, or moving to a query
 # that emits a different column set, would make an empty name with a live
 # deleted flag reachable, and this reads it as a failure rather than as nothing.
-# The `malformed_container_row` scenario in the harness pins the parse itself,
-# so a change to the splitting shows up as a moved verdict rather than as
-# silence.
+# The `malformed_container_row` scenario in the harness feeds exactly this row,
+# and it is worth being precise about what it does and does not pin. With the
+# strict branch in place the row is rejected either way -- through the
+# unknown-name arm as it parses today, through the empty-name arm if the
+# splitting ever changed -- so the shipped text's verdict does not move on a
+# splitting change alone. What the scenario catches is the combination: the
+# strict branch dropped *and* the row parsing the other way. That pair is the
+# only way `<tab>false` gets certified as nothing to see, and it is the pair
+# this file is defending against.
 inspect_state_containers() {
   if ! STATE_CONTAINER_EXISTS="$(
     private_az storage container exists \

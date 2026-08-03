@@ -84,6 +84,15 @@ operation_binding_sha256() {
 # is empty, and carries exactly the expected workload binding and nothing else.
 # The emptiness check is not fussiness: the container is a lock, not storage, so
 # anything inside it means something else is using it as something it is not.
+#
+# The identity comparison case-folds both sides. Azure echoes resource IDs back
+# with whatever casing whoever created them used -- `resourceGroups` and
+# `resourcegroups` denote the same resource -- so a case-sensitive `!=` on an ID
+# read back from the API is a false mismatch waiting to happen. It is written
+# out here rather than called through a shared helper on purpose: roughly forty
+# other gates in these runbooks fold exactly the same way, and a helper with one
+# caller is not a shared definition, it is a second place to look while the
+# other forty copies go on existing. Issue #77 converts all of them together.
 verify_operation_container() {
   if ! live_operation_container_id="$(
     private_az storage container-rm show \
@@ -91,7 +100,7 @@ verify_operation_container() {
       --query id \
       --output tsv
   )" ||
-    azure_ids_differ "$live_operation_container_id" "$EXPECTED_OPERATION_CONTAINER_ID" ||
+    test "$(printf '%s' "$live_operation_container_id" | tr '[:upper:]' '[:lower:]')" != "$(printf '%s' "$EXPECTED_OPERATION_CONTAINER_ID" | tr '[:upper:]' '[:lower:]')" ||
     ! operation_container_exists="$(
     private_az storage container exists \
       --account-name "$STATE_STORAGE_ACCOUNT" \

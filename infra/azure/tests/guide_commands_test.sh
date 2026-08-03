@@ -590,9 +590,15 @@ test_state_bootstrap() {
         # column, the extra branch can never fire, and the two copies were
         # already behaviourally identical. The strict text is what survived the
         # merge, so the branch is kept as defence in depth against a future edit
-        # to the splitting -- and this scenario is what would notice such an
-        # edit, because the verdict below is reached through the unknown-name
-        # arm and would move if the row started parsing the other way.
+        # to the splitting.
+        #
+        # Be precise about what this scenario pins. With the strict branch in
+        # place the row is rejected either way -- through the unknown-name arm
+        # as it parses today, through the empty-name arm if the splitting
+        # changed -- so the verdict below does not move on a splitting change
+        # alone. It moves only if the splitting changes *and* the strict branch
+        # is dropped, which is exactly the pair that would let `<tab>false` be
+        # skipped in silence.
         test "$status" -ne 0 ||
           fail "state bootstrap accepted a container inventory row it could not interpret"
         test ! -e "$backend" ||
@@ -2979,6 +2985,18 @@ server_image_precondition_is_pinned() {
 # The list is exact in both directions: a command that loads lease.sh and is not
 # named below fails too, so a new mutating command cannot quietly inherit
 # whichever mode happens to be convenient.
+#
+# One honest caveat about two of the five entries. deploy-resources and
+# stale-lease-recovery load lease.sh only for operation_binding_sha256(), which
+# never reads OPERATION_LEASE_AUTH_MODE; every data-plane call they make names
+# its mode as a literal `--auth-mode key` / `--auth-mode login` flag in the
+# command file itself. Their declaration is therefore a statement of the
+# privilege model those literals implement, not the thing that enforces it --
+# the literals are pinned by the flow log assertions below, and widening one of
+# them turns those scenarios red on its own. For app-release, app-rollback and
+# infrastructure-change, which do take the lease through this library, the
+# declaration is the only thing standing between a lease taken as a named human
+# and a lease taken with an account key.
 operation_lease_auth_modes_are_pinned() {
   awk -v cmd_dir="$1" \
     -v all_commands="$(printf '%s' "$GUIDE_COMMANDS" | tr '\n' ' ')" \
@@ -4423,10 +4441,15 @@ run_deployed_smoke_block() {
     esac
     case "$scenario" in
       upload_body_header_file_mutation)
+        # Send the authorization header file as the request body. The runbook
+        # names that file in $UPLOAD_HEADER_FILE, so the substituted line is a
+        # line the sabotaged runbook can actually execute -- which is the whole
+        # point: the mutated argv has to reach curl for curl's argv contract to
+        # be the thing that rejects it.
         awk '
           $0 == "    --data \"$UPLOAD_PAYLOAD\" \\" {
             replacements++
-            print "    --data-binary \"@$AUTH_HEADER_FILE\" \\"
+            print "    --data-binary \"@$UPLOAD_HEADER_FILE\" \\"
             next
           }
           { print }
@@ -4540,6 +4563,26 @@ test_deployed_smoke() {
       canary_inside_repo | canary_traversal_repo | canary_symlink_parent)
         test ! -e "$TMP_DIR/deployed-smoke-$scenario-repo/canary.env" ||
           fail "deployed smoke wrote a canary record inside the repository after $scenario"
+        ;;
+      upload_body_header_file_mutation | upload_duplicate_body_mutation)
+        # These two are the sabotage scenarios, and they run out of a scratch
+        # copy of the CLI. A scratch tree that is missing something -- lib/,
+        # most easily -- dies at a source line long before the mutated upload
+        # is reached, and every assertion above still passes: a green test
+        # proving nothing. So pin the failure reason rather than the failure.
+        #
+        # The mutated argv has to have actually reached curl, and the run has
+        # to have died at the upload rather than on the way there. Between them
+        # those two facts say the scratch CLI was complete and the sabotage is
+        # what stopped it.
+        grep -Fqx 'https://drafts.self-hoster.dev/api/uploads' \
+          "$TMP_DIR/deployed-smoke-$scenario-curl-argv.log" ||
+          fail "deployed smoke never attempted the upload during $scenario, so the sabotage proved nothing"
+        grep -Fq 'The authenticated upload request failed.' "$failure_output" ||
+          fail "deployed smoke did not fail at the sabotaged upload during $scenario"
+        if grep -Fq 'No such file or directory' "$failure_output"; then
+          fail "deployed smoke failed on an incomplete scratch CLI during $scenario, not on the sabotage"
+        fi
         ;;
     esac
   done

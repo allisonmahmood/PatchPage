@@ -29,17 +29,3 @@ private_curl() {
 private_dig() {
   dig "$@" 2>/dev/null
 }
-
-# Returns 0 when two Azure resource IDs are not the same resource, 1 when they
-# are. Azure echoes resource IDs back with the casing whoever created them used
-# -- `resourceGroups` and `resourcegroups`, `Microsoft.Storage` and
-# `microsoft.storage` -- and the ARM identity they denote is the same either
-# way. A case-sensitive `test x != y` on an ID read back from the API is
-# therefore a false mismatch waiting to happen, and every one of these
-# comparisons is a safety gate: it decides whether the live resource is the one
-# the private record names. Comparing case-folded is the whole mechanism, so it
-# gets one definition rather than being open-coded at each gate.
-azure_ids_differ() {
-  test "$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')" != \
-    "$(printf '%s' "$2" | tr '[:upper:]' '[:lower:]')"
-}
