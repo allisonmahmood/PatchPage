@@ -72,13 +72,13 @@ if ! STATE_ACCOUNT_NAME_AVAILABLE="$(
       --name "$STATE_RESOURCE_GROUP" \
       --output tsv
   )"; then
-  printf 'Could not verify the Terraform state resource names.\n' >&2
+  printf 'Could not verify the OpenTofu state resource names.\n' >&2
   exit 1
 fi
 case "$STATE_ACCOUNT_NAME_AVAILABLE:$EXISTING_STATE_RESOURCE_GROUP" in
   true:true | true:false | false:true | false:false) ;;
   *)
-    printf 'Azure returned an invalid Terraform state resource preflight result.\n' >&2
+    printf 'Azure returned an invalid OpenTofu state resource preflight result.\n' >&2
     exit 1
     ;;
 esac
@@ -139,11 +139,11 @@ if test "$EXISTING_STATE_RESOURCE_GROUP" = "false"; then
   if ! private_az group create \
     --name "$STATE_RESOURCE_GROUP" \
     --location "$STATE_LOCATION" >/dev/null; then
-    printf 'Could not create the Terraform state resource group.\n' >&2
+    printf 'Could not create the OpenTofu state resource group.\n' >&2
     exit 1
   fi
   if ! inventory_state_resource_group || test "$STATE_RESOURCE_COUNT" -ne 0; then
-    printf 'The new Terraform state resource group is not empty.\n' >&2
+    printf 'The new OpenTofu state resource group is not empty.\n' >&2
     exit 1
   fi
 fi
@@ -153,11 +153,11 @@ if ! STATE_RESOURCE_GROUP_LOCATION="$(
     --query location \
     --output tsv
 )"; then
-  printf 'Could not verify the Terraform state resource group.\n' >&2
+  printf 'Could not verify the OpenTofu state resource group.\n' >&2
   exit 1
 fi
 if test "$STATE_RESOURCE_GROUP_LOCATION" != "$STATE_LOCATION"; then
-  printf 'The Terraform state resource-group location does not match the private expected value.\n' >&2
+  printf 'The OpenTofu state resource-group location does not match the private expected value.\n' >&2
   exit 1
 fi
 if test "$STATE_STORAGE_ACCOUNT_EXISTS" = "false"; then
@@ -170,7 +170,7 @@ if test "$STATE_STORAGE_ACCOUNT_EXISTS" = "false"; then
     --min-tls-version TLS1_2 \
     --https-only true \
     --allow-blob-public-access false >/dev/null; then
-    printf 'Could not create the Terraform state storage account.\n' >&2
+    printf 'Could not create the OpenTofu state storage account.\n' >&2
     exit 1
   fi
 fi
@@ -180,7 +180,7 @@ if ! STATE_STORAGE_ACCOUNT_PROPERTIES="$(
     --resource-group "$STATE_RESOURCE_GROUP" \
     --output json
 )"; then
-  printf 'Could not verify the Terraform state storage account.\n' >&2
+  printf 'Could not verify the OpenTofu state storage account.\n' >&2
   exit 1
 fi
 EXPECTED_STATE_STORAGE_ACCOUNT_ID_LOWER="$(
@@ -197,11 +197,11 @@ if ! printf '%s\n' "$STATE_STORAGE_ACCOUNT_PROPERTIES" |
      .minimumTlsVersion == "TLS1_2" and
      .enableHttpsTrafficOnly == true and
      .allowBlobPublicAccess == false' >/dev/null; then
-  printf 'The Terraform state storage account does not match the required identity or security properties.\n' >&2
+  printf 'The OpenTofu state storage account does not match the required identity or security properties.\n' >&2
   exit 1
 fi
 if ! inspect_state_containers; then
-  printf 'Could not inspect the Terraform state account data plane.\n' >&2
+  printf 'Could not inspect the OpenTofu state account data plane.\n' >&2
   exit 1
 fi
 STATE_LOCK_NAME="protect-patchpage-tfstate"
@@ -212,7 +212,7 @@ if ! STATE_EXISTING_LOCKS="$(
     --query "[?name=='$STATE_LOCK_NAME'].[level,id]" \
     --output tsv
 )"; then
-  printf 'Could not inspect the existing Terraform state deletion lock.\n' >&2
+  printf 'Could not inspect the existing OpenTofu state deletion lock.\n' >&2
   exit 1
 fi
 case "$STATE_EXISTING_LOCKS" in
@@ -221,7 +221,7 @@ case "$STATE_EXISTING_LOCKS" in
     if test "$(printf '%s\n' "$STATE_EXISTING_LOCKS" | wc -l | tr -d ' ')" != "1" ||
       test "$(printf '%s\n' "$STATE_EXISTING_LOCKS" | cut -f1)" != "CanNotDelete" ||
       test "$(printf '%s\n' "$STATE_EXISTING_LOCKS" | cut -f2 | tr '[:upper:]' '[:lower:]')" != "$(printf '%s' "$EXPECTED_STATE_LOCK_ID" | tr '[:upper:]' '[:lower:]')"; then
-      printf 'A conflicting Terraform state lock requires explicit operator handling.\n' >&2
+      printf 'A conflicting OpenTofu state lock requires explicit operator handling.\n' >&2
       exit 1
     fi
     ;;
@@ -244,7 +244,7 @@ verify_unused_state_key() {
 }
 if test "$STATE_CONTAINER_EXISTS" = "true" &&
   ! verify_unused_state_key; then
-  printf 'The Terraform state key exists or has recoverable history; use the existing-environment flow.\n' >&2
+  printf 'The OpenTofu state key exists or has recoverable history; use the existing-environment flow.\n' >&2
   exit 1
 fi
 if ! CURRENT_STATE_BLOB_PROPERTIES="$(
@@ -261,7 +261,7 @@ if ! CURRENT_STATE_BLOB_PROPERTIES="$(
     printf '%s\n' "$CURRENT_STATE_BLOB_PROPERTIES" |
       jq -er '[.containerDeleteRetentionPolicy.days // 0, 30] | max'
   )"; then
-  printf 'Could not read the existing Terraform state retention settings.\n' >&2
+  printf 'Could not read the existing OpenTofu state retention settings.\n' >&2
   exit 1
 fi
 if ! private_az storage account blob-service-properties update \
@@ -273,7 +273,7 @@ if ! private_az storage account blob-service-properties update \
   --enable-container-delete-retention true \
   --container-delete-retention-days "$STATE_CONTAINER_RETENTION_DAYS" \
   --set deleteRetentionPolicy.allowPermanentDelete=false >/dev/null; then
-  printf 'Could not configure Terraform state versioning and soft-delete retention.\n' >&2
+  printf 'Could not configure OpenTofu state versioning and soft-delete retention.\n' >&2
   exit 1
 fi
 if ! STATE_BLOB_PROPERTIES="$(
@@ -282,7 +282,7 @@ if ! STATE_BLOB_PROPERTIES="$(
     --resource-group "$STATE_RESOURCE_GROUP" \
     --output json
 )"; then
-  printf 'Could not verify Terraform state versioning and soft-delete retention.\n' >&2
+  printf 'Could not verify OpenTofu state versioning and soft-delete retention.\n' >&2
   exit 1
 fi
 if ! printf '%s\n' "$STATE_BLOB_PROPERTIES" |
@@ -293,7 +293,7 @@ if ! printf '%s\n' "$STATE_BLOB_PROPERTIES" |
      .deleteRetentionPolicy.days >= 30 and
      .containerDeleteRetentionPolicy.enabled == true and
      .containerDeleteRetentionPolicy.days >= 30' >/dev/null; then
-  printf 'Terraform state versioning or soft-delete retention is below the required baseline.\n' >&2
+  printf 'OpenTofu state versioning or soft-delete retention is below the required baseline.\n' >&2
   exit 1
 fi
 if test "$STATE_CONTAINER_EXISTS" = "false"; then
@@ -301,7 +301,7 @@ if test "$STATE_CONTAINER_EXISTS" = "false"; then
     --name "$STATE_CONTAINER" \
     --account-name "$STATE_STORAGE_ACCOUNT" \
     --auth-mode key >/dev/null; then
-    printf 'Could not create the Terraform state container.\n' >&2
+    printf 'Could not create the OpenTofu state container.\n' >&2
     exit 1
   fi
 fi
@@ -336,7 +336,7 @@ if ! OPERATION_CONTAINER_METADATA="$(
   exit 1
 fi
 if ! verify_unused_state_key; then
-  printf 'The Terraform state key exists, has recoverable history, or could not be verified; use the existing-environment flow.\n' >&2
+  printf 'The OpenTofu state key exists, has recoverable history, or could not be verified; use the existing-environment flow.\n' >&2
   exit 1
 fi
 if ! OPERATION_CONTAINER_BLOBS="$(
@@ -384,7 +384,7 @@ if ! OPERATION_ROLE_ASSIGNMENTS="$(read_operation_role_assignments)" ||
   ! STATE_ROLE_ASSIGNMENTS="$(read_state_role_assignments)" ||
   ! printf '%s\n' "$STATE_ROLE_ASSIGNMENTS" |
     jq -e 'length == 0' >/dev/null; then
-  printf 'Could not prove the operation principal has no Terraform state access.\n' >&2
+  printf 'Could not prove the operation principal has no OpenTofu state access.\n' >&2
   exit 1
 fi
 case "$OPERATION_ROLE_ASSIGNMENT_COUNT" in
@@ -418,7 +418,7 @@ if ! OPERATION_ROLE_ASSIGNMENTS="$(read_operation_role_assignments)" ||
   ! STATE_ROLE_ASSIGNMENTS="$(read_state_role_assignments)" ||
   ! printf '%s\n' "$STATE_ROLE_ASSIGNMENTS" |
     jq -e 'length == 0' >/dev/null; then
-  printf 'Operation-principal access is missing, incorrectly scoped, or can reach Terraform state.\n' >&2
+  printf 'Operation-principal access is missing, incorrectly scoped, or can reach OpenTofu state.\n' >&2
   exit 1
 fi
 
@@ -428,7 +428,7 @@ if ! STATE_EXISTING_LOCKS="$(
     --query "[?name=='$STATE_LOCK_NAME'].[level,id]" \
     --output tsv
 )"; then
-  printf 'Could not inspect the existing Terraform state deletion lock.\n' >&2
+  printf 'Could not inspect the existing OpenTofu state deletion lock.\n' >&2
   exit 1
 fi
 case "$STATE_EXISTING_LOCKS" in
@@ -441,7 +441,7 @@ case "$STATE_EXISTING_LOCKS" in
       )" != "$(
         printf '%s' "$EXPECTED_STATE_LOCK_ID" | tr '[:upper:]' '[:lower:]'
       )"; then
-      printf 'A conflicting Terraform state lock requires explicit operator handling.\n' >&2
+      printf 'A conflicting OpenTofu state lock requires explicit operator handling.\n' >&2
       exit 1
     fi
     ;;
@@ -449,7 +449,7 @@ esac
 if ! inventory_state_resource_group ||
   test "$STATE_RESOURCE_COUNT" -ne 1 ||
   test "$STATE_STORAGE_ACCOUNT_EXISTS" != "true"; then
-  printf 'The Terraform state resource group contains an unexpected resource.\n' >&2
+  printf 'The OpenTofu state resource group contains an unexpected resource.\n' >&2
   exit 1
 fi
 if test -z "$STATE_EXISTING_LOCKS"; then
@@ -457,7 +457,7 @@ if test -z "$STATE_EXISTING_LOCKS"; then
     --name "$STATE_LOCK_NAME" \
     --lock-type CanNotDelete \
     --resource "$EXPECTED_STATE_STORAGE_ACCOUNT_ID" >/dev/null; then
-    printf 'Could not create the Terraform state-account deletion lock.\n' >&2
+    printf 'Could not create the OpenTofu state-account deletion lock.\n' >&2
     exit 1
   fi
 fi
@@ -473,7 +473,7 @@ if ! STATE_LOCK_PROPERTIES="$(
   )" != "$(
     printf '%s' "$EXPECTED_STATE_LOCK_ID" | tr '[:upper:]' '[:lower:]'
   )"; then
-  printf 'Terraform state-account deletion lock is missing or incorrectly scoped.\n' >&2
+  printf 'OpenTofu state-account deletion lock is missing or incorrectly scoped.\n' >&2
   exit 1
 fi
 unset CURRENT_STATE_BLOB_PROPERTIES EXPECTED_STATE_LOCK_ID
@@ -498,6 +498,6 @@ if ! (umask 077 && : > backend.hcl) ||
     "$STATE_STORAGE_ACCOUNT" \
     "$STATE_CONTAINER" \
     "$STATE_KEY" > backend.hcl; then
-  printf 'Could not write the private Terraform backend configuration.\n' >&2
+  printf 'Could not write the private OpenTofu backend configuration.\n' >&2
   exit 1
 fi

@@ -145,23 +145,23 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: hashicorp/setup-terraform@v3
+      - uses: opentofu/setup-opentofu@v2
         with:
-          terraform_version: 1.9.8
+          tofu_version: 1.12.5
       - name: Verify Azure guide command contracts
         run: |
           sh -n infra/azure/tests/guide_commands_test.sh
           sh infra/azure/tests/guide_commands_test.sh
-      - name: Verify Azure Terraform
+      - name: Verify Azure OpenTofu
         working-directory: infra/azure
         shell: bash
         run: |
           set -euo pipefail
 
-          terraform fmt -check -recursive
-          terraform init -backend=false -input=false -lockfile=readonly -no-color
-          terraform validate -no-color
-          terraform test -no-color
+          tofu fmt -check -recursive
+          tofu init -backend=false -input=false -lockfile=readonly -no-color
+          tofu validate -no-color
+          tofu test -no-color
 
   dependency-review:
     if: github.event_name == 'pull_request'

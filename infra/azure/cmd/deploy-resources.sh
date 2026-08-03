@@ -30,7 +30,7 @@ if ! REPO_ROOT_CANONICAL="$(
   ! TERRAFORM_DIAGNOSTIC_ROOT="$(
     CDPATH= cd -- "$TERRAFORM_DIAGNOSTIC_ROOT" 2>/dev/null && pwd -P
   )"; then
-  printf 'Could not resolve the private Terraform diagnostic root.\n' >&2
+  printf 'Could not resolve the private OpenTofu diagnostic root.\n' >&2
   exit 1
 fi
 case "$TERRAFORM_DIAGNOSTIC_ROOT" in
@@ -43,7 +43,7 @@ if ! TERRAFORM_DIAGNOSTIC_DIR="$(
   umask 077
   mktemp -d "$TERRAFORM_DIAGNOSTIC_ROOT/patchpage-terraform-diagnostics.XXXXXX" 2>/dev/null
 )"; then
-  printf 'Could not create a private Terraform diagnostic directory.\n' >&2
+  printf 'Could not create a private OpenTofu diagnostic directory.\n' >&2
   exit 1
 fi
 TERRAFORM_DIAGNOSTIC_LOG="$TERRAFORM_DIAGNOSTIC_DIR/terraform.log"
@@ -52,12 +52,12 @@ if ! { exec 3>>"$TERRAFORM_DIAGNOSTIC_LOG"; } 2>/dev/null ||
   ! chmod 600 "$TERRAFORM_DIAGNOSTIC_LOG" 2>/dev/null; then
   { exec 3>&-; } 2>/dev/null || :
   rm -rf -- "$TERRAFORM_DIAGNOSTIC_DIR" 2>/dev/null || :
-  printf 'Could not secure the private Terraform diagnostic log.\n' >&2
+  printf 'Could not secure the private OpenTofu diagnostic log.\n' >&2
   exit 1
 fi
 TERRAFORM_DIAGNOSTICS_COMPLETE=false
 TERRAFORM_DIAGNOSTIC_FD_OPEN=true
-trap 'terraform_diagnostic_exit' 0
+trap 'tofu_diagnostic_exit' 0
 trap 'exit 129' HUP
 trap 'exit 130' INT
 trap 'exit 143' TERM
@@ -81,7 +81,7 @@ if ! (umask 077 && : > backend.hcl) ||
     "$STATE_STORAGE_ACCOUNT" \
     "$STATE_CONTAINER" \
     "$STATE_KEY" > backend.hcl; then
-  printf 'Could not write the private Terraform backend configuration.\n' >&2
+  printf 'Could not write the private OpenTofu backend configuration.\n' >&2
   exit 1
 fi
 RESUME_INITIAL_DEPLOY="${RESUME_INITIAL_DEPLOY:-false}"
@@ -105,37 +105,37 @@ if test "$ACTIVE_SUBSCRIPTION_ID" != "$SUBSCRIPTION_ID"; then
   exit 1
 fi
 
-if ! private_terraform init -input=false -reconfigure -backend-config=backend.hcl >&3; then
-  printf 'Terraform initialization failed.\n' >&2
+if ! private_tofu init -input=false -reconfigure -backend-config=backend.hcl >&3; then
+  printf 'OpenTofu initialization failed.\n' >&2
   exit 1
 fi
 if ! TERRAFORM_SUBSCRIPTION_LITERAL="$(
-  private_terraform console -no-color <<'EOF'
+  private_tofu console -no-color <<'EOF'
 var.subscription_id
 EOF
 )"; then
-  printf 'Could not verify the Terraform provider subscription.\n' >&2
+  printf 'Could not verify the OpenTofu provider subscription.\n' >&2
   exit 1
 fi
 if test "$TERRAFORM_SUBSCRIPTION_LITERAL" != "\"$SUBSCRIPTION_ID\""; then
-  printf 'The Terraform provider subscription does not match the private expected value.\n' >&2
+  printf 'The OpenTofu provider subscription does not match the private expected value.\n' >&2
   exit 1
 fi
 unset TERRAFORM_SUBSCRIPTION_LITERAL
 
 if ! TERRAFORM_RESOURCE_GROUP_LITERAL="$(
-  private_terraform console -no-color <<'EOF'
+  private_tofu console -no-color <<'EOF'
 "rg-patchpage-${var.environment_name}"
 EOF
 )"; then
-  printf 'Could not verify the Terraform workload resource-group name.\n' >&2
+  printf 'Could not verify the OpenTofu workload resource-group name.\n' >&2
   exit 1
 fi
 if ! TERRAFORM_RESOURCE_GROUP="$(
   printf '%s\n' "$TERRAFORM_RESOURCE_GROUP_LITERAL" |
     jq -er 'select(type == "string" and length > 0)'
 )"; then
-  printf 'Terraform returned an invalid workload resource-group name.\n' >&2
+  printf 'OpenTofu returned an invalid workload resource-group name.\n' >&2
   exit 1
 fi
 unset TERRAFORM_RESOURCE_GROUP_LITERAL
@@ -151,10 +151,10 @@ if ! STATE_LIST_ERROR="$(
   mktemp "$TERRAFORM_DIAGNOSTIC_DIR/state-list.stderr.XXXXXX" 2>/dev/null
 )" ||
   ! { exec 4>"$STATE_LIST_ERROR"; } 2>/dev/null; then
-  printf 'Could not create private Terraform state diagnostics.\n' >&2
+  printf 'Could not create private OpenTofu state diagnostics.\n' >&2
   exit 1
 fi
-if STATE_ADDRESSES="$(terraform state list 2>&4)"; then
+if STATE_ADDRESSES="$(tofu state list 2>&4)"; then
   STATE_LIST_STATUS=0
 else
   STATE_LIST_STATUS=$?
@@ -168,11 +168,11 @@ if test "$STATE_LIST_STATUS" -ne 0 &&
 fi
 if ! cat -- "$STATE_LIST_ERROR" >&3 2>/dev/null ||
   ! rm -f -- "$STATE_LIST_ERROR" 2>/dev/null; then
-  printf 'Could not preserve the private Terraform state diagnostics.\n' >&2
+  printf 'Could not preserve the private OpenTofu state diagnostics.\n' >&2
   exit 1
 fi
 if test "$STATE_LIST_STATUS" -ne 0; then
-  printf 'Could not verify the selected Terraform state.\n' >&2
+  printf 'Could not verify the selected OpenTofu state.\n' >&2
   exit 1
 fi
 unset STATE_LIST_ERROR STATE_LIST_STATUS
@@ -233,7 +233,7 @@ else
     exit 1
   fi
   if test "$RESUME_HAS_RESOURCE_GROUP" = "true"; then
-    if ! RESUME_RESOURCE_GROUP="$(private_terraform output -raw resource_group_name)" ||
+    if ! RESUME_RESOURCE_GROUP="$(private_tofu output -raw resource_group_name)" ||
       test "$RESUME_RESOURCE_GROUP" != "$TERRAFORM_RESOURCE_GROUP" ||
       ! RESUME_LIVE_RESOURCE_GROUP_ID="$(
         private_az group show \
@@ -256,7 +256,7 @@ else
   fi
   RESUME_EXPECTED_ACR_ID=""
   if test "$RESUME_HAS_ACR" = "true"; then
-    if ! RESUME_ACR="$(private_terraform output -raw acr_name)" ||
+    if ! RESUME_ACR="$(private_tofu output -raw acr_name)" ||
       ! printf '%s\n' "$RESUME_ACR" | grep -Eq '^[a-z0-9]{5,50}$' ||
       ! RESUME_LIVE_ACR_ID="$(
         private_az acr show \
@@ -327,42 +327,42 @@ cleanup_registry_target_plan() {
     return 1
   fi
 }
-trap 'cleanup_registry_target_plan; terraform_diagnostic_exit' 0
+trap 'cleanup_registry_target_plan; tofu_diagnostic_exit' 0
 trap 'exit 129' HUP
 trap 'exit 130' INT
 trap 'exit 143' TERM
 REGISTRY_TARGET_PLAN="$SECURE_TARGET_DIR/registry-target.tfplan"
 REGISTRY_TARGET_PLAN_JSON="$SECURE_TARGET_DIR/registry-target.json"
-if ! private_terraform plan \
+if ! private_tofu plan \
   -target=azurerm_container_registry.patchpage \
   -input=false \
   -out="$REGISTRY_TARGET_PLAN" >&3 ||
-  ! { private_terraform show -json "$REGISTRY_TARGET_PLAN" > "$REGISTRY_TARGET_PLAN_JSON"; } 2>/dev/null; then
-  printf 'Terraform could not create or inspect the registry-target plan.\n' >&2
+  ! { private_tofu show -json "$REGISTRY_TARGET_PLAN" > "$REGISTRY_TARGET_PLAN_JSON"; } 2>/dev/null; then
+  printf 'OpenTofu could not create or inspect the registry-target plan.\n' >&2
   exit 1
 fi
 if ! plan_gate_accepts < "$REGISTRY_TARGET_PLAN_JSON"; then
   printf 'The registry-target plan contains a delete or replacement action.\n' >&2
   exit 1
 fi
-if ! private_terraform apply -input=false "$REGISTRY_TARGET_PLAN" >&3; then
-  printf 'Terraform could not create or resume the resource group and container registry.\n' >&2
+if ! private_tofu apply -input=false "$REGISTRY_TARGET_PLAN" >&3; then
+  printf 'OpenTofu could not create or resume the resource group and container registry.\n' >&2
   exit 1
 fi
 if ! cleanup_registry_target_plan; then
   exit 1
 fi
 SECURE_TARGET_DIR=''
-trap 'terraform_diagnostic_exit' 0
+trap 'tofu_diagnostic_exit' 0
 unset STATE_ADDRESSES WORKLOAD_RESOURCE_GROUP_EXISTS
 
-if ! RESOURCE_GROUP="$(private_terraform output -raw resource_group_name)" ||
+if ! RESOURCE_GROUP="$(private_tofu output -raw resource_group_name)" ||
   test -z "$RESOURCE_GROUP"; then
-  printf 'Could not load the workload resource group from Terraform.\n' >&2
+  printf 'Could not load the workload resource group from OpenTofu.\n' >&2
   exit 1
 fi
 if test "$RESOURCE_GROUP" != "$TERRAFORM_RESOURCE_GROUP"; then
-  printf 'Terraform returned an unexpected workload resource-group name.\n' >&2
+  printf 'OpenTofu returned an unexpected workload resource-group name.\n' >&2
   exit 1
 fi
 if ! LIVE_RESOURCE_GROUP_ID="$(
@@ -393,20 +393,20 @@ if ! GIT_STATUS="$(private_git -C ../.. status --porcelain)" ||
   exit 1
 fi
 unset GIT_STATUS
-if ! ACR="$(private_terraform output -raw acr_name)"; then
-  printf 'Could not read the container registry name from Terraform.\n' >&2
+if ! ACR="$(private_tofu output -raw acr_name)"; then
+  printf 'Could not read the container registry name from OpenTofu.\n' >&2
   exit 1
 fi
 if ! printf '%s\n' "$ACR" | grep -Eq '^[a-z0-9]{5,50}$'; then
-  printf 'Terraform returned an unexpected container registry name.\n' >&2
+  printf 'OpenTofu returned an unexpected container registry name.\n' >&2
   exit 1
 fi
-if ! LOGIN_SERVER="$(private_terraform output -raw acr_login_server)"; then
-  printf 'Could not read the registry login server from Terraform.\n' >&2
+if ! LOGIN_SERVER="$(private_tofu output -raw acr_login_server)"; then
+  printf 'Could not read the registry login server from OpenTofu.\n' >&2
   exit 1
 fi
 if test "$LOGIN_SERVER" != "$ACR.azurecr.io"; then
-  printf 'Terraform returned an unexpected registry login server.\n' >&2
+  printf 'OpenTofu returned an unexpected registry login server.\n' >&2
   exit 1
 fi
 if ! LIVE_ACR_ID="$(
@@ -473,7 +473,7 @@ fi
 
 if ! SECURE_PLAN_DIR="$(umask 077; mktemp -d \
   "$TERRAFORM_DIAGNOSTIC_ROOT/patchpage-initial-plan.XXXXXX" 2>/dev/null)"; then
-  printf 'Could not create a secure Terraform plan directory.\n' >&2
+  printf 'Could not create a secure OpenTofu plan directory.\n' >&2
   exit 1
 fi
 cleanup_initial_plan() {
@@ -483,18 +483,18 @@ cleanup_initial_plan() {
     return 1
   fi
 }
-trap 'cleanup_initial_plan; terraform_diagnostic_exit' 0
+trap 'cleanup_initial_plan; tofu_diagnostic_exit' 0
 trap 'exit 129' HUP
 trap 'exit 130' INT
 trap 'exit 143' TERM
 INITIAL_PLAN="$SECURE_PLAN_DIR/initial.tfplan"
 INITIAL_PLAN_JSON="$SECURE_PLAN_DIR/initial.json"
 
-if ! private_terraform plan -input=false -out="$INITIAL_PLAN" >&3; then
-  printf 'Terraform could not create the initial deployment plan.\n' >&2
+if ! private_tofu plan -input=false -out="$INITIAL_PLAN" >&3; then
+  printf 'OpenTofu could not create the initial deployment plan.\n' >&2
   exit 1
 fi
-if ! { private_terraform show -json "$INITIAL_PLAN" > "$INITIAL_PLAN_JSON"; } 2>/dev/null; then
+if ! { private_tofu show -json "$INITIAL_PLAN" > "$INITIAL_PLAN_JSON"; } 2>/dev/null; then
   printf 'Could not inspect the saved initial deployment plan.\n' >&2
   exit 1
 fi
@@ -513,28 +513,28 @@ if ! jq -r \
   printf 'Could not render the initial deployment action summary.\n' >&2
   exit 1
 fi
-if ! private_terraform apply -input=false "$INITIAL_PLAN" >&3; then
-  printf 'Terraform may have persisted a partial deployment. Stop: do not rerun either automated flow, delete resources, or replace state; preserve private diagnostics for second-operator recovery.\n' >&2
+if ! private_tofu apply -input=false "$INITIAL_PLAN" >&3; then
+  printf 'OpenTofu may have persisted a partial deployment. Stop: do not rerun either automated flow, delete resources, or replace state; preserve private diagnostics for second-operator recovery.\n' >&2
   exit 75
 fi
-terraform_resource_id() {
+tofu_resource_id() {
   printf '%s\n' "$1" |
-    private_terraform console -no-color |
+    private_tofu console -no-color |
     jq -er 'select(type == "string" and length > 0)'
 }
 if ! EXPECTED_STORAGE_ACCOUNT_ID="$(
-  terraform_resource_id 'azurerm_storage_account.drafts.id'
+  tofu_resource_id 'azurerm_storage_account.drafts.id'
 )" ||
   ! EXPECTED_POSTGRES_SERVER_ID="$(
-    terraform_resource_id 'azurerm_postgresql_flexible_server.patchpage.id'
+    tofu_resource_id 'azurerm_postgresql_flexible_server.patchpage.id'
   )" ||
   ! EXPECTED_CONTAINER_APP_ID="$(
-    terraform_resource_id 'azurerm_container_app.server.id'
+    tofu_resource_id 'azurerm_container_app.server.id'
   )" ||
   ! FINAL_ACR_ID="$(
-    terraform_resource_id 'azurerm_container_registry.patchpage.id'
+    tofu_resource_id 'azurerm_container_registry.patchpage.id'
   )" ||
-  ! CONTAINER_APP="$(private_terraform output -raw container_app_name)";
+  ! CONTAINER_APP="$(private_tofu output -raw container_app_name)";
 then
   printf 'Could not load the protected deployment identities.\n' >&2
   exit 1
@@ -757,7 +757,7 @@ then
   printf 'The exact persistent-resource deletion locks are missing or conflicting.\n' >&2
   exit 1
 fi
-unset -f ensure_exact_can_not_delete_lock terraform_resource_id
+unset -f ensure_exact_can_not_delete_lock tofu_resource_id
 unset FINAL_ACR_ID EXPECTED_CONTAINER_APP_PATH LIVE_OPERATION_CONTAINER_ID
 unset OPERATION_CONTAINER_BLOBS OPERATION_CONTAINER_EXISTS OPERATION_CONTAINER_METADATA
 unset WORKLOAD_POSTGRES_SERVER WORKLOAD_STORAGE_ACCOUNT
@@ -766,8 +766,8 @@ if ! cleanup_initial_plan; then
 fi
 SECURE_PLAN_DIR=''
 TERRAFORM_DIAGNOSTICS_COMPLETE=true
-terraform_diagnostic_exit
+tofu_diagnostic_exit
 trap - 0 HUP INT TERM
 unset TERRAFORM_DIAGNOSTIC_DIR TERRAFORM_DIAGNOSTIC_LOG
 unset TERRAFORM_DIAGNOSTICS_COMPLETE TERRAFORM_DIAGNOSTIC_FD_OPEN
-unset -f cleanup_initial_plan cleanup_registry_target_plan terraform_diagnostic_exit
+unset -f cleanup_initial_plan cleanup_registry_target_plan tofu_diagnostic_exit

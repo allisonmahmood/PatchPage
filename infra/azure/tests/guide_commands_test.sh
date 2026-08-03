@@ -132,7 +132,7 @@ done
 
 # --- mock shims --------------------------------------------------------------
 #
-# az, terraform, git, curl, dig, mktemp, cat, rm, chmod, jq and sleep are
+# az, tofu, terraform, git, curl, dig, mktemp, cat, rm, chmod, jq and sleep are
 # executables under tests/mocks, not shell functions. Each runbook runs as a
 # child process with the mock directory first on PATH, so a documented command
 # reaches a mock exactly the way it would reach the real tool. Because a shim is
@@ -153,7 +153,7 @@ GUIDE_WRAPPER_DIR="$TMP_ROOT/wrappers"
 GUIDE_PART_DIR="$TMP_ROOT/wrapper-parts"
 mkdir -p "$GUIDE_WRAPPER_DIR" "$GUIDE_PART_DIR"
 
-for guide_mock in mocklib.sh az terraform git curl dig mktemp cat rm chmod jq sleep; do
+for guide_mock in mocklib.sh az tofu terraform git curl dig mktemp cat rm chmod jq sleep; do
   test -f "$GUIDE_MOCK_DIR/$guide_mock" ||
     fail "guide harness mock $guide_mock is missing"
   case "$guide_mock" in
@@ -797,7 +797,7 @@ key                  = "patchpage-prod.tfstate"' ||
         test "$backend_mode" = "600" ||
           fail "deployment backend configuration is not mode 0600"
         grep -Fqx \
-          'terraform init -input=false -reconfigure -backend-config=backend.hcl' \
+          'tofu init -input=false -reconfigure -backend-config=backend.hcl' \
           "$log" ||
           fail "deployment did not reconfigure Terraform to the verified backend"
         initial_build_tag="$(
@@ -814,8 +814,8 @@ key                  = "patchpage-prod.tfstate"' ||
           fail "deployment did not resolve the unique built tag to an ACR manifest digest"
         target_plan="$(
           awk '
-            /^terraform plan -target=azurerm_container_registry\.patchpage -input=false -out=.*\/registry-target\.tfplan$/ {
-              sub(/^terraform plan -target=azurerm_container_registry\.patchpage -input=false -out=/, "")
+            /^tofu plan -target=azurerm_container_registry\.patchpage -input=false -out=.*\/registry-target\.tfplan$/ {
+              sub(/^tofu plan -target=azurerm_container_registry\.patchpage -input=false -out=/, "")
               print
             }
           ' "$log"
@@ -826,14 +826,14 @@ key                  = "patchpage-prod.tfstate"' ||
           "$diagnostic_root"/*) ;;
           *) fail "deployment stored its registry-target plan outside the private diagnostic root" ;;
         esac
-        grep -Fqx "terraform show -json $target_plan" "$log" ||
+        grep -Fqx "tofu show -json $target_plan" "$log" ||
           fail "deployment did not inspect the registry-target plan"
-        grep -Fqx "terraform apply -input=false $target_plan" "$log" ||
+        grep -Fqx "tofu apply -input=false $target_plan" "$log" ||
           fail "deployment did not apply the reviewed registry-target plan"
         initial_plan="$(
           awk '
-            /^terraform plan -input=false -out=.*\/initial\.tfplan$/ {
-              sub(/^terraform plan -input=false -out=/, "")
+            /^tofu plan -input=false -out=.*\/initial\.tfplan$/ {
+              sub(/^tofu plan -input=false -out=/, "")
               print
             }
           ' "$log"
@@ -844,12 +844,12 @@ key                  = "patchpage-prod.tfstate"' ||
           "$diagnostic_root"/*) ;;
           *) fail "deployment stored its initial plan outside the private diagnostic root" ;;
         esac
-        test "$(grep -Fxc "terraform show -json $initial_plan" "$log")" -eq 1 ||
+        test "$(grep -Fxc "tofu show -json $initial_plan" "$log")" -eq 1 ||
           fail "deployment did not capture the saved plan JSON exactly once"
-        grep -Fqx "terraform apply -input=false $initial_plan" "$log" ||
+        grep -Fqx "tofu apply -input=false $initial_plan" "$log" ||
           fail "deployment did not apply the reviewed saved plan"
         awk '
-          /^terraform apply -input=false .*\/initial\.tfplan$/ { stage = 1; next }
+          /^tofu apply -input=false .*\/initial\.tfplan$/ { stage = 1; next }
           stage == 1 && /^az storage container-rm show --ids .*\/blobServices\/default\/containers\/patchpage-operations --query id --output tsv$/ { stage = 2; next }
           stage == 2 && /^az storage container lease acquire --account-name patchpagestate --container-name patchpage-operations --auth-mode key --lease-duration 60 --proposed-lease-id [0-9a-f-]{36} --output none$/ { binding_lease_id = $15; stage = 3; next }
           stage == 3 && /^az storage container metadata update --account-name patchpagestate --name patchpage-operations --auth-mode key --lease-id [0-9a-f-]{36} --metadata patchpage_workload_binding_sha256=[0-9a-f]{64} --output none$/ && $13 == binding_lease_id { stage = 4; next }
@@ -871,7 +871,7 @@ key                  = "patchpage-prod.tfstate"' ||
         if test "$scenario" = "diagnostic_cleanup_failure"; then
           test -d "$(cat "$diagnostic_path_file")" ||
             fail "deployment cleanup-failure scenario unexpectedly removed diagnostics"
-          grep -Fqx 'Terraform succeeded, but private diagnostic cleanup failed.' "$output" ||
+          grep -Fqx 'OpenTofu succeeded, but private diagnostic cleanup failed.' "$output" ||
             fail "deployment cleanup failure did not emit only its generic error"
         else
           test ! -d "$(cat "$diagnostic_path_file")" ||
@@ -884,8 +884,8 @@ key                  = "patchpage-prod.tfstate"' ||
           fail "resumed deployment did not write digest-based image variables"
         target_plan="$(
           awk '
-            /^terraform plan -target=azurerm_container_registry\.patchpage -input=false -out=.*\/registry-target\.tfplan$/ {
-              sub(/^terraform plan -target=azurerm_container_registry\.patchpage -input=false -out=/, "")
+            /^tofu plan -target=azurerm_container_registry\.patchpage -input=false -out=.*\/registry-target\.tfplan$/ {
+              sub(/^tofu plan -target=azurerm_container_registry\.patchpage -input=false -out=/, "")
               print
             }
           ' "$log"
@@ -896,9 +896,9 @@ key                  = "patchpage-prod.tfstate"' ||
           "$diagnostic_root"/*) ;;
           *) fail "resumed deployment stored its target plan outside the private diagnostic root" ;;
         esac
-        grep -Fqx "terraform show -json $target_plan" "$log" ||
+        grep -Fqx "tofu show -json $target_plan" "$log" ||
           fail "resumed deployment did not inspect its registry-target plan"
-        grep -Fqx "terraform apply -input=false $target_plan" "$log" ||
+        grep -Fqx "tofu apply -input=false $target_plan" "$log" ||
           fail "resumed deployment did not apply only its reviewed registry-target plan"
         grep -Fq \
           'az lock create --name protect-patchpage-drafts --lock-type CanNotDelete --resource ' \
@@ -940,7 +940,7 @@ key                  = "patchpage-prod.tfstate"' ||
       digest_resolution_failure | invalid_digest | \
         secure_plan_dir_failure | plan_failure | plan_gate_show_failure | \
         plan_delete | plan_replacement | plan_summary_failure)
-        if grep -Eq '^terraform apply -input=false .*/initial\.tfplan$' "$log"; then
+        if grep -Eq '^tofu apply -input=false .*/initial\.tfplan$' "$log"; then
           fail "deployment reached the final apply after $scenario"
         fi
         ;;
@@ -979,7 +979,7 @@ key                  = "patchpage-prod.tfstate"' ||
         target_plan_show_failure | target_plan_delete | resume_full_state | \
         resume_acr_without_random | resume_unexpected_state | resume_acr_id_mismatch | \
         resume_live_foreign_resource | resume_stronger_lock)
-        if grep -Eq '^terraform apply -input=false .*/registry-target\.tfplan$' "$log"; then
+        if grep -Eq '^tofu apply -input=false .*/registry-target\.tfplan$' "$log"; then
           fail "deployment reached the registry-target apply after $scenario"
         fi
         ;;
@@ -992,7 +992,7 @@ key                  = "patchpage-prod.tfstate"' ||
       fail "deployment continued after $scenario"
     fi
     if grep -Eq \
-      '00000000-0000-0000-0000-000000000000|22222222-2222-2222-2222-222222222222|private-(az|terraform)-diagnostic' \
+      '00000000-0000-0000-0000-000000000000|22222222-2222-2222-2222-222222222222|private-(az|tofu)-diagnostic' \
       "$output"; then
       fail "deployment exposed private identifiers or producer diagnostics after $scenario"
     fi
@@ -1019,7 +1019,7 @@ key                  = "patchpage-prod.tfstate"' ||
       )"
       test "$diagnostic_mode" = "600" ||
         fail "failed deployment diagnostic log is not mode 0600"
-      grep -Fq 'private-terraform-diagnostic apply -input=false' "$diagnostic_log" ||
+      grep -Fq 'private-tofu-diagnostic apply -input=false' "$diagnostic_log" ||
         fail "failed deployment diagnostic log omitted provider diagnostics"
     fi
   done
@@ -1446,7 +1446,7 @@ test_app_release() {
     esac
 
     if grep -Eq \
-      '^terraform |^az (network|postgres|resource delete|group delete|lock delete) ' \
+      '^tofu |^az (network|postgres|resource delete|group delete|lock delete) ' \
       "$log"; then
       fail "app release attempted Terraform, DNS, Storage, PostgreSQL, or destructive resource mutation"
     fi
@@ -2217,7 +2217,7 @@ azurerm_container_app.server'
       )"
       printf '%s\n' "$infrastructure_review_token" | grep -Eq '^[0-9a-f]{64}$' ||
         fail "infrastructure change did not print a review token after $scenario"
-      if grep -Eq '^terraform apply ' "$log"; then
+      if grep -Eq '^tofu apply ' "$log"; then
         fail "infrastructure change applied without a matching approval after $scenario"
       fi
       grep -Eq '^az storage container lease release ' "$log" ||
@@ -2264,8 +2264,8 @@ azurerm_container_app.server'
       test "$status" -eq 0 || fail "infrastructure change rejected $scenario"
       infra_plan="$(
         awk '
-          /^terraform plan -input=false -out=.*\/infrastructure\.tfplan$/ {
-            sub(/^terraform plan -input=false -out=/, "")
+          /^tofu plan -input=false -out=.*\/infrastructure\.tfplan$/ {
+            sub(/^tofu plan -input=false -out=/, "")
             print
           }
         ' "$log"
@@ -2276,16 +2276,16 @@ azurerm_container_app.server'
         "$diagnostic_root"/*) ;;
         *) fail "infrastructure change stored its plan outside the private diagnostic root" ;;
       esac
-      test "$(grep -Fxc "terraform show -json $infra_plan" "$log")" -eq 1 ||
+      test "$(grep -Fxc "tofu show -json $infra_plan" "$log")" -eq 1 ||
         fail "infrastructure change did not capture the saved plan JSON exactly once"
-      test "$(grep -Fxc "terraform apply -input=false $infra_plan" "$log")" -eq 1 ||
+      test "$(grep -Fxc "tofu apply -input=false $infra_plan" "$log")" -eq 1 ||
         fail "infrastructure change did not apply exactly the reviewed saved plan"
       test -f "$diagnostic_path_file" ||
         fail "successful infrastructure change did not create a private diagnostic location"
       if test "$scenario" = "infra_diagnostic_cleanup_failure"; then
         test -d "$(cat "$diagnostic_path_file")" ||
           fail "infrastructure cleanup-failure scenario unexpectedly removed diagnostics"
-        grep -Fqx 'Terraform succeeded, but private diagnostic cleanup failed.' "$output" ||
+        grep -Fqx 'OpenTofu succeeded, but private diagnostic cleanup failed.' "$output" ||
           fail "infrastructure cleanup failure did not emit only its generic error"
       else
         test ! -d "$(cat "$diagnostic_path_file")" ||
@@ -2369,11 +2369,11 @@ azurerm_container_app.server'
             "$log" ||
             fail "safety adoption did not create the exact PostgreSQL deletion lock"
           grep -Fqx \
-            'terraform import -input=false azurerm_management_lock.drafts_storage /subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg-patchpage-workload/providers/Microsoft.Storage/storageAccounts/patchpagedrafts/providers/Microsoft.Authorization/locks/protect-patchpage-drafts' \
+            'tofu import -input=false azurerm_management_lock.drafts_storage /subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg-patchpage-workload/providers/Microsoft.Storage/storageAccounts/patchpagedrafts/providers/Microsoft.Authorization/locks/protect-patchpage-drafts' \
             "$log" ||
             fail "safety adoption did not bind the Storage lock to Terraform state"
           grep -Fqx \
-            'terraform import -input=false azurerm_management_lock.patchpage_postgres /subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg-patchpage-workload/providers/Microsoft.DBforPostgreSQL/flexibleServers/patchpage-db/providers/Microsoft.Authorization/locks/protect-patchpage-postgres' \
+            'tofu import -input=false azurerm_management_lock.patchpage_postgres /subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg-patchpage-workload/providers/Microsoft.DBforPostgreSQL/flexibleServers/patchpage-db/providers/Microsoft.Authorization/locks/protect-patchpage-postgres' \
             "$log" ||
             fail "safety adoption did not bind the PostgreSQL lock to Terraform state"
           if grep -Eq '^az lock .*--resource-group ' "$log"; then
@@ -2430,8 +2430,8 @@ azurerm_container_app.server'
           role_create_line="$(grep -nF "$role_create_command" "$log" | sed -n '1s/:.*//p')"
           key_verify_line="$(grep -nF "$key_verify_command" "$log" | sed -n '$s/:.*//p')"
           lease_line="$(grep -nE '^az storage container lease acquire .* --lease-duration -1 ' "$log" | sed -n '1s/:.*//p')"
-          plan_line="$(grep -nE '^terraform plan ' "$log" | sed -n '1s/:.*//p')"
-          apply_line="$(grep -nE '^terraform apply ' "$log" | sed -n '1s/:.*//p')"
+          plan_line="$(grep -nE '^tofu plan ' "$log" | sed -n '1s/:.*//p')"
+          apply_line="$(grep -nE '^tofu apply ' "$log" | sed -n '1s/:.*//p')"
           if test -z "$first_inventory_line" || test -z "$create_line" ||
             test -z "$second_inventory_line" || test -z "$role_create_line" ||
             test -z "$key_verify_line" || test -z "$lease_line" ||
@@ -2472,7 +2472,7 @@ azurerm_container_app.server'
         test "$scenario" != "final_pinned_drift" &&
         test "$scenario" != "operation_lease_release_failure" &&
         test "$scenario" != "secure_change_cleanup_failure" &&
-        grep -Eq '^terraform apply -input=false .*/infrastructure\.tfplan$' "$log"; then
+        grep -Eq '^tofu apply -input=false .*/infrastructure\.tfplan$' "$log"; then
         fail "infrastructure change reached apply after $scenario"
       fi
       if grep -q '^completed$' "$log"; then
@@ -2480,7 +2480,7 @@ azurerm_container_app.server'
       fi
     fi
     if grep -Eq \
-      'private-infra-(az|terraform)-diagnostic|22222222-2222-4222-8222-222222222222|33333333-3333-3333-3333-333333333333|44444444-4444-4444-4444-444444444444|patchpagestate' \
+      'private-infra-(az|tofu)-diagnostic|22222222-2222-4222-8222-222222222222|33333333-3333-3333-3333-333333333333|44444444-4444-4444-4444-444444444444|patchpagestate' \
       "$output"; then
       fail "infrastructure change exposed private producer diagnostics"
     fi
@@ -2499,13 +2499,13 @@ azurerm_container_app.server'
         adoption_operation_container_create_failure | adoption_operation_role_create_failure | \
         adoption_operation_role_broad | adoption_operation_role_wrong | \
         adoption_operation_role_ambiguous | adoption_state_role_reader)
-        if grep -Eq '^az storage container lease acquire |^terraform (plan|apply) ' "$log"; then
+        if grep -Eq '^az storage container lease acquire |^tofu (plan|apply) ' "$log"; then
           fail "safety adoption reached the lease or Terraform after unsafe operation-storage preflight $scenario"
         fi
         ;;
       adoption_binding_update_failure | adoption_binding_concurrent_metadata)
         if grep -Eq \
-          '^az storage container lease acquire .* --lease-duration -1 |^terraform (plan|apply) ' \
+          '^az storage container lease acquire .* --lease-duration -1 |^tofu (plan|apply) ' \
           "$log"; then
           fail "safety adoption reached the operation lease or Terraform after $scenario"
         fi
@@ -2534,7 +2534,7 @@ azurerm_container_app.server'
         fi
         ;;
       adoption_storage_lock_import_failure | adoption_postgres_lock_import_failure)
-        if grep -Eq '^terraform (plan|apply) ' "$log"; then
+        if grep -Eq '^tofu (plan|apply) ' "$log"; then
           fail "safety adoption planned after a management-lock state import failed"
         fi
         ;;
@@ -2544,14 +2544,14 @@ azurerm_container_app.server'
         fi
         ;;
       adoption_image_config_mismatch)
-        if grep -Eq '^terraform (plan|apply) ' "$log"; then
+        if grep -Eq '^tofu (plan|apply) ' "$log"; then
           fail "safety adoption planned after Terraform rejected the synchronized image"
         fi
         ;;
       operation_lease_acquire_ok_renew_fails)
         # Acquire succeeded, so Azure holds the infinite lease even though the
         # renew-as-proof blipped. The EXIT trap must still release it.
-        if grep -Eq '^terraform (plan|apply) ' "$log"; then
+        if grep -Eq '^tofu (plan|apply) ' "$log"; then
           fail "infrastructure change planned or applied after rejecting $scenario"
         fi
         # Qualify the release against the infinite operation lease: the finite
@@ -2571,12 +2571,12 @@ azurerm_container_app.server'
         ;;
       operation_container_id_mismatch | operation_container_missing | operation_container_nonempty | operation_lease_held | \
         operation_lease_acquire_failure | operation_lease_renew_failure)
-        if grep -Eq '^terraform (plan|apply) ' "$log"; then
+        if grep -Eq '^tofu (plan|apply) ' "$log"; then
           fail "infrastructure change planned or applied after rejecting $scenario"
         fi
         ;;
       operation_lease_release_failure)
-        grep -Eq '^terraform apply -input=false .*/infrastructure\.tfplan$' "$log" ||
+        grep -Eq '^tofu apply -input=false .*/infrastructure\.tfplan$' "$log" ||
           fail "infrastructure release-failure scenario did not hold the lease through apply"
         ;;
       adoption_image_update_failure | final_apply_failure)
@@ -2655,7 +2655,7 @@ azurerm_container_app.server'
       )"
       test "$diagnostic_mode" = "600" ||
         fail "failed infrastructure diagnostic log is not mode 0600"
-      grep -Fq 'private-infra-terraform-diagnostic plan -input=false' "$diagnostic_log" ||
+      grep -Fq 'private-infra-tofu-diagnostic plan -input=false' "$diagnostic_log" ||
         fail "failed infrastructure diagnostic log omitted provider diagnostics"
     fi
   done
@@ -3491,24 +3491,28 @@ test_public_safe_runbook_static() {
     fail "Azure guide queries caller details instead of only the active subscription ID"
   fi
   if grep -Eq -- \
-    'terraform state pull[[:space:]]*>[[:space:]]*[^[:space:]"$]|terraform show[[:space:]]+"\$[^"]*PLAN"|terraform plan[[:space:]]+-out=[^[:space:]"$]' \
+    'tofu state pull[[:space:]]*>[[:space:]]*[^[:space:]"$]|tofu show[[:space:]]+"\$[^"]*PLAN"|tofu plan[[:space:]]+-out=[^[:space:]"$]' \
     "$README" "$@"; then
-    fail "Azure guide writes raw Terraform state or plan output to a repository-visible path"
+    fail "Azure guide writes raw OpenTofu state or plan output to a repository-visible path"
   fi
   if grep -Eq '(^|[;&|][[:space:]]*)echo[[:space:]].*\$(IMAGE|.*_ID|RESOURCE_GROUP|STATE_)' \
     "$GUIDE_CMD_DIR/app-release.sh" "$GUIDE_CMD_DIR/infrastructure-change.sh"; then
     fail "new runbook commands directly echo a sensitive image or resource value"
   fi
-  # The release flow never runs Terraform. That has to be asserted over what it
+  # The release flow never runs OpenTofu. That has to be asserted over what it
   # actually loads, not just its own file: the shared libraries it sources are
-  # as much a part of it as its own lines, and a private_terraform arriving in
-  # one of them would put Terraform back into the release path invisibly.
-  if grep -Fq 'terraform ' \
+  # as much a part of it as its own lines, and a private_tofu arriving in
+  # one of them would put OpenTofu back into the release path invisibly.
+  #
+  # Both binary names are matched. `terraform` is no longer invoked anywhere, so
+  # the alternation costs nothing -- and it is what keeps this assertion from
+  # going quietly vacuous if a stale Terraform call is ever reintroduced here.
+  if grep -Eq '(^|[^[:alnum:]_])(tofu|terraform) ' \
     "$GUIDE_CMD_DIR/app-release.sh" \
     "$GUIDE_LIB_DIR/wrappers.sh" \
     "$GUIDE_LIB_DIR/lease.sh" \
     "$GUIDE_LIB_DIR/revision.sh"; then
-    fail "app release command contains a Terraform command"
+    fail "app release command contains an OpenTofu or Terraform command"
   fi
   if grep -Eq \
     'Could not select Azure subscription %s|Expected subscription %s|Could not add hostname %s|Could not bind a managed certificate for %s|empty managed certificate ID for %s|No SNI binding for %s uses exact certificate ID %s' \

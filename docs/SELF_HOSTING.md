@@ -1,6 +1,6 @@
 # Self-Hosting PatchPage
 
-PatchPage is a normal Node HTTP service and runs anywhere that supports Node or containers. Azure Container Apps is the maintainer's deployment target, not a requirement — this guide covers the container image contract that release automation will publish and running your own instance from source. The [Azure Terraform](../infra/azure) directory is a worked example you can adapt.
+PatchPage is a normal Node HTTP service and runs anywhere that supports Node or containers. Azure Container Apps is the maintainer's deployment target, not a requirement — this guide covers the container image contract that release automation will publish and running your own instance from source. The [Azure OpenTofu](../infra/azure) directory is a worked example you can adapt.
 
 Once your server is running, point the CLI at it and you have a self-hosted PatchPage. Upload access requires a token by default; an operator can opt in to anonymous creation. Automatic anonymous creation happens only when no environment or stored credentials exist, and credential failures are returned instead of retried anonymously. Pass `--anonymous` to explicitly force create-only anonymous mode and bypass available credentials. In either mode, draft viewer URLs are public and unlisted, so anyone with the link can view them.
 
@@ -214,7 +214,7 @@ AZURE_STORAGE_CONNECTION_STRING=
 
 Notes on values:
 
-- `PATCHPAGE_PUBLIC_BASE_URL` is used to build the public draft URLs returned by uploads and rendered in the viewer. Set it to the externally reachable origin (scheme + host, no trailing slash). The Azure Terraform example requires a deployer-owned HTTPS origin; the application itself retains its `http://localhost:3000` default for local development.
+- `PATCHPAGE_PUBLIC_BASE_URL` is used to build the public draft URLs returned by uploads and rendered in the viewer. Set it to the externally reachable origin (scheme + host, no trailing slash). The Azure OpenTofu example requires a deployer-owned HTTPS origin; the application itself retains its `http://localhost:3000` default for local development.
 - `PATCHPAGE_TRUST_PROXY` controls whether Fastify derives `request.ip` from `X-Forwarded-For`. Leave it undefined unless every route to the server has a verified trust boundary. See [Client IP attribution behind proxies](#client-ip-attribution-behind-proxies).
 - `PATCHPAGE_MAX_HTML_BYTES` caps the size of a single HTML document (default 524288 = 512 KiB).
 - `PATCHPAGE_PROTECTED_API_RATE_LIMIT_PER_MINUTE`, `PATCHPAGE_AUTHENTICATED_UPLOAD_RATE_LIMIT_PER_MINUTE`, and `PATCHPAGE_ANONYMOUS_CREATE_RATE_LIMIT_PER_MINUTE` are decimal integers from `1` through `10000`. Defaults are `60`, `20`, and `5`.
@@ -704,7 +704,7 @@ The setting accepts exactly one of these forms:
 - A decimal hop count from `1` through `32`, kept as a number for Fastify. Starting at PatchPage, Fastify considers the socket peer first, then the rightmost `X-Forwarded-For` entry, and continues right-to-left. Count `1` trusts the socket peer and selects the rightmost forwarded address. Count `2` also trusts that nearest forwarded hop and selects the next address to its left.
 - One or more comma-separated literal IPv4/IPv6 addresses or CIDR networks. Fastify walks from the socket outward while each address belongs to the configured set; the first address outside the set becomes `request.ip`.
 
-Values such as `0`, negative or fractional counts, `true`, `false`, `all`, `*`, empty list entries, malformed addresses, blanket `/0` networks, deprecated `::` plus dotted-IPv4 transitional aliases, IPv4-mapped IPv6 aliases, and CIDR lists whose effective union covers all IPv4 or all IPv6 addresses are rejected. IPv6 entries with dotted IPv4 tails must use canonical decimal octets; ambiguous forms with leading zeroes are rejected so Terraform and the Node.js runtime interpret the same trust boundary. Network entries are syntax-only until you replace them with the proxy addresses actually observed in your environment; for example:
+Values such as `0`, negative or fractional counts, `true`, `false`, `all`, `*`, empty list entries, malformed addresses, blanket `/0` networks, deprecated `::` plus dotted-IPv4 transitional aliases, IPv4-mapped IPv6 aliases, and CIDR lists whose effective union covers all IPv4 or all IPv6 addresses are rejected. IPv6 entries with dotted IPv4 tails must use canonical decimal octets; ambiguous forms with leading zeroes are rejected so OpenTofu and the Node.js runtime interpret the same trust boundary. Network entries are syntax-only until you replace them with the proxy addresses actually observed in your environment; for example:
 
 ```env
 # Documentation addresses only; replace both entries with observed proxy egress ranges.
@@ -748,7 +748,7 @@ PATCHPAGE_TRUST_PROXY=2
 
 Hop counts are safe only when every reachable route has that exact proxy depth and each proxy overwrites or predictably appends forwarding data. A shorter bypass path can turn an attacker-supplied header entry into `request.ip`. Prefer a verified address/CIDR set when path length varies, but do not trust broad private networks shared with untrusted workloads. In either mode, prevent clients from reaching PatchPage around the trusted proxy and test every public hostname with a deliberately spoofed `X-Forwarded-For` value before relying on the attribution for audit.
 
-The [`infra/azure`](../infra/azure) Terraform directory is an Azure-specific worked example for the platform resources: Container Apps and external ingress, a container registry, PostgreSQL, Blob Storage with a private container, managed identity, and server configuration. It intentionally does not provision the deployer's DNS records, Container App custom hostname, Azure managed certificate, or certificate binding. Its [README](../infra/azure/README.md) separates those resources from the complete manual custom-domain and certificate flow.
+The [`infra/azure`](../infra/azure) OpenTofu directory is an Azure-specific worked example for the platform resources: Container Apps and external ingress, a container registry, PostgreSQL, Blob Storage with a private container, managed identity, and server configuration. It intentionally does not provision the deployer's DNS records, Container App custom hostname, Azure managed certificate, or certificate binding. Its [README](../infra/azure/README.md) separates those resources from the complete manual custom-domain and certificate flow.
 
 ## Security
 

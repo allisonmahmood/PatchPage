@@ -2,7 +2,7 @@
 
 This directory is a reusable Azure Container Apps deployment example. It requires an HTTPS public origin on a DNS hostname the deployer owns; it has no default or fallback to the PatchPage maintainer's hosted service.
 
-Terraform creates:
+OpenTofu creates:
 
 - the resource group, Log Analytics workspace, Container Apps environment, and Container App;
 - external platform ingress with insecure HTTP disabled;
@@ -10,13 +10,13 @@ Terraform creates:
 - the Blob Storage account and private container, plus the PostgreSQL server/database; and
 - generated application secrets and the Container App environment variables, including `PATCHPAGE_PUBLIC_BASE_URL`, `PATCHPAGE_ALLOW_ANONYMOUS_UPLOADS`, the rate-limit settings, and, when configured, `PATCHPAGE_TRUST_PROXY`.
 
-Terraform does **not** create or manage the remote-state resources, container image build, DNS zone or records, Container App custom hostname, managed certificate, or certificate binding. Those steps are deliberately manual and provider-neutral below. Terraform creates the initial Container App ingress and image, then ignores later changes to the whole ingress block and the image leaf. These exceptions prevent an infrastructure apply from overwriting the CLI-managed hostname, certificate binding, or release image. Resource postconditions and the live check below fail closed if any ignored security or routing invariant drifts. Any intentional ingress change therefore remains HITL: update the lifecycle rule and restore the manual binding as one coordinated operation.
+OpenTofu does **not** create or manage the remote-state resources, container image build, DNS zone or records, Container App custom hostname, managed certificate, or certificate binding. Those steps are deliberately manual and provider-neutral below. OpenTofu creates the initial Container App ingress and image, then ignores later changes to the whole ingress block and the image leaf. These exceptions prevent an infrastructure apply from overwriting the CLI-managed hostname, certificate binding, or release image. Resource postconditions and the live check below fail closed if any ignored security or routing invariant drifts. Any intentional ingress change therefore remains HITL: update the lifecycle rule and restore the manual binding as one coordinated operation.
 
-The PostgreSQL server/database and Blob Storage account/container are persistent data, not release artifacts. Never delete the workload resource group, run `terraform destroy`, or replace a persistent resource to deploy, roll back, repair state, or repair DNS. Routine releases update only the Container App image by immutable registry digest.
+The PostgreSQL server/database and Blob Storage account/container are persistent data, not release artifacts. Never delete the workload resource group, run `tofu destroy`, or replace a persistent resource to deploy, roll back, repair state, or repair DNS. Routine releases update only the Container App image by immutable registry digest.
 
 ## Prerequisites
 
-- Terraform 1.9 or newer.
+- OpenTofu 1.9 or newer — `brew install opentofu`, or see [the OpenTofu install guide](https://opentofu.org/docs/intro/install/). CI verifies this directory against 1.12.5, so that is the version to match if you want the same result the tests prove.
 - Azure CLI, authenticated to the deployer's own Azure account with `az login`.
 - Git for the image tag.
 - `dig`, `curl`, `jq`, and `openssl` for the verification commands and workload-binding digest.
@@ -24,9 +24,17 @@ The PostgreSQL server/database and Blob Storage account/container are persistent
 
 Do not run this example against a maintainer subscription. Set `SUBSCRIPTION_ID` privately to the exact target subscription. Every mutation block selects it and compares the active account without printing subscription, tenant, or caller details.
 
+### Coming from Terraform
+
+This directory used Terraform 1.9.8 until PatchPage moved to OpenTofu. There is no state migration step. The state format is compatible and the backend is unchanged, so an existing environment picks up the new binary on its next infrastructure change: the flow runs `tofu init` against the same `azurerm` backend and the same state key, and continues from the state already there. Nothing needs to be exported, re-imported, or re-applied first.
+
+Provider addresses resolve through the OpenTofu registry, so the first `tofu init` rewrites `registry.terraform.io/...` to `registry.opentofu.org/...` in `.terraform.lock.hcl` and replaces the recorded hashes. Provider versions are preserved. The checked-in lock file in this repository is already in that form.
+
+Moving back to Terraform remains possible: reverse the same `init`, and the state reads back unchanged. That stays true only until this directory adopts an OpenTofu-only feature — state encryption being the obvious one — which it deliberately has not.
+
 ## State bootstrap
 
-Create remote Terraform state once. Set `STATE_STORAGE_ACCOUNT` to a globally unique name containing 3-24 lowercase letters and digits and `STATE_KEY` to a unique environment-specific `*.tfstate` object name before running the block. Privately set `OPERATION_PRINCIPAL_ID` to the Microsoft Entra object ID that will run release/rollback operations and `OPERATION_PRINCIPAL_TYPE` to `User` or `ServicePrincipal`. Group principals are deliberately unsupported because Azure's transitive assigned-to inventory does not accept a group object ID. Never place those private values in this guide or a tracked shell file. Never reuse a state key across environments.
+Create remote OpenTofu state once. Set `STATE_STORAGE_ACCOUNT` to a globally unique name containing 3-24 lowercase letters and digits and `STATE_KEY` to a unique environment-specific `*.tfstate` object name before running the block. Privately set `OPERATION_PRINCIPAL_ID` to the Microsoft Entra object ID that will run release/rollback operations and `OPERATION_PRINCIPAL_TYPE` to `User` or `ServicePrincipal`. Group principals are deliberately unsupported because Azure's transitive assigned-to inventory does not accept a group object ID. Never place those private values in this guide or a tracked shell file. Never reuse a state key across environments.
 This guarded bootstrap intentionally supports one PatchPage workload per Azure subscription: its fixed state resource group and single operation container are bound to one state key/workload tuple. Do not reuse them for a second environment. Use a separate subscription, or design and review separately named state and operation resources before adding another workload.
 
 The bootstrap creates exactly two private containers in the state account: `tfstate` for backend data and an empty, initially unbound `patchpage-operations` container used only for the operation lease. The initial deployment seals that empty operation container to one state/workload tuple before release use; an existing environment does the same during its first safety-guard adoption. Before granting access, the bootstrap inventories every direct, inherited, and group-derived role assignment effective at the exact `tfstate` container and rejects any assignment, including otherwise benign roles, so the operation identity cannot read state or obtain account keys. It separately creates or verifies one direct `Storage Blob Data Contributor` grant at the exact operation container. Other roles scoped only to that sibling container cannot reach `tfstate`. The state account itself receives the `CanNotDelete` management lock; the surrounding fixed resource group does not.
@@ -53,7 +61,7 @@ sh infra/azure/ops.sh state-bootstrap
 
 ## Deploy the Azure resources
 
-Copy the example and edit both required values before the first Terraform command:
+Copy the example and edit both required values before the first OpenTofu command:
 
 ```sh
 AZURE_DIR="$(git rev-parse --show-toplevel)/infra/azure"
@@ -65,11 +73,11 @@ cp terraform.tfvars.example terraform.tfvars
 - Replace the deliberately invalid `public_base_url` with the deployer's real origin. It must be HTTPS with a public DNS hostname and no credentials, port, path, query, fragment, or trailing slash.
 - Keep `trust_proxy = null` for the initial deployment. This omits `PATCHPAGE_TRUST_PROXY` so forwarded client-address headers remain untrusted. Enable it only after completing [the client-IP HITL verification](#4-verify-and-enable-client-ip-attribution).
 - Keep `max_html_bytes = 524288` unless you intentionally change the maximum accepted HTML artifact size.
-- Keep `allow_anonymous_uploads = false` unless this self-hosted deployment intentionally accepts create-only requests without credentials. Terraform converts the boolean to `PATCHPAGE_ALLOW_ANONYMOUS_UPLOADS`; changing it does not enable anonymous uploads on any maintainer-hosted environment.
-- Keep the rate-limit defaults unless the deployment needs a different local safety envelope: `protected_api_rate_limit_per_minute = 60`, `authenticated_upload_rate_limit_per_minute = 20`, and `anonymous_create_rate_limit_per_minute = 5`. Each value must be an integer from `1` through `10000`; Terraform wires them to the matching `PATCHPAGE_*_RATE_LIMIT_PER_MINUTE` Container App environment variables.
+- Keep `allow_anonymous_uploads = false` unless this self-hosted deployment intentionally accepts create-only requests without credentials. OpenTofu converts the boolean to `PATCHPAGE_ALLOW_ANONYMOUS_UPLOADS`; changing it does not enable anonymous uploads on any maintainer-hosted environment.
+- Keep the rate-limit defaults unless the deployment needs a different local safety envelope: `protected_api_rate_limit_per_minute = 60`, `authenticated_upload_rate_limit_per_minute = 20`, and `anonymous_create_rate_limit_per_minute = 5`. Each value must be an integer from `1` through `10000`; OpenTofu wires them to the matching `PATCHPAGE_*_RATE_LIMIT_PER_MINUTE` Container App environment variables.
 
-Terraform rejects the maintainer's domains, localhost/private-style names, reserved example names, common placeholder values, unsafe trusted-proxy values, and any Container App image that is not an immutable lowercase SHA-256 digest reference. The checked-in quickstart default exists only so the targeted registry bootstrap can run before the deployment image exists; every plan that includes the Container App must override it with the generated immutable image value. A normal first run leaves `RESUME_INITIAL_DEPLOY=false` and requires both empty state and an absent workload resource group. If this exact block failed during its targeted registry apply, set `RESUME_INITIAL_DEPLOY=true`: the block accepts only the registry target's data, random suffix, resource-group, and registry addresses; proves every already-managed live resource before mutation; reruns that fixed target; and then resumes through the same no-delete saved-plan gate. It rejects any broader or completed deployment state; use the existing-environment flow instead.
-Before running the block, export the exact `STATE_STORAGE_ACCOUNT` and environment-specific `STATE_KEY` recorded by bootstrap, and set `TERRAFORM_DIAGNOSTIC_ROOT` to an existing private directory outside the repository. The block writes provider output to a randomized mode-0600 log below that root. After the saved final apply, it privately reads the exact workload resource IDs from Terraform, seals the empty operation container to the state/workload tuple with key authorization, and creates or verifies `CanNotDelete` only on the workload Storage account and PostgreSQL server. It rejects every foreign or inherited lock and never locks the workload resource group. On any failure or abort it preserves the log and prints only a generic reminder; inspect the configured root only in the private operator shell. A successful final apply plus safeguard verification removes the diagnostic directory.
+OpenTofu rejects the maintainer's domains, localhost/private-style names, reserved example names, common placeholder values, unsafe trusted-proxy values, and any Container App image that is not an immutable lowercase SHA-256 digest reference. The checked-in quickstart default exists only so the targeted registry bootstrap can run before the deployment image exists; every plan that includes the Container App must override it with the generated immutable image value. A normal first run leaves `RESUME_INITIAL_DEPLOY=false` and requires both empty state and an absent workload resource group. If this exact block failed during its targeted registry apply, set `RESUME_INITIAL_DEPLOY=true`: the block accepts only the registry target's data, random suffix, resource-group, and registry addresses; proves every already-managed live resource before mutation; reruns that fixed target; and then resumes through the same no-delete saved-plan gate. It rejects any broader or completed deployment state; use the existing-environment flow instead.
+Before running the block, export the exact `STATE_STORAGE_ACCOUNT` and environment-specific `STATE_KEY` recorded by bootstrap, and set `TERRAFORM_DIAGNOSTIC_ROOT` to an existing private directory outside the repository. The block writes provider output to a randomized mode-0600 log below that root. After the saved final apply, it privately reads the exact workload resource IDs from OpenTofu, seals the empty operation container to the state/workload tuple with key authorization, and creates or verifies `CanNotDelete` only on the workload Storage account and PostgreSQL server. It rejects every foreign or inherited lock and never locks the workload resource group. On any failure or abort it preserves the log and prints only a generic reminder; inspect the configured root only in the private operator shell. A successful final apply plus safeguard verification removes the diagnostic directory.
 
 
 Export the inputs this command requires, then run it:
@@ -92,7 +100,7 @@ At this point Azure's generated Container App hostname is live over HTTPS, but t
 
 ## Normal app-only releases and rollback
 
-Complete the custom-domain, managed-certificate, deployed-smoke, and private-canary steps below before using this routine release flow. Terraform ignores the Container App image leaf in addition to its existing CLI-owned ingress exception. A routine release therefore uses `az containerapp update` and never initializes, plans, or applies Terraform. Run it with a release identity that can build in the expected ACR, update the expected Container App, and use the dedicated operation-lease container, but cannot remove management locks, delete the resource group, read Terraform state, or administer PostgreSQL or workload Blob data.
+Complete the custom-domain, managed-certificate, deployed-smoke, and private-canary steps below before using this routine release flow. OpenTofu ignores the Container App image leaf in addition to its existing CLI-owned ingress exception. A routine release therefore uses `az containerapp update` and never initializes, plans, or applies OpenTofu. Run it with a release identity that can build in the expected ACR, update the expected Container App, and use the dedicated operation-lease container, but cannot remove management locks, delete the resource group, read OpenTofu state, or administer PostgreSQL or workload Blob data.
 
 Set the following values privately from the same verified deployment and state records before a release: `SUBSCRIPTION_ID`, `STATE_STORAGE_ACCOUNT`, `STATE_CONTAINER`, `STATE_KEY`, `RESOURCE_GROUP`, `CONTAINER_APP`, `ACR`, `EXPECTED_STORAGE_ACCOUNT_ID`, `EXPECTED_POSTGRES_SERVER_ID`, `LOGIN_SERVER`, `CONTAINER_APP_FQDN`, `PUBLIC_BASE_URL`, `CANARY_URL`, and `CANARY_MARKER`. `STATE_CONTAINER` must be the bootstrap-recorded `tfstate` container; the operation container name is fixed as `patchpage-operations`. Set `ROLLBACK_RECORD` to a durable private path outside the repository. The canary must predate the release. Release and rollback need management read only on the exact operation container, Container App, registry, and the two private lock IDs; they do not read the parent state Storage account.
 
@@ -156,13 +164,13 @@ sh infra/azure/ops.sh app-rollback
 
 This command exits `75` if it cannot prove the result of its Container App mutation or the readiness that follows it: the infinite lease stays held on purpose and only the documented second-operator recovery may clear it.
 
-The rollback block completes the deployed-image, native/public health, and pre-existing canary checks while it still owns the exact operation lease, then re-reads the final image before releasing that lease. Keep using the separate ignored-ingress invariant procedure after intentional ingress changes. Never roll back by running Terraform, selecting a mutable tag, deleting infrastructure, changing DNS, or pointing the public hostname at another environment.
+The rollback block completes the deployed-image, native/public health, and pre-existing canary checks while it still owns the exact operation lease, then re-reads the final image before releasing that lease. Keep using the separate ignored-ingress invariant procedure after intentional ingress changes. Never roll back by running OpenTofu, selecting a mutable tag, deleting infrastructure, changing DNS, or pointing the public hostname at another environment.
 
 ## Existing-environment infrastructure changes
 
 An image release is not an infrastructure change. PostgreSQL, Blob Storage, identities, networking, state, backup, locks, DNS, and certificates require a separate reviewed maintenance window. Before planning, privately set the expected subscription, backend key, state lineage, resource-group ID, Storage account ID, PostgreSQL server ID, registry ID, and Container App ID. The infrastructure operator must already be authorized to retrieve the state-account key for backend/state verification; this block uses that same key authorization to recompute and verify the operation-container workload binding and use the shared lease. Stop on any mismatch; never repair state by deleting the live resource.
 
-Deployments created before these safety guards exist can use this same flow without replacing state or infrastructure. Set `ADOPT_SAFETY_GUARDS=true` only for that first reviewed run. For that adoption run only, privately set `OPERATION_PRINCIPAL_ID` and `OPERATION_PRINCIPAL_TYPE` for the least-privileged identity that will run release and rollback operations; it does not have to be the infrastructure caller. Before any adoption mutation, the block proves the existing state lineage and every exact live resource ID and rejects foreign locks. It creates a missing private operation container with its workload-binding metadata atomically, or seals an existing empty container only when it has no metadata; it never overwrites foreign metadata or container data. It grants only exact-container Blob access, raises state retention without shortening any longer live setting, creates only the two exact persistent-resource locks plus the separate state-account lock, and imports the two Terraform-managed workload locks at their deterministic IDs before planning. A partially completed adoption can be rerun: already imported exact lock addresses are verified rather than re-imported. It also resolves a legacy image tag to a separately verified registry digest, updates only the exact Container App under the shared lease, and atomically writes `server-image.auto.tfvars` as mode `0600` so Terraform agrees before planning.
+Deployments created before these safety guards exist can use this same flow without replacing state or infrastructure. Set `ADOPT_SAFETY_GUARDS=true` only for that first reviewed run. For that adoption run only, privately set `OPERATION_PRINCIPAL_ID` and `OPERATION_PRINCIPAL_TYPE` for the least-privileged identity that will run release and rollback operations; it does not have to be the infrastructure caller. Before any adoption mutation, the block proves the existing state lineage and every exact live resource ID and rejects foreign locks. It creates a missing private operation container with its workload-binding metadata atomically, or seals an existing empty container only when it has no metadata; it never overwrites foreign metadata or container data. It grants only exact-container Blob access, raises state retention without shortening any longer live setting, creates only the two exact persistent-resource locks plus the separate state-account lock, and imports the two OpenTofu-managed workload locks at their deterministic IDs before planning. A partially completed adoption can be rerun: already imported exact lock addresses are verified rather than re-imported. It also resolves a legacy image tag to a separately verified registry digest, updates only the exact Container App under the shared lease, and atomically writes `server-image.auto.tfvars` as mode `0600` so OpenTofu agrees before planning.
 Before running this flow, set `TERRAFORM_DIAGNOSTIC_ROOT` to an existing private directory outside the repository. Provider output remains in a randomized mode-0600 log below that root for the duration of each run. Failure or abort preserves it and emits only a generic reminder; a successful saved-plan apply removes it, as does the plan-and-report run that stops at the review gate below.
 
 Required base state addresses before the first safety-guard adoption:
@@ -251,12 +259,12 @@ PostgreSQL backup retention defaults to 35 days (`postgres_backup_retention_days
 
 ## Configure the custom domain and managed certificate
 
-The commands below follow [Microsoft's managed-certificate flow](https://learn.microsoft.com/azure/container-apps/custom-domains-managed-certificates). They read Azure resource names and DNS values from Terraform so there are no copied resource-name placeholders.
+The commands below follow [Microsoft's managed-certificate flow](https://learn.microsoft.com/azure/container-apps/custom-domains-managed-certificates). They read Azure resource names and DNS values from OpenTofu so there are no copied resource-name placeholders.
 
 Load the outputs and make sure the Azure CLI is using the same subscription:
 
 
-This command takes no inputs: it reads every value from Terraform, so run it from a shell where `terraform output` works for this deployment. It is the one command whose result is the variables it leaves behind — `SUBSCRIPTION_ID`, `RESOURCE_GROUP`, `CONTAINER_APP`, `CONTAINER_APP_ENVIRONMENT`, `CONTAINER_APP_FQDN`, `CONTAINER_APP_STATIC_IP`, `DOMAIN_VERIFICATION_ID`, `PUBLIC_BASE_URL` and the normalized `CUSTOM_DOMAIN` — which every later custom-domain command reads. Source it into the shell you will run the rest of this section in:
+This command takes no inputs: it reads every value from OpenTofu, so run it from a shell where `tofu output` works for this deployment. It is the one command whose result is the variables it leaves behind — `SUBSCRIPTION_ID`, `RESOURCE_GROUP`, `CONTAINER_APP`, `CONTAINER_APP_ENVIRONMENT`, `CONTAINER_APP_FQDN`, `CONTAINER_APP_STATIC_IP`, `DOMAIN_VERIFICATION_ID`, `PUBLIC_BASE_URL` and the normalized `CUSTOM_DOMAIN` — which every later custom-domain command reads. Source it into the shell you will run the rest of this section in:
 
 ```sh
 . infra/azure/cmd/custom-domain-context.sh
@@ -264,9 +272,9 @@ This command takes no inputs: it reads every value from Terraform, so run it fro
 
 `sh infra/azure/ops.sh custom-domain-context` runs the same checks as a standalone verification, but a child process cannot hand its variables back, so the later commands would not see them.
 
-### Verify the Terraform-ignored ingress invariants
+### Verify the OpenTofu-ignored ingress invariants
 
-Every Terraform plan and apply checks these invariants through resource postconditions. Because Terraform deliberately preserves the CLI-managed custom-domain state by ignoring the complete ingress block, also read the live Azure ingress before DNS or certificate work and after every intentional ingress change.
+Every OpenTofu plan and apply checks these invariants through resource postconditions. Because OpenTofu deliberately preserves the CLI-managed custom-domain state by ignoring the complete ingress block, also read the live Azure ingress before DNS or certificate work and after every intentional ingress change.
 
 
 Run this in the shell that sourced the context above; it reads `SUBSCRIPTION_ID`, `RESOURCE_GROUP` and `CONTAINER_APP` from there.
@@ -380,10 +388,10 @@ sh infra/azure/ops.sh certificate-binding
 ### 3. Verify HTTPS and the configured upload origin
 
 Set `CANARY_RECORD` to a private path outside the repository if this first successful smoke should become the durable pre-release canary. The block writes the URL and marker there with mode `0600`; it never prints either value.
-Terraform disables insecure ingress. Verify the exact HTTPS redirect, health response, authenticated upload response, configured draft origin, and fetched draft content as one fail-closed smoke. This uses the sensitive bootstrap token from Terraform state; do not enable shell tracing or paste its value into logs.
+OpenTofu disables insecure ingress. Verify the exact HTTPS redirect, health response, authenticated upload response, configured draft origin, and fetched draft content as one fail-closed smoke. This uses the sensitive bootstrap token from OpenTofu state; do not enable shell tracing or paste its value into logs.
 
 
-Run this in the shell that sourced the context above; it reads `PUBLIC_BASE_URL` and `CUSTOM_DOMAIN` from there and reads the bootstrap token straight from Terraform, so `terraform output` must work for this deployment.
+Run this in the shell that sourced the context above; it reads `PUBLIC_BASE_URL` and `CUSTOM_DOMAIN` from there and reads the bootstrap token straight from OpenTofu, so `tofu output` must work for this deployment.
 
 | Variable | Value |
 | --- | --- |
@@ -397,14 +405,14 @@ Repository tests execute these guide blocks against failure-injection stubs, but
 
 ### 4. Verify and enable client IP attribution
 
-Terraform cannot determine Azure Container Apps' forwarding chain or prove which peer addresses reach this application. The `trust_proxy` default is therefore `null`: the Container App receives no `PATCHPAGE_TRUST_PROXY` variable, Fastify ignores `X-Forwarded-For`, and persisted upload `source_ip` values identify the direct socket peer. Do not replace this default with a guessed Azure hop count or network.
+OpenTofu cannot determine Azure Container Apps' forwarding chain or prove which peer addresses reach this application. The `trust_proxy` default is therefore `null`: the Container App receives no `PATCHPAGE_TRUST_PROXY` variable, Fastify ignores `X-Forwarded-For`, and persisted upload `source_ip` values identify the direct socket peer. Do not replace this default with a guessed Azure hop count or network.
 
 Complete this verification in the real deployment:
 
 1. Inventory every reachable path to the Container App: the generated `*.azurecontainerapps.io` hostname, the custom hostname, and any CDN, WAF, gateway, or additional reverse proxy. A fixed hop count is valid only if every path that remains reachable has the same depth.
 2. With `trust_proxy = null`, send controlled authenticated uploads from an independently known public client address through each path. The resulting `draft_versions.source_ip` shows the socket peer seen by PatchPage. PatchPage deliberately does not persist the raw `X-Forwarded-For` chain, so inspect that header at the application boundary with an approved temporary diagnostic revision or equivalent ingress observability. Remove temporary header logging after the observation and do not log API tokens.
 3. Record the socket peer, the right-to-left forwarded chain, whether each proxy overwrites or appends incoming forwarding headers, and whether the observed path is invariant. Repeat enough requests and revisions to detect changing peer addresses.
-4. Choose either a decimal count from `1` through `32` for a proven fixed-depth path, or comma-separated literal IP/CIDR entries for stable, verified proxy source networks. Terraform rejects deprecated `::` plus dotted-IPv4 transitional aliases, IPv4-mapped IPv6 aliases, and CIDR lists whose effective union covers an entire address family. Do not use broad address ranges merely because they include the observed peer.
+4. Choose either a decimal count from `1` through `32` for a proven fixed-depth path, or comma-separated literal IP/CIDR entries for stable, verified proxy source networks. OpenTofu rejects deprecated `::` plus dotted-IPv4 transitional aliases, IPv4-mapped IPv6 aliases, and CIDR lists whose effective union covers an entire address family. Do not use broad address ranges merely because they include the observed peer.
 5. Set the observed value in `terraform.tfvars`, review the environment change, and apply it:
 
    ```hcl
@@ -412,7 +420,7 @@ Complete this verification in the real deployment:
    trust_proxy = "2"
    ```
 
-   Apply this as an existing-environment infrastructure change through the saved-plan and no-delete gate above. Do not run an ad hoc `terraform apply`.
+   Apply this as an existing-environment infrastructure change through the saved-plan and no-delete gate above. Do not run an ad hoc `tofu apply`.
 
 6. From the same known client, perform a new authenticated upload through every reachable path while supplying a canary header such as `X-Forwarded-For: 198.51.100.123`. Query the matching upload and confirm that both persisted fields equal the independently known client address and never the spoof canary:
 
@@ -430,7 +438,7 @@ Complete this verification in the real deployment:
 
 7. If any path attributes the spoof value, a proxy peer, or a different header position, restore `trust_proxy = null` and correct the topology or trust rule before using the address for audit.
 
-This verification remains an operator responsibility after deploy. Repeat it whenever Azure ingress behavior, DNS paths, custom domains, CDN/WAF layers, proxy source ranges, or Container App networking changes. Repository and Terraform tests validate parsing and environment wiring only; they do not establish the hosted trust boundary.
+This verification remains an operator responsibility after deploy. Repeat it whenever Azure ingress behavior, DNS paths, custom domains, CDN/WAF layers, proxy source ranges, or Container App networking changes. Repository and OpenTofu tests validate parsing and environment wiring only; they do not establish the hosted trust boundary.
 
 ## Intentional retirement
 
@@ -452,7 +460,7 @@ Never use retirement to repair state, DNS, certificates, image rollout, or envir
 ## Security notes
 
 - Do not commit `terraform.tfvars`, `backend.hcl`, `.terraform/`, saved plans, state snapshots, private canary/rollback records, or generated deployment notes.
-- Terraform state and saved plans contain generated secrets. Keep state in the private protected account, create plans only in mode-0700 temporary directories, and never upload either as CI or public artifacts.
+- OpenTofu state and saved plans contain generated secrets. Keep state in the private protected account, create plans only in mode-0700 temporary directories, and never upload either as CI or public artifacts.
 - The Blob container is private; public draft viewing goes through the PatchPage server.
 - The server uses managed identity for Blob access in production.
 - Uploads require API tokens by default. Anonymous creation remains disabled unless this deployment explicitly sets `allow_anonymous_uploads = true`.

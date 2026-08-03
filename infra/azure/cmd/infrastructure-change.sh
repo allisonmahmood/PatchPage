@@ -1,6 +1,6 @@
 set -u
 set +x
-# This flow already holds a storage account key for the Terraform backend, and
+# This flow already holds a storage account key for the OpenTofu backend, and
 # takes the operation lease with it. That is a different privilege model from
 # the release flows, which authenticate as the operator's own principal, so
 # lib/lease.sh takes it as an explicit input rather than assuming either one.
@@ -31,7 +31,7 @@ if ! REPO_ROOT_CANONICAL="$(
   ! TERRAFORM_DIAGNOSTIC_ROOT="$(
     CDPATH= cd -- "$TERRAFORM_DIAGNOSTIC_ROOT" 2>/dev/null && pwd -P
   )"; then
-  printf 'Could not resolve the private Terraform diagnostic root.\n' >&2
+  printf 'Could not resolve the private OpenTofu diagnostic root.\n' >&2
   exit 1
 fi
 case "$TERRAFORM_DIAGNOSTIC_ROOT" in
@@ -44,7 +44,7 @@ if ! TERRAFORM_DIAGNOSTIC_DIR="$(
   umask 077
   mktemp -d "$TERRAFORM_DIAGNOSTIC_ROOT/patchpage-terraform-diagnostics.XXXXXX" 2>/dev/null
 )"; then
-  printf 'Could not create a private Terraform diagnostic directory.\n' >&2
+  printf 'Could not create a private OpenTofu diagnostic directory.\n' >&2
   exit 1
 fi
 TERRAFORM_DIAGNOSTIC_LOG="$TERRAFORM_DIAGNOSTIC_DIR/terraform.log"
@@ -53,12 +53,12 @@ if ! { exec 3>>"$TERRAFORM_DIAGNOSTIC_LOG"; } 2>/dev/null ||
   ! chmod 600 "$TERRAFORM_DIAGNOSTIC_LOG" 2>/dev/null; then
   { exec 3>&-; } 2>/dev/null || :
   rm -rf -- "$TERRAFORM_DIAGNOSTIC_DIR" 2>/dev/null || :
-  printf 'Could not secure the private Terraform diagnostic log.\n' >&2
+  printf 'Could not secure the private OpenTofu diagnostic log.\n' >&2
   exit 1
 fi
 TERRAFORM_DIAGNOSTICS_COMPLETE=false
 TERRAFORM_DIAGNOSTIC_FD_OPEN=true
-trap 'terraform_diagnostic_exit' 0
+trap 'tofu_diagnostic_exit' 0
 trap 'exit 129' HUP
 trap 'exit 130' INT
 trap 'exit 143' TERM
@@ -144,11 +144,11 @@ if ! STATE_BLOB_EXISTS="$(
     --output tsv
 )" ||
   test "$STATE_BLOB_EXISTS" != "true"; then
-  printf 'The expected Terraform state blob does not exist.\n' >&2
+  printf 'The expected OpenTofu state blob does not exist.\n' >&2
   exit 1
 fi
 if ! inspect_state_containers || test "$STATE_CONTAINER_EXISTS" != "true"; then
-  printf 'The Terraform state account data plane is unavailable or inconsistent.\n' >&2
+  printf 'The OpenTofu state account data plane is unavailable or inconsistent.\n' >&2
   exit 1
 fi
 if test "$ADOPT_SAFETY_GUARDS" = "false" &&
@@ -165,44 +165,44 @@ if ! (umask 077 && : > backend.hcl) ||
     "$STATE_STORAGE_ACCOUNT" \
     "$STATE_CONTAINER" \
     "$STATE_KEY" > backend.hcl; then
-  printf 'Could not write the private Terraform backend configuration.\n' >&2
+  printf 'Could not write the private OpenTofu backend configuration.\n' >&2
   exit 1
 fi
-if ! private_terraform init -input=false -reconfigure -backend-config=backend.hcl >&3; then
-  printf 'Terraform initialization failed.\n' >&2
+if ! private_tofu init -input=false -reconfigure -backend-config=backend.hcl >&3; then
+  printf 'OpenTofu initialization failed.\n' >&2
   exit 1
 fi
 if ! TERRAFORM_SUBSCRIPTION_LITERAL="$(
-  private_terraform console -no-color <<'EOF'
+  private_tofu console -no-color <<'EOF'
 var.subscription_id
 EOF
 )"; then
-  printf 'Could not verify the Terraform provider subscription.\n' >&2
+  printf 'Could not verify the OpenTofu provider subscription.\n' >&2
   exit 1
 fi
 if test "$TERRAFORM_SUBSCRIPTION_LITERAL" != "\"$SUBSCRIPTION_ID\""; then
-  printf 'The Terraform provider subscription does not match the private expected value.\n' >&2
+  printf 'The OpenTofu provider subscription does not match the private expected value.\n' >&2
   exit 1
 fi
 unset TERRAFORM_SUBSCRIPTION_LITERAL
 if ! TERRAFORM_RESOURCE_GROUP_LITERAL="$(
-  private_terraform console -no-color <<'EOF'
+  private_tofu console -no-color <<'EOF'
 "rg-patchpage-${var.environment_name}"
 EOF
 )"; then
-  printf 'Could not verify the Terraform workload resource-group name.\n' >&2
+  printf 'Could not verify the OpenTofu workload resource-group name.\n' >&2
   exit 1
 fi
 if ! TERRAFORM_RESOURCE_GROUP="$(
   printf '%s\n' "$TERRAFORM_RESOURCE_GROUP_LITERAL" |
     jq -er 'select(type == "string" and length > 0)'
 )"; then
-  printf 'Terraform returned an invalid workload resource-group name.\n' >&2
+  printf 'OpenTofu returned an invalid workload resource-group name.\n' >&2
   exit 1
 fi
 unset TERRAFORM_RESOURCE_GROUP_LITERAL
 if test "$TERRAFORM_RESOURCE_GROUP" != "$RESOURCE_GROUP"; then
-  printf 'The Terraform workload resource-group name does not match the private expected value.\n' >&2
+  printf 'The OpenTofu workload resource-group name does not match the private expected value.\n' >&2
   exit 1
 fi
 unset TERRAFORM_RESOURCE_GROUP
@@ -219,7 +219,7 @@ cleanup_infrastructure_change() {
     return 1
   fi
 }
-trap 'cleanup_infrastructure_change; terraform_diagnostic_exit' 0
+trap 'cleanup_infrastructure_change; tofu_diagnostic_exit' 0
 trap 'exit 129' HUP
 trap 'exit 130' INT
 trap 'exit 143' TERM
@@ -228,13 +228,13 @@ STATE_VALUES="$SECURE_CHANGE_DIR/state-values.json"
 INFRA_PLAN="$SECURE_CHANGE_DIR/infrastructure.tfplan"
 INFRA_PLAN_JSON="$SECURE_CHANGE_DIR/infrastructure-plan.json"
 
-if ! { private_terraform state pull > "$STATE_SNAPSHOT"; } 2>/dev/null ||
-  ! { private_terraform show -json > "$STATE_VALUES"; } 2>/dev/null; then
-  printf 'Could not read the selected Terraform state securely.\n' >&2
+if ! { private_tofu state pull > "$STATE_SNAPSHOT"; } 2>/dev/null ||
+  ! { private_tofu show -json > "$STATE_VALUES"; } 2>/dev/null; then
+  printf 'Could not read the selected OpenTofu state securely.\n' >&2
   exit 1
 fi
 if test "$(jq -r .lineage "$STATE_SNAPSHOT" 2>/dev/null)" != "$EXPECTED_STATE_LINEAGE"; then
-  printf 'Terraform state lineage does not match the private expected value.\n' >&2
+  printf 'OpenTofu state lineage does not match the private expected value.\n' >&2
   exit 1
 fi
 for address in \
@@ -246,8 +246,8 @@ for address in \
   azurerm_postgresql_flexible_server_database.patchpage \
   azurerm_container_app.server
 do
-  if ! private_terraform state show "$address" >/dev/null; then
-    printf 'Terraform state is missing a required managed resource.\n' >&2
+  if ! private_tofu state show "$address" >/dev/null; then
+    printf 'OpenTofu state is missing a required managed resource.\n' >&2
     exit 1
   fi
 done
@@ -307,14 +307,14 @@ if test "$STATE_RESOURCE_GROUP_ID" != "$(
   test "$STATE_CONTAINER_APP_ID" != "$(
     printf '%s' "$EXPECTED_CONTAINER_APP_ID" | tr '[:upper:]' '[:lower:]'
   )"; then
-  printf 'Terraform state resource identity does not match the private expected values.\n' >&2
+  printf 'OpenTofu state resource identity does not match the private expected values.\n' >&2
   exit 1
 fi
 if ! private_az resource show --ids "$EXPECTED_STORAGE_ACCOUNT_ID" --output none ||
   ! private_az resource show --ids "$EXPECTED_POSTGRES_SERVER_ID" --output none ||
   ! private_az resource show --ids "$EXPECTED_ACR_ID" --output none ||
   ! private_az resource show --ids "$EXPECTED_CONTAINER_APP_ID" --output none; then
-  printf 'A resource recorded in Terraform state is missing from Azure.\n' >&2
+  printf 'A resource recorded in OpenTofu state is missing from Azure.\n' >&2
   exit 1
 fi
 EXPECTED_STATE_LOCK_ID="$EXPECTED_STATE_STORAGE_ACCOUNT_ID/providers/Microsoft.Authorization/locks/protect-patchpage-tfstate"
@@ -535,7 +535,7 @@ if test "$ADOPT_SAFETY_GUARDS" = "true"; then
     ! STATE_ROLE_ASSIGNMENTS="$(read_state_role_assignments)" ||
     ! printf '%s\n' "$STATE_ROLE_ASSIGNMENTS" |
       jq -e 'length == 0' >/dev/null; then
-    printf 'Could not prove the operation principal has no Terraform state access.\n' >&2
+    printf 'Could not prove the operation principal has no OpenTofu state access.\n' >&2
     exit 1
   fi
   case "$OPERATION_ROLE_ASSIGNMENT_COUNT" in
@@ -569,7 +569,7 @@ if test "$ADOPT_SAFETY_GUARDS" = "true"; then
     ! STATE_ROLE_ASSIGNMENTS="$(read_state_role_assignments)" ||
     ! printf '%s\n' "$STATE_ROLE_ASSIGNMENTS" |
       jq -e 'length == 0' >/dev/null; then
-    printf 'Operation-principal access is missing, incorrectly scoped, or can reach Terraform state.\n' >&2
+    printf 'Operation-principal access is missing, incorrectly scoped, or can reach OpenTofu state.\n' >&2
     exit 1
   fi
 fi
@@ -600,7 +600,7 @@ unset OPERATION_LEASE_HEX
 OPERATION_LEASE_ACTIVE=false
 OPERATION_LEASE_RETAINED=false
 OPERATION_MUTATION_UNCERTAIN=false
-trap 'operation_lease_exit; cleanup_infrastructure_change; terraform_diagnostic_exit; operation_lease_retention_exit' 0
+trap 'operation_lease_exit; cleanup_infrastructure_change; tofu_diagnostic_exit; operation_lease_retention_exit' 0
 trap 'exit 129' HUP
 trap 'exit 130' INT
 trap 'exit 143' TERM
@@ -612,7 +612,7 @@ WORKLOAD_STORAGE_ACCOUNT_NAME="${EXPECTED_STORAGE_ACCOUNT_ID##*/}"
 if ! printf '%s\n' "$WORKLOAD_STORAGE_ACCOUNT_NAME" |
   grep -Eq '^[a-z0-9]{3,24}$' ||
   ! TERRAFORM_STORAGE_RETENTION_DAYS="$(
-    private_terraform console -no-color <<'EOF'
+    private_tofu console -no-color <<'EOF'
 var.storage_delete_retention_days
 EOF
   )" ||
@@ -632,12 +632,12 @@ EOF
     printf '%s\n' "$WORKLOAD_BLOB_PROPERTIES" |
       jq -er '.containerDeleteRetentionPolicy.days // 0'
   )"; then
-  printf 'Could not compare Terraform and live workload Storage retention.\n' >&2
+  printf 'Could not compare OpenTofu and live workload Storage retention.\n' >&2
   exit 1
 fi
 if test "$TERRAFORM_STORAGE_RETENTION_DAYS" -lt "$LIVE_WORKLOAD_BLOB_RETENTION_DAYS" ||
   test "$TERRAFORM_STORAGE_RETENTION_DAYS" -lt "$LIVE_WORKLOAD_CONTAINER_RETENTION_DAYS"; then
-  printf 'Terraform would shorten live workload Storage retention; raise the private configured value and restart.\n' >&2
+  printf 'OpenTofu would shorten live workload Storage retention; raise the private configured value and restart.\n' >&2
   exit 1
 fi
 unset LIVE_WORKLOAD_BLOB_RETENTION_DAYS LIVE_WORKLOAD_CONTAINER_RETENTION_DAYS
@@ -658,7 +658,7 @@ if test "$ADOPT_SAFETY_GUARDS" = "true"; then
       printf '%s\n' "$ADOPTION_BLOB_PROPERTIES" |
         jq -er '[.containerDeleteRetentionPolicy.days // 0, 30] | max'
     )"; then
-    printf 'Could not read the existing Terraform state retention settings.\n' >&2
+    printf 'Could not read the existing OpenTofu state retention settings.\n' >&2
     exit 1
   fi
   if ! private_az storage account blob-service-properties update \
@@ -670,7 +670,7 @@ if test "$ADOPT_SAFETY_GUARDS" = "true"; then
     --enable-container-delete-retention true \
     --container-delete-retention-days "$ADOPTION_CONTAINER_RETENTION_DAYS" \
     --set deleteRetentionPolicy.allowPermanentDelete=false >/dev/null; then
-    printf 'Could not adopt Terraform state retention safeguards.\n' >&2
+    printf 'Could not adopt OpenTofu state retention safeguards.\n' >&2
     exit 1
   fi
   if test -z "$STATE_EXISTING_LOCK_ROWS" &&
@@ -678,7 +678,7 @@ if test "$ADOPT_SAFETY_GUARDS" = "true"; then
       --name protect-patchpage-tfstate \
       --lock-type CanNotDelete \
       --resource "$EXPECTED_STATE_STORAGE_ACCOUNT_ID" >/dev/null; then
-    printf 'Could not adopt the Terraform state deletion lock.\n' >&2
+    printf 'Could not adopt the OpenTofu state deletion lock.\n' >&2
     exit 1
   fi
   if test -z "$STORAGE_EXISTING_LOCK_ROWS" &&
@@ -711,7 +711,7 @@ if ! STATE_LOCK_PROPERTIES="$(
 )" ||
   test "$(printf '%s\n' "$STATE_LOCK_PROPERTIES" | cut -f1)" != "CanNotDelete" ||
   test "$(printf '%s\n' "$STATE_LOCK_PROPERTIES" | cut -f2 | tr '[:upper:]' '[:lower:]')" != "$(printf '%s' "$EXPECTED_STATE_LOCK_ID" | tr '[:upper:]' '[:lower:]')"; then
-  printf 'The Terraform state-account deletion lock is missing or incorrectly scoped.\n' >&2
+  printf 'The OpenTofu state-account deletion lock is missing or incorrectly scoped.\n' >&2
   exit 1
 fi
 if ! STATE_BLOB_PROPERTIES="$(
@@ -720,7 +720,7 @@ if ! STATE_BLOB_PROPERTIES="$(
     --resource-group rg-patchpage-tfstate \
     --output json
 )"; then
-  printf 'Could not verify Terraform state versioning and soft-delete retention.\n' >&2
+  printf 'Could not verify OpenTofu state versioning and soft-delete retention.\n' >&2
   exit 1
 fi
 if ! printf '%s\n' "$STATE_BLOB_PROPERTIES" |
@@ -731,7 +731,7 @@ if ! printf '%s\n' "$STATE_BLOB_PROPERTIES" |
      .deleteRetentionPolicy.days >= 30 and
      .containerDeleteRetentionPolicy.enabled == true and
      .containerDeleteRetentionPolicy.days >= 30' >/dev/null; then
-  printf 'Terraform state versioning or soft-delete retention is below the required baseline.\n' >&2
+  printf 'OpenTofu state versioning or soft-delete retention is below the required baseline.\n' >&2
   exit 1
 fi
 if ! STORAGE_LOCK_PROPERTIES="$(
@@ -756,11 +756,11 @@ fi
 ensure_managed_lock_state() {
   managed_lock_address="$1"
   managed_lock_id="$2"
-  if private_terraform state show "$managed_lock_address" >/dev/null; then
+  if private_tofu state show "$managed_lock_address" >/dev/null; then
     return 0
   fi
   test "$ADOPT_SAFETY_GUARDS" = "true" &&
-    private_terraform import -input=false \
+    private_tofu import -input=false \
       "$managed_lock_address" \
       "$managed_lock_id" >&3
 }
@@ -770,10 +770,10 @@ if ! ensure_managed_lock_state \
   ! ensure_managed_lock_state \
     azurerm_management_lock.patchpage_postgres \
     "$EXPECTED_POSTGRES_LOCK_ID"; then
-  printf 'The persistent-resource locks are not bound to this Terraform state.\n' >&2
+  printf 'The persistent-resource locks are not bound to this OpenTofu state.\n' >&2
   exit 1
 fi
-if ! { private_terraform show -json > "$STATE_VALUES"; } 2>/dev/null; then
+if ! { private_tofu show -json > "$STATE_VALUES"; } 2>/dev/null; then
   printf 'Could not verify the managed-lock state bindings.\n' >&2
   exit 1
 fi
@@ -799,7 +799,7 @@ if ! STATE_STORAGE_LOCK_ID="$(
   test "$STATE_POSTGRES_LOCK_ID" != "$(
     printf '%s' "$EXPECTED_POSTGRES_LOCK_ID" | tr '[:upper:]' '[:lower:]'
   )"; then
-  printf 'A Terraform management-lock binding has an unexpected identity.\n' >&2
+  printf 'A OpenTofu management-lock binding has an unexpected identity.\n' >&2
   exit 1
 fi
 unset STATE_POSTGRES_LOCK_ID STATE_STORAGE_LOCK_ID
@@ -993,21 +993,21 @@ if ! (umask 077 && printf 'server_image = "%s"\n' \
   exit 1
 fi
 if ! TERRAFORM_SERVER_IMAGE_LITERAL="$(
-  private_terraform console -no-color <<'EOF'
+  private_tofu console -no-color <<'EOF'
 var.server_image
 EOF
 )" ||
   test "$TERRAFORM_SERVER_IMAGE_LITERAL" != "\"$LOCKED_CONTAINER_APP_IMAGE\""; then
-  printf 'Terraform did not resolve the synchronized immutable server image.\n' >&2
+  printf 'OpenTofu did not resolve the synchronized immutable server image.\n' >&2
   exit 1
 fi
 unset SERVER_IMAGE_VARS SERVER_IMAGE_VARS_TEMP TERRAFORM_SERVER_IMAGE_LITERAL
 
-if ! private_terraform plan -input=false -out="$INFRA_PLAN" >&3; then
-  printf 'Terraform could not create the infrastructure plan.\n' >&2
+if ! private_tofu plan -input=false -out="$INFRA_PLAN" >&3; then
+  printf 'OpenTofu could not create the infrastructure plan.\n' >&2
   exit 1
 fi
-if ! { private_terraform show -json "$INFRA_PLAN" > "$INFRA_PLAN_JSON"; } 2>/dev/null; then
+if ! { private_tofu show -json "$INFRA_PLAN" > "$INFRA_PLAN_JSON"; } 2>/dev/null; then
   printf 'Could not inspect the saved infrastructure plan.\n' >&2
   exit 1
 fi
@@ -1040,7 +1040,7 @@ if ! printf '%s\n' "$PLANNED_CONTAINER_APP_DIGEST" |
 fi
 unset PLANNED_ACR_NAME PLANNED_CONTAINER_APP_DIGEST
 # Every one of the four protected addresses is passed: an infrastructure change
-# is never the run that legitimately creates persistent data, so Terraform
+# is never the run that legitimately creates persistent data, so OpenTofu
 # planning to create one of them means it has lost sight of the existing one.
 if ! plan_gate_accepts \
   azurerm_storage_account.drafts \
@@ -1076,7 +1076,7 @@ set +x
 # than the same-shell pause it replaces, because that pause could not tell that
 # the world had moved under the saved plan.
 #
-# The token is printed and nothing else is. It is computed over Terraform
+# The token is printed and nothing else is. It is computed over OpenTofu
 # resource addresses and action words, which carry no subscription, tenant or
 # resource identifier, and a digest would not give them back if they did.
 if ! INFRA_CHANGE_REVIEW_SHA256="$(
@@ -1109,7 +1109,7 @@ if test "${INFRA_CHANGE_APPROVAL_SHA256:-}" != "$INFRA_CHANGE_REVIEW_SHA256"; th
   fi
   SECURE_CHANGE_DIR=''
   TERRAFORM_DIAGNOSTICS_COMPLETE=true
-  terraform_diagnostic_exit
+  tofu_diagnostic_exit
   trap - 0 HUP INT TERM
   exit 0
 fi
@@ -1124,8 +1124,8 @@ if ! verify_operation_lease ||
   exit 1
 fi
 OPERATION_MUTATION_UNCERTAIN=true
-if ! private_terraform apply -input=false "$INFRA_PLAN" >&3; then
-  printf 'Terraform could not apply the reviewed infrastructure plan.\n' >&2
+if ! private_tofu apply -input=false "$INFRA_PLAN" >&3; then
+  printf 'OpenTofu could not apply the reviewed infrastructure plan.\n' >&2
   exit 75
 fi
 if ! POSTAPPLY_CONTAINER_APP_PROPERTIES="$(
@@ -1161,11 +1161,11 @@ if ! cleanup_infrastructure_change; then
 fi
 SECURE_CHANGE_DIR=''
 TERRAFORM_DIAGNOSTICS_COMPLETE=true
-terraform_diagnostic_exit
+tofu_diagnostic_exit
 trap - 0 HUP INT TERM
 unset TERRAFORM_DIAGNOSTIC_DIR TERRAFORM_DIAGNOSTIC_LOG
 unset TERRAFORM_DIAGNOSTICS_COMPLETE TERRAFORM_DIAGNOSTIC_FD_OPEN
-unset -f cleanup_infrastructure_change terraform_diagnostic_exit
+unset -f cleanup_infrastructure_change tofu_diagnostic_exit
 unset -f acquire_operation_lease operation_lease_exit release_operation_lease
 unset -f operation_lease_retention_exit
 unset -f verify_operation_container verify_operation_lease
