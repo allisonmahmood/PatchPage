@@ -3425,7 +3425,8 @@ test_stale_lease_recovery() {
 #
 # The runbooks are executables now, so this scans ops.sh and cmd/*.sh whole
 # rather than the guide's ```sh fences: the shell moved, and the rule has to
-# move with it. PR E turns the guide-side check into fence purity.
+# move with it. The guide-side rule is guide_fences_document_only_ops_commands
+# below, which says the guide has no shell left for this one to scan.
 #
 # Exactly what this guarantees: none of the 13 tools the harness mocks -- az,
 # terraform, tofu, git, curl, dig, jq, openssl, mktemp, chmod, sleep, cat, rm --
@@ -3449,13 +3450,6 @@ ops_sources_reach_tools_through_path() {
   ' "$@"
 }
 
-# Returns 0 when the guide no longer carries any of the runbooks that moved into
-# cmd/, 1 otherwise. Two independent statements, because either one alone rots:
-# no `guide-test` marker survives, and no ```sh fence is anywhere near
-# block-sized. The smallest runbook that moved is 45 lines, so a 40-line ceiling
-# cannot be satisfied by a re-inlined runbook. Takes the guide file so the check
-# itself can be meta-tested against a sabotaged copy.
-# Deliberately reports status instead of calling fail.
 # Returns 0 when none of the given files mentions `trap`, 1 when one does. Two
 # of the commands are documented as `. cmd/<name>.sh`, so they run in the
 # operator's own shell. A trap installed there is installed on that shell: no
@@ -3473,12 +3467,106 @@ sourced_commands_install_no_trap() {
   ' "$@"
 }
 
-guide_carries_no_moved_runbook() {
-  awk '
+# Returns 0 when the guide's shell fences carry nothing but the documented
+# command invocations, 1 otherwise. Takes the guide file and the space-separated
+# command names so the check itself can be meta-tested against a sabotaged copy.
+# Deliberately reports status instead of calling fail.
+#
+# This replaces a 40-line ceiling on ```sh fences. That heuristic was a proxy
+# for "no runbook was re-inlined" and it was sized against the runbooks that
+# happened to move -- the smallest was 45 lines -- so it accepted anything
+# shorter, and it read only ```sh. Both gaps were real: the guide still carried
+# a 32-line subdomain DNS runbook that no command owns and no test ever ran, and
+# the same block in a ```bash or bare ``` fence would have passed at any length.
+#
+# The rule now is a whitelist rather than a size, which is the version that
+# cannot be satisfied by writing a smaller runbook. Inside a shell fence, a line
+# may be exactly one of:
+#
+#   * blank, or a comment;
+#   * `sh infra/azure/ops.sh <command>`, where <command> is dispatchable;
+#   * `. infra/azure/cmd/custom-domain-context.sh` or
+#     `. infra/azure/cmd/hostname-mutation.sh` -- the two commands the guide has
+#     the operator source, because a child process cannot hand values back.
+#
+# Nothing else: no assignment prefixes, no exports, no pipelines, no
+# redirections. The narrower whitelist is deliberate. Every input a command
+# takes is stated in that command's table, so an assignment inside a fence is a
+# second place for the same fact to live, and a whitelist clause with no fence
+# exercising it is a clause nothing keeps honest. A guide that physically cannot
+# hold an executable line cannot regrow the surface PR B moved out.
+#
+# Three independent statements, because any one alone rots:
+#
+#   1. no `guide-test` marker survives -- the extraction markers the harness
+#      used to key on;
+#   2. every line of every shell fence is on the whitelist above;
+#   3. every dispatchable command is documented by at least one such line, so
+#      shrinking the guide cannot quietly drop a command's section.
+#
+# A "shell fence" is ```sh, ```bash, or a bare ```. Info strings the guide uses
+# for data -- txt, hcl, sql -- are skipped, and their fences still drive the
+# open/closed state machine so a bare closing ``` is never read as an opening
+# one. Fences are matched after trimming, because the guide indents the two
+# inside a numbered list. Tilde fences are not handled; the guide has none, and
+# statement 3 would notice a section rewritten to use them.
+guide_fences_document_only_ops_commands() {
+  awk -v command_list=" $2 " '
+    function trim(s) {
+      sub(/^[ \t]+/, "", s)
+      sub(/[ \t]+$/, "", s)
+      return s
+    }
+    function is_command(name) {
+      return index(command_list, " " name " ") > 0
+    }
     /^<!-- guide-test:/ { marker = 1 }
-    $0 == "```sh" { fence = NR; next }
-    $0 == "```" && fence { if (NR - fence - 1 > 40) oversized = 1; fence = 0 }
-    END { exit (marker || oversized) ? 1 : 0 }
+    {
+      line = trim($0)
+      if (substr(line, 1, 3) == "```") {
+        if (in_fence) {
+          in_fence = 0
+          shell_fence = 0
+        } else {
+          info = trim(substr(line, 4))
+          in_fence = 1
+          shell_fence = (info == "" || info == "sh" || info == "bash")
+        }
+        next
+      }
+      if (!in_fence || !shell_fence) next
+      if (line == "" || substr(line, 1, 1) == "#") next
+      if (line ~ /^sh infra\/azure\/ops\.sh [a-z][a-z0-9-]*$/) {
+        name = line
+        sub(/^sh infra\/azure\/ops\.sh /, "", name)
+        if (is_command(name)) {
+          documented[name] = 1
+          next
+        }
+      }
+      if (line ~ /^\. infra\/azure\/cmd\/(custom-domain-context|hostname-mutation)\.sh$/) {
+        name = line
+        sub(/^\. infra\/azure\/cmd\//, "", name)
+        sub(/\.sh$/, "", name)
+        if (is_command(name)) {
+          documented[name] = 1
+          next
+        }
+      }
+      impure = 1
+    }
+    END {
+      # An unclosed fence would leave the rest of the file unscanned, and an
+      # empty command list would make statement 3 vacuous. Both are failures.
+      name_count = split(command_list, names, " ")
+      if (in_fence || name_count == 0) {
+        exit 1
+      }
+      for (i = 1; i <= name_count; i++) {
+        if (!(names[i] in documented)) undocumented = 1
+      }
+      exit (marker || impure || undocumented) ? 1 : 0
+    }
   ' "$1"
 }
 
@@ -4212,36 +4300,124 @@ test_public_safe_runbook_static() {
   fi
   rm -rf "$auth_mode_probe_dir"
 
-  # The runbooks left the guide in this change, and nothing may bring one back:
-  # a re-inlined block would be documentation the harness never runs.
-  guide_carries_no_moved_runbook "$README" ||
-    fail "the Azure guide still carries a guide-test marker or a runbook-sized shell fence"
+  # The runbooks left the guide, and nothing may bring one back: a re-inlined
+  # block would be documentation the harness never runs.
+  guide_command_names="$(printf '%s' "$GUIDE_COMMANDS" | tr '\n' ' ')"
+  guide_fences_document_only_ops_commands "$README" "$guide_command_names" ||
+    fail "the Azure guide carries a guide-test marker, a shell fence line that is not a documented command invocation, or no invocation for some command"
 
-  # Meta-test both halves of that check separately, otherwise one of them could
-  # rot into decoration behind the other.
-  moved_runbook_probe_dir="$TMP_DIR/moved-runbook-probe"
-  rm -rf "$moved_runbook_probe_dir"
-  mkdir -p "$moved_runbook_probe_dir" ||
-    fail "could not create the moved-runbook probe directory"
+  # Meta-test each statement separately, otherwise one of them could rot into
+  # decoration behind another. Every probe starts from an unmodified copy of the
+  # guide, and that copy is asserted to pass first, so each rejection below is
+  # attributable to its own sabotage rather than to the copying.
+  fence_probe_dir="$TMP_DIR/guide-fence-probe"
+  rm -rf "$fence_probe_dir"
+  mkdir -p "$fence_probe_dir" ||
+    fail "could not create the guide-fence probe directory"
+  cp "$README" "$fence_probe_dir/clean.md" ||
+    fail "could not copy the guide for the fence probes"
+  guide_fences_document_only_ops_commands "$fence_probe_dir/clean.md" \
+    "$guide_command_names" ||
+    fail "the guide-fence check rejects an unmodified copy of the guide"
+
+  # Statement 1: the extraction markers.
   {
     cat "$README" &&
       printf '%s\n' '<!-- guide-test:app-release -->'
-  } > "$moved_runbook_probe_dir/marker.md" ||
+  } > "$fence_probe_dir/marker.md" ||
     fail "could not build the guide-test marker probe"
-  if guide_carries_no_moved_runbook "$moved_runbook_probe_dir/marker.md"; then
-    fail "the moved-runbook check accepts a surviving guide-test marker"
+  if guide_fences_document_only_ops_commands "$fence_probe_dir/marker.md" \
+    "$guide_command_names"; then
+    fail "the guide-fence check accepts a surviving guide-test marker"
   fi
+
+  # Statement 2, in each of the three fence spellings a runbook could arrive in.
+  # The rogue block is deliberately far shorter than any runbook that moved:
+  # size is exactly what the check this replaced was measuring, so a five-line
+  # block is the proof that it no longer is.
+  for fence_probe_info in sh bash ''; do
+    fence_probe_name="${fence_probe_info:-bare}"
+    {
+      cat "$README" &&
+        printf '%s\n' '```'"$fence_probe_info" &&
+        printf '%s\n' \
+          'RESOURCE_GROUP="${RESOURCE_GROUP:?Set the resource group}"' \
+          'if ! az containerapp show --name "$CONTAINER_APP" >/dev/null; then' \
+          '  printf %s\\n "The Container App is missing." >&2' \
+          '  exit 1' \
+          'fi' &&
+        printf '%s\n' '```'
+    } > "$fence_probe_dir/rogue-$fence_probe_name.md" ||
+      fail "could not build the rogue $fence_probe_name fence probe"
+    if guide_fences_document_only_ops_commands \
+      "$fence_probe_dir/rogue-$fence_probe_name.md" "$guide_command_names"; then
+      fail "the guide-fence check accepts a five-line runbook in a $fence_probe_name fence"
+    fi
+  done
+
+  # Statement 2, subsumption: the probe the 40-line ceiling was meta-tested
+  # with. The replacement is only allowed to be a replacement if what the old
+  # check caught, it still catches.
   {
     cat "$README" &&
       printf '%s\n' '```sh' &&
       awk 'NR > 1 && NR <= 60' "$GUIDE_CMD_DIR/hostname-mutation.sh" &&
       printf '%s\n' '```'
-  } > "$moved_runbook_probe_dir/inlined.md" ||
+  } > "$fence_probe_dir/inlined.md" ||
     fail "could not build the re-inlined runbook probe"
-  if guide_carries_no_moved_runbook "$moved_runbook_probe_dir/inlined.md"; then
-    fail "the moved-runbook check accepts a re-inlined runbook fence"
+  if guide_fences_document_only_ops_commands "$fence_probe_dir/inlined.md" \
+    "$guide_command_names"; then
+    fail "the guide-fence check accepts a re-inlined runbook fence"
   fi
-  rm -rf "$moved_runbook_probe_dir"
+
+  # Statement 2, the near misses. These are the lines most likely to be added in
+  # good faith, and each is one clause away from allowed: an export the tables
+  # already state, an assignment prefix on an otherwise valid invocation, and an
+  # invocation of a name ops.sh would refuse to dispatch.
+  for fence_probe_line in \
+    'export STATE_KEY=patchpage-prod.tfstate' \
+    'STATE_KEY=x sh infra/azure/ops.sh app-release' \
+    'sh infra/azure/ops.sh state-boostrap'; do
+    {
+      cat "$README" &&
+        printf '%s\n' '```sh' "$fence_probe_line" '```'
+    } > "$fence_probe_dir/near-miss.md" ||
+      fail "could not build the near-miss fence probe"
+    if guide_fences_document_only_ops_commands "$fence_probe_dir/near-miss.md" \
+      "$guide_command_names"; then
+      fail "the guide-fence check accepts the fence line: $fence_probe_line"
+    fi
+  done
+
+  # Statement 3: a shrink that drops a command's section. Removing the one
+  # invocation line leaves a guide that is still pure and still marker-free, so
+  # only this statement can be what turns it red.
+  awk '$0 != "sh infra/azure/ops.sh deployed-smoke"' "$README" \
+    > "$fence_probe_dir/undocumented.md" ||
+    fail "could not build the undocumented-command probe"
+  if cmp -s "$README" "$fence_probe_dir/undocumented.md"; then
+    fail "the undocumented-command probe did not remove an invocation"
+  fi
+  if guide_fences_document_only_ops_commands \
+    "$fence_probe_dir/undocumented.md" "$guide_command_names"; then
+    fail "the guide-fence check accepts a guide that documents no way to run a command"
+  fi
+
+  # And the two degenerate inputs the END block guards, which no sabotage of the
+  # guide itself can reach: an unclosed fence, and an empty command list that
+  # would make statement 3 vacuous.
+  {
+    cat "$README" && printf '%s\n' '```sh'
+  } > "$fence_probe_dir/unclosed.md" ||
+    fail "could not build the unclosed-fence probe"
+  if guide_fences_document_only_ops_commands "$fence_probe_dir/unclosed.md" \
+    "$guide_command_names"; then
+    fail "the guide-fence check accepts an unclosed shell fence"
+  fi
+  if guide_fences_document_only_ops_commands "$fence_probe_dir/clean.md" ""; then
+    fail "the guide-fence check passes vacuously when given no command names"
+  fi
+  rm -rf "$fence_probe_dir"
   rm -rf "$restricted_path_probe_dir"
 
   # The two sourced commands run in the operator's shell, where a trap would
