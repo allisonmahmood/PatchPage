@@ -96,15 +96,23 @@ if ! private_az account set ||
   printf 'The abandoned operation lease could not be verified safely.\n' >&2
   exit 1
 fi
-if ! private_az storage container lease break \
-  --account-name "$STATE_STORAGE_ACCOUNT" \
-  --container-name "$OPERATION_CONTAINER" \
-  --auth-mode login \
-  --lease-break-period 0 \
-  --output none >/dev/null; then
-  printf 'Operation lease recovery failed closed.\n' >&2
-  exit 1
-fi
+# --- single-flight break and reacquire ---------------------------------------
+#
+# Breaking a lease and taking it back are two calls, and everything a recoverer
+# does between them is time in which a *second* recoverer can break the lease
+# this one is about to acquire. That window used to contain the lease-ID
+# generation below -- an od, a grep and a sed, three process spawns -- so two
+# operators who started recovery together could both break a live lease and both
+# report success, which is exactly the mutual exclusion this container exists to
+# provide being handed to two people at once.
+#
+# The identity is therefore minted first, and the acquire follows the break with
+# nothing between them but a shell assignment: no subprocess, no network call,
+# nothing that can fail or block. The acquire is then the arbiter. Whichever
+# recoverer reaches it while the other holds the container is refused by Azure,
+# and a refused recoverer gives up rather than recovering: it releases its own
+# lease ID -- see the trap below for why that is safe to send blind -- and
+# exits 1 without touching the container's binding.
 if ! RECOVERY_LEASE_HEX="$(
   od -An -N16 -tx1 /dev/urandom 2>/dev/null | tr -d ' \n'
 )" ||
@@ -116,13 +124,48 @@ if ! RECOVERY_LEASE_HEX="$(
   printf 'Operation lease recovery failed closed.\n' >&2
   exit 1
 fi
-RECOVERY_LEASE_ACTIVE=true
-# RECOVERY_LEASE_ACTIVE stays optimistic on purpose: an acquire whose result is
-# unknown may still have been granted, so the exit trap always offers the lease
-# back. RECOVERY_LEASE_ACQUIRED is the narrower fact -- Azure confirmed the
-# acquire -- and only that fact turns a failed release into the exit-75 stop.
-# Without it an acquire that was refused outright would report a lease this
-# recovery never held.
+# RECOVERY_LEASE_ACTIVE starts false and is raised in the one statement before
+# the acquire, so a failed break -- which cannot have granted anything -- leaves
+# the trap with nothing to give back. From the acquire onwards it stays
+# optimistic on purpose: an acquire whose result is unknown may still have been
+# granted, so the exit trap offers the lease back.
+#
+# RECOVERY_LEASE_ACQUIRED is the narrower fact -- Azure confirmed the acquire --
+# and only that fact turns a failed release into the exit-75 stop. Without it an
+# acquire that was refused outright would report a lease this recovery never
+# held.
+#
+# The losing side of the race still sends its release, and that is deliberate.
+# A refused acquire has two indistinguishable causes: the winner got there
+# first, or Azure granted this acquire and the answer was lost in transit. Only
+# the second leaves an infinite lease held by this process, and only a release
+# clears it -- so the release is sent either way.
+#
+# It is safe to send blind because an Azure container-lease release names the
+# lease ID it is releasing and Azure matches it exactly. The loser holds
+# RECOVERY_LEASE_ID, which it minted from the system random device above and
+# which no other process has ever seen. If the winner holds the container, the
+# loser's release names an ID that is not the live lease and Azure answers 409
+# LeaseIdMismatchWithLeaseOperation: nothing is released, the winner is
+# untouched, and the loser exits 1 having changed nothing. If instead the grant
+# did land and was lost, the ID matches, the leak is cleaned, and the container
+# is left free for the next recovery. There is no third outcome, so refusing to
+# send the release only ever preserved the leak.
+#
+# The exit code is unchanged: RECOVERY_LEASE_ACQUIRED, not the release result,
+# is what turns a failed release into the exit-75 stop, so a loser whose blind
+# release is rejected still exits 1 -- nothing was confirmed taken, and retrying
+# after the winner finishes is safe.
+#
+# The reverse interleaving is a known and accepted case. A acquires; B breaks
+# and acquires; A's renew then fails because A no longer holds anything. A's
+# trap sends its release, Azure rejects it -- A's ID is not B's -- and because
+# A's acquire had been confirmed, A exits 75 with the retention message while
+# in fact holding nothing. The exactly-one-winner property still holds: B holds
+# the lease and B alone reports success. The message is conservative in the safe
+# direction -- it sends an operator to look at a container that is genuinely
+# leased, just not by A -- and the remedy it names is this same command.
+RECOVERY_LEASE_ACTIVE=false
 RECOVERY_LEASE_ACQUIRED=false
 release_recovery_lease() {
   if test "${RECOVERY_LEASE_ACTIVE:-false}" = "true"; then
@@ -143,6 +186,16 @@ trap 'release_recovery_lease' 0
 trap 'exit 129' HUP
 trap 'exit 130' INT
 trap 'exit 143' TERM
+if ! private_az storage container lease break \
+  --account-name "$STATE_STORAGE_ACCOUNT" \
+  --container-name "$OPERATION_CONTAINER" \
+  --auth-mode login \
+  --lease-break-period 0 \
+  --output none >/dev/null; then
+  printf 'Operation lease recovery failed closed.\n' >&2
+  exit 1
+fi
+RECOVERY_LEASE_ACTIVE=true
 if ! private_az storage container lease acquire \
   --account-name "$STATE_STORAGE_ACCOUNT" \
   --container-name "$OPERATION_CONTAINER" \

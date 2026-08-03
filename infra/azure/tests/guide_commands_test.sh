@@ -7,6 +7,10 @@ README="$ROOT/infra/azure/README.md"
 TMP_ROOT="$(mktemp -d)"
 TMP_DIR="$TMP_ROOT/guide commands"
 mkdir -p "$TMP_DIR"
+# Both spellings of the harness root. On macOS mktemp hands back a /var/folders
+# path that is a symlink to /private/var/folders, and a runbook that resolved a
+# private directory with `pwd -P` would print the second one.
+TMP_ROOT_PHYSICAL="$(CDPATH= cd -- "$TMP_ROOT" && pwd -P)"
 
 # Set PP_KEEP_TMP=1 to keep the scenario command logs, stdout/stderr captures
 # and mock state for inspection; tests/canonicalize_guide_logs.sh turns what is
@@ -27,6 +31,68 @@ fail() {
 
 file_mode() {
   stat -c '%a' "$1" 2>/dev/null || stat -f '%Lp' "$1"
+}
+
+# --- the no-private-output sweep ---------------------------------------------
+#
+# Every documented command makes the same promise about its own output: an
+# operator watching it, and an AI agent reading it back, learn nothing about the
+# environment they did not already have to know in order to run it. Failure
+# messages are generic on purpose, and the private values are in the operator's
+# record rather than on the terminal.
+#
+# That promise used to be kept by a grep copied into eight scenario loops, each
+# with a slightly different pattern list and each covering only the flow it sat
+# in. A command that grew a new printf was covered if somebody remembered to
+# extend the right list; a command written next year was covered if somebody
+# remembered to write one. The promise is universal, so the check is now too:
+# the driver runs it over every scenario's captured stdout and stderr after
+# every group, and a new command is covered the moment its first scenario runs.
+#
+# The pattern is the union of the eight lists it replaces. The harness's own
+# temporary root is checked alongside it, which subsumes the two hand-written
+# "exposed the private diagnostic path" assertions -- a private diagnostic,
+# session or plan directory can only be somewhere under that root.
+#
+# What is deliberately not here: a bare 64-hex-character pattern. The workload
+# binding digest is 64 hex and must never be printed -- but so is the
+# infrastructure review token, which is printed on purpose and is the whole
+# mechanism of the second-operator approval. A universal ban would have to be a
+# ban on the approval flow. The release and rollback flows have no reason to
+# print any 64-hex string, so they keep that one conjunct in their own stanzas,
+# which is the only thing left in them.
+GUIDE_PRIVATE_OUTPUT_PATTERN='[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}|sha256:[0-9a-f]{64}|patchpagestate|patchpagedrafts|patchpage-prod\.tfstate|patchpage-operations|patchpage-db|patchpage-app|acrpatchpageabc123|rg-patchpage-tfstate|rg-patchpage-workload|rg-test|app-test|env-test|drafts\.self-hoster\.dev|203\.0\.113\.10|verification-id|private-(az|tofu|rollback|infra-az|infra-tofu)-diagnostic|pp_[A-Za-z0-9]|[Aa]ccount[Kk]ey'
+
+# Returns 0 when one of the given captures contains a private value, naming the
+# first offender on stdout, and 1 when they are all clean. Reports status rather
+# than calling fail so the check itself can be meta-tested, and takes the whole
+# set rather than one file so the sweep and the meta-test run the same code: a
+# per-file loop over eighteen groups was some thirty thousand grep spawns, and
+# the batch form that fixed that is only trustworthy if it is the form the
+# meta-test exercises.
+guide_private_output_leaks() {
+  guide_output_leak_hit="$(
+    grep -lE "$GUIDE_PRIVATE_OUTPUT_PATTERN" "$@" 2>/dev/null | sed -n '1p'
+  )"
+  test -n "$guide_output_leak_hit" || return 1
+  printf '%s\n' "$guide_output_leak_hit"
+}
+
+# The same shape for the harness's own temporary root, which is the other half
+# of the promise: a private diagnostic, session or plan directory can only be
+# somewhere under it, so a capture naming it has exposed a private path. Both
+# spellings are checked because macOS hands back a /var/folders path that is a
+# symlink to /private/var/folders, and a runbook that resolved a directory with
+# `pwd -P` would print the second.
+guide_private_path_leaks() {
+  guide_path_leak_hit="$(
+    {
+      grep -lF "$TMP_ROOT" "$@" 2>/dev/null
+      grep -lF "$TMP_ROOT_PHYSICAL" "$@" 2>/dev/null
+    } | sed -n '1p'
+  )"
+  test -n "$guide_path_leak_hit" || return 1
+  printf '%s\n' "$guide_path_leak_hit"
 }
 
 # The one interesting case in the exit-code contract ops.sh --help states: a
@@ -80,7 +146,8 @@ GUIDE_OPS="$ROOT/infra/azure/ops.sh"
 GUIDE_CMD_DIR="$ROOT/infra/azure/cmd"
 GUIDE_LIB_DIR="$ROOT/infra/azure/lib"
 GUIDE_COMMANDS="state-bootstrap deploy-resources app-release app-rollback
-infrastructure-change stale-lease-recovery custom-domain-context
+infrastructure-change infrastructure-plan infrastructure-apply
+infrastructure-abandon stale-lease-recovery custom-domain-context
 ingress-verification apex-dns caa-policy hostname-mutation certificate-binding
 deployed-smoke"
 
@@ -88,7 +155,7 @@ deployed-smoke"
 # and is now one definition; they are part of the executable surface and are
 # held to the same rules as the commands, which is why they are named here
 # rather than discovered by globbing.
-GUIDE_LIBS="wrappers lease revision diag plan_gate state_inspect dns"
+GUIDE_LIBS="wrappers lease revision diag plan_gate state_inspect dns infra_change"
 
 test -f "$GUIDE_OPS" || fail "infra/azure/ops.sh is missing"
 sh -n "$GUIDE_OPS" || fail "infra/azure/ops.sh is not valid POSIX shell"
@@ -606,20 +673,10 @@ test_state_bootstrap() {
         grep -Fq 'Could not verify the dedicated state containers.' \
           "$TMP_DIR/state-$scenario.out" ||
           fail "state bootstrap did not reject the malformed container inventory row"
-        if grep -Eq \
-          '00000000-0000-0000-0000-000000000000|11111111-1111-1111-1111-111111111111|patchpagestate|rg-patchpage-tfstate|patchpage-prod\.tfstate' \
-          "$TMP_DIR/state-$scenario.out"; then
-          fail "state bootstrap exposed private identifiers after $scenario"
-        fi
         ;;
       *)
         test "$status" -ne 0 || fail "state bootstrap succeeded after $scenario"
         test ! -e "$backend" || fail "state bootstrap created backend config after $scenario"
-        if grep -Eq \
-          '00000000-0000-0000-0000-000000000000|11111111-1111-1111-1111-111111111111|patchpagestate|rg-patchpage-tfstate|patchpage-prod\.tfstate' \
-          "$TMP_DIR/state-$scenario.out"; then
-          fail "state bootstrap exposed private identifiers after $scenario"
-        fi
         ;;
     esac
     case "$scenario" in
@@ -990,14 +1047,6 @@ key                  = "patchpage-prod.tfstate"' ||
       test "$scenario" != "resume_target_complete_success" &&
       grep -q '^completed$' "$log"; then
       fail "deployment continued after $scenario"
-    fi
-    if grep -Eq \
-      '00000000-0000-0000-0000-000000000000|22222222-2222-2222-2222-222222222222|private-(az|tofu)-diagnostic' \
-      "$output"; then
-      fail "deployment exposed private identifiers or producer diagnostics after $scenario"
-    fi
-    if grep -Fq "$TMP_DIR/deploy-diagnostics-$scenario" "$output"; then
-      fail "deployment exposed the private OpenTofu diagnostic path"
     fi
     if test "$scenario" = "final_apply_failure"; then
       # A half-applied deployment is the same "stop, a second operator must
@@ -1525,10 +1574,13 @@ test_app_release() {
           fail "app release readiness failure omitted the retained-lease recovery warning after $scenario"
         ;;
     esac
-    if grep -Eq \
-      '00000000-0000-0000-0000-000000000000|patchpagestate|rg-patchpage-workload|[0-9a-f]{64}' \
-      "$output"; then
-      fail "app release exposed a private ID or workload-binding hash after $scenario"
+    # The identifiers are the driver's sweep now. What stays here is the bare
+    # 64-hex conjunct, which cannot be universal: the infrastructure review
+    # token is 64 hex and is printed on purpose. This flow has no such token and
+    # no reason to print any 64-hex string, so the workload binding digest
+    # reaching its output is a leak with no legitimate reading.
+    if grep -Eq '[0-9a-f]{64}' "$output"; then
+      fail "app release exposed a workload-binding hash after $scenario"
     fi
   done
   test "$((GUIDE_RETAINED_LEASE_EXITS - release_retained_start))" -ge 5 ||
@@ -1717,10 +1769,11 @@ test_app_rollback() {
         "$log" ||
         fail "rollback did not target only the expected Container App and digest"
     fi
-    if grep -Eq \
-      'private-rollback-diagnostic|00000000-0000-0000-0000-000000000000|22222222-2222-2222-2222-222222222222|acrpatchpageabc123|patchpagestate|[0-9a-f]{64}' \
-      "$output"; then
-      fail "rollback exposed private identifiers or producer diagnostics"
+    # As for app release: the identifiers and the producer diagnostics are the
+    # driver's sweep, and the bare 64-hex conjunct is what only this flow can
+    # say.
+    if grep -Eq '[0-9a-f]{64}' "$output"; then
+      fail "rollback exposed a workload-binding hash"
     fi
 
     if test "$scenario" = "success" ||
@@ -2056,7 +2109,7 @@ azurerm_container_app.server'
   printf '%s\n' "$required_addresses" |
     while IFS= read -r address; do
       test -z "$address" && continue
-      grep -Fq "$address" "$GUIDE_CMD_DIR/infrastructure-change.sh" ||
+      grep -Fq "$address" "$GUIDE_LIB_DIR/infra_change.sh" ||
         fail "infrastructure change omitted required state address $address"
     done
 
@@ -2641,9 +2694,6 @@ azurerm_container_app.server'
         fi
         ;;
     esac
-    if grep -Fq "$TMP_DIR/infrastructure-diagnostics-$scenario" "$output"; then
-      fail "infrastructure change exposed the private OpenTofu diagnostic path"
-    fi
     if test "$scenario" = "plan_failure"; then
       test -f "$diagnostic_path_file" ||
         fail "failed infrastructure change lost its private diagnostic location"
@@ -2662,6 +2712,428 @@ azurerm_container_app.server'
   test "$((GUIDE_RETAINED_LEASE_EXITS - infrastructure_retained_start))" -ge 3 ||
     fail "infrastructure change never exercised a deliberately retained operation lease"
 }
+
+# --- the infrastructure plan/apply session ------------------------------------
+#
+# infrastructure-plan, infrastructure-apply and infrastructure-abandon are one
+# flow across three processes, so unlike every other group here a scenario is a
+# *sequence* of commands sharing one mock state directory, one command log and
+# one session root. That sharing is the point: the operation lease the plan
+# takes has to still be there when the apply renews it, and the only way to test
+# that is to let one process's state be the next process's world.
+#
+# The scenarios are the ways the handoff can be wrong, not the ways the plan can
+# be wrong -- the plan half is the same library the twenty infrastructure-change
+# scenarios already drive, and re-testing it here would only pin it twice.
+
+# The bytes tests/mocks/tofu writes for a saved plan, and their SHA-256. Both
+# are stated here rather than computed, so a change to either side of the
+# session's integrity check has to be made deliberately in two places.
+GUIDE_SESSION_PLAN_BYTES="patchpage-mock-infrastructure-plan"
+GUIDE_SESSION_PLAN_SHA256="8f0c4197a0e5fa9fa8d7f60dc2fb7e7a2213ed4fa05945fa35f5490a2911f733"
+
+guide_session_paths() {
+  session_scenario="$1"
+  session_root="$TMP_DIR/session-$session_scenario-root"
+  session_repo="$TMP_DIR/session-$session_scenario-repo"
+  session_diagnostics="$TMP_DIR/session-$session_scenario-diagnostics"
+  session_dir="$session_root/patchpage-infrastructure-session"
+}
+
+guide_session_setup() {
+  guide_session_paths "$1"
+  rm -rf "$session_root" "$session_repo" "$session_diagnostics"
+  mkdir -p "$session_root" "$session_repo/infra/azure" "$session_diagnostics"
+  session_root="$(CDPATH= cd -- "$session_root" && pwd -P)"
+  session_diagnostics="$(CDPATH= cd -- "$session_diagnostics" && pwd -P)"
+  session_dir="$session_root/patchpage-infrastructure-session"
+  prepare_mock_state "$TMP_DIR/session-$1.mockstate"
+  # Every session scenario runs against an environment whose operation
+  # container is already sealed; adoption is infrastructure-change's subject.
+  : > "$PP_MOCK_STATE/operation-container-created"
+}
+
+# Runs one command of a session. The step name only names the output file, so a
+# scenario can run the same command twice and keep both captures.
+run_infrastructure_session_command() {
+  session_scenario="$1"
+  session_command="$2"
+  session_step="$3"
+  session_approval="${4:-}"
+  session_root_override="${5:-$session_root}"
+  output="$TMP_DIR/session-$session_scenario-$session_step.out"
+  # One log per step, not per scenario. What the three processes of a session
+  # share is the mock state -- the operation lease, the plan marker -- and that
+  # is the sharing under test. Their command logs are separate so an assertion
+  # about what the apply did cannot be satisfied by something the plan did.
+  session_log="$TMP_DIR/session-$session_scenario-$session_step.log"
+  : > "$session_log"
+
+  (
+    SUBSCRIPTION_ID="00000000-0000-0000-0000-000000000000"
+    STATE_STORAGE_ACCOUNT="patchpagestate"
+    STATE_CONTAINER="tfstate"
+    STATE_KEY="patchpage-prod.tfstate"
+    EXPECTED_OPERATION_AUTH_MODE="key"
+    EXPECTED_STATE_LINEAGE="11111111-1111-1111-1111-111111111111"
+    EXPECTED_RESOURCE_GROUP_ID="/subscriptions/$SUBSCRIPTION_ID/resourceGroups/rg-patchpage-workload"
+    EXPECTED_STORAGE_ACCOUNT_ID="$EXPECTED_RESOURCE_GROUP_ID/providers/Microsoft.Storage/storageAccounts/patchpagedrafts"
+    EXPECTED_POSTGRES_SERVER_ID="$EXPECTED_RESOURCE_GROUP_ID/providers/Microsoft.DBforPostgreSQL/flexibleServers/patchpage-db"
+    EXPECTED_ACR_ID="$EXPECTED_RESOURCE_GROUP_ID/providers/Microsoft.ContainerRegistry/registries/acrpatchpageabc123"
+    EXPECTED_CONTAINER_APP_ID="$EXPECTED_RESOURCE_GROUP_ID/providers/Microsoft.App/containerApps/patchpage-app"
+    RESOURCE_GROUP="rg-patchpage-workload"
+    CONTAINER_APP="patchpage-app"
+    ACR="acrpatchpageabc123"
+    LEGACY_IMAGE_TAG="1111111"
+    LEGACY_IMAGE_DIGEST="sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    IMMUTABLE_IMAGE="acrpatchpageabc123.azurecr.io/patchpage-server@$LEGACY_IMAGE_DIGEST"
+    OLD_REVISION_NAME="patchpage-app--stable"
+    ADOPTION_REVISION_NAME="patchpage-app--adopted"
+    POSTAPPLY_REVISION_NAME="patchpage-app--infra"
+    LATER_REVISION_NAME="patchpage-app--later"
+    EXPECTED_OPERATION_BINDING_SHA256="$(
+      guide_operation_binding_sha256 "$STATE_KEY"
+    )"
+    TERRAFORM_DIAGNOSTIC_ROOT="$session_diagnostics"
+    INFRA_CHANGE_SESSION_ROOT="$session_root_override"
+    ADOPT_SAFETY_GUARDS="false"
+    export SUBSCRIPTION_ID STATE_STORAGE_ACCOUNT STATE_CONTAINER STATE_KEY \
+      EXPECTED_OPERATION_AUTH_MODE EXPECTED_STATE_LINEAGE \
+      EXPECTED_RESOURCE_GROUP_ID EXPECTED_STORAGE_ACCOUNT_ID \
+      EXPECTED_POSTGRES_SERVER_ID EXPECTED_ACR_ID EXPECTED_CONTAINER_APP_ID \
+      RESOURCE_GROUP CONTAINER_APP ACR LEGACY_IMAGE_TAG LEGACY_IMAGE_DIGEST \
+      IMMUTABLE_IMAGE OLD_REVISION_NAME ADOPTION_REVISION_NAME \
+      POSTAPPLY_REVISION_NAME LATER_REVISION_NAME \
+      EXPECTED_OPERATION_BINDING_SHA256 TERRAFORM_DIAGNOSTIC_ROOT \
+      INFRA_CHANGE_SESSION_ROOT ADOPT_SAFETY_GUARDS
+    if test -n "$session_approval"; then
+      INFRA_CHANGE_APPROVAL_SHA256="$session_approval"
+      export INFRA_CHANGE_APPROVAL_SHA256
+    fi
+
+    PP_MOCK_GROUP="infrastructure"
+    PP_MOCK_SCENARIO="$session_scenario"
+    PP_MOCK_LOG="$session_log"
+    PP_MOCK_REPO_ROOT="$session_repo"
+    PP_MOCK_SCENARIO_ROOT="$session_repo"
+    export PP_MOCK_GROUP PP_MOCK_SCENARIO PP_MOCK_LOG PP_MOCK_REPO_ROOT \
+      PP_MOCK_SCENARIO_ROOT
+
+    run_ops_command_completed "$session_command"
+  ) >"$output" 2>&1
+}
+
+# The recorded operation lease, read back from the session the way the apply
+# reads it. Used to state, from outside the commands, whether the container is
+# still leased to the plan.
+guide_session_lease_is_held() {
+  test -f "$PP_MOCK_STATE/operation-lease-id"
+}
+
+# Runs one session command, records its status, and holds it to the exit-code
+# contract every other flow here is held to: a run that says it kept the
+# operation lease must exit 75, and a run that exits 75 must say so.
+#
+# infrastructure-plan is the one command that ends with the lease deliberately
+# held and still exits 0, and it is worth being clear about what keeps that
+# exception narrow, because it is not this assertion. This assertion only knows
+# the two retention messages; the plan's hand-off message is a third string it
+# has never heard of, so the plan passes here the way any non-retaining run
+# does. What pins the plan is the standalone grep for
+# 'The operation lease is held for this session.' further down, together with
+# the group-wide check that this group contributed nothing to
+# GUIDE_RETAINED_LEASE_EXITS. A plan that started printing a *retention*
+# message would be caught here; a plan that stopped saying anything about the
+# lease at all would be caught there.
+guide_session_run() {
+  if run_infrastructure_session_command "$@"; then
+    session_status=0
+  else
+    session_status=$?
+  fi
+  session_output="$TMP_DIR/session-$1-$3.out"
+  session_log="$TMP_DIR/session-$1-$3.log"
+  assert_retained_lease_exit_code "infrastructure session $2" "$1" \
+    "$session_status" "$session_output"
+}
+
+guide_session_run_plan() {
+  guide_session_run "$1" infrastructure-plan plan
+  session_plan_output="$TMP_DIR/session-$1-plan.out"
+  session_token="$(
+    sed -n 's/^INFRA_CHANGE_APPROVAL_SHA256=//p' "$session_plan_output"
+  )"
+}
+
+test_infrastructure_session() {
+  session_retained_start="$GUIDE_RETAINED_LEASE_EXITS"
+
+  # --- the handoff itself ----------------------------------------------------
+  guide_session_setup session_success
+  guide_session_run_plan session_success
+  test "$session_status" -eq 0 ||
+    fail "infrastructure plan rejected the session handoff"
+  printf '%s\n' "$session_token" | grep -Eq '^[0-9a-f]{64}$' ||
+    fail "infrastructure plan did not print a well-formed review token"
+  test -d "$session_dir" ||
+    fail "infrastructure plan did not leave a session behind"
+  test "$(file_mode "$session_dir")" = "700" ||
+    fail "the infrastructure session directory is not private"
+  for session_field in plan.tfplan plan.sha256 inventory lease revision \
+    locked-image planned-image; do
+    test -f "$session_dir/$session_field" ||
+      fail "the infrastructure session is missing $session_field"
+    test "$(file_mode "$session_dir/$session_field")" = "600" ||
+      fail "the infrastructure session field $session_field is not private"
+  done
+  test "$(cat "$session_dir/plan.tfplan")" = "$GUIDE_SESSION_PLAN_BYTES" ||
+    fail "the infrastructure session did not preserve the saved plan"
+  test "$(cat "$session_dir/plan.sha256")" = "$GUIDE_SESSION_PLAN_SHA256" ||
+    fail "the infrastructure session recorded the wrong plan digest"
+  # The whole reason the session exists: the environment is still held.
+  guide_session_lease_is_held ||
+    fail "infrastructure plan gave the operation lease back and left nothing holding the reviewed plan's world still"
+  test "$(cat "$session_dir/lease")" = "$(cat "$PP_MOCK_STATE/operation-lease-id")" ||
+    fail "the infrastructure session recorded a lease it is not holding"
+  grep -Fq 'The operation lease is held for this session.' "$session_plan_output" ||
+    fail "infrastructure plan did not say the lease is still held"
+  if grep -Fq 'tofu apply ' "$session_log"; then
+    fail "infrastructure plan applied something"
+  fi
+
+  guide_session_run session_success infrastructure-apply apply "$session_token"
+  test "$session_status" -eq 0 ||
+    fail "infrastructure apply rejected its own session"
+  # The exact saved plan file, not a path this process could have replanned to.
+  grep -Fqx "tofu apply -input=false $session_dir/plan.tfplan" "$session_log" ||
+    fail "infrastructure apply did not apply the exact plan file the session preserved"
+  test ! -e "$session_dir" ||
+    fail "infrastructure apply left the session behind"
+  if guide_session_lease_is_held; then
+    fail "infrastructure apply did not give the operation lease back"
+  fi
+
+  # --- a plan that is not the plan that was reviewed --------------------------
+  guide_session_setup session_tampered_plan
+  guide_session_run_plan session_tampered_plan
+  test "$session_status" -eq 0 ||
+    fail "infrastructure plan failed before the tamper scenario could tamper"
+  printf '%s\n' "tampered" >> "$session_dir/plan.tfplan" ||
+    fail "could not tamper with the saved plan"
+  guide_session_run session_tampered_plan infrastructure-apply apply \
+    "$session_token"
+  test "$session_status" -ne 0 ||
+    fail "infrastructure apply accepted a saved plan that had been edited"
+  grep -Fq 'is not the plan that was reviewed' "$session_output" ||
+    fail "infrastructure apply did not name the plan-integrity failure"
+  if grep -Fq 'tofu apply ' "$session_log"; then
+    fail "infrastructure apply applied a tampered plan"
+  fi
+  # Refused before the lease was touched: the session is intact and still holds
+  # the environment, so the operator can review again or abandon.
+  test -d "$session_dir" ||
+    fail "infrastructure apply discarded a session it refused"
+  guide_session_lease_is_held ||
+    fail "infrastructure apply gave back a lease it never took"
+
+  # --- an approval that names other actions ----------------------------------
+  guide_session_setup session_wrong_token
+  guide_session_run_plan session_wrong_token
+  test "$session_status" -eq 0 || fail "infrastructure plan failed before the token scenario"
+  guide_session_run session_wrong_token infrastructure-apply apply \
+    "0000000000000000000000000000000000000000000000000000000000000000"
+  test "$session_status" -ne 0 ||
+    fail "infrastructure apply accepted an approval for other actions"
+  if grep -Fq 'tofu apply ' "$session_log"; then
+    fail "infrastructure apply applied an unapproved plan"
+  fi
+  guide_session_lease_is_held ||
+    fail "a refused approval cost the session its operation lease"
+
+  # --- the lease was recovered between the review and the apply ---------------
+  #
+  # A second operator proved this session's process was gone and ran
+  # stale-lease-recovery. The saved plan is still on disk and still hashes
+  # correctly; what it no longer describes is an environment nobody has touched.
+  guide_session_setup session_stale_lease
+  guide_session_run_plan session_stale_lease
+  test "$session_status" -eq 0 || fail "infrastructure plan failed before the stale-lease scenario"
+  rm -f "$PP_MOCK_STATE/operation-lease-id" ||
+    fail "could not simulate the recovered operation lease"
+  guide_session_run session_stale_lease infrastructure-apply apply \
+    "$session_token"
+  test "$session_status" -ne 0 ||
+    fail "infrastructure apply applied a reviewed plan after its lease was recovered"
+  grep -Fq 'no longer holding the operation lease' "$session_output" ||
+    fail "infrastructure apply did not name the lost lease"
+  if grep -Fq 'tofu apply ' "$session_log"; then
+    fail "infrastructure apply applied a plan whose lease it could not renew"
+  fi
+
+  # --- no session at all ------------------------------------------------------
+  guide_session_setup session_missing
+  guide_session_run session_missing infrastructure-apply apply \
+    "0000000000000000000000000000000000000000000000000000000000000000"
+  test "$session_status" -ne 0 ||
+    fail "infrastructure apply ran without a reviewed plan"
+  grep -Fq 'No reviewed infrastructure plan is open' "$session_output" ||
+    fail "infrastructure apply did not name the missing session"
+
+  # --- abandoning -------------------------------------------------------------
+  guide_session_setup session_abandon
+  guide_session_run_plan session_abandon
+  test "$session_status" -eq 0 || fail "infrastructure plan failed before the abandon scenario"
+  guide_session_run session_abandon infrastructure-abandon abandon
+  test "$session_status" -eq 0 || fail "infrastructure abandon refused an open session"
+  grep -Fqx 'Infrastructure session abandoned.' "$session_output" ||
+    fail "infrastructure abandon did not report completion"
+  test ! -e "$session_dir" || fail "infrastructure abandon left the session behind"
+  if guide_session_lease_is_held; then
+    fail "infrastructure abandon did not give the operation lease back"
+  fi
+  # It loads no OpenTofu at all: a session must stay closable when the thing it
+  # was planning against is what is broken.
+  if grep -Fq 'tofu ' "$session_log"; then
+    fail "infrastructure abandon ran OpenTofu"
+  fi
+
+  # --- abandoning a session whose lease is already gone -----------------------
+  guide_session_setup session_abandon_recovered
+  guide_session_run_plan session_abandon_recovered
+  test "$session_status" -eq 0 ||
+    fail "infrastructure plan failed before the recovered-abandon scenario"
+  rm -f "$PP_MOCK_STATE/operation-lease-id" ||
+    fail "could not simulate the recovered operation lease"
+  guide_session_run session_abandon_recovered infrastructure-abandon abandon
+  test "$session_status" -eq 0 ||
+    fail "infrastructure abandon escalated over a lease that was already recovered"
+  test ! -e "$session_dir" ||
+    fail "infrastructure abandon kept a session whose lease was already gone"
+
+  # --- a session a crash left half-written ------------------------------------
+  #
+  # infra_session_create writes seven things one after another. A process killed
+  # between two of them, or a disk that fills, leaves a directory complete
+  # enough to stop the next plan -- a session is open -- and incomplete enough
+  # to fail a load that insists on all seven. Every command then refuses: plan
+  # because a session is open, apply and abandon because the session will not
+  # load, and the operation lease stays held with nothing able to give it back.
+  # Abandoning is the way out of that, so abandoning must not require the six
+  # fields it never reads.
+  guide_session_setup session_partial
+  guide_session_run_plan session_partial
+  test "$session_status" -eq 0 ||
+    fail "infrastructure plan failed before the half-written-session scenario"
+  guide_session_lease_is_held ||
+    fail "infrastructure plan left nothing holding the environment before the half-written-session scenario"
+  session_partial_lease="$(cat "$session_dir/lease")"
+  rm -f "$session_dir/plan.tfplan" "$session_dir/plan.sha256" \
+    "$session_dir/revision" "$session_dir/locked-image" ||
+    fail "could not simulate a half-written session"
+  for session_field in lease inventory planned-image; do
+    test -f "$session_dir/$session_field" ||
+      fail "the half-written-session scenario did not leave $session_field behind"
+  done
+  guide_session_run session_partial infrastructure-abandon abandon
+  test "$session_status" -eq 0 ||
+    fail "infrastructure abandon refused a half-written session, leaving it unclosable"
+  grep -Fqx 'Infrastructure session abandoned.' "$session_output" ||
+    fail "infrastructure abandon did not report closing the half-written session"
+  test ! -e "$session_dir" ||
+    fail "infrastructure abandon left the half-written session behind"
+  # The lease is why any of this matters, and the one surviving field that names
+  # it is enough to prove it and give it back.
+  if guide_session_lease_is_held; then
+    fail "infrastructure abandon cleared a half-written session without giving back its operation lease"
+  fi
+  grep -Fqx \
+    "az storage container lease release --account-name patchpagestate --container-name patchpage-operations --auth-mode key --lease-id $session_partial_lease --output none" \
+    "$session_log" ||
+    fail "infrastructure abandon did not release the exact lease the half-written session recorded"
+  # And the referral cycle is broken where it matters: a plan can be opened
+  # again, which is the whole point of having closed the session.
+  guide_session_run session_partial infrastructure-plan replan
+  test "$session_status" -eq 0 ||
+    fail "infrastructure plan still could not open a session after the half-written one was abandoned"
+  test -d "$session_dir" ||
+    fail "the plan after the abandoned half-written session left no session behind"
+
+  # --- a session too damaged to name a lease ----------------------------------
+  #
+  # Below the one field abandon needs. There is no lease it could prove or hand
+  # back, so it clears the record and says so, and it must not guess at an ID:
+  # what is left is a container whose lease only stale-lease-recovery can reach.
+  guide_session_setup session_partial_no_lease
+  guide_session_run_plan session_partial_no_lease
+  test "$session_status" -eq 0 ||
+    fail "infrastructure plan failed before the unnameable-lease scenario"
+  rm -f "$session_dir/lease" "$session_dir/plan.sha256" ||
+    fail "could not simulate a session that lost its lease field"
+  guide_session_run session_partial_no_lease infrastructure-abandon abandon
+  test "$session_status" -eq 0 ||
+    fail "infrastructure abandon refused a session that had lost its lease field"
+  grep -Fq 'clearing the session record only' "$session_output" ||
+    fail "infrastructure abandon did not say it was clearing the record only"
+  test ! -e "$session_dir" ||
+    fail "infrastructure abandon kept a session it could not read a lease from"
+  for session_lease_verb in renew release; do
+    if grep -Fq "az storage container lease $session_lease_verb " "$session_log"; then
+      fail "infrastructure abandon sent a lease $session_lease_verb for a lease the session never named"
+    fi
+  done
+  guide_session_lease_is_held ||
+    fail "infrastructure abandon released a lease it could not name"
+
+  # --- a second session over an open one --------------------------------------
+  guide_session_setup session_reopen
+  guide_session_run_plan session_reopen
+  test "$session_status" -eq 0 || fail "infrastructure plan failed before the reopen scenario"
+  session_first_lease="$(cat "$session_dir/lease")"
+  guide_session_run session_reopen infrastructure-plan replan
+  test "$session_status" -ne 0 ||
+    fail "infrastructure plan opened a second session over an open one"
+  grep -Fq 'An infrastructure session is already open' "$session_output" ||
+    fail "infrastructure plan did not name the open session"
+  test "$(cat "$session_dir/lease")" = "$session_first_lease" ||
+    fail "the refused second plan overwrote the open session"
+  guide_session_lease_is_held ||
+    fail "the refused second plan released the open session's lease"
+
+  # --- a session root inside the repository -----------------------------------
+  #
+  # A saved plan is a complete description of an environment, and one written
+  # inside the repository is one `git add -A` away from being published. The
+  # refusal has to land before anything is planned or leased.
+  guide_session_setup session_inside_repo
+  guide_session_run session_inside_repo infrastructure-plan plan "" \
+    "$session_repo/infra"
+  test "$session_status" -ne 0 ||
+    fail "infrastructure plan wrote its session inside the repository"
+  grep -Fq 'must remain outside the repository' "$session_output" ||
+    fail "infrastructure plan did not name the in-repository session root"
+  if grep -Fq 'az storage container lease acquire ' "$session_log"; then
+    fail "infrastructure plan took the operation lease before vetting its session root"
+  fi
+
+  # No session command may retain a lease, so this group must contribute nothing
+  # to the retained-lease count. Stated rather than assumed: a session command
+  # that started exiting 75 would otherwise pass silently.
+  test "$GUIDE_RETAINED_LEASE_EXITS" -eq "$session_retained_start" ||
+    fail "an infrastructure session command retained the operation lease"
+
+  # The two facts an operator cannot discover from the commands' own output: the
+  # lease is deliberately held between the plan and the apply, and the saved
+  # plan is what the apply checks rather than a fresh one.
+  grep -Fq 'the operation lease stays held' "$README" ||
+    fail "the infrastructure session guidance omits that the lease is held across the review"
+  grep -Fq 'still hashes to the digest recorded at review time' "$README" ||
+    fail "the infrastructure session guidance omits the saved-plan integrity check"
+  grep -Fq 'What it cannot carry forward is the plan itself' "$README" ||
+    fail "the guide no longer says what the one-shot flow does not carry between its two runs"
+}
+
+# The lease ID the winning recoverer holds in the concurrent-recovery scenario.
+GUIDE_CONCURRENT_RECOVERY_LEASE_ID="99999999-9999-9999-9999-999999999999"
 
 run_stale_lease_recovery_block() {
   scenario="$1"
@@ -2699,8 +3171,14 @@ run_stale_lease_recovery_block() {
     PP_MOCK_OPERATION_BINDING_SHA256="$(
       guide_operation_binding_sha256 "$STATE_KEY"
     )"
+    # The lease the *other* recoverer holds in the concurrent scenario. It is a
+    # fixed value the harness knows, so the loser's log can be checked for ever
+    # having named it: a loser that somehow released the winner's lease would be
+    # doing the one thing the single-flight rule exists to prevent.
+    PP_MOCK_CONCURRENT_LEASE_ID="$GUIDE_CONCURRENT_RECOVERY_LEASE_ID"
     export PP_MOCK_GROUP PP_MOCK_SCENARIO PP_MOCK_LOG \
-      PP_MOCK_LEASE_SCENARIO_PREFIX PP_MOCK_OPERATION_BINDING_SHA256
+      PP_MOCK_LEASE_SCENARIO_PREFIX PP_MOCK_OPERATION_BINDING_SHA256 \
+      PP_MOCK_CONCURRENT_LEASE_ID
     prepare_mock_state "$TMP_DIR/stale-lease-$scenario.mockstate"
 
     run_ops_command_completed stale-lease-recovery
@@ -2719,6 +3197,8 @@ test_stale_lease_recovery() {
     container_nonempty \
     break_failure \
     acquire_failure \
+    acquire_ok_transit_fails \
+    concurrent_recovery \
     renew_failure \
     release_failure \
     success; do
@@ -2774,11 +3254,6 @@ test_stale_lease_recovery() {
       if grep -q '^completed$' "$log"; then
         fail "stale operation lease recovery continued after $scenario"
       fi
-      if grep -Eq \
-        '00000000-0000-0000-0000-000000000000|patchpagestate|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}' \
-        "$output"; then
-        fail "stale operation lease recovery exposed a private identifier after $scenario"
-      fi
       case "$scenario" in
         operation_container_lookup_failure | operation_container_identity_mismatch | \
           binding_lookup_failure | foreign_binding)
@@ -2786,9 +3261,152 @@ test_stale_lease_recovery() {
             fail "stale operation lease recovery broke a lease after $scenario"
           fi
           ;;
+        acquire_ok_transit_fails)
+          # Azure granted the acquire and the answer was lost coming back. The
+          # container is leased under this recovery's own ID, this recovery has
+          # been told it failed, and no other process can ever name that ID --
+          # so if this run does not release it, nothing short of another break
+          # will. The release the exit trap sends blind is what makes the leak
+          # recoverable, and it is why a refused acquire is not a reason to
+          # stop calling Azure.
+          transit_lease_id="$(
+            sed -n 's/^az storage container lease acquire .* --proposed-lease-id \([^ ]*\) --output none$/\1/p' "$log"
+          )"
+          test -n "$transit_lease_id" ||
+            fail "the recoverer proposed no lease ID during $scenario"
+          grep -Fqx \
+            "az storage container lease release --account-name patchpagestate --container-name patchpage-operations --auth-mode login --lease-id $transit_lease_id --output none" \
+            "$log" ||
+            fail "the recoverer left behind the lease its refused acquire had in fact been granted during $scenario"
+          # And the leak is actually gone, not merely aimed at: the container
+          # the mock is keeping is unleased again.
+          test ! -e "$TMP_DIR/stale-lease-$scenario.mockstate/operation-lease-id" ||
+            fail "the operation container is still leased after $scenario"
+          # Still exit 1, not 75: nothing was ever confirmed taken, so retrying
+          # is the right advice.
+          test "$status" -eq 1 ||
+            fail "the recoverer exited $status instead of 1 during $scenario"
+          ;;
+        concurrent_recovery)
+          # The losing side of the race. Its break landed, a second recoverer
+          # took the container back in that instant, and its own acquire was
+          # refused. Three things have to be true of what it did next.
+          #
+          # First: it gave up recovering, and everything it sent after the
+          # refused acquire is one release of the ID it minted itself. That
+          # release is deliberate and safe to send blind -- Azure matches a
+          # release against the live lease ID exactly, so against the winner's
+          # lease it is a 409 that changes nothing, and against the residue of
+          # an acquire that was granted but lost in transit it is the only
+          # thing that clears it. What is forbidden is anything else: a renew,
+          # a second break, a metadata write, a second acquire. Asserting on
+          # the whole tail rather than a list of verbs fails on ones nobody has
+          # written yet.
+          grep -Fq 'az storage container lease break ' "$log" ||
+            fail "the losing recoverer never reached the lease break, so $scenario proved nothing"
+          test "$(
+            grep -cF 'az storage container lease acquire ' "$log" | tr -d ' '
+          )" = "1" ||
+            fail "the losing recoverer did not attempt exactly one acquire during $scenario"
+          loser_lease_id="$(
+            sed -n 's/^az storage container lease acquire .* --proposed-lease-id \([^ ]*\) --output none$/\1/p' "$log"
+          )"
+          test -n "$loser_lease_id" ||
+            fail "the losing recoverer proposed no lease ID during $scenario"
+          loser_acquire_line="$(
+            grep -nF 'az storage container lease acquire ' "$log" |
+              sed -n '1s/:.*//p'
+          )"
+          loser_tail="$(tail -n "+$((loser_acquire_line + 1))" "$log")"
+          test "$loser_tail" = \
+            "az storage container lease release --account-name patchpagestate --container-name patchpage-operations --auth-mode login --lease-id $loser_lease_id --output none" ||
+            fail "the losing recoverer's calls after its refused acquire were not one release of its own lease during $scenario"
+          # Second: it never named the winner's lease. Releasing or renewing the
+          # lease the other operator is holding is the precise harm the
+          # single-flight rule exists to prevent.
+          if grep -Fq "$GUIDE_CONCURRENT_RECOVERY_LEASE_ID" "$log"; then
+            fail "the losing recoverer touched the winning recoverer's lease during $scenario"
+          fi
+          # Third: it did not claim success, on stdout or through the exit code.
+          if grep -Fq 'Operation lease recovery completed.' "$output"; then
+            fail "the losing recoverer claimed success during $scenario"
+          fi
+          test "$status" -eq 1 ||
+            fail "the losing recoverer exited $status instead of 1 during $scenario"
+          ;;
       esac
     fi
   done
+  # Exactly one winner. This is implied by the two per-run assertions above --
+  # success must print the completion line, and the loser must not -- so it
+  # catches nothing they would let through today, and it is kept anyway rather
+  # than dressed up as independent. It is the only place the cross-run property
+  # is stated as a property, so relaxing either per-run assertion later does not
+  # quietly take the pair invariant with it, and the failure message names the
+  # thing that actually went wrong instead of one run's output.
+  stale_lease_winners=0
+  for stale_lease_outcome in success concurrent_recovery; do
+    if grep -Fqx 'Operation lease recovery completed.' \
+      "$TMP_DIR/stale-lease-$stale_lease_outcome.out"; then
+      stale_lease_winners=$((stale_lease_winners + 1))
+    fi
+  done
+  test "$stale_lease_winners" -eq 1 ||
+    fail "two concurrent recoverers produced $stale_lease_winners winners, not exactly one"
+
+  # The single-flight property itself: nothing may sit between the break and the
+  # acquire. Every call this command makes is logged, so "adjacent in the log"
+  # is "nothing was sent in between" -- which is the whole of the window a
+  # second recoverer could have used.
+  stale_lease_success_log="$TMP_DIR/stale-lease-success.log"
+  stale_lease_break_line="$(
+    grep -nF 'az storage container lease break ' "$stale_lease_success_log" |
+      sed -n '1s/:.*//p'
+  )"
+  stale_lease_acquire_line="$(
+    grep -nF 'az storage container lease acquire ' "$stale_lease_success_log" |
+      sed -n '1s/:.*//p'
+  )"
+  test -n "$stale_lease_break_line" && test -n "$stale_lease_acquire_line" ||
+    fail "stale operation lease recovery did not both break and acquire"
+  test "$((stale_lease_break_line + 1))" -eq "$stale_lease_acquire_line" ||
+    fail "stale operation lease recovery sent a call between the lease break and the reacquire"
+
+  # The log can only show the calls that were made, and minting a lease ID makes
+  # none -- it is an od, a grep and a sed. Those three process spawns are real
+  # time between the break and the acquire all the same, so where the minting
+  # sits is pinned in the source instead.
+  #
+  # Both anchors are the whole statement and both are required to appear exactly
+  # once. A pin that took the first line merely *mentioning* /dev/urandom is a
+  # pin a comment can satisfy: writing prose about the minting above the break
+  # would leave the ordering true of the prose while the code moved below it,
+  # and the pin would go on passing. Uniqueness is what forecloses that, and it
+  # is not hypothetical -- it is how this check was first found to be defeated.
+  stale_lease_source="$GUIDE_CMD_DIR/stale-lease-recovery.sh"
+  stale_lease_mint_statement='od -An -N16 -tx1 /dev/urandom'
+  stale_lease_break_statement='private_az storage container lease break \'
+  test "$(
+    grep -cF "$stale_lease_mint_statement" "$stale_lease_source" | tr -d ' '
+  )" = "1" ||
+    fail "stale operation lease recovery does not mint its lease ID in exactly one place, so the source-order pin cannot say where that place is"
+  test "$(
+    grep -cF "$stale_lease_break_statement" "$stale_lease_source" | tr -d ' '
+  )" = "1" ||
+    fail "stale operation lease recovery does not break the lease in exactly one place, so the source-order pin cannot say where that place is"
+  stale_lease_mint_line="$(
+    grep -nF "$stale_lease_mint_statement" "$stale_lease_source" |
+      sed -n '1s/:.*//p'
+  )"
+  stale_lease_source_break_line="$(
+    grep -nF "$stale_lease_break_statement" "$stale_lease_source" |
+      sed -n '1s/:.*//p'
+  )"
+  test -n "$stale_lease_mint_line" && test -n "$stale_lease_source_break_line" ||
+    fail "stale operation lease recovery no longer mints a lease ID or breaks a lease"
+  test "$stale_lease_mint_line" -lt "$stale_lease_source_break_line" ||
+    fail "stale operation lease recovery mints its lease ID after the break, reopening the window a second recoverer breaks into"
+
   test "$((GUIDE_RETAINED_LEASE_EXITS - stale_lease_retained_start))" -ge 1 ||
     fail "stale lease recovery never exercised a lease it could not give back"
   grep -Fq 'A second authorized operator must independently verify' "$README" ||
@@ -2986,7 +3604,7 @@ server_image_precondition_is_pinned() {
 # named below fails too, so a new mutating command cannot quietly inherit
 # whichever mode happens to be convenient.
 #
-# One honest caveat about two of the five entries. deploy-resources and
+# One honest caveat about two of the eight entries. deploy-resources and
 # stale-lease-recovery load lease.sh only for operation_binding_sha256(), which
 # never reads OPERATION_LEASE_AUTH_MODE; every data-plane call they make names
 # its mode as a literal `--auth-mode key` / `--auth-mode login` flag in the
@@ -2994,13 +3612,13 @@ server_image_precondition_is_pinned() {
 # privilege model those literals implement, not the thing that enforces it --
 # the literals are pinned by the flow log assertions below, and widening one of
 # them turns those scenarios red on its own. For app-release, app-rollback and
-# infrastructure-change, which do take the lease through this library, the
-# declaration is the only thing standing between a lease taken as a named human
-# and a lease taken with an account key.
+# the four infrastructure commands, which do take, hold or give back the lease
+# through this library, the declaration is the only thing standing between a
+# lease taken as a named human and a lease taken with an account key.
 operation_lease_auth_modes_are_pinned() {
   awk -v cmd_dir="$1" \
     -v all_commands="$(printf '%s' "$GUIDE_COMMANDS" | tr '\n' ' ')" \
-    -v expected="app-release=login app-rollback=login stale-lease-recovery=login infrastructure-change=key deploy-resources=key" '
+    -v expected="app-release=login app-rollback=login stale-lease-recovery=login infrastructure-change=key infrastructure-plan=key infrastructure-apply=key infrastructure-abandon=key deploy-resources=key" '
     BEGIN {
       count = split(expected, pairs, " ")
       for (i = 1; i <= count; i++) {
@@ -3461,8 +4079,8 @@ test_public_safe_runbook_static() {
     set -- "$@" "$GUIDE_LIB_DIR/$guide_lib.sh"
   done
   GUIDE_SHELL_SOURCES_COUNT="$#"
-  test "$GUIDE_SHELL_SOURCES_COUNT" -eq 21 ||
-    fail "the operations CLI is not ops.sh plus the 13 documented commands and the 7 shared libraries"
+  test "$GUIDE_SHELL_SOURCES_COUNT" -eq 25 ||
+    fail "the operations CLI is not ops.sh plus the 16 documented commands and the 8 shared libraries"
 
   if grep -Eiq 'If[-]Match|e[t]ag|patchpageOperation[L]ock|private_az r[e]st' \
     "$README" "$@"; then
@@ -3496,7 +4114,9 @@ test_public_safe_runbook_static() {
     fail "Azure guide writes raw OpenTofu state or plan output to a repository-visible path"
   fi
   if grep -Eq '(^|[;&|][[:space:]]*)echo[[:space:]].*\$(IMAGE|.*_ID|RESOURCE_GROUP|STATE_)' \
-    "$GUIDE_CMD_DIR/app-release.sh" "$GUIDE_CMD_DIR/infrastructure-change.sh"; then
+    "$GUIDE_CMD_DIR/app-release.sh" "$GUIDE_CMD_DIR/infrastructure-change.sh" \
+    "$GUIDE_CMD_DIR/infrastructure-plan.sh" "$GUIDE_CMD_DIR/infrastructure-apply.sh" \
+    "$GUIDE_CMD_DIR/infrastructure-abandon.sh" "$GUIDE_LIB_DIR/infra_change.sh"; then
     fail "new runbook commands directly echo a sensitive image or resource value"
   fi
   # The release flow never runs OpenTofu. That has to be asserted over what it
@@ -3682,15 +4302,47 @@ test_public_safe_runbook_static() {
   # Lifecycle prevent_destroy is a meta-argument and is invisible to plan-time
   # tofu test assertions. Statically require the expected blocks.
   #
-  # Management-lock scope wiring also cannot be asserted behaviorally under
-  # `tofu test`. A lock's scope is another resource's computed `id`, and
-  # mock_resource defaults supply one constant id per resource type, not per
-  # instance: every azurerm_storage_account in the configuration mocks to the
-  # same id. An assertion that the lock's scope equals that id therefore holds
-  # for a lock wired to any storage account, so it pins the mock rather than the
-  # wiring -- which is the only thing worth pinning here. Statically require each
-  # lock's scope to name the intended resource id instead. See #73, which
-  # revisits how much of this can move to a behavioral guard test.
+  # --- what #73 settled about moving these to behavioural guards ---------------
+  #
+  # Management-lock scope: moved, and this check is now the second layer rather
+  # than the only one. The obstacle was that mock_resource defaults supply one
+  # constant id per resource *type*, so every azurerm_storage_account in the
+  # configuration mocks to the same id and an assertion on the lock's scope
+  # pinned the mock instead of the wiring. OpenTofu's override_resource is
+  # per-address, which removes exactly that obstacle:
+  # tests/persistent_data_invariants.tftest.hcl now gives the two protected
+  # parents distinct ids and asserts each lock's scope against its own. Swapping
+  # the two locks' scopes turns both runs red, and re-scoping one to the resource
+  # group turns that one red. This static check stays because it reads the
+  # expression rather than its value, so the two fail for different reasons.
+  #
+  # Container App precondition isolation: not achievable, and the static pin
+  # below remains the only guard. `expect_failures` for
+  # azurerm_container_app.server is satisfied by the postcondition on the same
+  # resource, so deleting the precondition keeps such a run green -- verified,
+  # not assumed. Isolating it needs a run where the precondition fails while the
+  # postcondition holds, and neither route exists here:
+  #
+  #   * override_resource cannot supply one. The postcondition reads
+  #     self.template[0].container[0].image, which is configured rather than
+  #     computed, and OpenTofu refuses it -- "Non-computed field `image` is not
+  #     allowed to be overridden". Overriding the enclosing block fails first
+  #     with "Blocks can be overridden only by objects".
+  #   * Seeding prior state with a `command = apply` run would work -- with the
+  #     image ignored by lifecycle.ignore_changes, the planned image stays the
+  #     valid prior one while an invalid var.server_image fails the precondition,
+  #     and the run does go red when the precondition is deleted. But the file
+  #     cannot then be torn down: tofu test's cleanup destroy hits
+  #     prevent_destroy on six resources, fails unconditionally, exits 2 and
+  #     writes errored_test.tfstate into this directory. The guard that makes
+  #     the other half of this function necessary is what makes that route
+  #     unusable.
+  #
+  # Reaching the precondition behaviourally therefore means weakening a real
+  # protection to test another one, which is the wrong trade. The predicate
+  # itself stays independently asserted through the server_image_is_managed_digest
+  # output in tests/server_image_invariants.tftest.hcl; what only this static
+  # check can say is that the resource's precondition is still wired to it.
   azure_tf_dir="$ROOT/infra/azure"
   for prevent_destroy_resource in \
     'azurerm_storage_account.drafts' \
@@ -3918,11 +4570,6 @@ custom_domain_hostname"
       if grep -q '^completed$' "$TMP_DIR/custom-domain-output-$scenario.log"; then
         fail "custom-domain context continued after $scenario"
       fi
-      if grep -Eq \
-        '00000000-0000-0000-0000-000000000000|rg-test|app-test|env-test|203\.0\.113\.10|verification-id|drafts\.self-hoster\.dev' \
-        "$TMP_DIR/custom-domain-output-$scenario.out"; then
-        fail "custom-domain context exposed a private output after $scenario"
-      fi
     done
   done
   for scenario in account_set_failure account_show_failure subscription_mismatch; do
@@ -3932,17 +4579,13 @@ custom_domain_hostname"
     if grep -q '^completed$' "$TMP_DIR/custom-domain-output-$scenario.log"; then
       fail "custom-domain context continued after $scenario"
     fi
-    if grep -Eq \
-      '00000000-0000-0000-0000-000000000000|11111111-1111-1111-1111-111111111111|rg-test|app-test|env-test|203\.0\.113\.10|verification-id|drafts\.self-hoster\.dev' \
-      "$TMP_DIR/custom-domain-output-$scenario.out"; then
-      fail "custom-domain context exposed private deployment details after $scenario"
-    fi
   done
 }
 
 run_ingress_verification_block() {
   scenario="$1"
   log="$TMP_DIR/ingress-$scenario.log"
+  output="$TMP_DIR/ingress-$scenario.out"
   : > "$log"
 
   (
@@ -3958,7 +4601,7 @@ run_ingress_verification_block() {
     prepare_mock_state "$TMP_DIR/ingress-$scenario.mockstate"
 
     run_ops_command ingress-verification
-  ) >/dev/null 2>&1
+  ) >"$output" 2>&1
 }
 
 test_ingress_verification() {
@@ -4117,9 +4760,18 @@ test_hostname_mutation_guard() {
   done
 }
 
+# One apex run per (A-record set, AAAA scenario) pair, so its captures are
+# numbered. They exist for one reason: until this change these three blocks
+# threw their output away, which meant the flows with the *most* private values
+# in scope -- the hostname, the static IP, the domain verification ID -- were
+# the three the sweep could not see at all.
+GUIDE_APEX_CAPTURE=0
+
 run_apex_block() {
   a_records="$1"
   aaaa_scenario="$2"
+  GUIDE_APEX_CAPTURE=$((GUIDE_APEX_CAPTURE + 1))
+  output="$TMP_DIR/apex-$GUIDE_APEX_CAPTURE.out"
 
   (
     DNS_ZONE="drafts.self-hoster.dev"
@@ -4138,7 +4790,7 @@ run_apex_block() {
     prepare_mock_state "$TMP_DIR/apex.mockstate"
 
     run_ops_command apex-dns
-  ) >/dev/null 2>&1
+  ) >"$output" 2>&1
 }
 
 test_apex_dns() {
@@ -4164,6 +4816,7 @@ test_apex_dns() {
 run_caa_block() {
   scenario="$1"
   log="$TMP_DIR/caa-$scenario.log"
+  output="$TMP_DIR/caa-$scenario.out"
   : > "$log"
 
   (
@@ -4178,7 +4831,7 @@ run_caa_block() {
     prepare_mock_state "$TMP_DIR/caa-$scenario.mockstate"
 
     run_ops_command caa-policy
-  ) >/dev/null 2>&1
+  ) >"$output" 2>&1
 }
 
 test_caa_policy() {
@@ -4271,12 +4924,18 @@ CAA team.example.com"
   done
 }
 
+# The capture name is a parameter because all five calls used to write the same
+# certificate-binding.out, so four of the five were overwritten before the
+# central sweep ever looked at them and only the last scenario's output was
+# swept. The inline grep below still guards this flow's own three values; the
+# names are what put the other four captures in front of the universal check.
 run_certificate_block() {
-  subject="$1"
-  certificate_id="$2"
-  binding_id="$3"
-  provisioning_state="$4"
-  output="$TMP_DIR/certificate-binding.out"
+  certificate_case="$1"
+  subject="$2"
+  certificate_id="$3"
+  binding_id="$4"
+  provisioning_state="$5"
+  output="$TMP_DIR/certificate-binding-$certificate_case.out"
 
   (
     SUBSCRIPTION_ID="00000000-0000-0000-0000-000000000000"
@@ -4315,14 +4974,14 @@ test_certificate_binding() {
   certificate_id="/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg-test/providers/Microsoft.App/managedEnvironments/env-test/managedCertificates/cert-one"
   other_certificate_id="/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg-test/providers/Microsoft.App/managedEnvironments/env-test/managedCertificates/cert-two"
 
-  run_certificate_block \
+  run_certificate_block normalized_subject \
     "CN=Drafts.Self-Hoster.Dev." \
     "$certificate_id" \
     "$certificate_id" \
     "Succeeded" ||
     fail "normalized CN certificate subject was not matched"
 
-  if run_certificate_block \
+  if run_certificate_block foreign_subject \
     "CN=other.example.com" \
     "$certificate_id" \
     "$certificate_id" \
@@ -4330,7 +4989,7 @@ test_certificate_binding() {
     fail "certificate verification accepted a different subject"
   fi
 
-  if run_certificate_block \
+  if run_certificate_block foreign_certificate_id \
     "CN=Drafts.Self-Hoster.Dev." \
     "$other_certificate_id" \
     "$certificate_id" \
@@ -4338,7 +4997,7 @@ test_certificate_binding() {
     fail "certificate verification accepted a different managed-certificate resource ID"
   fi
 
-  if run_certificate_block \
+  if run_certificate_block foreign_binding_id \
     "CN=Drafts.Self-Hoster.Dev." \
     "$certificate_id" \
     "$other_certificate_id" \
@@ -4346,7 +5005,7 @@ test_certificate_binding() {
     fail "certificate verification accepted a binding to a different certificate ID"
   fi
 
-  if run_certificate_block \
+  if run_certificate_block pending_certificate \
     "CN=Drafts.Self-Hoster.Dev." \
     "$certificate_id" \
     "$certificate_id" \
@@ -4619,6 +5278,7 @@ set -- \
   test_app_release \
   test_app_rollback \
   test_infrastructure_change \
+  test_infrastructure_session \
   test_stale_lease_recovery \
   test_operation_binding_wire_format \
   test_plan_gate_filter \
@@ -4632,8 +5292,121 @@ set -- \
   test_certificate_binding \
   test_deployed_smoke
 
+# The running total of captures swept, not the count for one group. Every group
+# writes its captures into the one $TMP_DIR and none of them are ever removed,
+# so the set this recounts after each group is cumulative and the last group's
+# count is the total. That accumulation is what the exact pin at the bottom is
+# pinning, and it is an assumption rather than a fact the code enforces: a group
+# that started cleaning up after itself, or a capture path that collided with an
+# earlier group's, would lower this number rather than raise it. The pin turns
+# either into a failure instead of a silently smaller sweep, which is the only
+# defence there is -- so a scenario added or removed means changing that number
+# deliberately.
+GUIDE_PRIVATE_OUTPUT_SWEPT=0
+guide_sweep_private_output() {
+  guide_sweep_group="$1"
+  guide_sweep_count=0
+  for guide_sweep_capture in "$TMP_DIR"/*.out; do
+    test -f "$guide_sweep_capture" || continue
+    guide_sweep_count=$((guide_sweep_count + 1))
+  done
+  GUIDE_PRIVATE_OUTPUT_SWEPT="$guide_sweep_count"
+  test "$guide_sweep_count" -gt 0 || return 0
+  # Two batched checks over the whole set rather than two per capture: this runs
+  # after every group, and per-file it would be some thirty thousand process
+  # spawns in a CI job whose whole point is to be cheap enough to be required.
+  # Both are the meta-tested functions, so what runs here in bulk is the code the
+  # probes above proved rejects each shape of private value.
+  if guide_sweep_hit="$(guide_private_output_leaks "$TMP_DIR"/*.out)"; then
+    fail "a private value reached ${guide_sweep_hit##*/}, seen after $guide_sweep_group"
+  fi
+  if guide_sweep_hit="$(guide_private_path_leaks "$TMP_DIR"/*.out)"; then
+    fail "a private harness path reached ${guide_sweep_hit##*/}, seen after $guide_sweep_group"
+  fi
+}
+
+# Meta-test the sweep before any of it is trusted. A pattern that matched
+# nothing would let every capture through and every group would pass, so the
+# check is shown to reject one capture of each shape it exists to catch, and to
+# accept a message of the shape the runbooks actually print.
+guide_sweep_probe_dir="$TMP_DIR/private-output-probe"
+mkdir -p "$guide_sweep_probe_dir" ||
+  fail "could not create the private-output probe directory"
+printf 'The active Azure subscription does not match the private expected value.\n' \
+  > "$guide_sweep_probe_dir/clean"
+if guide_private_output_leaks "$guide_sweep_probe_dir/clean" >/dev/null; then
+  fail "the private-output sweep rejects a generic runbook message"
+fi
+if guide_private_path_leaks "$guide_sweep_probe_dir/clean" >/dev/null; then
+  fail "the private-path sweep rejects a generic runbook message"
+fi
+# One probe per alternative in the pattern, not one per shape of value. The
+# pattern replaced eight hand-written stanzas whose lists were not identical,
+# and an alternative that no probe reaches is an alternative that can be deleted
+# -- or mistyped into never matching -- with every group still green. Each probe
+# is written to match exactly one alternative, so removing that alternative from
+# the pattern turns this loop red rather than being absorbed by a neighbour.
+guide_sweep_probe_case=0
+for guide_sweep_probe_value in \
+  'active subscription 00000000-0000-0000-0000-000000000000 mismatched' \
+  'recorded binding sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' \
+  'state account patchpagestate is unavailable' \
+  'blob account patchpagedrafts is unavailable' \
+  'state key patchpage-prod.tfstate is missing' \
+  'container patchpage-operations is already leased' \
+  'server patchpage-db refused the connection' \
+  'app patchpage-app has no ready revision' \
+  'registry acrpatchpageabc123 login failed' \
+  'group rg-patchpage-tfstate not found' \
+  'could not read rg-patchpage-workload' \
+  'group rg-test not found' \
+  'container app app-test not found' \
+  'managed environment env-test not found' \
+  'hostname drafts.self-hoster.dev did not resolve' \
+  'apex A record 203.0.113.10 is wrong' \
+  'expected TXT record verification-id was absent' \
+  'private-az-diagnostic account show' \
+  'private-tofu-diagnostic plan -input=false' \
+  'private-rollback-diagnostic containerapp show' \
+  'private-infra-az-diagnostic account show' \
+  'private-infra-tofu-diagnostic plan -input=false' \
+  'token pp_abcdef' \
+  'BlobEndpoint=x;AccountKey=secret'; do
+  guide_sweep_probe_case=$((guide_sweep_probe_case + 1))
+  printf '%s\n' "$guide_sweep_probe_value" \
+    > "$guide_sweep_probe_dir/leak-$guide_sweep_probe_case"
+  guide_private_output_leaks "$guide_sweep_probe_dir/leak-$guide_sweep_probe_case" \
+    >/dev/null ||
+    fail "the private-output sweep accepts a capture containing $guide_sweep_probe_value"
+done
+test "$guide_sweep_probe_case" -eq 24 ||
+  fail "the private-output sweep meta-test lost one of its cases"
+# The harness-root half, which subsumes the two hand-written "exposed the
+# private diagnostic path" assertions and had no meta-test of its own. Both
+# spellings are probed. On Linux they are the same string, and on macOS the
+# physical one contains the logical one, so this proves the pair catches either
+# spelling rather than proving each grep is separately load-bearing -- which is
+# the most the platform allows and is stated here rather than implied.
+printf 'diagnostics retained under %s/private-run\n' "$TMP_ROOT" \
+  > "$guide_sweep_probe_dir/path-leak-logical"
+guide_private_path_leaks "$guide_sweep_probe_dir/path-leak-logical" >/dev/null ||
+  fail "the private-path sweep accepts a capture naming the harness temporary root"
+printf 'diagnostics retained under %s/private-run\n' "$TMP_ROOT_PHYSICAL" \
+  > "$guide_sweep_probe_dir/path-leak-physical"
+guide_private_path_leaks "$guide_sweep_probe_dir/path-leak-physical" >/dev/null ||
+  fail "the private-path sweep accepts a capture naming the resolved harness temporary root"
+rm -rf "$guide_sweep_probe_dir"
+
 for guide_scenario_group in "$@"; do
   "$guide_scenario_group"
+  guide_sweep_private_output "$guide_scenario_group"
 done
 
-printf 'guide_commands_test: %s scenario groups passed\n' "$#"
+# Exact, so a scenario whose output stopped being captured -- or a group that
+# silently stopped running -- cannot leave the sweep passing over less than it
+# used to. Adding scenarios means updating this number.
+test "$GUIDE_PRIVATE_OUTPUT_SWEPT" -eq 550 ||
+  fail "the private-output sweep examined $GUIDE_PRIVATE_OUTPUT_SWEPT scenario captures, not the expected 550"
+
+printf 'guide_commands_test: %s scenario groups passed, %s captures swept\n' \
+  "$#" "$GUIDE_PRIVATE_OUTPUT_SWEPT"

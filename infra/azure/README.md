@@ -188,7 +188,15 @@ After adoption, and for every normal infrastructure run, state must also contain
 
 
 
-Export the inputs this command requires, then run it:
+### Plan, review, apply
+
+This is the flow to use. It is three commands: `infrastructure-plan` produces and saves the plan a second operator reviews, `infrastructure-apply` applies that exact saved plan, and `infrastructure-abandon` closes the session without applying anything.
+
+The three share a **session**: a mode-`0700` directory named `patchpage-infrastructure-session` under the private root you set as `INFRA_CHANGE_SESSION_ROOT`. It holds the saved plan, that plan's SHA-256, the rendered action inventory, the pinned Container App revision and image, and the operation lease ID. `infrastructure-apply` re-derives every one of those rather than trusting it. Set the root to an existing private directory outside the repository; a saved plan describes the whole environment, and one written inside the repository is one `git add -A` away from being published.
+
+Between the plan and the apply, **the operation lease stays held**. That is the point of the session and it is the one documented exception to `sh infra/azure/ops.sh --help`'s "exit `0` released everything it held": the reviewed plan describes an environment that nothing else may change while the review is happening, so releases, rollbacks and other infrastructure changes are locked out until the session closes. Close it with `infrastructure-apply` or `infrastructure-abandon`. Never break the lease to clear a session — if you believe the planning process is gone, that is the same stop-and-prove situation as any other retained lease, and [the stale-lease recovery](#recover-an-abandoned-operation-lease) is the only way through it.
+
+Export the inputs `infrastructure-plan` requires, then run it:
 
 | Variable | Value |
 | --- | --- |
@@ -207,24 +215,85 @@ Export the inputs this command requires, then run it:
 | `OPERATION_PRINCIPAL_TYPE` | `User` or `ServicePrincipal` |
 | `EXPECTED_LEGACY_IMAGE_DIGEST` | from a separately verified legacy release record; required only for a legacy adoption |
 | `TERRAFORM_DIAGNOSTIC_ROOT` | an existing private diagnostic directory outside the repository |
+| `INFRA_CHANGE_SESSION_ROOT` | an existing private session directory outside the repository |
 | `ADOPT_SAFETY_GUARDS` | optional; `true` only to adopt an existing environment's safety guards |
+
+```sh
+sh infra/azure/ops.sh infrastructure-plan
+```
+
+It prints the exact address/action inventory, then the review token — the SHA-256 digest of exactly that inventory — then a line stating that the lease is held. It applies nothing. If a session is already open it refuses without touching it; abandon the open one first.
+
+Require a second operator to compare the private environment record, the backup/restore evidence, and that exact address/action inventory. Then apply, with the token they approved and the same `INFRA_CHANGE_SESSION_ROOT`:
+
+| Variable | Value |
+| --- | --- |
+| `SUBSCRIPTION_ID` | the private expected subscription ID |
+| `STATE_STORAGE_ACCOUNT` | the private state account name |
+| `STATE_CONTAINER` | the private state container name |
+| `STATE_KEY` | the private environment-specific state key |
+| `EXPECTED_STATE_LINEAGE` | the private expected state lineage |
+| `EXPECTED_RESOURCE_GROUP_ID` | the private workload resource-group ID |
+| `EXPECTED_STORAGE_ACCOUNT_ID` | the private workload Storage account ID |
+| `EXPECTED_POSTGRES_SERVER_ID` | the private PostgreSQL server ID |
+| `EXPECTED_ACR_ID` | the private Azure Container Registry ID |
+| `EXPECTED_CONTAINER_APP_ID` | the private Container App ID |
+| `RESOURCE_GROUP` | the expected workload resource-group name |
+| `TERRAFORM_DIAGNOSTIC_ROOT` | an existing private diagnostic directory outside the repository |
+| `INFRA_CHANGE_SESSION_ROOT` | the same private session directory the plan used |
+| `INFRA_CHANGE_APPROVAL_SHA256` | the review token the plan printed and a second operator approved |
+
+```sh
+INFRA_CHANGE_APPROVAL_SHA256=<the token the plan printed> sh infra/azure/ops.sh infrastructure-apply
+```
+
+`infrastructure-apply` refuses unless all three of these hold, and it checks them in this order:
+
+- the saved plan file still hashes to the digest recorded at review time, so a plan that was edited or regenerated is refused rather than applied;
+- the approval matches the token recomputed from the inventory the session recorded, so the token proves a second operator read *these* actions;
+- the recorded operation lease renews, which only the container this session leased will accept — so a lease that was broken and reacquired between the review and now stops the apply instead of letting it land on an environment somebody else has been changing.
+
+The first two need nothing but the session, and are deliberately checked before this command touches the lease at all: a mistyped token costs nothing and leaves the session exactly as the plan left it, still reviewable and still holding the environment. Only after they pass does it renew the lease, recheck the pinned revision, apply the exact saved plan, prove readiness, release the lease and remove the session.
+
+`ADOPT_SAFETY_GUARDS` is not accepted here. Adoption creates locks, seals the operation container and migrates a legacy image; none of that is described by a plan that has already been reviewed, so it belongs to `infrastructure-plan` and this command refuses the flag rather than ignoring it.
+
+To close a session without applying — a review that says no, or an apply that was refused — abandon it:
+
+| Variable | Value |
+| --- | --- |
+| `SUBSCRIPTION_ID` | the private expected subscription ID |
+| `STATE_STORAGE_ACCOUNT` | the private state account name |
+| `INFRA_CHANGE_SESSION_ROOT` | the same private session directory the plan used |
+
+```sh
+sh infra/azure/ops.sh infrastructure-abandon
+```
+
+It renews the recorded lease as proof that the session and the live lease are the same lease, releases it, and removes the session. It loads no OpenTofu, reads no state and runs no plan gate, because a session has to stay closable when the thing it was planning against is what is broken. A session whose lease a second operator has already recovered is not an error: there is nothing to release, so it clears the record and exits `0`. A lease it holds but cannot release is the retained case, and it exits `75` with the session left intact.
+
+It also reads only the recorded lease, not the whole session. A plan killed partway through saving leaves a session complete enough that `infrastructure-plan` refuses to open another over it, so a half-written session that this command would not accept would be a session nothing could close and a lease nothing could give back. A session too damaged to name a lease at all is cleared the same way, and the container it left leased is then the stale-lease recovery's problem rather than a permanent one.
+
+### The one-shot alternative
+
+`infrastructure-change` does the plan and the apply in one command, run twice. For one operator at one terminal with a second operator available to review between the two runs, it is the shorter path, and it takes the same inputs as `infrastructure-plan` minus `INFRA_CHANGE_SESSION_ROOT`, plus:
+
+| Variable | Value |
+| --- | --- |
 | `INFRA_CHANGE_APPROVAL_SHA256` | optional; the review token a first run printed, set only on the approved rerun |
 
 ```sh
 sh infra/azure/ops.sh infrastructure-change
 ```
 
-This command exits `75` if it cannot prove the result of its apply or the readiness that follows it: the infinite lease stays held on purpose and only the documented second-operator recovery may clear it.
-
-That first run does not apply anything. It plans, prints the exact address/action inventory, releases the operation lease, and stops at the second-operator review gate with exit `0`, after printing a review token: the SHA-256 digest of exactly the inventory it just printed.
-
-Require a second operator to compare the private environment record, backup/restore evidence, and that exact address/action inventory. Then rerun the same command with the token they approved:
+The first run does not apply anything. It plans, prints the exact address/action inventory, prints the review token, releases the operation lease, and stops at the review gate with exit `0`. After the review, rerun it with the approved token:
 
 ```sh
 INFRA_CHANGE_APPROVAL_SHA256=<the token the first run printed> sh infra/azure/ops.sh infrastructure-change
 ```
 
-The rerun replans against current state and recomputes the token from the new inventory. Because the approval is the digest of the actions it approves, it can only ever apply those actions: if the state drifted so the plan changed in between, the recorded token no longer matches and the command stops with exit `1` and a fresh token to review. Never carry a token over from a different environment or an earlier plan. Splitting the plan and the apply into two named commands is tracked separately; until then this token is what carries the second-operator review between the two runs.
+Understand what this carries between the two runs and what it does not. The rerun **replans against current state** and recomputes the token from the new inventory, so it can only apply actions equal to the ones that were approved: if the state drifted so the plan changed in between, the recorded token no longer matches and the command stops with exit `1` and a fresh token to review. What it cannot carry forward is the plan itself, or the environment — it gives the lease back at the review gate, so a release, a rollback or another infrastructure change can land in the window, and the plan the rerun applies is a new plan that merely renders the same inventory. Where either of those matters, use `infrastructure-plan` and `infrastructure-apply`. Never carry a token over from a different environment or an earlier plan.
+
+Both flows exit `75` if the apply, or the readiness proof that follows it, cannot be proved: the infinite lease stays held on purpose and only the documented second-operator recovery may clear it.
 
 ### Recover an abandoned operation lease
 

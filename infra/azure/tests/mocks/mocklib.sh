@@ -31,6 +31,11 @@ mock_real() (
 # rather than a comparison against the block's own variable.
 MOCK_SUBSCRIPTION_ID="${PP_MOCK_SUBSCRIPTION_ID:-${SUBSCRIPTION_ID:-}}"
 
+# The bytes the tofu shim writes for a saved infrastructure plan. Fixed, so the
+# infrastructure session's recorded SHA-256 is a constant the harness can name,
+# and so a canonicalized log diff is not full of per-run noise.
+MOCK_INFRA_PLAN_BYTES="patchpage-mock-infrastructure-plan"
+
 # --- recording ---------------------------------------------------------------
 
 # Append one already-formatted line to the scenario command log.
@@ -278,6 +283,17 @@ mock_operation_lease() {
     break)
       test "$operation_break_period" = "0" || return 1
       test "$scenario" != "${operation_lease_prefix}break_failure" || return 1
+      # A zero-period break ends whatever lease is held right now, so the
+      # recorded holder goes away here rather than at the next acquire.
+      mock_real rm -f "$operation_lease_file"
+      # ...and in the concurrent-recovery scenario a second recoverer wins the
+      # race back to the container in that same instant. The break this process
+      # just made succeeded; the container is leased again, to someone else,
+      # before this process reaches its own acquire. That is the only ordering
+      # in which the single-flight rule has anything to decide.
+      if test "$scenario" = "${operation_lease_prefix}concurrent_recovery"; then
+        printf '%s\n' "${PP_MOCK_CONCURRENT_LEASE_ID:?}" > "$operation_lease_file"
+      fi
       ;;
     acquire)
       case "$operation_duration" in
@@ -294,6 +310,14 @@ mock_operation_lease() {
       esac
       test ! -e "$operation_lease_file" || return 1
       printf '%s\n' "$operation_proposed_id" > "$operation_lease_file"
+      # Azure granted the lease and the answer was lost on the way back. The
+      # container is now leased under the caller's own proposed ID and the
+      # caller has been told its acquire failed -- the one interleaving in which
+      # a caller that declines to release leaks an infinite lease that only its
+      # own ID can clear. Recorded first, refused second, the same shape as the
+      # renew blip above.
+      test "$scenario" != "${operation_lease_prefix}acquire_ok_transit_fails" ||
+        return 1
       ;;
     renew)
       test -f "$operation_lease_file" || return 1

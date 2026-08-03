@@ -52,7 +52,10 @@ state-bootstrap|Create and verify the OpenTofu state account, containers, operat
 deploy-resources|Plan and apply the first workload deployment, then seal the operation binding and locks.
 app-release|Build, push and roll a new immutable server image forward under the operation lease.
 app-rollback|Return the Container App to the recorded pre-release image under the operation lease.
-infrastructure-change|Adopt, plan and apply a reviewed no-delete infrastructure change.
+infrastructure-change|Adopt, plan and apply a reviewed no-delete infrastructure change in one process.
+infrastructure-plan|Plan a no-delete infrastructure change, save it for review, and hold the lease.
+infrastructure-apply|Apply the exact plan a reviewed infrastructure-plan session saved.
+infrastructure-abandon|Release the lease and discard an infrastructure-plan session without applying.
 stale-lease-recovery|Second-operator break, reacquire and release of an abandoned operation lease.
 custom-domain-context|Verify the custom-domain deployment context. SOURCE cmd/custom-domain-context.sh to keep its values.
 ingress-verification|Prove the Container App ingress is external, HTTPS-only and on the expected port.
@@ -88,7 +91,13 @@ ops_usage() {
   ops_each_command ops_print_command
   printf '\n'
   printf 'Exit codes:\n'
-  printf '  0   Success. The operation completed and released anything it held.\n'
+  printf '  0   Success. The operation completed and released anything it held,\n'
+  printf '      with one documented exception: infrastructure-plan keeps the\n'
+  printf '      operation lease so the plan it saved describes an environment\n'
+  printf '      nothing else can change. infrastructure-apply gives that lease\n'
+  printf '      back on success and infrastructure-abandon gives it back without\n'
+  printf '      applying; until one of them runs, the lease is held on purpose\n'
+  printf '      and the stale-lease rule below applies to it too.\n'
   printf '  1   Failed safely, and safe to retry after fixing the reported problem.\n'
   printf '      Nothing is still held: the operation lease was never acquired, or it\n'
   printf '      was released cleanly on the way out.\n'
