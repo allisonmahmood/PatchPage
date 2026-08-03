@@ -4155,6 +4155,39 @@ test_operation_binding_wire_format() {
   rm -rf "$binding_fixture_dir"
 }
 
+# --- what stays static here, and why ------------------------------------------
+#
+# Every other group in this harness proves a behaviour by running a command.
+# This one reads files, so it is worth stating exactly which guards are static
+# because nothing behavioural can reach them, and which are static because there
+# is no behaviour to reach in the first place. The distinction matters when the
+# next person asks why these were not converted with the rest.
+#
+# Blocked on capabilities OpenTofu does not have:
+#
+#   * The Container App image precondition. `expect_failures` cannot isolate it
+#     from the postcondition on the same resource, and neither override_resource
+#     nor a seeded `command = apply` run reaches it. Both routes were tried
+#     during #73 and both are written out in full at the prevent_destroy check
+#     below -- verified, not assumed. Convert this if the test framework ever
+#     gains per-condition failure expectations.
+#   * lifecycle prevent_destroy. It is a meta-argument: no plan carries it as a
+#     value, so a plan-time assertion has nothing to read.
+#
+# Static because the subject is a file rather than a process: guide fence
+# purity, absolute tool paths in the CLI sources, traps in the two sourced
+# commands, and the per-command operation-lease auth-mode declarations. A
+# document and a source line have no behaviour to drive. What keeps these
+# honest instead is that each is a status-returning function run against a
+# deliberately sabotaged copy of what it reads, so the check is itself under
+# test even though its subject is not executed.
+#
+# Already converted, and the reason this list is worth keeping current:
+# management-lock scope. #73 moved it to persistent_data_invariants.tftest.hcl
+# once override_resource made per-address ids possible, and the static half
+# below is now a second layer rather than the only one. That is the direction
+# the two blocked guards should travel if the mock framework gains finer
+# control; they are blocked on capability, not on effort.
 test_public_safe_runbook_static() {
   # The runbooks are files under cmd/ now, so every check that is really about
   # the shell reads those files; the checks that are about what the guide says
