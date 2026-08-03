@@ -19,7 +19,7 @@
 # principal holds the operation-container data role, and use `--auth-mode
 # login`: their whole safety argument is that a human with a named identity took
 # the lease. infrastructure-change runs where a storage account key is already
-# in hand for the Terraform backend, and uses `--auth-mode key`.
+# in hand for the OpenTofu backend, and uses `--auth-mode key`.
 #
 # That difference is deliberate, it is a difference in who is allowed to do
 # this, and collapsing it to one value would silently widen or narrow authority.

@@ -8,6 +8,19 @@ All notable changes to PatchPage are documented in this file. The format is base
 
 ### Changed
 
+- The Azure self-hosting example now uses [OpenTofu](https://opentofu.org) instead of
+  Terraform. CI pins OpenTofu 1.12.5; the runbooks call `tofu`; install it with
+  `brew install opentofu`. There is no state migration: the state format is compatible and
+  the backend is unchanged, so an existing environment picks it up on its next
+  infrastructure change, when the flow runs `tofu init` against the same `azurerm` backend
+  and state key. The first `init` rewrites the provider registry addresses and hashes in
+  `.terraform.lock.hcl`, preserving provider versions; the checked-in lock file is already
+  in that form. Moving back to Terraform reads the same state back unchanged, but it needs a
+  plain `terraform init` to regenerate the lock file, because `-lockfile=readonly` rejects the
+  OpenTofu-form addresses; that regeneration re-resolves the version constraints, so provider
+  versions float unless they are pinned exactly first. Either direction stays possible only
+  until this directory adopts an OpenTofu-only feature such as state encryption, which it
+  deliberately has not.
 - Azure workload Blob Storage now defaults to geo-redundant replication (`GRS`). Existing
   environments that still use `LRS` will see an in-place Storage account update on the first
   infrastructure apply after upgrade; review cost and replication behavior before approving.

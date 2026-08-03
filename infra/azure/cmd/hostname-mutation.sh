@@ -14,7 +14,7 @@ private_az() {
   az "$@" --subscription "$SUBSCRIPTION_ID" 2>/dev/null
 }
 VALIDATION_METHOD="${VALIDATION_METHOD:?Run the matching DNS section first}"
-SUBSCRIPTION_ID="${SUBSCRIPTION_ID:?Load the Terraform outputs first}"
+SUBSCRIPTION_ID="${SUBSCRIPTION_ID:?Load the OpenTofu outputs first}"
 
 if ! private_az account set; then
   printf 'Could not select the expected Azure subscription.\n' >&2

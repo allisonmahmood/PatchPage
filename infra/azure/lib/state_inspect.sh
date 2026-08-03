@@ -1,4 +1,4 @@
-# The Terraform state account's data plane: what containers exist, and is that
+# The OpenTofu state account's data plane: what containers exist, and is that
 # exactly what the private record says should exist?
 #
 # Sourced by cmd/*.sh through ops.sh, which exports PP_OPS_LIB; see ops.sh.

@@ -14,7 +14,7 @@
           - "packages/db/**"
           - "packages/storage/**"
           - "packages/config/**"
-          # Terraform that deploys the hosting context.
+          # OpenTofu that deploys the hosting context.
           - "infra/**"
 
 "area:cli":

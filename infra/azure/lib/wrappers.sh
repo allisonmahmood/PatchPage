@@ -10,8 +10,8 @@
 # scrollback. The runbooks report failures themselves, in their own words, from
 # the exit status.
 #
-# A private_terraform() wrapper is deliberately absent. Two of its callers route
-# Terraform's stderr to a private diagnostic file on fd 3 rather than discarding
+# A private_tofu() wrapper is deliberately absent. Two of its callers route
+# OpenTofu's stderr to a private diagnostic file on fd 3 rather than discarding
 # it, and that wrapper lives in lib/diag.sh with the rest of that plumbing. The two
 # commands that merely discard it keep their own one-line copy: sharing a
 # definition between exactly two callers, one of which is a sourced command that

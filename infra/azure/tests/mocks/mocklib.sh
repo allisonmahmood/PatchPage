@@ -1,6 +1,6 @@
 # Shared helpers for the Azure guide-harness PATH shims.
 #
-# The shims (az, terraform, git, curl, dig) are executables, not shell
+# The shims (az, tofu, git, curl, dig) are executables, not shell
 # functions, so they cannot see the variables of the shell that runs the
 # extracted README block. Everything a shim needs is therefore either
 #   * exported by the harness before it starts the block (PP_MOCK_* and the

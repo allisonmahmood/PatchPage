@@ -1,8 +1,8 @@
 set -u
 (
 set +x
-private_terraform() {
-  terraform "$@" 2>/dev/null
+private_tofu() {
+  tofu "$@" 2>/dev/null
 }
 . "${PP_OPS_LIB:?run this through the dispatcher: sh infra/azure/ops.sh deployed-smoke}/wrappers.sh"
 if test -n "${CANARY_RECORD:-}"; then
@@ -121,11 +121,11 @@ if test "$HTTPS_HEALTH_BODY" != '{"ok":true}'; then
   smoke_fail 'The HTTPS health response body was unexpected.'
 fi
 
-if ! BOOTSTRAP_API_TOKEN="$(private_terraform output -raw bootstrap_api_token)"; then
-  smoke_fail 'Could not read the bootstrap API token from Terraform.'
+if ! BOOTSTRAP_API_TOKEN="$(private_tofu output -raw bootstrap_api_token)"; then
+  smoke_fail 'Could not read the bootstrap API token from OpenTofu.'
 fi
 if test -z "$BOOTSTRAP_API_TOKEN"; then
-  smoke_fail 'Terraform returned an empty bootstrap API token.'
+  smoke_fail 'OpenTofu returned an empty bootstrap API token.'
 fi
 UPLOAD_HEADER_FILE="$SMOKE_TMP_DIR/upload.headers"
 if ! (umask 077 && printf 'Authorization: Bearer %s\n' \

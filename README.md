@@ -64,7 +64,7 @@ This is a Turborepo monorepo managed with pnpm.
 - `packages/db` — metadata store with Postgres and JSON-file drivers, plus schema migrations (`@patchpage/db`).
 - `packages/storage` — HTML object storage adapters: filesystem and Azure Blob (`@patchpage/storage`).
 - `packages/config` — environment-variable parsing and server configuration (`@patchpage/config`).
-- `infra/azure` — Terraform for a worked Azure Container Apps self-hosting deployment.
+- `infra/azure` — OpenTofu for a worked Azure Container Apps self-hosting deployment.
 - `skills/patchpage` — the bundled agent skill.
 - `examples/plan.html` — a Patchy-styled starter draft.
 

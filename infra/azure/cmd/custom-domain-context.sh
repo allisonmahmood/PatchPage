@@ -10,22 +10,22 @@ case $- in
 esac
 set -u
 set +x
-private_terraform() {
-  terraform "$@" 2>/dev/null
+private_tofu() {
+  tofu "$@" 2>/dev/null
 }
 private_az() {
   az "$@" --subscription "$SUBSCRIPTION_ID" 2>/dev/null
 }
-if ! SUBSCRIPTION_ID="$(private_terraform output -raw subscription_id)" ||
-  ! RESOURCE_GROUP="$(private_terraform output -raw resource_group_name)" ||
-  ! CONTAINER_APP="$(private_terraform output -raw container_app_name)" ||
-  ! CONTAINER_APP_ENVIRONMENT="$(private_terraform output -raw container_app_environment_name)" ||
-  ! CONTAINER_APP_FQDN="$(private_terraform output -raw container_app_fqdn)" ||
-  ! CONTAINER_APP_STATIC_IP="$(private_terraform output -raw container_app_environment_static_ip)" ||
-  ! DOMAIN_VERIFICATION_ID="$(private_terraform output -raw custom_domain_verification_id)" ||
-  ! PUBLIC_BASE_URL="$(private_terraform output -raw public_base_url)" ||
-  ! CUSTOM_DOMAIN="$(private_terraform output -raw custom_domain_hostname)"; then
-  printf 'Could not load the required Terraform outputs.\n' >&2
+if ! SUBSCRIPTION_ID="$(private_tofu output -raw subscription_id)" ||
+  ! RESOURCE_GROUP="$(private_tofu output -raw resource_group_name)" ||
+  ! CONTAINER_APP="$(private_tofu output -raw container_app_name)" ||
+  ! CONTAINER_APP_ENVIRONMENT="$(private_tofu output -raw container_app_environment_name)" ||
+  ! CONTAINER_APP_FQDN="$(private_tofu output -raw container_app_fqdn)" ||
+  ! CONTAINER_APP_STATIC_IP="$(private_tofu output -raw container_app_environment_static_ip)" ||
+  ! DOMAIN_VERIFICATION_ID="$(private_tofu output -raw custom_domain_verification_id)" ||
+  ! PUBLIC_BASE_URL="$(private_tofu output -raw public_base_url)" ||
+  ! CUSTOM_DOMAIN="$(private_tofu output -raw custom_domain_hostname)"; then
+  printf 'Could not load the required OpenTofu outputs.\n' >&2
   exit 1
 fi
 
@@ -40,7 +40,7 @@ for REQUIRED_OUTPUT in \
   "$PUBLIC_BASE_URL" \
   "$CUSTOM_DOMAIN"; do
   if test -z "$REQUIRED_OUTPUT"; then
-    printf 'Terraform returned an empty required deployment output.\n' >&2
+    printf 'OpenTofu returned an empty required deployment output.\n' >&2
     exit 1
   fi
 done

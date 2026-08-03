@@ -5,7 +5,7 @@ locals {
   # lowercase SHA-256 digest, and never the quickstart placeholder.
   #
   # This predicate is a named local rather than an inline precondition expression
-  # because plan-time `terraform test` cannot tell a precondition failure apart
+  # because plan-time `tofu test` cannot tell a precondition failure apart
   # from a postcondition failure on the same resource: `expect_failures` for
   # azurerm_container_app.server stays satisfied by the postcondition even if the
   # precondition is deleted. Naming it lets the guide harness statically pin the
@@ -13,7 +13,7 @@ locals {
   # the predicate directly through the server_image_is_managed_digest output.
   #
   # Guard indexes with try() so malformed images fail the predicate instead of
-  # raising Invalid index during expression evaluation (Terraform 1.9.8).
+  # raising Invalid index during expression evaluation.
   #
   # Conjunct-level coverage: the registry, repository, sha256-algorithm,
   # digest-length and lowercase-hex conjuncts are each pinned by a dedicated
@@ -78,7 +78,7 @@ resource "azurerm_container_app" "server" {
   # Azure CLI owns the custom hostname and managed-certificate binding. In the
   # AzureRM schema custom_domain is computed under ingress, so ignoring only
   # that leaf is ineffective; ignoring ingress prevents a later update from
-  # replacing the CLI-managed binding with Terraform's original ingress shape.
+  # replacing the CLI-managed binding with OpenTofu's original ingress shape.
   lifecycle {
     ignore_changes = [
       ingress,

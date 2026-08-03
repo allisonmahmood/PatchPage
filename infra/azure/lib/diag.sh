@@ -1,12 +1,12 @@
-# Private Terraform diagnostics on fd 3.
+# Private OpenTofu diagnostics on fd 3.
 #
 # Sourced by cmd/*.sh through ops.sh, which exports PP_OPS_LIB; see ops.sh.
 #
-# Terraform's stderr is the most useful output either Terraform runbook produces
+# OpenTofu's stderr is the most useful output either OpenTofu runbook produces
 # and the least safe to show: it quotes resource IDs, backend configuration and
-# occasionally attribute values. The two commands that run Terraform against
+# occasionally attribute values. The two commands that run OpenTofu against
 # real state therefore open fd 3 onto a file inside a private diagnostic
-# directory and route Terraform's stderr there, so the detail survives for an
+# directory and route OpenTofu's stderr there, so the detail survives for an
 # operator who goes looking for it and never lands in a terminal, a CI log or a
 # scrollback buffer.
 #
@@ -17,25 +17,25 @@
 # telling the operator where to look, and it fires on every failing exit,
 # including the ones that also keep the operation lease.
 #
-# The two commands that only discard Terraform's stderr keep their own one-line
-# private_terraform, for the reason given in lib/wrappers.sh.
+# The two commands that only discard OpenTofu's stderr keep their own one-line
+# private_tofu, for the reason given in lib/wrappers.sh.
 
-private_terraform() {
-  terraform "$@" 2>&3
+private_tofu() {
+  tofu "$@" 2>&3
 }
 
 # Requires TERRAFORM_DIAGNOSTIC_FD_OPEN, TERRAFORM_DIAGNOSTICS_COMPLETE and
 # TERRAFORM_DIAGNOSTIC_DIR, all set by the command before it installs the trap.
-terraform_diagnostic_exit() {
+tofu_diagnostic_exit() {
   if test "$TERRAFORM_DIAGNOSTIC_FD_OPEN" = "true"; then
     { exec 3>&-; } 2>/dev/null || :
     TERRAFORM_DIAGNOSTIC_FD_OPEN=false
   fi
   if test "$TERRAFORM_DIAGNOSTICS_COMPLETE" = "true"; then
     if ! rm -rf -- "$TERRAFORM_DIAGNOSTIC_DIR" 2>/dev/null; then
-      printf 'Terraform succeeded, but private diagnostic cleanup failed.\n' >&2
+      printf 'OpenTofu succeeded, but private diagnostic cleanup failed.\n' >&2
     fi
   else
-    printf 'Private Terraform diagnostics were retained under the configured diagnostic root.\n' >&2
+    printf 'Private OpenTofu diagnostics were retained under the configured diagnostic root.\n' >&2
   fi
 }
