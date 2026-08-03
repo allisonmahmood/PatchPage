@@ -23,6 +23,15 @@ OPERATION_LEASE_AUTH_MODE=key
 # ID. A renew that succeeds is therefore proof that the recorded lease and the
 # live lease are the same lease, which is the fact worth having before
 # releasing one.
+#
+# For the same reason it reads one field rather than the seven a plan records.
+# The other six describe a change this command will never make, and a session
+# missing any of them -- a plan killed between writing the digest and writing
+# the revision, a disk that filled -- is precisely the session that has to be
+# closable: infrastructure-plan already refuses to open a second one over it,
+# so a load gate here would leave the lease held with no command able to give
+# it back. A session too damaged to yield even a lease ID is still cleared; it
+# names nothing this command could release.
 SUBSCRIPTION_ID="${SUBSCRIPTION_ID:?Set the private expected subscription ID}"
 STATE_STORAGE_ACCOUNT="${STATE_STORAGE_ACCOUNT:?Set the private state account name}"
 if ! printf '%s\n' "$STATE_STORAGE_ACCOUNT" | grep -Eq '^[a-z0-9]{3,24}$'; then
@@ -31,7 +40,12 @@ if ! printf '%s\n' "$STATE_STORAGE_ACCOUNT" | grep -Eq '^[a-z0-9]{3,24}$'; then
 fi
 OPERATION_CONTAINER="patchpage-operations"
 infra_session_locate
-infra_session_load
+if ! test -e "$INFRA_SESSION_DIR"; then
+  printf 'No infrastructure session is open; there is nothing to abandon.\n' >&2
+  exit 1
+fi
+INFRA_SESSION_LEASE_USABLE=true
+infra_session_load_lease || INFRA_SESSION_LEASE_USABLE=false
 if ! private_az account set ||
   ! ACTIVE_SUBSCRIPTION_ID="$(private_az account show --query id --output tsv)" ||
   test "$ACTIVE_SUBSCRIPTION_ID" != "$SUBSCRIPTION_ID"; then
@@ -53,7 +67,10 @@ trap 'exit 143' TERM
 # and this exits 0. A lease that is held and will not release is the retained
 # case the exit-code contract covers, and it exits 75 with the session left
 # intact for whoever picks it up.
-if ! verify_operation_lease; then
+# A session that recorded no usable lease ID takes the same branch, and for the
+# same reason: there is no lease this command could prove or give back, so the
+# record is all there is to clear.
+if test "$INFRA_SESSION_LEASE_USABLE" != "true" || ! verify_operation_lease; then
   printf 'The session no longer holds the operation lease; clearing the session record only.\n'
 else
   OPERATION_LEASE_ACTIVE=true
@@ -68,6 +85,8 @@ if ! infra_session_discard; then
   exit 1
 fi
 trap - 0 HUP INT TERM
+unset INFRA_SESSION_LEASE_USABLE
+unset -f infra_session_load_lease
 unset -f operation_lease_exit release_operation_lease
 unset -f operation_lease_retention_exit
 unset -f verify_operation_container verify_operation_lease

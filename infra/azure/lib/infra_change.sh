@@ -1291,9 +1291,34 @@ infra_session_create() {
     ! infra_session_write_field revision "$LOCKED_CONTAINER_APP_REVISION" ||
     ! infra_session_write_field locked-image "$LOCKED_CONTAINER_APP_IMAGE" ||
     ! infra_session_write_field planned-image "$PLANNED_CONTAINER_APP_IMAGE"; then
+    # A half-written session is worse than none: it is complete enough to make
+    # infrastructure-plan refuse to open another, and incomplete enough that a
+    # command reading all seven fields would refuse it too. The directory this
+    # call created is therefore removed before the failure is reported, so the
+    # only states an operator can be left in are "an open session" and "no
+    # session". infrastructure-abandon covers the residue if even this fails.
+    rm -rf -- "$INFRA_SESSION_DIR" 2>/dev/null
     printf 'Could not record the reviewed infrastructure plan.\n' >&2
     exit 1
   fi
+}
+
+# The one field infrastructure-abandon needs, read without the all-seven gate
+# infra_session_load applies. Abandoning is not planning or applying: it does
+# not need the plan, its digest, the inventory or the revision pins, and a
+# session that lost any of those is exactly the session that most needs closing.
+# Requiring the full set would make a partial session unclosable -- plan refuses
+# because one is open, apply and abandon refuse because it will not load -- and
+# the lease would stay held with no command able to give it back.
+#
+# The lease field is still shape-checked, because a malformed ID is not
+# something to send to Azure and a session with no usable lease is a session
+# whose record is simply cleared.
+infra_session_load_lease() {
+  test -d "$INFRA_SESSION_DIR" || return 1
+  OPERATION_LEASE_ID="$(infra_session_read_field lease)" || return 1
+  printf '%s\n' "$OPERATION_LEASE_ID" |
+    grep -Eq '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
 }
 
 infra_session_load() {

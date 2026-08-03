@@ -42,8 +42,13 @@ case "${ADOPT_SAFETY_GUARDS:-false}" in
 esac
 infra_change_begin
 infra_session_locate
-infra_change_open_workspace
+# The session is read before the workspace is opened, so "there is no reviewed
+# plan" is answered by the one thing that can answer it rather than by whatever
+# `tofu init` happens to say first. It is the same diagnosability property
+# infrastructure-abandon has: the command that closes or completes a session
+# must not be able to fail for a reason that has nothing to do with the session.
 infra_session_load
+infra_change_open_workspace
 # The exact bytes the review approved. infra_change_apply_phase applies
 # $INFRA_PLAN, and this is the one assignment that decides which plan that is:
 # the session's copy, never the workspace this process could have replanned in.

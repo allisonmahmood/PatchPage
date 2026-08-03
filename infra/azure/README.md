@@ -271,6 +271,8 @@ sh infra/azure/ops.sh infrastructure-abandon
 
 It renews the recorded lease as proof that the session and the live lease are the same lease, releases it, and removes the session. It loads no OpenTofu, reads no state and runs no plan gate, because a session has to stay closable when the thing it was planning against is what is broken. A session whose lease a second operator has already recovered is not an error: there is nothing to release, so it clears the record and exits `0`. A lease it holds but cannot release is the retained case, and it exits `75` with the session left intact.
 
+It also reads only the recorded lease, not the whole session. A plan killed partway through saving leaves a session complete enough that `infrastructure-plan` refuses to open another over it, so a half-written session that this command would not accept would be a session nothing could close and a lease nothing could give back. A session too damaged to name a lease at all is cleared the same way, and the container it left leased is then the stale-lease recovery's problem rather than a permanent one.
+
 ### The one-shot alternative
 
 `infrastructure-change` does the plan and the apply in one command, run twice. For one operator at one terminal with a second operator available to review between the two runs, it is the shorter path, and it takes the same inputs as `infrastructure-plan` minus `INFRA_CHANGE_SESSION_ROOT`, plus:

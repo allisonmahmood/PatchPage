@@ -2976,6 +2976,80 @@ test_infrastructure_session() {
   test ! -e "$session_dir" ||
     fail "infrastructure abandon kept a session whose lease was already gone"
 
+  # --- a session a crash left half-written ------------------------------------
+  #
+  # infra_session_create writes seven things one after another. A process killed
+  # between two of them, or a disk that fills, leaves a directory complete
+  # enough to stop the next plan -- a session is open -- and incomplete enough
+  # to fail a load that insists on all seven. Every command then refuses: plan
+  # because a session is open, apply and abandon because the session will not
+  # load, and the operation lease stays held with nothing able to give it back.
+  # Abandoning is the way out of that, so abandoning must not require the six
+  # fields it never reads.
+  guide_session_setup session_partial
+  guide_session_run_plan session_partial
+  test "$session_status" -eq 0 ||
+    fail "infrastructure plan failed before the half-written-session scenario"
+  guide_session_lease_is_held ||
+    fail "infrastructure plan left nothing holding the environment before the half-written-session scenario"
+  session_partial_lease="$(cat "$session_dir/lease")"
+  rm -f "$session_dir/plan.tfplan" "$session_dir/plan.sha256" \
+    "$session_dir/revision" "$session_dir/locked-image" ||
+    fail "could not simulate a half-written session"
+  for session_field in lease inventory planned-image; do
+    test -f "$session_dir/$session_field" ||
+      fail "the half-written-session scenario did not leave $session_field behind"
+  done
+  guide_session_run session_partial infrastructure-abandon abandon
+  test "$session_status" -eq 0 ||
+    fail "infrastructure abandon refused a half-written session, leaving it unclosable"
+  grep -Fqx 'Infrastructure session abandoned.' "$session_output" ||
+    fail "infrastructure abandon did not report closing the half-written session"
+  test ! -e "$session_dir" ||
+    fail "infrastructure abandon left the half-written session behind"
+  # The lease is why any of this matters, and the one surviving field that names
+  # it is enough to prove it and give it back.
+  if guide_session_lease_is_held; then
+    fail "infrastructure abandon cleared a half-written session without giving back its operation lease"
+  fi
+  grep -Fqx \
+    "az storage container lease release --account-name patchpagestate --container-name patchpage-operations --auth-mode key --lease-id $session_partial_lease --output none" \
+    "$session_log" ||
+    fail "infrastructure abandon did not release the exact lease the half-written session recorded"
+  # And the referral cycle is broken where it matters: a plan can be opened
+  # again, which is the whole point of having closed the session.
+  guide_session_run session_partial infrastructure-plan replan
+  test "$session_status" -eq 0 ||
+    fail "infrastructure plan still could not open a session after the half-written one was abandoned"
+  test -d "$session_dir" ||
+    fail "the plan after the abandoned half-written session left no session behind"
+
+  # --- a session too damaged to name a lease ----------------------------------
+  #
+  # Below the one field abandon needs. There is no lease it could prove or hand
+  # back, so it clears the record and says so, and it must not guess at an ID:
+  # what is left is a container whose lease only stale-lease-recovery can reach.
+  guide_session_setup session_partial_no_lease
+  guide_session_run_plan session_partial_no_lease
+  test "$session_status" -eq 0 ||
+    fail "infrastructure plan failed before the unnameable-lease scenario"
+  rm -f "$session_dir/lease" "$session_dir/plan.sha256" ||
+    fail "could not simulate a session that lost its lease field"
+  guide_session_run session_partial_no_lease infrastructure-abandon abandon
+  test "$session_status" -eq 0 ||
+    fail "infrastructure abandon refused a session that had lost its lease field"
+  grep -Fq 'clearing the session record only' "$session_output" ||
+    fail "infrastructure abandon did not say it was clearing the record only"
+  test ! -e "$session_dir" ||
+    fail "infrastructure abandon kept a session it could not read a lease from"
+  for session_lease_verb in renew release; do
+    if grep -Fq "az storage container lease $session_lease_verb " "$session_log"; then
+      fail "infrastructure abandon sent a lease $session_lease_verb for a lease the session never named"
+    fi
+  done
+  guide_session_lease_is_held ||
+    fail "infrastructure abandon released a lease it could not name"
+
   # --- a second session over an open one --------------------------------------
   guide_session_setup session_reopen
   guide_session_run_plan session_reopen
@@ -3089,6 +3163,7 @@ test_stale_lease_recovery() {
     container_nonempty \
     break_failure \
     acquire_failure \
+    acquire_ok_transit_fails \
     concurrent_recovery \
     renew_failure \
     release_failure \
@@ -3152,15 +3227,46 @@ test_stale_lease_recovery() {
             fail "stale operation lease recovery broke a lease after $scenario"
           fi
           ;;
+        acquire_ok_transit_fails)
+          # Azure granted the acquire and the answer was lost coming back. The
+          # container is leased under this recovery's own ID, this recovery has
+          # been told it failed, and no other process can ever name that ID --
+          # so if this run does not release it, nothing short of another break
+          # will. The release the exit trap sends blind is what makes the leak
+          # recoverable, and it is why a refused acquire is not a reason to
+          # stop calling Azure.
+          transit_lease_id="$(
+            sed -n 's/^az storage container lease acquire .* --proposed-lease-id \([^ ]*\) --output none$/\1/p' "$log"
+          )"
+          test -n "$transit_lease_id" ||
+            fail "the recoverer proposed no lease ID during $scenario"
+          grep -Fqx \
+            "az storage container lease release --account-name patchpagestate --container-name patchpage-operations --auth-mode login --lease-id $transit_lease_id --output none" \
+            "$log" ||
+            fail "the recoverer left behind the lease its refused acquire had in fact been granted during $scenario"
+          # And the leak is actually gone, not merely aimed at: the container
+          # the mock is keeping is unleased again.
+          test ! -e "$TMP_DIR/stale-lease-$scenario.mockstate/operation-lease-id" ||
+            fail "the operation container is still leased after $scenario"
+          # Still exit 1, not 75: nothing was ever confirmed taken, so retrying
+          # is the right advice.
+          test "$status" -eq 1 ||
+            fail "the recoverer exited $status instead of 1 during $scenario"
+          ;;
         concurrent_recovery)
           # The losing side of the race. Its break landed, a second recoverer
           # took the container back in that instant, and its own acquire was
           # refused. Three things have to be true of what it did next.
           #
-          # First: it stopped. The refused acquire has to be the last thing it
-          # sent, so the assertion is on the final logged call rather than on a
-          # list of forbidden verbs -- a future release, renew, break or
-          # metadata write would all fail this, including ones nobody has
+          # First: it gave up recovering, and everything it sent after the
+          # refused acquire is one release of the ID it minted itself. That
+          # release is deliberate and safe to send blind -- Azure matches a
+          # release against the live lease ID exactly, so against the winner's
+          # lease it is a 409 that changes nothing, and against the residue of
+          # an acquire that was granted but lost in transit it is the only
+          # thing that clears it. What is forbidden is anything else: a renew,
+          # a second break, a metadata write, a second acquire. Asserting on
+          # the whole tail rather than a list of verbs fails on ones nobody has
           # written yet.
           grep -Fq 'az storage container lease break ' "$log" ||
             fail "the losing recoverer never reached the lease break, so $scenario proved nothing"
@@ -3168,12 +3274,19 @@ test_stale_lease_recovery() {
             grep -cF 'az storage container lease acquire ' "$log" | tr -d ' '
           )" = "1" ||
             fail "the losing recoverer did not attempt exactly one acquire during $scenario"
-          case "$(tail -n 1 "$log")" in
-            'az storage container lease acquire '*) ;;
-            *)
-              fail "the losing recoverer kept calling Azure after its acquire was refused during $scenario"
-              ;;
-          esac
+          loser_lease_id="$(
+            sed -n 's/^az storage container lease acquire .* --proposed-lease-id \([^ ]*\) --output none$/\1/p' "$log"
+          )"
+          test -n "$loser_lease_id" ||
+            fail "the losing recoverer proposed no lease ID during $scenario"
+          loser_acquire_line="$(
+            grep -nF 'az storage container lease acquire ' "$log" |
+              sed -n '1s/:.*//p'
+          )"
+          loser_tail="$(tail -n "+$((loser_acquire_line + 1))" "$log")"
+          test "$loser_tail" = \
+            "az storage container lease release --account-name patchpagestate --container-name patchpage-operations --auth-mode login --lease-id $loser_lease_id --output none" ||
+            fail "the losing recoverer's calls after its refused acquire were not one release of its own lease during $scenario"
           # Second: it never named the winner's lease. Releasing or renewing the
           # lease the other operator is holding is the precise harm the
           # single-flight rule exists to prevent.
@@ -3225,12 +3338,30 @@ test_stale_lease_recovery() {
   # none -- it is an od, a grep and a sed. Those three process spawns are real
   # time between the break and the acquire all the same, so where the minting
   # sits is pinned in the source instead.
+  #
+  # Both anchors are the whole statement and both are required to appear exactly
+  # once. A pin that took the first line merely *mentioning* /dev/urandom is a
+  # pin a comment can satisfy: writing prose about the minting above the break
+  # would leave the ordering true of the prose while the code moved below it,
+  # and the pin would go on passing. Uniqueness is what forecloses that, and it
+  # is not hypothetical -- it is how this check was first found to be defeated.
   stale_lease_source="$GUIDE_CMD_DIR/stale-lease-recovery.sh"
+  stale_lease_mint_statement='od -An -N16 -tx1 /dev/urandom'
+  stale_lease_break_statement='private_az storage container lease break \'
+  test "$(
+    grep -cF "$stale_lease_mint_statement" "$stale_lease_source" | tr -d ' '
+  )" = "1" ||
+    fail "stale operation lease recovery does not mint its lease ID in exactly one place, so the source-order pin cannot say where that place is"
+  test "$(
+    grep -cF "$stale_lease_break_statement" "$stale_lease_source" | tr -d ' '
+  )" = "1" ||
+    fail "stale operation lease recovery does not break the lease in exactly one place, so the source-order pin cannot say where that place is"
   stale_lease_mint_line="$(
-    grep -nF '/dev/urandom' "$stale_lease_source" | sed -n '1s/:.*//p'
+    grep -nF "$stale_lease_mint_statement" "$stale_lease_source" |
+      sed -n '1s/:.*//p'
   )"
   stale_lease_source_break_line="$(
-    grep -nF 'private_az storage container lease break' "$stale_lease_source" |
+    grep -nF "$stale_lease_break_statement" "$stale_lease_source" |
       sed -n '1s/:.*//p'
   )"
   test -n "$stale_lease_mint_line" && test -n "$stale_lease_source_break_line" ||
@@ -5186,8 +5317,8 @@ done
 # Exact, so a scenario whose output stopped being captured -- or a group that
 # silently stopped running -- cannot leave the sweep passing over less than it
 # used to. Adding scenarios means updating this number.
-test "$GUIDE_PRIVATE_OUTPUT_SWEPT" -eq 540 ||
-  fail "the private-output sweep examined $GUIDE_PRIVATE_OUTPUT_SWEPT scenario captures, not the expected 540"
+test "$GUIDE_PRIVATE_OUTPUT_SWEPT" -eq 546 ||
+  fail "the private-output sweep examined $GUIDE_PRIVATE_OUTPUT_SWEPT scenario captures, not the expected 546"
 
 printf 'guide_commands_test: %s scenario groups passed, %s captures swept\n' \
   "$#" "$GUIDE_PRIVATE_OUTPUT_SWEPT"

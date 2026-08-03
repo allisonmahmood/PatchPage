@@ -310,6 +310,14 @@ mock_operation_lease() {
       esac
       test ! -e "$operation_lease_file" || return 1
       printf '%s\n' "$operation_proposed_id" > "$operation_lease_file"
+      # Azure granted the lease and the answer was lost on the way back. The
+      # container is now leased under the caller's own proposed ID and the
+      # caller has been told its acquire failed -- the one interleaving in which
+      # a caller that declines to release leaks an infinite lease that only its
+      # own ID can clear. Recorded first, refused second, the same shape as the
+      # renew blip above.
+      test "$scenario" != "${operation_lease_prefix}acquire_ok_transit_fails" ||
+        return 1
       ;;
     renew)
       test -f "$operation_lease_file" || return 1
