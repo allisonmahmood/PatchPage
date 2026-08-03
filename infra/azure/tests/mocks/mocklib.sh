@@ -31,6 +31,11 @@ mock_real() (
 # rather than a comparison against the block's own variable.
 MOCK_SUBSCRIPTION_ID="${PP_MOCK_SUBSCRIPTION_ID:-${SUBSCRIPTION_ID:-}}"
 
+# The bytes the tofu shim writes for a saved infrastructure plan. Fixed, so the
+# infrastructure session's recorded SHA-256 is a constant the harness can name,
+# and so a canonicalized log diff is not full of per-run noise.
+MOCK_INFRA_PLAN_BYTES="patchpage-mock-infrastructure-plan"
+
 # --- recording ---------------------------------------------------------------
 
 # Append one already-formatted line to the scenario command log.

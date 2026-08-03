@@ -320,6 +320,11 @@ tofu_infrastructure() {
       infra_plan="${3#-out=}"
       mock_state_write infra-plan "$infra_plan"
       test "$scenario" != "plan_failure" || return 1
+      # A real saved plan is a file, and the plan/apply session copies it and
+      # records its SHA-256, so the shim has to produce actual bytes. They are
+      # fixed rather than random so a canonicalized log diff stays meaningful
+      # and so the harness can state the digest it expects.
+      printf '%s\n' "$MOCK_INFRA_PLAN_BYTES" > "$infra_plan" || return 1
       mock_state_mark infra-plan-created
       if test "$scenario" = "plan_json_open_failure"; then
         # The block writes the plan JSON beside the saved plan; see
@@ -356,7 +361,13 @@ tofu_infrastructure() {
       # infra-plan-created is set only after a successful plan, so an apply
       # that follows a failed plan is refused by the shim itself.
       mock_state_exists infra-plan-created || return 1
-      test "$3" = "$(mock_state_read infra-plan)" || return 1
+      # The merged command applies the plan where the plan wrote it; the split
+      # command applies the copy its session preserved, at a different path. The
+      # bytes are what both have to be right about, so the bytes are what this
+      # compares -- which also means a saved plan edited between the review and
+      # the apply is refused here as well as by the command.
+      test -f "$3" || return 1
+      test "$(mock_real cat "$3")" = "$MOCK_INFRA_PLAN_BYTES" || return 1
       test "$scenario" != "final_apply_failure" || return 1
       mock_state_mark infra-apply-completed
       ;;

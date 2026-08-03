@@ -80,7 +80,8 @@ GUIDE_OPS="$ROOT/infra/azure/ops.sh"
 GUIDE_CMD_DIR="$ROOT/infra/azure/cmd"
 GUIDE_LIB_DIR="$ROOT/infra/azure/lib"
 GUIDE_COMMANDS="state-bootstrap deploy-resources app-release app-rollback
-infrastructure-change stale-lease-recovery custom-domain-context
+infrastructure-change infrastructure-plan infrastructure-apply
+infrastructure-abandon stale-lease-recovery custom-domain-context
 ingress-verification apex-dns caa-policy hostname-mutation certificate-binding
 deployed-smoke"
 
@@ -88,7 +89,7 @@ deployed-smoke"
 # and is now one definition; they are part of the executable surface and are
 # held to the same rules as the commands, which is why they are named here
 # rather than discovered by globbing.
-GUIDE_LIBS="wrappers lease revision diag plan_gate state_inspect dns"
+GUIDE_LIBS="wrappers lease revision diag plan_gate state_inspect dns infra_change"
 
 test -f "$GUIDE_OPS" || fail "infra/azure/ops.sh is missing"
 sh -n "$GUIDE_OPS" || fail "infra/azure/ops.sh is not valid POSIX shell"
@@ -2056,7 +2057,7 @@ azurerm_container_app.server'
   printf '%s\n' "$required_addresses" |
     while IFS= read -r address; do
       test -z "$address" && continue
-      grep -Fq "$address" "$GUIDE_CMD_DIR/infrastructure-change.sh" ||
+      grep -Fq "$address" "$GUIDE_LIB_DIR/infra_change.sh" ||
         fail "infrastructure change omitted required state address $address"
     done
 
@@ -2663,6 +2664,343 @@ azurerm_container_app.server'
     fail "infrastructure change never exercised a deliberately retained operation lease"
 }
 
+# --- the infrastructure plan/apply session ------------------------------------
+#
+# infrastructure-plan, infrastructure-apply and infrastructure-abandon are one
+# flow across three processes, so unlike every other group here a scenario is a
+# *sequence* of commands sharing one mock state directory, one command log and
+# one session root. That sharing is the point: the operation lease the plan
+# takes has to still be there when the apply renews it, and the only way to test
+# that is to let one process's state be the next process's world.
+#
+# The scenarios are the ways the handoff can be wrong, not the ways the plan can
+# be wrong -- the plan half is the same library the twenty infrastructure-change
+# scenarios already drive, and re-testing it here would only pin it twice.
+
+# The bytes tests/mocks/tofu writes for a saved plan, and their SHA-256. Both
+# are stated here rather than computed, so a change to either side of the
+# session's integrity check has to be made deliberately in two places.
+GUIDE_SESSION_PLAN_BYTES="patchpage-mock-infrastructure-plan"
+GUIDE_SESSION_PLAN_SHA256="8f0c4197a0e5fa9fa8d7f60dc2fb7e7a2213ed4fa05945fa35f5490a2911f733"
+
+guide_session_paths() {
+  session_scenario="$1"
+  session_root="$TMP_DIR/session-$session_scenario-root"
+  session_repo="$TMP_DIR/session-$session_scenario-repo"
+  session_diagnostics="$TMP_DIR/session-$session_scenario-diagnostics"
+  session_dir="$session_root/patchpage-infrastructure-session"
+}
+
+guide_session_setup() {
+  guide_session_paths "$1"
+  rm -rf "$session_root" "$session_repo" "$session_diagnostics"
+  mkdir -p "$session_root" "$session_repo/infra/azure" "$session_diagnostics"
+  session_root="$(CDPATH= cd -- "$session_root" && pwd -P)"
+  session_diagnostics="$(CDPATH= cd -- "$session_diagnostics" && pwd -P)"
+  session_dir="$session_root/patchpage-infrastructure-session"
+  prepare_mock_state "$TMP_DIR/session-$1.mockstate"
+  # Every session scenario runs against an environment whose operation
+  # container is already sealed; adoption is infrastructure-change's subject.
+  : > "$PP_MOCK_STATE/operation-container-created"
+}
+
+# Runs one command of a session. The step name only names the output file, so a
+# scenario can run the same command twice and keep both captures.
+run_infrastructure_session_command() {
+  session_scenario="$1"
+  session_command="$2"
+  session_step="$3"
+  session_approval="${4:-}"
+  session_root_override="${5:-$session_root}"
+  output="$TMP_DIR/session-$session_scenario-$session_step.out"
+  # One log per step, not per scenario. What the three processes of a session
+  # share is the mock state -- the operation lease, the plan marker -- and that
+  # is the sharing under test. Their command logs are separate so an assertion
+  # about what the apply did cannot be satisfied by something the plan did.
+  session_log="$TMP_DIR/session-$session_scenario-$session_step.log"
+  : > "$session_log"
+
+  (
+    SUBSCRIPTION_ID="00000000-0000-0000-0000-000000000000"
+    STATE_STORAGE_ACCOUNT="patchpagestate"
+    STATE_CONTAINER="tfstate"
+    STATE_KEY="patchpage-prod.tfstate"
+    EXPECTED_OPERATION_AUTH_MODE="key"
+    EXPECTED_STATE_LINEAGE="11111111-1111-1111-1111-111111111111"
+    EXPECTED_RESOURCE_GROUP_ID="/subscriptions/$SUBSCRIPTION_ID/resourceGroups/rg-patchpage-workload"
+    EXPECTED_STORAGE_ACCOUNT_ID="$EXPECTED_RESOURCE_GROUP_ID/providers/Microsoft.Storage/storageAccounts/patchpagedrafts"
+    EXPECTED_POSTGRES_SERVER_ID="$EXPECTED_RESOURCE_GROUP_ID/providers/Microsoft.DBforPostgreSQL/flexibleServers/patchpage-db"
+    EXPECTED_ACR_ID="$EXPECTED_RESOURCE_GROUP_ID/providers/Microsoft.ContainerRegistry/registries/acrpatchpageabc123"
+    EXPECTED_CONTAINER_APP_ID="$EXPECTED_RESOURCE_GROUP_ID/providers/Microsoft.App/containerApps/patchpage-app"
+    RESOURCE_GROUP="rg-patchpage-workload"
+    CONTAINER_APP="patchpage-app"
+    ACR="acrpatchpageabc123"
+    LEGACY_IMAGE_TAG="1111111"
+    LEGACY_IMAGE_DIGEST="sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    IMMUTABLE_IMAGE="acrpatchpageabc123.azurecr.io/patchpage-server@$LEGACY_IMAGE_DIGEST"
+    OLD_REVISION_NAME="patchpage-app--stable"
+    ADOPTION_REVISION_NAME="patchpage-app--adopted"
+    POSTAPPLY_REVISION_NAME="patchpage-app--infra"
+    LATER_REVISION_NAME="patchpage-app--later"
+    EXPECTED_OPERATION_BINDING_SHA256="$(
+      guide_operation_binding_sha256 "$STATE_KEY"
+    )"
+    TERRAFORM_DIAGNOSTIC_ROOT="$session_diagnostics"
+    INFRA_CHANGE_SESSION_ROOT="$session_root_override"
+    ADOPT_SAFETY_GUARDS="false"
+    export SUBSCRIPTION_ID STATE_STORAGE_ACCOUNT STATE_CONTAINER STATE_KEY \
+      EXPECTED_OPERATION_AUTH_MODE EXPECTED_STATE_LINEAGE \
+      EXPECTED_RESOURCE_GROUP_ID EXPECTED_STORAGE_ACCOUNT_ID \
+      EXPECTED_POSTGRES_SERVER_ID EXPECTED_ACR_ID EXPECTED_CONTAINER_APP_ID \
+      RESOURCE_GROUP CONTAINER_APP ACR LEGACY_IMAGE_TAG LEGACY_IMAGE_DIGEST \
+      IMMUTABLE_IMAGE OLD_REVISION_NAME ADOPTION_REVISION_NAME \
+      POSTAPPLY_REVISION_NAME LATER_REVISION_NAME \
+      EXPECTED_OPERATION_BINDING_SHA256 TERRAFORM_DIAGNOSTIC_ROOT \
+      INFRA_CHANGE_SESSION_ROOT ADOPT_SAFETY_GUARDS
+    if test -n "$session_approval"; then
+      INFRA_CHANGE_APPROVAL_SHA256="$session_approval"
+      export INFRA_CHANGE_APPROVAL_SHA256
+    fi
+
+    PP_MOCK_GROUP="infrastructure"
+    PP_MOCK_SCENARIO="$session_scenario"
+    PP_MOCK_LOG="$session_log"
+    PP_MOCK_REPO_ROOT="$session_repo"
+    PP_MOCK_SCENARIO_ROOT="$session_repo"
+    export PP_MOCK_GROUP PP_MOCK_SCENARIO PP_MOCK_LOG PP_MOCK_REPO_ROOT \
+      PP_MOCK_SCENARIO_ROOT
+
+    run_ops_command_completed "$session_command"
+  ) >"$output" 2>&1
+}
+
+# The recorded operation lease, read back from the session the way the apply
+# reads it. Used to state, from outside the commands, whether the container is
+# still leased to the plan.
+guide_session_lease_is_held() {
+  test -f "$PP_MOCK_STATE/operation-lease-id"
+}
+
+# Runs one session command, records its status, and holds it to the exit-code
+# contract every other flow here is held to: a run that says it kept the
+# operation lease must exit 75, and a run that exits 75 must say so. The session
+# commands are the first ones that can end with the lease deliberately held
+# *without* being in that state -- infrastructure-plan holds it and exits 0 --
+# so putting them through the same assertion is what keeps that exception to
+# exactly the one message that names it.
+guide_session_run() {
+  if run_infrastructure_session_command "$@"; then
+    session_status=0
+  else
+    session_status=$?
+  fi
+  session_output="$TMP_DIR/session-$1-$3.out"
+  session_log="$TMP_DIR/session-$1-$3.log"
+  assert_retained_lease_exit_code "infrastructure session $2" "$1" \
+    "$session_status" "$session_output"
+}
+
+guide_session_run_plan() {
+  guide_session_run "$1" infrastructure-plan plan
+  session_plan_output="$TMP_DIR/session-$1-plan.out"
+  session_token="$(
+    sed -n 's/^INFRA_CHANGE_APPROVAL_SHA256=//p' "$session_plan_output"
+  )"
+}
+
+test_infrastructure_session() {
+  session_retained_start="$GUIDE_RETAINED_LEASE_EXITS"
+
+  # --- the handoff itself ----------------------------------------------------
+  guide_session_setup session_success
+  guide_session_run_plan session_success
+  test "$session_status" -eq 0 ||
+    fail "infrastructure plan rejected the session handoff"
+  printf '%s\n' "$session_token" | grep -Eq '^[0-9a-f]{64}$' ||
+    fail "infrastructure plan did not print a well-formed review token"
+  test -d "$session_dir" ||
+    fail "infrastructure plan did not leave a session behind"
+  test "$(file_mode "$session_dir")" = "700" ||
+    fail "the infrastructure session directory is not private"
+  for session_field in plan.tfplan plan.sha256 inventory lease revision \
+    locked-image planned-image; do
+    test -f "$session_dir/$session_field" ||
+      fail "the infrastructure session is missing $session_field"
+    test "$(file_mode "$session_dir/$session_field")" = "600" ||
+      fail "the infrastructure session field $session_field is not private"
+  done
+  test "$(cat "$session_dir/plan.tfplan")" = "$GUIDE_SESSION_PLAN_BYTES" ||
+    fail "the infrastructure session did not preserve the saved plan"
+  test "$(cat "$session_dir/plan.sha256")" = "$GUIDE_SESSION_PLAN_SHA256" ||
+    fail "the infrastructure session recorded the wrong plan digest"
+  # The whole reason the session exists: the environment is still held.
+  guide_session_lease_is_held ||
+    fail "infrastructure plan gave the operation lease back and left nothing holding the reviewed plan's world still"
+  test "$(cat "$session_dir/lease")" = "$(cat "$PP_MOCK_STATE/operation-lease-id")" ||
+    fail "the infrastructure session recorded a lease it is not holding"
+  grep -Fq 'The operation lease is held for this session.' "$session_plan_output" ||
+    fail "infrastructure plan did not say the lease is still held"
+  if grep -Fq 'tofu apply ' "$session_log"; then
+    fail "infrastructure plan applied something"
+  fi
+
+  guide_session_run session_success infrastructure-apply apply "$session_token"
+  test "$session_status" -eq 0 ||
+    fail "infrastructure apply rejected its own session"
+  # The exact saved plan file, not a path this process could have replanned to.
+  grep -Fqx "tofu apply -input=false $session_dir/plan.tfplan" "$session_log" ||
+    fail "infrastructure apply did not apply the exact plan file the session preserved"
+  test ! -e "$session_dir" ||
+    fail "infrastructure apply left the session behind"
+  if guide_session_lease_is_held; then
+    fail "infrastructure apply did not give the operation lease back"
+  fi
+
+  # --- a plan that is not the plan that was reviewed --------------------------
+  guide_session_setup session_tampered_plan
+  guide_session_run_plan session_tampered_plan
+  test "$session_status" -eq 0 ||
+    fail "infrastructure plan failed before the tamper scenario could tamper"
+  printf '%s\n' "tampered" >> "$session_dir/plan.tfplan" ||
+    fail "could not tamper with the saved plan"
+  guide_session_run session_tampered_plan infrastructure-apply apply \
+    "$session_token"
+  test "$session_status" -ne 0 ||
+    fail "infrastructure apply accepted a saved plan that had been edited"
+  grep -Fq 'is not the plan that was reviewed' "$session_output" ||
+    fail "infrastructure apply did not name the plan-integrity failure"
+  if grep -Fq 'tofu apply ' "$session_log"; then
+    fail "infrastructure apply applied a tampered plan"
+  fi
+  # Refused before the lease was touched: the session is intact and still holds
+  # the environment, so the operator can review again or abandon.
+  test -d "$session_dir" ||
+    fail "infrastructure apply discarded a session it refused"
+  guide_session_lease_is_held ||
+    fail "infrastructure apply gave back a lease it never took"
+
+  # --- an approval that names other actions ----------------------------------
+  guide_session_setup session_wrong_token
+  guide_session_run_plan session_wrong_token
+  test "$session_status" -eq 0 || fail "infrastructure plan failed before the token scenario"
+  guide_session_run session_wrong_token infrastructure-apply apply \
+    "0000000000000000000000000000000000000000000000000000000000000000"
+  test "$session_status" -ne 0 ||
+    fail "infrastructure apply accepted an approval for other actions"
+  if grep -Fq 'tofu apply ' "$session_log"; then
+    fail "infrastructure apply applied an unapproved plan"
+  fi
+  guide_session_lease_is_held ||
+    fail "a refused approval cost the session its operation lease"
+
+  # --- the lease was recovered between the review and the apply ---------------
+  #
+  # A second operator proved this session's process was gone and ran
+  # stale-lease-recovery. The saved plan is still on disk and still hashes
+  # correctly; what it no longer describes is an environment nobody has touched.
+  guide_session_setup session_stale_lease
+  guide_session_run_plan session_stale_lease
+  test "$session_status" -eq 0 || fail "infrastructure plan failed before the stale-lease scenario"
+  rm -f "$PP_MOCK_STATE/operation-lease-id" ||
+    fail "could not simulate the recovered operation lease"
+  guide_session_run session_stale_lease infrastructure-apply apply \
+    "$session_token"
+  test "$session_status" -ne 0 ||
+    fail "infrastructure apply applied a reviewed plan after its lease was recovered"
+  grep -Fq 'no longer holding the operation lease' "$session_output" ||
+    fail "infrastructure apply did not name the lost lease"
+  if grep -Fq 'tofu apply ' "$session_log"; then
+    fail "infrastructure apply applied a plan whose lease it could not renew"
+  fi
+
+  # --- no session at all ------------------------------------------------------
+  guide_session_setup session_missing
+  guide_session_run session_missing infrastructure-apply apply \
+    "0000000000000000000000000000000000000000000000000000000000000000"
+  test "$session_status" -ne 0 ||
+    fail "infrastructure apply ran without a reviewed plan"
+  grep -Fq 'No reviewed infrastructure plan is open' "$session_output" ||
+    fail "infrastructure apply did not name the missing session"
+
+  # --- abandoning -------------------------------------------------------------
+  guide_session_setup session_abandon
+  guide_session_run_plan session_abandon
+  test "$session_status" -eq 0 || fail "infrastructure plan failed before the abandon scenario"
+  guide_session_run session_abandon infrastructure-abandon abandon
+  test "$session_status" -eq 0 || fail "infrastructure abandon refused an open session"
+  grep -Fqx 'Infrastructure session abandoned.' "$session_output" ||
+    fail "infrastructure abandon did not report completion"
+  test ! -e "$session_dir" || fail "infrastructure abandon left the session behind"
+  if guide_session_lease_is_held; then
+    fail "infrastructure abandon did not give the operation lease back"
+  fi
+  # It loads no OpenTofu at all: a session must stay closable when the thing it
+  # was planning against is what is broken.
+  if grep -Fq 'tofu ' "$session_log"; then
+    fail "infrastructure abandon ran OpenTofu"
+  fi
+
+  # --- abandoning a session whose lease is already gone -----------------------
+  guide_session_setup session_abandon_recovered
+  guide_session_run_plan session_abandon_recovered
+  test "$session_status" -eq 0 ||
+    fail "infrastructure plan failed before the recovered-abandon scenario"
+  rm -f "$PP_MOCK_STATE/operation-lease-id" ||
+    fail "could not simulate the recovered operation lease"
+  guide_session_run session_abandon_recovered infrastructure-abandon abandon
+  test "$session_status" -eq 0 ||
+    fail "infrastructure abandon escalated over a lease that was already recovered"
+  test ! -e "$session_dir" ||
+    fail "infrastructure abandon kept a session whose lease was already gone"
+
+  # --- a second session over an open one --------------------------------------
+  guide_session_setup session_reopen
+  guide_session_run_plan session_reopen
+  test "$session_status" -eq 0 || fail "infrastructure plan failed before the reopen scenario"
+  session_first_lease="$(cat "$session_dir/lease")"
+  guide_session_run session_reopen infrastructure-plan replan
+  test "$session_status" -ne 0 ||
+    fail "infrastructure plan opened a second session over an open one"
+  grep -Fq 'An infrastructure session is already open' "$session_output" ||
+    fail "infrastructure plan did not name the open session"
+  test "$(cat "$session_dir/lease")" = "$session_first_lease" ||
+    fail "the refused second plan overwrote the open session"
+  guide_session_lease_is_held ||
+    fail "the refused second plan released the open session's lease"
+
+  # --- a session root inside the repository -----------------------------------
+  #
+  # A saved plan is a complete description of an environment, and one written
+  # inside the repository is one `git add -A` away from being published. The
+  # refusal has to land before anything is planned or leased.
+  guide_session_setup session_inside_repo
+  guide_session_run session_inside_repo infrastructure-plan plan "" \
+    "$session_repo/infra"
+  test "$session_status" -ne 0 ||
+    fail "infrastructure plan wrote its session inside the repository"
+  grep -Fq 'must remain outside the repository' "$session_output" ||
+    fail "infrastructure plan did not name the in-repository session root"
+  if grep -Fq 'az storage container lease acquire ' "$session_log"; then
+    fail "infrastructure plan took the operation lease before vetting its session root"
+  fi
+
+  # No session command may retain a lease, so this group must contribute nothing
+  # to the retained-lease count. Stated rather than assumed: a session command
+  # that started exiting 75 would otherwise pass silently.
+  test "$GUIDE_RETAINED_LEASE_EXITS" -eq "$session_retained_start" ||
+    fail "an infrastructure session command retained the operation lease"
+
+  # The two facts an operator cannot discover from the commands' own output: the
+  # lease is deliberately held between the plan and the apply, and the saved
+  # plan is what the apply checks rather than a fresh one.
+  grep -Fq 'the operation lease stays held' "$README" ||
+    fail "the infrastructure session guidance omits that the lease is held across the review"
+  grep -Fq 'still hashes to the digest recorded at review time' "$README" ||
+    fail "the infrastructure session guidance omits the saved-plan integrity check"
+  grep -Fq 'What it cannot carry forward is the plan itself' "$README" ||
+    fail "the guide no longer says what the one-shot flow does not carry between its two runs"
+}
+
 # The lease ID the winning recoverer holds in the concurrent-recovery scenario.
 GUIDE_CONCURRENT_RECOVERY_LEASE_ID="99999999-9999-9999-9999-999999999999"
 
@@ -3079,7 +3417,7 @@ server_image_precondition_is_pinned() {
 # named below fails too, so a new mutating command cannot quietly inherit
 # whichever mode happens to be convenient.
 #
-# One honest caveat about two of the five entries. deploy-resources and
+# One honest caveat about two of the eight entries. deploy-resources and
 # stale-lease-recovery load lease.sh only for operation_binding_sha256(), which
 # never reads OPERATION_LEASE_AUTH_MODE; every data-plane call they make names
 # its mode as a literal `--auth-mode key` / `--auth-mode login` flag in the
@@ -3087,13 +3425,13 @@ server_image_precondition_is_pinned() {
 # privilege model those literals implement, not the thing that enforces it --
 # the literals are pinned by the flow log assertions below, and widening one of
 # them turns those scenarios red on its own. For app-release, app-rollback and
-# infrastructure-change, which do take the lease through this library, the
-# declaration is the only thing standing between a lease taken as a named human
-# and a lease taken with an account key.
+# the four infrastructure commands, which do take, hold or give back the lease
+# through this library, the declaration is the only thing standing between a
+# lease taken as a named human and a lease taken with an account key.
 operation_lease_auth_modes_are_pinned() {
   awk -v cmd_dir="$1" \
     -v all_commands="$(printf '%s' "$GUIDE_COMMANDS" | tr '\n' ' ')" \
-    -v expected="app-release=login app-rollback=login stale-lease-recovery=login infrastructure-change=key deploy-resources=key" '
+    -v expected="app-release=login app-rollback=login stale-lease-recovery=login infrastructure-change=key infrastructure-plan=key infrastructure-apply=key infrastructure-abandon=key deploy-resources=key" '
     BEGIN {
       count = split(expected, pairs, " ")
       for (i = 1; i <= count; i++) {
@@ -3554,8 +3892,8 @@ test_public_safe_runbook_static() {
     set -- "$@" "$GUIDE_LIB_DIR/$guide_lib.sh"
   done
   GUIDE_SHELL_SOURCES_COUNT="$#"
-  test "$GUIDE_SHELL_SOURCES_COUNT" -eq 21 ||
-    fail "the operations CLI is not ops.sh plus the 13 documented commands and the 7 shared libraries"
+  test "$GUIDE_SHELL_SOURCES_COUNT" -eq 25 ||
+    fail "the operations CLI is not ops.sh plus the 16 documented commands and the 8 shared libraries"
 
   if grep -Eiq 'If[-]Match|e[t]ag|patchpageOperation[L]ock|private_az r[e]st' \
     "$README" "$@"; then
@@ -3589,7 +3927,9 @@ test_public_safe_runbook_static() {
     fail "Azure guide writes raw OpenTofu state or plan output to a repository-visible path"
   fi
   if grep -Eq '(^|[;&|][[:space:]]*)echo[[:space:]].*\$(IMAGE|.*_ID|RESOURCE_GROUP|STATE_)' \
-    "$GUIDE_CMD_DIR/app-release.sh" "$GUIDE_CMD_DIR/infrastructure-change.sh"; then
+    "$GUIDE_CMD_DIR/app-release.sh" "$GUIDE_CMD_DIR/infrastructure-change.sh" \
+    "$GUIDE_CMD_DIR/infrastructure-plan.sh" "$GUIDE_CMD_DIR/infrastructure-apply.sh" \
+    "$GUIDE_CMD_DIR/infrastructure-abandon.sh" "$GUIDE_LIB_DIR/infra_change.sh"; then
     fail "new runbook commands directly echo a sensitive image or resource value"
   fi
   # The release flow never runs OpenTofu. That has to be asserted over what it
@@ -4712,6 +5052,7 @@ set -- \
   test_app_release \
   test_app_rollback \
   test_infrastructure_change \
+  test_infrastructure_session \
   test_stale_lease_recovery \
   test_operation_binding_wire_format \
   test_plan_gate_filter \
