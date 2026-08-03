@@ -1,8 +1,6 @@
 set -u
 set +x
-private_az() {
-  az "$@" --subscription "$SUBSCRIPTION_ID" 2>/dev/null
-}
+. "${PP_OPS_LIB:?run this through the dispatcher: sh infra/azure/ops.sh ingress-verification}/wrappers.sh"
 if ! LIVE_INGRESS="$(
   private_az containerapp ingress show \
     --resource-group "$RESOURCE_GROUP" \

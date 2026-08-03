@@ -1,8 +1,7 @@
 set -u
 set +x
-private_az() {
-  az "$@" --subscription "$SUBSCRIPTION_ID" 2>/dev/null
-}
+. "${PP_OPS_LIB:?run this through the dispatcher: sh infra/azure/ops.sh state-bootstrap}/wrappers.sh"
+. "$PP_OPS_LIB/state_inspect.sh"
 if ! REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null)" ||
   ! test -d "$REPO_ROOT/infra/azure" ||
   ! cd "$REPO_ROOT/infra/azure"; then
@@ -201,63 +200,6 @@ if ! printf '%s\n' "$STATE_STORAGE_ACCOUNT_PROPERTIES" |
   printf 'The Terraform state storage account does not match the required identity or security properties.\n' >&2
   exit 1
 fi
-inspect_state_containers() {
-  if ! STATE_CONTAINER_EXISTS="$(
-    private_az storage container exists \
-      --name "$STATE_CONTAINER" \
-      --account-name "$STATE_STORAGE_ACCOUNT" \
-      --auth-mode key \
-      --query exists \
-      --output tsv
-  )" ||
-    ! OPERATION_CONTAINER_EXISTS="$(
-      private_az storage container exists \
-        --name "$OPERATION_CONTAINER" \
-        --account-name "$STATE_STORAGE_ACCOUNT" \
-        --auth-mode key \
-        --query exists \
-        --output tsv
-    )" ||
-    ! STATE_CONTAINER_NAMES="$(
-      private_az storage container list \
-        --account-name "$STATE_STORAGE_ACCOUNT" \
-        --auth-mode key \
-        --include-deleted true \
-        --num-results '*' \
-        --query '[].[name,deleted]' \
-        --output tsv
-    )"; then
-    return 1
-  fi
-  case "$STATE_CONTAINER_EXISTS:$OPERATION_CONTAINER_EXISTS" in
-    true:true | true:false | false:true | false:false) ;;
-    *) return 1 ;;
-  esac
-  SEEN_STATE_CONTAINER=false
-  SEEN_OPERATION_CONTAINER=false
-  while IFS="$(printf '\t')" read -r state_container_name state_container_deleted; do
-    test -z "$state_container_name" && continue
-    case "$state_container_deleted" in
-      "" | false | None | null) ;;
-      *) return 1 ;;
-    esac
-    case "$state_container_name" in
-      "$STATE_CONTAINER")
-        test "$SEEN_STATE_CONTAINER" = "false" || return 1
-        SEEN_STATE_CONTAINER=true
-        ;;
-      "$OPERATION_CONTAINER")
-        test "$SEEN_OPERATION_CONTAINER" = "false" || return 1
-        SEEN_OPERATION_CONTAINER=true
-        ;;
-      *) return 1 ;;
-    esac
-  done <<EOF
-$STATE_CONTAINER_NAMES
-EOF
-  test "$SEEN_STATE_CONTAINER" = "$STATE_CONTAINER_EXISTS" &&
-    test "$SEEN_OPERATION_CONTAINER" = "$OPERATION_CONTAINER_EXISTS"
-}
 if ! inspect_state_containers; then
   printf 'Could not inspect the Terraform state account data plane.\n' >&2
   exit 1

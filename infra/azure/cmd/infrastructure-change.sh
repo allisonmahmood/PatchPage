@@ -1,14 +1,16 @@
 set -u
 set +x
-private_az() {
-  az "$@" --subscription "$SUBSCRIPTION_ID" 2>/dev/null
-}
-private_terraform() {
-  terraform "$@" 2>&3
-}
-private_git() {
-  git "$@" 2>/dev/null
-}
+# This flow already holds a storage account key for the Terraform backend, and
+# takes the operation lease with it. That is a different privilege model from
+# the release flows, which authenticate as the operator's own principal, so
+# lib/lease.sh takes it as an explicit input rather than assuming either one.
+OPERATION_LEASE_AUTH_MODE=key
+. "${PP_OPS_LIB:?run this through the dispatcher: sh infra/azure/ops.sh infrastructure-change}/wrappers.sh"
+. "$PP_OPS_LIB/diag.sh"
+. "$PP_OPS_LIB/lease.sh"
+. "$PP_OPS_LIB/revision.sh"
+. "$PP_OPS_LIB/state_inspect.sh"
+. "$PP_OPS_LIB/plan_gate.sh"
 if ! REPO_ROOT="$(private_git rev-parse --show-toplevel)" ||
   ! test -d "$REPO_ROOT/infra/azure" ||
   ! cd "$REPO_ROOT/infra/azure"; then
@@ -56,19 +58,6 @@ if ! { exec 3>>"$TERRAFORM_DIAGNOSTIC_LOG"; } 2>/dev/null ||
 fi
 TERRAFORM_DIAGNOSTICS_COMPLETE=false
 TERRAFORM_DIAGNOSTIC_FD_OPEN=true
-terraform_diagnostic_exit() {
-  if test "$TERRAFORM_DIAGNOSTIC_FD_OPEN" = "true"; then
-    { exec 3>&-; } 2>/dev/null || :
-    TERRAFORM_DIAGNOSTIC_FD_OPEN=false
-  fi
-  if test "$TERRAFORM_DIAGNOSTICS_COMPLETE" = "true"; then
-    if ! rm -rf -- "$TERRAFORM_DIAGNOSTIC_DIR" 2>/dev/null; then
-      printf 'Terraform succeeded, but private diagnostic cleanup failed.\n' >&2
-    fi
-  else
-    printf 'Private Terraform diagnostics were retained under the configured diagnostic root.\n' >&2
-  fi
-}
 trap 'terraform_diagnostic_exit' 0
 trap 'exit 129' HUP
 trap 'exit 130' INT
@@ -86,259 +75,6 @@ EXPECTED_STORAGE_ACCOUNT_ID="${EXPECTED_STORAGE_ACCOUNT_ID:?Set the private work
 EXPECTED_POSTGRES_SERVER_ID="${EXPECTED_POSTGRES_SERVER_ID:?Set the private PostgreSQL server ID}"
 EXPECTED_ACR_ID="${EXPECTED_ACR_ID:?Set the private Azure Container Registry ID}"
 EXPECTED_CONTAINER_APP_ID="${EXPECTED_CONTAINER_APP_ID:?Set the private Container App ID}"
-verify_pinned_revision_stable() {
-  stable_gate_pinned_revision="$1"
-  stable_gate_expected_image="$2"
-  test -n "$stable_gate_pinned_revision" ||
-    return 1
-  printf '%s\n' "$stable_gate_expected_image" |
-    grep -Eq '^.+@sha256:[0-9a-f]{64}$' ||
-    return 1
-  if ! stable_gate_app_json="$(
-    private_az containerapp show \
-      --ids "$EXPECTED_CONTAINER_APP_ID" \
-      --output json
-  )" ||
-    ! stable_gate_revision_json="$(
-      private_az containerapp revision show \
-        --resource-group "$RESOURCE_GROUP" \
-        --name "$CONTAINER_APP" \
-        --revision "$stable_gate_pinned_revision" \
-        --output json
-    )" ||
-    ! stable_gate_revision_list_json="$(
-      private_az containerapp revision list \
-        --resource-group "$RESOURCE_GROUP" \
-        --name "$CONTAINER_APP" \
-        --all \
-        --output json
-    )"; then
-    return 1
-  fi
-  printf '%s\n' "$stable_gate_app_json" |
-    jq -e \
-      --arg pinned_revision "$stable_gate_pinned_revision" \
-      --arg expected_image "$stable_gate_expected_image" \
-      '.properties.configuration.activeRevisionsMode == "Single" and
-       .properties.provisioningState == "Succeeded" and
-       ($pinned_revision | length) > 0 and
-       .properties.latestRevisionName == $pinned_revision and
-       .properties.latestReadyRevisionName == $pinned_revision and
-       (([.properties.template.containers[]? |
-          select(.name == "server")]) as $servers |
-        ($servers | length) == 1 and
-        $servers[0].image == $expected_image) and
-       (.properties.configuration.ingress.traffic as $traffic |
-        ($traffic | type) == "array" and
-        ($traffic | length) == 1 and
-        (($traffic[0].revisionName // "") == "") and
-        (($traffic[0].label // "") == "") and
-        $traffic[0].latestRevision == true and
-        $traffic[0].weight == 100)' >/dev/null &&
-    printf '%s\n' "$stable_gate_revision_json" |
-      jq -e \
-        --arg pinned_revision "$stable_gate_pinned_revision" \
-        --arg expected_image "$stable_gate_expected_image" \
-        '.name == $pinned_revision and
-         .properties.active == true and
-         .properties.provisioningState == "Provisioned" and
-         .properties.trafficWeight == 100 and
-         (([.properties.template.containers[]? |
-            select(.name == "server")]) as $servers |
-          ($servers | length) == 1 and
-          $servers[0].image == $expected_image)' >/dev/null &&
-    printf '%s\n' "$stable_gate_revision_list_json" |
-      jq -e \
-        --arg pinned_revision "$stable_gate_pinned_revision" \
-        '[.[]? | select(.properties.active == true) | .name] ==
-         [$pinned_revision]' >/dev/null
-}
-poll_pinned_revision_stable() {
-  stable_poll_pinned_revision="$1"
-  stable_poll_expected_image="$2"
-  stable_poll_attempt=1
-  while test "$stable_poll_attempt" -le 120; do
-    if ! verify_operation_lease; then
-      return 1
-    fi
-    if verify_pinned_revision_stable \
-      "$stable_poll_pinned_revision" \
-      "$stable_poll_expected_image"; then
-      return 0
-    fi
-    if test "$stable_poll_attempt" -eq 120; then
-      return 1
-    fi
-    sleep 5
-    stable_poll_attempt=$((stable_poll_attempt + 1))
-  done
-  return 1
-}
-container_app_readiness_recovery_required() {
-  OPERATION_LEASE_ACTIVE=false
-  printf 'Container App readiness failed; second-operator recovery is required.\n' >&2
-  printf 'The operation lease remains held for second-operator recovery.\n' >&2
-  exit 75
-}
-verify_operation_container() {
-  if ! live_operation_container_id="$(
-    private_az storage container-rm show \
-      --ids "$EXPECTED_OPERATION_CONTAINER_ID" \
-      --query id \
-      --output tsv
-  )" ||
-    test "$(printf '%s' "$live_operation_container_id" | tr '[:upper:]' '[:lower:]')" != "$(printf '%s' "$EXPECTED_OPERATION_CONTAINER_ID" | tr '[:upper:]' '[:lower:]')" ||
-    ! operation_container_exists="$(
-    private_az storage container exists \
-      --account-name "$STATE_STORAGE_ACCOUNT" \
-      --name "$OPERATION_CONTAINER" \
-      --auth-mode key \
-      --query exists \
-      --output tsv
-  )" || test "$operation_container_exists" != "true" ||
-    ! operation_container_blobs="$(
-      private_az storage blob list \
-        --account-name "$STATE_STORAGE_ACCOUNT" \
-        --container-name "$OPERATION_CONTAINER" \
-        --auth-mode key \
-        --include d v \
-        --num-results '*' \
-        --query '[].name' \
-        --output tsv
-    )" ||
-    test -n "$operation_container_blobs" ||
-    ! operation_container_metadata="$(
-      private_az storage container metadata show \
-        --account-name "$STATE_STORAGE_ACCOUNT" \
-        --name "$OPERATION_CONTAINER" \
-        --auth-mode key \
-        --output json
-    )"; then
-    return 1
-  fi
-  printf '%s\n' "$operation_container_metadata" |
-    jq -e \
-      --arg binding "$OPERATION_BINDING_SHA256" \
-      'type == "object" and
-       length == 1 and
-       .patchpage_workload_binding_sha256 == $binding' >/dev/null
-}
-inspect_state_containers() {
-  if ! STATE_CONTAINER_EXISTS="$(
-    private_az storage container exists \
-      --name "$STATE_CONTAINER" \
-      --account-name "$STATE_STORAGE_ACCOUNT" \
-      --auth-mode key \
-      --query exists \
-      --output tsv
-  )" ||
-    ! OPERATION_CONTAINER_EXISTS="$(
-      private_az storage container exists \
-        --name "$OPERATION_CONTAINER" \
-        --account-name "$STATE_STORAGE_ACCOUNT" \
-        --auth-mode key \
-        --query exists \
-        --output tsv
-    )" ||
-    ! STATE_CONTAINER_NAMES="$(
-      private_az storage container list \
-        --account-name "$STATE_STORAGE_ACCOUNT" \
-        --auth-mode key \
-        --include-deleted true \
-        --num-results '*' \
-        --query '[].[name,deleted]' \
-        --output tsv
-    )"; then
-    return 1
-  fi
-  case "$STATE_CONTAINER_EXISTS:$OPERATION_CONTAINER_EXISTS" in
-    true:true | true:false | false:true | false:false) ;;
-    *) return 1 ;;
-  esac
-  SEEN_STATE_CONTAINER=false
-  SEEN_OPERATION_CONTAINER=false
-  while IFS="$(printf '\t')" read -r state_container_name state_container_deleted; do
-    if test -z "$state_container_name"; then
-      test -z "$state_container_deleted" || return 1
-      continue
-    fi
-    case "$state_container_deleted" in
-      "" | false | None | null) ;;
-      *) return 1 ;;
-    esac
-    case "$state_container_name" in
-      "$STATE_CONTAINER")
-        test "$SEEN_STATE_CONTAINER" = "false" || return 1
-        SEEN_STATE_CONTAINER=true
-        ;;
-      "$OPERATION_CONTAINER")
-        test "$SEEN_OPERATION_CONTAINER" = "false" || return 1
-        SEEN_OPERATION_CONTAINER=true
-        ;;
-      *) return 1 ;;
-    esac
-  done <<EOF
-$STATE_CONTAINER_NAMES
-EOF
-  test "$SEEN_STATE_CONTAINER" = "$STATE_CONTAINER_EXISTS" &&
-    test "$SEEN_OPERATION_CONTAINER" = "$OPERATION_CONTAINER_EXISTS"
-}
-verify_operation_lease() {
-  private_az storage container lease renew \
-    --account-name "$STATE_STORAGE_ACCOUNT" \
-    --container-name "$OPERATION_CONTAINER" \
-    --auth-mode key \
-    --lease-id "$OPERATION_LEASE_ID" \
-    --output none >/dev/null
-}
-acquire_operation_lease() {
-  verify_operation_container || return 1
-  private_az storage container lease acquire \
-    --account-name "$STATE_STORAGE_ACCOUNT" \
-    --container-name "$OPERATION_CONTAINER" \
-    --auth-mode key \
-    --lease-duration -1 \
-    --proposed-lease-id "$OPERATION_LEASE_ID" \
-    --output none >/dev/null || return 1
-  # Azure now holds the infinite lease, so the EXIT trap owes a release from this
-  # point on. Set the flag before the renew-as-proof: a single renew blip must not
-  # leave a held lease behind with the trap believing there is nothing to release.
-  OPERATION_LEASE_ACTIVE=true
-  verify_operation_lease || return 1
-}
-release_operation_lease() {
-  verify_operation_lease || return 1
-  private_az storage container lease release \
-    --account-name "$STATE_STORAGE_ACCOUNT" \
-    --container-name "$OPERATION_CONTAINER" \
-    --auth-mode key \
-    --lease-id "$OPERATION_LEASE_ID" \
-    --output none >/dev/null || return 1
-  OPERATION_LEASE_ACTIVE=false
-}
-operation_lease_exit() {
-  if test "${OPERATION_LEASE_ACTIVE:-false}" = "true"; then
-    if test "${OPERATION_MUTATION_UNCERTAIN:-false}" = "true"; then
-      OPERATION_LEASE_ACTIVE=false
-      printf 'The operation lease remains held for second-operator recovery.\n' >&2
-    elif ! release_operation_lease; then
-      OPERATION_LEASE_RETAINED=true
-      printf 'Operation lease cleanup requires second-operator review.\n' >&2
-    fi
-  fi
-}
-# Whether the lease outlived the process is not known at any exit site: a site
-# that fails while holding it may still get it back from the trap's own release,
-# and a site that never acquired it must not claim otherwise. Only the trap
-# knows, so only the trap sets the exit status for that case. An exit inside an
-# EXIT handler replaces the pending status; it also ends the handler list, so
-# this is the last handler in the list and the change-directory and diagnostic
-# cleanups before it still finish first.
-operation_lease_retention_exit() {
-  if test "${OPERATION_LEASE_RETAINED:-false}" = "true"; then
-    exit 75
-  fi
-}
 RESOURCE_GROUP="${RESOURCE_GROUP:?Set the expected workload resource-group name}"
 if ! printf '%s\n' "$STATE_STORAGE_ACCOUNT" | grep -Eq '^[a-z0-9]{3,24}$' ||
   test "$STATE_CONTAINER" != "tfstate" ||
@@ -352,24 +88,7 @@ EXPECTED_STATE_STORAGE_ACCOUNT_ID="/subscriptions/$SUBSCRIPTION_ID/resourceGroup
 EXPECTED_OPERATION_CONTAINER_ID="$EXPECTED_STATE_STORAGE_ACCOUNT_ID/blobServices/default/containers/$OPERATION_CONTAINER"
 ACR="${EXPECTED_ACR_ID##*/}"
 CONTAINER_APP="${EXPECTED_CONTAINER_APP_ID##*/}"
-if ! OPERATION_BINDING_SHA256="$(
-  printf '%s\n' \
-    'patchpage-operation-binding-v1' \
-    "subscription_id=$SUBSCRIPTION_ID" \
-    "state_storage_account=$STATE_STORAGE_ACCOUNT" \
-    "state_key=$STATE_KEY" \
-    "resource_group=$RESOURCE_GROUP" \
-    "container_app=$CONTAINER_APP" \
-    "acr=$ACR" \
-    "operation_container_id=$EXPECTED_OPERATION_CONTAINER_ID" \
-    "container_app_id=$EXPECTED_CONTAINER_APP_ID" \
-    "acr_id=$EXPECTED_ACR_ID" \
-    "storage_account_id=$EXPECTED_STORAGE_ACCOUNT_ID" \
-    "postgres_server_id=$EXPECTED_POSTGRES_SERVER_ID" |
-    openssl dgst -sha256 -r 2>/dev/null |
-    cut -d ' ' -f1
-)" ||
-  ! printf '%s\n' "$OPERATION_BINDING_SHA256" | grep -Eq '^[0-9a-f]{64}$'; then
+if ! OPERATION_BINDING_SHA256="$(operation_binding_sha256)"; then
   printf 'Could not compute the operation-container workload binding.\n' >&2
   exit 1
 fi
@@ -1320,22 +1039,15 @@ if ! printf '%s\n' "$PLANNED_CONTAINER_APP_DIGEST" |
   exit 1
 fi
 unset PLANNED_ACR_NAME PLANNED_CONTAINER_APP_DIGEST
-if ! jq -e \
-  '[.resource_changes[] |
-    . as $resource |
-    select(
-      ($resource.change.actions | index("delete")) or
-      (
-        (
-          $resource.address == "azurerm_storage_account.drafts" or
-          $resource.address == "azurerm_storage_container.drafts" or
-          $resource.address == "azurerm_postgresql_flexible_server.patchpage" or
-          $resource.address == "azurerm_postgresql_flexible_server_database.patchpage"
-        ) and
-        ($resource.change.actions | index("create"))
-      )
-    )] |
-   length == 0' "$INFRA_PLAN_JSON" >/dev/null 2>&1; then
+# Every one of the four protected addresses is passed: an infrastructure change
+# is never the run that legitimately creates persistent data, so Terraform
+# planning to create one of them means it has lost sight of the existing one.
+if ! plan_gate_accepts \
+  azurerm_storage_account.drafts \
+  azurerm_storage_container.drafts \
+  azurerm_postgresql_flexible_server.patchpage \
+  azurerm_postgresql_flexible_server_database.patchpage \
+  < "$INFRA_PLAN_JSON"; then
   printf 'The infrastructure plan deletes a resource or recreates protected persistent data.\n' >&2
   exit 1
 fi

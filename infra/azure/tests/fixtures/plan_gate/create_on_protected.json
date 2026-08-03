@@ -1,0 +1,13 @@
+{
+  "format_version": "1.2",
+  "resource_changes": [
+    {
+      "address": "azurerm_container_app.server",
+      "change": { "actions": ["update"] }
+    },
+    {
+      "address": "azurerm_postgresql_flexible_server.patchpage",
+      "change": { "actions": ["create"] }
+    }
+  ]
+}

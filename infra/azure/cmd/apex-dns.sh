@@ -1,8 +1,7 @@
 set -u
 set +x
-private_dig() {
-  dig "$@" 2>/dev/null
-}
+. "${PP_OPS_LIB:?run this through the dispatcher: sh infra/azure/ops.sh apex-dns}/wrappers.sh"
+. "$PP_OPS_LIB/dns.sh"
 DNS_ZONE="${DNS_ZONE:?Set DNS_ZONE to the apex DNS zone you control}"
 DNS_ZONE="$(printf '%s\n' "$DNS_ZONE" | sed 's/\.$//' | tr '[:upper:]' '[:lower:]')"
 
@@ -34,18 +33,7 @@ fi
 
 AAAA_STATUS="$(
   printf '%s\n' "$AAAA_RESPONSE" |
-    awk '
-      /^;; ->>HEADER<<-/ {
-        for (i = 1; i <= NF; i++) {
-          if ($i == "status:") {
-            status = $(i + 1)
-            sub(/,$/, "", status)
-            print status
-            exit
-          }
-        }
-      }
-    '
+    dns_response_status
 )"
 if test "$AAAA_STATUS" != "NOERROR"; then
   printf 'The apex AAAA lookup returned an unexpected DNS status.\n' >&2

@@ -1,8 +1,7 @@
 set -u
 set +x
-private_dig() {
-  dig "$@" 2>/dev/null
-}
+. "${PP_OPS_LIB:?run this through the dispatcher: sh infra/azure/ops.sh caa-policy}/wrappers.sh"
+. "$PP_OPS_LIB/dns.sh"
 CAA_TREE_NAME="$CUSTOM_DOMAIN"
 CAA_LOOKUP_NAME=""
 CAA_RECORDS=""
@@ -35,18 +34,7 @@ while test -n "$CAA_TREE_NAME"; do
 
     CNAME_STATUS="$(
       printf '%s\n' "$CNAME_RESPONSE" |
-        awk '
-          /^;; ->>HEADER<<-/ {
-            for (i = 1; i <= NF; i++) {
-              if ($i == "status:") {
-                status = $(i + 1)
-                sub(/,$/, "", status)
-                print status
-                exit
-              }
-            }
-          }
-        '
+        dns_response_status
     )"
     if test "$CNAME_STATUS" != "NOERROR"; then
       printf 'CNAME lookup returned an unexpected DNS status during CAA evaluation.\n' >&2
@@ -109,18 +97,7 @@ while test -n "$CAA_TREE_NAME"; do
 
   CAA_STATUS="$(
     printf '%s\n' "$CAA_RESPONSE" |
-      awk '
-        /^;; ->>HEADER<<-/ {
-          for (i = 1; i <= NF; i++) {
-            if ($i == "status:") {
-              status = $(i + 1)
-              sub(/,$/, "", status)
-              print status
-              exit
-            }
-          }
-        }
-      '
+      dns_response_status
   )"
   if test "$CAA_STATUS" != "NOERROR"; then
     printf 'CAA lookup returned an unexpected DNS status.\n' >&2

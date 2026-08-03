@@ -3,13 +3,32 @@
 #
 # ops.sh is a dispatcher and nothing else. Every subcommand is a script under
 # infra/azure/cmd/ whose body is the operator runbook that infra/azure/README.md
-# used to carry inline. Each cmd/*.sh is exactly one `set -u` line followed by
-# that verbatim body, so the guide and the executable stay the same text and a
-# line number in a shell diagnostic still points at the documented step.
+# used to carry inline.
 #
 # ops.sh never inspects, rewrites, retries or wraps a command. It validates the
 # name and hands the process over with exec, so the operator sees exactly the
 # runbook's own output and exit status.
+#
+# --- the shared library -------------------------------------------------------
+#
+# The safety mechanisms the runbooks share -- the operation lease, the plan
+# gate, the revision readiness proof, the state-account inventory, the tool
+# wrappers -- have one definition each, under infra/azure/lib/. A command reads
+# them with `. "${PP_OPS_LIB:?...}/<file>.sh"`.
+#
+# The path arrives in the environment rather than being recomputed by each
+# command, because a command cannot reliably find lib/ on its own: $0 is the
+# command's path when ops.sh dispatches it, but the two commands the guide has
+# the operator *source* run with the operator's own $0, and a command that
+# guessed would find the wrong tree or none at all. Exporting it from the one
+# place that already knows where it is keeps a single answer.
+#
+# The `:?` in each command's source line is the other half: a cmd/*.sh run
+# directly, outside the dispatcher, fails immediately with a message naming the
+# variable instead of running with half its safety mechanisms undefined. That is
+# the fail-closed direction -- an undefined `verify_operation_lease` in a shell
+# without `set -u` would otherwise be a command that silently does nothing and
+# returns success.
 
 set -u
 
@@ -19,6 +38,8 @@ case "$0" in
 esac
 ops_dir="$(CDPATH= cd -- "$ops_dir" && pwd)" || exit 1
 ops_cmd_dir="$ops_dir/cmd"
+PP_OPS_LIB="$ops_dir/lib"
+export PP_OPS_LIB
 
 # One line per command: <name>|<one-line purpose>. This list is the whole
 # command surface; a name that is not here is not dispatchable.
