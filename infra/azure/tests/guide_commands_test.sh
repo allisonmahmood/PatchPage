@@ -3425,13 +3425,23 @@ test_stale_lease_recovery() {
 #
 # The runbooks are executables now, so this scans ops.sh and cmd/*.sh whole
 # rather than the guide's ```sh fences: the shell moved, and the rule has to
-# move with it. PR E turns the guide-side check into fence purity.
+# move with it. The guide-side rule is guide_fences_document_only_ops_commands
+# below, which says the guide has no shell left for this one to scan.
 #
-# Exactly what this guarantees: none of the 13 tools the harness mocks -- az,
-# terraform, tofu, git, curl, dig, jq, openssl, mktemp, chmod, sleep, cat, rm --
-# is named by an absolute path. That is the one bypass that would fail silently,
-# because the real tool would answer and the command would still look like it
-# passed.
+# Exactly what this guarantees: none of these 13 tools -- az, terraform, tofu,
+# git, curl, dig, jq, openssl, mktemp, chmod, sleep, cat, rm -- is named by an
+# absolute path.
+#
+# Twelve of them have a shim in tests/mocks: az, terraform, tofu, git, curl,
+# dig, jq, mktemp, chmod, sleep, cat and rm. For those, an absolute path is the
+# one bypass that would fail silently, because the real tool would answer and
+# the command would still look like it passed. openssl is the thirteenth and has
+# no shim -- the digest helpers in lib/ run the runner's real openssl -- and the
+# jq shim delegates everything it does not special-case to the real jq through
+# mock_real, so both of those binaries are the runner's own. They are still in
+# the list because the rule being enforced is PATH resolution, not mocking:
+# `/usr/bin/openssl` is a guess about where a tool lives that is wrong on plenty
+# of the machines an operator would run this from.
 #
 # What it deliberately does not catch: `command -p az`, which resolves against
 # the implementation-defined default PATH, and a `PATH=/usr/bin az ...`
@@ -3449,13 +3459,6 @@ ops_sources_reach_tools_through_path() {
   ' "$@"
 }
 
-# Returns 0 when the guide no longer carries any of the runbooks that moved into
-# cmd/, 1 otherwise. Two independent statements, because either one alone rots:
-# no `guide-test` marker survives, and no ```sh fence is anywhere near
-# block-sized. The smallest runbook that moved is 45 lines, so a 40-line ceiling
-# cannot be satisfied by a re-inlined runbook. Takes the guide file so the check
-# itself can be meta-tested against a sabotaged copy.
-# Deliberately reports status instead of calling fail.
 # Returns 0 when none of the given files mentions `trap`, 1 when one does. Two
 # of the commands are documented as `. cmd/<name>.sh`, so they run in the
 # operator's own shell. A trap installed there is installed on that shell: no
@@ -3473,12 +3476,240 @@ sourced_commands_install_no_trap() {
   ' "$@"
 }
 
-guide_carries_no_moved_runbook() {
-  awk '
+# Returns 0 when the guide's shell fences carry nothing but the documented
+# command invocations, 1 otherwise. Takes the guide file and the space-separated
+# command names so the check itself can be meta-tested against a sabotaged copy.
+# Deliberately reports status instead of calling fail.
+#
+# This replaces a 40-line ceiling on ```sh fences. That heuristic was a proxy
+# for "no runbook was re-inlined" and it was sized against the runbooks that
+# happened to move -- the smallest was 45 lines -- so it accepted anything
+# shorter, and it read only ```sh. Both gaps were real: the guide still carried
+# a 32-line subdomain DNS runbook that no command owns and no test ever ran, and
+# the same block in a ```bash or bare ``` fence would have passed at any length.
+#
+# The rule now is a whitelist rather than a size, which is the version that
+# cannot be satisfied by writing a smaller runbook. Inside a shell fence, a line
+# may be exactly one of:
+#
+#   * blank, or a comment;
+#   * `sh infra/azure/ops.sh <command>`, where <command> is dispatchable;
+#   * `. infra/azure/cmd/custom-domain-context.sh` or
+#     `. infra/azure/cmd/hostname-mutation.sh` -- the two commands the guide has
+#     the operator source, because a child process cannot hand values back.
+#
+# Nothing else: no assignment prefixes, no exports, no pipelines, no
+# redirections. The narrower whitelist is deliberate. Every input a command
+# takes is stated in that command's table, so an assignment inside a fence is a
+# second place for the same fact to live, and a whitelist clause with no fence
+# exercising it is a clause nothing keeps honest. A guide that physically cannot
+# hold an executable line cannot regrow the surface PR B moved out.
+#
+# Four independent statements, because any one alone rots:
+#
+#   1. no `guide-test` marker survives -- the extraction markers the harness
+#      used to key on;
+#   2. every line of every shell fence is on the whitelist above;
+#   3. every dispatchable command is documented by at least one such line, so
+#      shrinking the guide cannot quietly drop a command's section;
+#   4. no fence in the guide is spelled with tildes or with four or more
+#      backticks.
+#
+# What counts as a shell fence is decided fail-closed, and that direction is the
+# whole point. An allowlist of shell info strings -- sh, bash, bare -- makes
+# every info string nobody thought of a way past the check: ```shell and
+# ```console are what a runbook actually arrives labelled as, and ```Sh and
+# ```sh {.line-numbers} are what an editor or a docs pipeline produces from a
+# fence that was ```sh yesterday. So the set that is enumerated is the other
+# one: the guide uses txt, hcl and sql for data, and a fence is a shell fence
+# unless its info string is one of those three. Classification takes the first
+# whitespace-separated word of the info string, lowercased, so an attribute
+# suffix cannot smuggle a shell fence past as an unknown language, and casing
+# cannot either.
+#
+# Data fences are skipped but still drive the open/closed state machine, so a
+# bare closing ``` is never read as an opening one. Fences are matched after
+# trimming, because the guide indents the two inside a numbered list.
+#
+# Statement 4 is what keeps that state machine honest about the fences it does
+# not model. A ~~~ fence, or a ```` fence wrapping content that itself contains
+# ```, is a real CommonMark fence this scanner would walk straight through --
+# its body would be read as prose, and a runbook inside it would never be seen.
+# Rather than model them, the guide is not permitted to contain them: it has
+# none today, none is needed, and a rejection is a far smaller thing to be wrong
+# about than a silently unscanned block.
+guide_fences_document_only_ops_commands() {
+  awk -v command_list=" $2 " '
+    function trim(s) {
+      sub(/^[ \t]+/, "", s)
+      sub(/[ \t]+$/, "", s)
+      return s
+    }
+    function is_command(name) {
+      return index(command_list, " " name " ") > 0
+    }
+    function is_data_language(info) {
+      return info == "txt" || info == "hcl" || info == "sql"
+    }
     /^<!-- guide-test:/ { marker = 1 }
-    $0 == "```sh" { fence = NR; next }
-    $0 == "```" && fence { if (NR - fence - 1 > 40) oversized = 1; fence = 0 }
-    END { exit (marker || oversized) ? 1 : 0 }
+    {
+      line = trim($0)
+      if (substr(line, 1, 3) == "~~~" || substr(line, 1, 4) == "````") {
+        exotic_fence = 1
+        next
+      }
+      if (substr(line, 1, 3) == "```") {
+        if (in_fence) {
+          in_fence = 0
+          shell_fence = 0
+        } else {
+          info = trim(substr(line, 4))
+          split(info, info_words, /[ \t]+/)
+          in_fence = 1
+          shell_fence = !is_data_language(tolower(info_words[1]))
+        }
+        next
+      }
+      if (!in_fence || !shell_fence) next
+      if (line == "" || substr(line, 1, 1) == "#") next
+      if (line ~ /^sh infra\/azure\/ops\.sh [a-z][a-z0-9-]*$/) {
+        name = line
+        sub(/^sh infra\/azure\/ops\.sh /, "", name)
+        if (is_command(name)) {
+          documented[name] = 1
+          next
+        }
+      }
+      if (line ~ /^\. infra\/azure\/cmd\/(custom-domain-context|hostname-mutation)\.sh$/) {
+        name = line
+        sub(/^\. infra\/azure\/cmd\//, "", name)
+        sub(/\.sh$/, "", name)
+        if (is_command(name)) {
+          documented[name] = 1
+          next
+        }
+      }
+      impure = 1
+    }
+    END {
+      # An unclosed fence would leave the rest of the file unscanned, and an
+      # empty command list would make statement 3 vacuous. Both are failures.
+      name_count = split(command_list, names, " ")
+      if (in_fence || name_count == 0) {
+        exit 1
+      }
+      for (i = 1; i <= name_count; i++) {
+        if (!(names[i] in documented)) undocumented = 1
+      }
+      exit (marker || impure || undocumented || exotic_fence) ? 1 : 0
+    }
+  ' "$1"
+}
+
+# Returns 0 when every input a documented command hard-requires is named in that
+# command's section of the guide, 1 otherwise. Takes the guide, the cmd
+# directory and the space-separated command names so the check itself can be
+# meta-tested against sabotaged copies.
+# Deliberately reports status instead of calling fail.
+#
+# The fence check above says the guide may hold nothing but invocation lines.
+# That makes the input tables load-bearing: they are now the only place an
+# operator -- or an AI agent reading this repository without a human present --
+# can learn what to export before running a command. A table that is missing a
+# row is therefore not a documentation nit, it is a command that stops with a
+# `${VAR:?}` message and no stated way to satisfy it, and nothing in the harness
+# noticed. Auditing the tables against the commands by hand is what found the
+# `VALIDATION_METHOD` row this branch added; this is that audit, as a check.
+#
+# The rule: for every dispatchable command, every `${VAR:?}` name in its cmd
+# file appears somewhere in that command's section of the guide, wrapped in
+# backticks. A command's section is the text between the previous command's
+# invocation line and its own -- the same invocation lines the fence check
+# whitelists, which is what makes the two checks agree on where a section ends.
+#
+# Deliberately the section rather than the table alone. Two commands are
+# documented as `. cmd/<name>.sh` because they hand values into the operator's
+# shell, and a command run afterwards reads some of those values rather than
+# taking them from the operator: `hostname-mutation` guards `SUBSCRIPTION_ID`,
+# which the sourced context sets, and its section states that in prose on
+# purpose -- putting it in the table would tell the operator to export a value
+# the context already computed. Requiring the table would make the guide wrong
+# in order to make the check simple.
+#
+# `PP_OPS_LIB` is the one name excluded, and it is excluded everywhere: ops.sh
+# exports it before sourcing a command, so its guard exists to catch a cmd file
+# run directly instead of through the dispatcher. It is not an operator input
+# and no table should list it.
+#
+# The limitation, stated rather than hidden: only the cmd file is scanned. A
+# guard inside infra/azure/lib is not seen, so an input reachable only through a
+# library is not covered -- `EXPECTED_STATE_LINEAGE` and the other infrastructure
+# expectations are documented but not proven documented by this. Extending the
+# scan to the libraries means deciding which of a library's guards are reachable
+# from which command, which is a call graph, not a grep. What is covered is
+# every input a command states for itself, which is where both of this branch's
+# table errors were.
+guide_states_every_command_input() {
+  awk -v cmd_dir="$2" -v command_list=" $3 " '
+    function trim(s) {
+      sub(/^[ \t]+/, "", s)
+      sub(/[ \t]+$/, "", s)
+      return s
+    }
+    {
+      line = trim($0)
+      name = ""
+      if (line ~ /^sh infra\/azure\/ops\.sh [a-z][a-z0-9-]*$/) {
+        name = line
+        sub(/^sh infra\/azure\/ops\.sh /, "", name)
+      } else if (line ~ /^\. infra\/azure\/cmd\/[a-z][a-z0-9-]*\.sh$/) {
+        name = line
+        sub(/^\. infra\/azure\/cmd\//, "", name)
+        sub(/\.sh$/, "", name)
+      }
+      if (name != "" && index(command_list, " " name " ") > 0) {
+        # First invocation wins, so a command named twice cannot borrow the
+        # section of the one before it.
+        if (!(name in section)) section[name] = section_text
+        section_text = ""
+        next
+      }
+      section_text = section_text "\n" $0
+    }
+    END {
+      name_count = split(command_list, names, " ")
+      # An empty command list would make every loop below vacuous, and so would
+      # a guide in which no command is invoked or a cmd file that cannot be
+      # read. All three are failures rather than silent passes.
+      if (name_count == 0) exit 1
+      for (i = 1; i <= name_count; i++) {
+        documented_command = names[i]
+        if (!(documented_command in section)) {
+          broken = 1
+          continue
+        }
+        source_path = cmd_dir "/" documented_command ".sh"
+        read_any = 0
+        while ((getline source_line < source_path) > 0) {
+          read_any = 1
+          rest = source_line
+          while ((at = index(rest, "${")) > 0) {
+            rest = substr(rest, at + 2)
+            if (!match(rest, /^[A-Z][A-Z0-9_]*:[?]/)) continue
+            guard = substr(rest, 1, RLENGTH - 2)
+            if (guard == "PP_OPS_LIB") continue
+            checked++
+            if (index(section[documented_command], "`" guard "`") == 0) {
+              broken = 1
+            }
+          }
+        }
+        close(source_path)
+        if (!read_any) broken = 1
+      }
+      if (checked == 0) broken = 1
+      exit broken ? 1 : 0
+    }
   ' "$1"
 }
 
@@ -4067,6 +4298,39 @@ test_operation_binding_wire_format() {
   rm -rf "$binding_fixture_dir"
 }
 
+# --- what stays static here, and why ------------------------------------------
+#
+# Every other group in this harness proves a behaviour by running a command.
+# This one reads files, so it is worth stating exactly which guards are static
+# because nothing behavioural can reach them, and which are static because there
+# is no behaviour to reach in the first place. The distinction matters when the
+# next person asks why these were not converted with the rest.
+#
+# Blocked on capabilities OpenTofu does not have:
+#
+#   * The Container App image precondition. `expect_failures` cannot isolate it
+#     from the postcondition on the same resource, and neither override_resource
+#     nor a seeded `command = apply` run reaches it. Both routes were tried
+#     during #73 and both are written out in full at the prevent_destroy check
+#     below -- verified, not assumed. Convert this if the test framework ever
+#     gains per-condition failure expectations.
+#   * lifecycle prevent_destroy. It is a meta-argument: no plan carries it as a
+#     value, so a plan-time assertion has nothing to read.
+#
+# Static because the subject is a file rather than a process: guide fence
+# purity, absolute tool paths in the CLI sources, traps in the two sourced
+# commands, and the per-command operation-lease auth-mode declarations. A
+# document and a source line have no behaviour to drive. What keeps these
+# honest instead is that each is a status-returning function run against a
+# deliberately sabotaged copy of what it reads, so the check is itself under
+# test even though its subject is not executed.
+#
+# Already converted, and the reason this list is worth keeping current:
+# management-lock scope. #73 moved it to persistent_data_invariants.tftest.hcl
+# once override_resource made per-address ids possible, and the static half
+# below is now a second layer rather than the only one. That is the direction
+# the two blocked guards should travel if the mock framework gains finer
+# control; they are blocked on capability, not on effort.
 test_public_safe_runbook_static() {
   # The runbooks are files under cmd/ now, so every check that is really about
   # the shell reads those files; the checks that are about what the guide says
@@ -4212,37 +4476,266 @@ test_public_safe_runbook_static() {
   fi
   rm -rf "$auth_mode_probe_dir"
 
-  # The runbooks left the guide in this change, and nothing may bring one back:
-  # a re-inlined block would be documentation the harness never runs.
-  guide_carries_no_moved_runbook "$README" ||
-    fail "the Azure guide still carries a guide-test marker or a runbook-sized shell fence"
+  # The runbooks left the guide, and nothing may bring one back: a re-inlined
+  # block would be documentation the harness never runs.
+  guide_command_names="$(printf '%s' "$GUIDE_COMMANDS" | tr '\n' ' ')"
+  guide_fences_document_only_ops_commands "$README" "$guide_command_names" ||
+    fail "the Azure guide carries a guide-test marker, a shell fence line that is not a documented command invocation, no invocation for some command, or a tilde or four-backtick fence"
 
-  # Meta-test both halves of that check separately, otherwise one of them could
-  # rot into decoration behind the other.
-  moved_runbook_probe_dir="$TMP_DIR/moved-runbook-probe"
-  rm -rf "$moved_runbook_probe_dir"
-  mkdir -p "$moved_runbook_probe_dir" ||
-    fail "could not create the moved-runbook probe directory"
+  # Meta-test each statement separately, otherwise one of them could rot into
+  # decoration behind another. Every probe starts from an unmodified copy of the
+  # guide, and that copy is asserted to pass first, so each rejection below is
+  # attributable to its own sabotage rather than to the copying.
+  fence_probe_dir="$TMP_DIR/guide-fence-probe"
+  rm -rf "$fence_probe_dir"
+  mkdir -p "$fence_probe_dir" ||
+    fail "could not create the guide-fence probe directory"
+  cp "$README" "$fence_probe_dir/clean.md" ||
+    fail "could not copy the guide for the fence probes"
+  guide_fences_document_only_ops_commands "$fence_probe_dir/clean.md" \
+    "$guide_command_names" ||
+    fail "the guide-fence check rejects an unmodified copy of the guide"
+
+  # Statement 1: the extraction markers.
   {
     cat "$README" &&
       printf '%s\n' '<!-- guide-test:app-release -->'
-  } > "$moved_runbook_probe_dir/marker.md" ||
+  } > "$fence_probe_dir/marker.md" ||
     fail "could not build the guide-test marker probe"
-  if guide_carries_no_moved_runbook "$moved_runbook_probe_dir/marker.md"; then
-    fail "the moved-runbook check accepts a surviving guide-test marker"
+  if guide_fences_document_only_ops_commands "$fence_probe_dir/marker.md" \
+    "$guide_command_names"; then
+    fail "the guide-fence check accepts a surviving guide-test marker"
   fi
+
+  # Statement 2, in each of the three fence spellings a runbook could arrive in.
+  # The rogue block is deliberately far shorter than any runbook that moved:
+  # size is exactly what the check this replaced was measuring, so a five-line
+  # block is the proof that it no longer is.
+  for fence_probe_info in sh bash ''; do
+    fence_probe_name="${fence_probe_info:-bare}"
+    {
+      cat "$README" &&
+        printf '%s\n' '```'"$fence_probe_info" &&
+        printf '%s\n' \
+          'RESOURCE_GROUP="${RESOURCE_GROUP:?Set the resource group}"' \
+          'if ! az containerapp show --name "$CONTAINER_APP" >/dev/null; then' \
+          '  printf %s\\n "The Container App is missing." >&2' \
+          '  exit 1' \
+          'fi' &&
+        printf '%s\n' '```'
+    } > "$fence_probe_dir/rogue-$fence_probe_name.md" ||
+      fail "could not build the rogue $fence_probe_name fence probe"
+    if guide_fences_document_only_ops_commands \
+      "$fence_probe_dir/rogue-$fence_probe_name.md" "$guide_command_names"; then
+      fail "the guide-fence check accepts a five-line runbook in a $fence_probe_name fence"
+    fi
+  done
+
+  # Statement 2, in the info strings an allowlist of shell languages would have
+  # let through. These are the reason the classification is fail-closed: each is
+  # a plausible way for the very same runbook to arrive labelled, and under
+  # `shell_fence = (info == "" || info == "sh" || info == "bash")` every one of
+  # them was skipped entirely rather than scanned.
+  for fence_probe_info in shell console Sh 'sh {.line-numbers}'; do
+    {
+      cat "$README" &&
+        printf '%s\n' '```'"$fence_probe_info" &&
+        printf '%s\n' \
+          'RESOURCE_GROUP="${RESOURCE_GROUP:?Set the resource group}"' \
+          'if ! az containerapp show --name "$CONTAINER_APP" >/dev/null; then' \
+          '  printf %s\\n "The Container App is missing." >&2' \
+          '  exit 1' \
+          'fi' &&
+        printf '%s\n' '```'
+    } > "$fence_probe_dir/unknown-info.md" ||
+      fail "could not build the unknown-info-string fence probe"
+    if guide_fences_document_only_ops_commands \
+      "$fence_probe_dir/unknown-info.md" "$guide_command_names"; then
+      fail "the guide-fence check accepts a runbook in a fence labelled: $fence_probe_info"
+    fi
+  done
+
+  # And the other direction for the same statement: the three info strings the
+  # guide really uses for data must keep passing, or fail-closed would just mean
+  # the check rejects the guide it is written against. The content is data, not
+  # shell, and each is appended on its own so a failure names the language.
+  for fence_probe_info in txt hcl sql; do
+    {
+      cat "$README" &&
+        printf '%s\n' '```'"$fence_probe_info" &&
+        printf '%s\n' \
+          'azurerm_resource_group.patchpage' \
+          'trust_proxy = "2"' \
+          'SELECT draft_versions.source_ip FROM draft_versions;' &&
+        printf '%s\n' '```'
+    } > "$fence_probe_dir/data-$fence_probe_info.md" ||
+      fail "could not build the $fence_probe_info data-fence probe"
+    guide_fences_document_only_ops_commands \
+      "$fence_probe_dir/data-$fence_probe_info.md" "$guide_command_names" ||
+      fail "the guide-fence check rejects data content in a $fence_probe_info fence"
+  done
+
+  # Statement 4: the two fence spellings the scanner does not model. Both would
+  # be walked straight through -- their bodies read as prose -- so the guide is
+  # not permitted to contain them at all. The bodies here are deliberately inert,
+  # so only statement 4 can be what turns each probe red.
+  {
+    cat "$README" &&
+      printf '%s\n' '~~~sh' 'az containerapp update --name "$CONTAINER_APP"' '~~~'
+  } > "$fence_probe_dir/tilde.md" ||
+    fail "could not build the tilde-fence probe"
+  if guide_fences_document_only_ops_commands "$fence_probe_dir/tilde.md" \
+    "$guide_command_names"; then
+    fail "the guide-fence check accepts a tilde fence"
+  fi
+  {
+    cat "$README" &&
+      printf '%s\n' '````sh' 'az containerapp update --name "$CONTAINER_APP"' '````'
+  } > "$fence_probe_dir/four-backtick.md" ||
+    fail "could not build the four-backtick-fence probe"
+  if guide_fences_document_only_ops_commands \
+    "$fence_probe_dir/four-backtick.md" "$guide_command_names"; then
+    fail "the guide-fence check accepts a four-backtick fence"
+  fi
+
+  # Statement 2, subsumption: the probe the 40-line ceiling was meta-tested
+  # with. The replacement is only allowed to be a replacement if what the old
+  # check caught, it still catches.
   {
     cat "$README" &&
       printf '%s\n' '```sh' &&
       awk 'NR > 1 && NR <= 60' "$GUIDE_CMD_DIR/hostname-mutation.sh" &&
       printf '%s\n' '```'
-  } > "$moved_runbook_probe_dir/inlined.md" ||
+  } > "$fence_probe_dir/inlined.md" ||
     fail "could not build the re-inlined runbook probe"
-  if guide_carries_no_moved_runbook "$moved_runbook_probe_dir/inlined.md"; then
-    fail "the moved-runbook check accepts a re-inlined runbook fence"
+  if guide_fences_document_only_ops_commands "$fence_probe_dir/inlined.md" \
+    "$guide_command_names"; then
+    fail "the guide-fence check accepts a re-inlined runbook fence"
   fi
-  rm -rf "$moved_runbook_probe_dir"
+
+  # Statement 2, the near misses. These are the lines most likely to be added in
+  # good faith, and each is one clause away from allowed: an export the tables
+  # already state, an assignment prefix on an otherwise valid invocation, and an
+  # invocation of a name ops.sh would refuse to dispatch.
+  for fence_probe_line in \
+    'export STATE_KEY=patchpage-prod.tfstate' \
+    'STATE_KEY=x sh infra/azure/ops.sh app-release' \
+    'sh infra/azure/ops.sh state-boostrap'; do
+    {
+      cat "$README" &&
+        printf '%s\n' '```sh' "$fence_probe_line" '```'
+    } > "$fence_probe_dir/near-miss.md" ||
+      fail "could not build the near-miss fence probe"
+    if guide_fences_document_only_ops_commands "$fence_probe_dir/near-miss.md" \
+      "$guide_command_names"; then
+      fail "the guide-fence check accepts the fence line: $fence_probe_line"
+    fi
+  done
+
+  # Statement 3: a shrink that drops a command's section. Removing the one
+  # invocation line leaves a guide that is still pure and still marker-free, so
+  # only this statement can be what turns it red.
+  awk '$0 != "sh infra/azure/ops.sh deployed-smoke"' "$README" \
+    > "$fence_probe_dir/undocumented.md" ||
+    fail "could not build the undocumented-command probe"
+  if cmp -s "$README" "$fence_probe_dir/undocumented.md"; then
+    fail "the undocumented-command probe did not remove an invocation"
+  fi
+  if guide_fences_document_only_ops_commands \
+    "$fence_probe_dir/undocumented.md" "$guide_command_names"; then
+    fail "the guide-fence check accepts a guide that documents no way to run a command"
+  fi
+
+  # And the two degenerate inputs the END block guards, which no sabotage of the
+  # guide itself can reach: an unclosed fence, and an empty command list that
+  # would make statement 3 vacuous.
+  {
+    cat "$README" && printf '%s\n' '```sh'
+  } > "$fence_probe_dir/unclosed.md" ||
+    fail "could not build the unclosed-fence probe"
+  if guide_fences_document_only_ops_commands "$fence_probe_dir/unclosed.md" \
+    "$guide_command_names"; then
+    fail "the guide-fence check accepts an unclosed shell fence"
+  fi
+  if guide_fences_document_only_ops_commands "$fence_probe_dir/clean.md" ""; then
+    fail "the guide-fence check passes vacuously when given no command names"
+  fi
+  rm -rf "$fence_probe_dir"
   rm -rf "$restricted_path_probe_dir"
+
+  # With the shell gone from the guide, the input tables are the only thing left
+  # telling an operator what to export. So they are tied to the commands: a
+  # `${VAR:?}` a command hard-requires must be named where that command is
+  # documented.
+  guide_states_every_command_input "$README" "$GUIDE_CMD_DIR" \
+    "$guide_command_names" ||
+    fail "a documented command hard-requires an input its section of the Azure guide never names"
+
+  # Meta-tested from both sides, because the check has two moving parts and each
+  # can rot alone: the guide can lose a row, and a command can grow a guard.
+  # Both probes start from copies asserted to pass first.
+  command_input_probe_dir="$TMP_DIR/command-input-probe"
+  rm -rf "$command_input_probe_dir"
+  mkdir -p "$command_input_probe_dir/cmd" ||
+    fail "could not create the command-input probe directory"
+  cp "$README" "$command_input_probe_dir/clean.md" ||
+    fail "could not copy the guide for the command-input probes"
+  for command_input_probe_command in $GUIDE_COMMANDS; do
+    cp "$GUIDE_CMD_DIR/$command_input_probe_command.sh" \
+      "$command_input_probe_dir/cmd/$command_input_probe_command.sh" ||
+      fail "could not populate the command-input probe"
+  done
+  guide_states_every_command_input "$command_input_probe_dir/clean.md" \
+    "$command_input_probe_dir/cmd" "$guide_command_names" ||
+    fail "the command-input check rejects unmodified copies of the guide and the commands"
+
+  # The guide side: a table row removed. `VALIDATION_METHOD` is the row this
+  # branch added, and hostname-mutation's section names it nowhere else, so its
+  # absence is the whole difference.
+  awk '$0 !~ /^\| `VALIDATION_METHOD` \|/' "$README" \
+    > "$command_input_probe_dir/dropped-row.md" ||
+    fail "could not build the dropped-table-row probe"
+  if cmp -s "$README" "$command_input_probe_dir/dropped-row.md"; then
+    fail "the dropped-table-row probe did not remove a row"
+  fi
+  if guide_states_every_command_input \
+    "$command_input_probe_dir/dropped-row.md" "$command_input_probe_dir/cmd" \
+    "$guide_command_names"; then
+    fail "the command-input check accepts a guide missing a required input's table row"
+  fi
+
+  # The command side: a new guard added to a command whose table nobody updated.
+  {
+    cat "$GUIDE_CMD_DIR/deployed-smoke.sh" &&
+      printf '%s\n' 'PATCHPAGE_PROBE_INPUT="${PATCHPAGE_PROBE_INPUT:?probe}"'
+  } > "$command_input_probe_dir/cmd/deployed-smoke.sh" ||
+    fail "could not build the undocumented-guard probe"
+  if guide_states_every_command_input "$command_input_probe_dir/clean.md" \
+    "$command_input_probe_dir/cmd" "$guide_command_names"; then
+    fail "the command-input check accepts a command guarding an input the guide never names"
+  fi
+  cp "$GUIDE_CMD_DIR/deployed-smoke.sh" \
+    "$command_input_probe_dir/cmd/deployed-smoke.sh" ||
+    fail "could not restore the undocumented-guard probe"
+  # Green again once the guard is removed, so the rejection above is
+  # attributable to the added guard rather than to anything else in the copy.
+  guide_states_every_command_input "$command_input_probe_dir/clean.md" \
+    "$command_input_probe_dir/cmd" "$guide_command_names" ||
+    fail "the command-input check stays red after the added guard is removed"
+
+  # And the degenerate inputs: an empty command list, and a command whose file
+  # the check cannot read. Either would otherwise be a silent pass.
+  if guide_states_every_command_input "$command_input_probe_dir/clean.md" \
+    "$command_input_probe_dir/cmd" ""; then
+    fail "the command-input check passes vacuously when given no command names"
+  fi
+  rm -f "$command_input_probe_dir/cmd/apex-dns.sh" ||
+    fail "could not build the missing-command-file probe"
+  if guide_states_every_command_input "$command_input_probe_dir/clean.md" \
+    "$command_input_probe_dir/cmd" "$guide_command_names"; then
+    fail "the command-input check passes when a command's file cannot be read"
+  fi
+  rm -rf "$command_input_probe_dir"
 
   # The two sourced commands run in the operator's shell, where a trap would
   # outlive the command instead of being torn down with a process.
