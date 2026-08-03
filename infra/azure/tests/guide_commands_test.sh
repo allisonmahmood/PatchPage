@@ -5124,15 +5124,27 @@ guide_sweep_private_output() {
   for guide_sweep_capture in "$TMP_DIR"/*.out; do
     test -f "$guide_sweep_capture" || continue
     guide_sweep_count=$((guide_sweep_count + 1))
-    if guide_private_output_leaks "$guide_sweep_capture"; then
-      fail "a private value reached ${guide_sweep_capture##*/}, seen after $guide_sweep_group"
-    fi
-    if grep -Fq "$TMP_ROOT" "$guide_sweep_capture" ||
-      grep -Fq "$TMP_ROOT_PHYSICAL" "$guide_sweep_capture"; then
-      fail "a private harness path reached ${guide_sweep_capture##*/}, seen after $guide_sweep_group"
-    fi
   done
   GUIDE_PRIVATE_OUTPUT_SWEPT="$guide_sweep_count"
+  test "$guide_sweep_count" -gt 0 || return 0
+  # Three greps over the whole set rather than three per capture: this runs
+  # after every group, and per-file it would be some thirty thousand process
+  # spawns in a CI job whose whole point is to be cheap enough to be required.
+  # grep -l names the first offender, which is all the message needs.
+  guide_sweep_hit="$(
+    grep -lE "$GUIDE_PRIVATE_OUTPUT_PATTERN" "$TMP_DIR"/*.out 2>/dev/null |
+      sed -n '1p'
+  )"
+  test -z "$guide_sweep_hit" ||
+    fail "a private value reached ${guide_sweep_hit##*/}, seen after $guide_sweep_group"
+  guide_sweep_hit="$(
+    {
+      grep -lF "$TMP_ROOT" "$TMP_DIR"/*.out 2>/dev/null
+      grep -lF "$TMP_ROOT_PHYSICAL" "$TMP_DIR"/*.out 2>/dev/null
+    } | sed -n '1p'
+  )"
+  test -z "$guide_sweep_hit" ||
+    fail "a private harness path reached ${guide_sweep_hit##*/}, seen after $guide_sweep_group"
 }
 
 # Meta-test the sweep before any of it is trusted. A pattern that matched
