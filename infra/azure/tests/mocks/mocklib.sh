@@ -278,6 +278,17 @@ mock_operation_lease() {
     break)
       test "$operation_break_period" = "0" || return 1
       test "$scenario" != "${operation_lease_prefix}break_failure" || return 1
+      # A zero-period break ends whatever lease is held right now, so the
+      # recorded holder goes away here rather than at the next acquire.
+      mock_real rm -f "$operation_lease_file"
+      # ...and in the concurrent-recovery scenario a second recoverer wins the
+      # race back to the container in that same instant. The break this process
+      # just made succeeded; the container is leased again, to someone else,
+      # before this process reaches its own acquire. That is the only ordering
+      # in which the single-flight rule has anything to decide.
+      if test "$scenario" = "${operation_lease_prefix}concurrent_recovery"; then
+        printf '%s\n' "${PP_MOCK_CONCURRENT_LEASE_ID:?}" > "$operation_lease_file"
+      fi
       ;;
     acquire)
       case "$operation_duration" in

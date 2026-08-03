@@ -2663,6 +2663,9 @@ azurerm_container_app.server'
     fail "infrastructure change never exercised a deliberately retained operation lease"
 }
 
+# The lease ID the winning recoverer holds in the concurrent-recovery scenario.
+GUIDE_CONCURRENT_RECOVERY_LEASE_ID="99999999-9999-9999-9999-999999999999"
+
 run_stale_lease_recovery_block() {
   scenario="$1"
   scenario_root="$TMP_DIR/stale-lease-$scenario"
@@ -2699,8 +2702,14 @@ run_stale_lease_recovery_block() {
     PP_MOCK_OPERATION_BINDING_SHA256="$(
       guide_operation_binding_sha256 "$STATE_KEY"
     )"
+    # The lease the *other* recoverer holds in the concurrent scenario. It is a
+    # fixed value the harness knows, so the loser's log can be checked for ever
+    # having named it: a loser that somehow released the winner's lease would be
+    # doing the one thing the single-flight rule exists to prevent.
+    PP_MOCK_CONCURRENT_LEASE_ID="$GUIDE_CONCURRENT_RECOVERY_LEASE_ID"
     export PP_MOCK_GROUP PP_MOCK_SCENARIO PP_MOCK_LOG \
-      PP_MOCK_LEASE_SCENARIO_PREFIX PP_MOCK_OPERATION_BINDING_SHA256
+      PP_MOCK_LEASE_SCENARIO_PREFIX PP_MOCK_OPERATION_BINDING_SHA256 \
+      PP_MOCK_CONCURRENT_LEASE_ID
     prepare_mock_state "$TMP_DIR/stale-lease-$scenario.mockstate"
 
     run_ops_command_completed stale-lease-recovery
@@ -2719,6 +2728,7 @@ test_stale_lease_recovery() {
     container_nonempty \
     break_failure \
     acquire_failure \
+    concurrent_recovery \
     renew_failure \
     release_failure \
     success; do
@@ -2786,9 +2796,92 @@ test_stale_lease_recovery() {
             fail "stale operation lease recovery broke a lease after $scenario"
           fi
           ;;
+        concurrent_recovery)
+          # The losing side of the race. Its break landed, a second recoverer
+          # took the container back in that instant, and its own acquire was
+          # refused. Three things have to be true of what it did next.
+          #
+          # First: it stopped. The refused acquire has to be the last thing it
+          # sent, so the assertion is on the final logged call rather than on a
+          # list of forbidden verbs -- a future release, renew, break or
+          # metadata write would all fail this, including ones nobody has
+          # written yet.
+          grep -Fq 'az storage container lease break ' "$log" ||
+            fail "the losing recoverer never reached the lease break, so $scenario proved nothing"
+          test "$(
+            grep -cF 'az storage container lease acquire ' "$log" | tr -d ' '
+          )" = "1" ||
+            fail "the losing recoverer did not attempt exactly one acquire during $scenario"
+          case "$(tail -n 1 "$log")" in
+            'az storage container lease acquire '*) ;;
+            *)
+              fail "the losing recoverer kept calling Azure after its acquire was refused during $scenario"
+              ;;
+          esac
+          # Second: it never named the winner's lease. Releasing or renewing the
+          # lease the other operator is holding is the precise harm the
+          # single-flight rule exists to prevent.
+          if grep -Fq "$GUIDE_CONCURRENT_RECOVERY_LEASE_ID" "$log"; then
+            fail "the losing recoverer touched the winning recoverer's lease during $scenario"
+          fi
+          # Third: it did not claim success, on stdout or through the exit code.
+          if grep -Fq 'Operation lease recovery completed.' "$output"; then
+            fail "the losing recoverer claimed success during $scenario"
+          fi
+          test "$status" -eq 1 ||
+            fail "the losing recoverer exited $status instead of 1 during $scenario"
+          ;;
       esac
     fi
   done
+  # Exactly one winner, asserted across the pair rather than inside either run:
+  # the point of the change is that two recoverers cannot both come away
+  # believing they hold the lease, and neither run alone can say that.
+  stale_lease_winners=0
+  for stale_lease_outcome in success concurrent_recovery; do
+    if grep -Fqx 'Operation lease recovery completed.' \
+      "$TMP_DIR/stale-lease-$stale_lease_outcome.out"; then
+      stale_lease_winners=$((stale_lease_winners + 1))
+    fi
+  done
+  test "$stale_lease_winners" -eq 1 ||
+    fail "two concurrent recoverers produced $stale_lease_winners winners, not exactly one"
+
+  # The single-flight property itself: nothing may sit between the break and the
+  # acquire. Every call this command makes is logged, so "adjacent in the log"
+  # is "nothing was sent in between" -- which is the whole of the window a
+  # second recoverer could have used.
+  stale_lease_success_log="$TMP_DIR/stale-lease-success.log"
+  stale_lease_break_line="$(
+    grep -nF 'az storage container lease break ' "$stale_lease_success_log" |
+      sed -n '1s/:.*//p'
+  )"
+  stale_lease_acquire_line="$(
+    grep -nF 'az storage container lease acquire ' "$stale_lease_success_log" |
+      sed -n '1s/:.*//p'
+  )"
+  test -n "$stale_lease_break_line" && test -n "$stale_lease_acquire_line" ||
+    fail "stale operation lease recovery did not both break and acquire"
+  test "$((stale_lease_break_line + 1))" -eq "$stale_lease_acquire_line" ||
+    fail "stale operation lease recovery sent a call between the lease break and the reacquire"
+
+  # The log can only show the calls that were made, and minting a lease ID makes
+  # none -- it is an od, a grep and a sed. Those three process spawns are real
+  # time between the break and the acquire all the same, so where the minting
+  # sits is pinned in the source instead.
+  stale_lease_source="$GUIDE_CMD_DIR/stale-lease-recovery.sh"
+  stale_lease_mint_line="$(
+    grep -nF '/dev/urandom' "$stale_lease_source" | sed -n '1s/:.*//p'
+  )"
+  stale_lease_source_break_line="$(
+    grep -nF 'private_az storage container lease break' "$stale_lease_source" |
+      sed -n '1s/:.*//p'
+  )"
+  test -n "$stale_lease_mint_line" && test -n "$stale_lease_source_break_line" ||
+    fail "stale operation lease recovery no longer mints a lease ID or breaks a lease"
+  test "$stale_lease_mint_line" -lt "$stale_lease_source_break_line" ||
+    fail "stale operation lease recovery mints its lease ID after the break, reopening the window a second recoverer breaks into"
+
   test "$((GUIDE_RETAINED_LEASE_EXITS - stale_lease_retained_start))" -ge 1 ||
     fail "stale lease recovery never exercised a lease it could not give back"
   grep -Fq 'A second authorized operator must independently verify' "$README" ||
