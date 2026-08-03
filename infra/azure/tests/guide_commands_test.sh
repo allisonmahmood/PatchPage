@@ -63,10 +63,36 @@ file_mode() {
 # which is the only thing left in them.
 GUIDE_PRIVATE_OUTPUT_PATTERN='[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}|sha256:[0-9a-f]{64}|patchpagestate|patchpagedrafts|patchpage-prod\.tfstate|patchpage-operations|patchpage-db|patchpage-app|acrpatchpageabc123|rg-patchpage-tfstate|rg-patchpage-workload|rg-test|app-test|env-test|drafts\.self-hoster\.dev|203\.0\.113\.10|verification-id|private-(az|tofu|rollback|infra-az|infra-tofu)-diagnostic|pp_[A-Za-z0-9]|[Aa]ccount[Kk]ey'
 
-# Returns 0 when the given capture contains a private value, 1 when it is clean.
-# Reports status rather than calling fail so the check itself can be meta-tested.
+# Returns 0 when one of the given captures contains a private value, naming the
+# first offender on stdout, and 1 when they are all clean. Reports status rather
+# than calling fail so the check itself can be meta-tested, and takes the whole
+# set rather than one file so the sweep and the meta-test run the same code: a
+# per-file loop over eighteen groups was some thirty thousand grep spawns, and
+# the batch form that fixed that is only trustworthy if it is the form the
+# meta-test exercises.
 guide_private_output_leaks() {
-  grep -Eq "$GUIDE_PRIVATE_OUTPUT_PATTERN" "$1"
+  guide_output_leak_hit="$(
+    grep -lE "$GUIDE_PRIVATE_OUTPUT_PATTERN" "$@" 2>/dev/null | sed -n '1p'
+  )"
+  test -n "$guide_output_leak_hit" || return 1
+  printf '%s\n' "$guide_output_leak_hit"
+}
+
+# The same shape for the harness's own temporary root, which is the other half
+# of the promise: a private diagnostic, session or plan directory can only be
+# somewhere under it, so a capture naming it has exposed a private path. Both
+# spellings are checked because macOS hands back a /var/folders path that is a
+# symlink to /private/var/folders, and a runbook that resolved a directory with
+# `pwd -P` would print the second.
+guide_private_path_leaks() {
+  guide_path_leak_hit="$(
+    {
+      grep -lF "$TMP_ROOT" "$@" 2>/dev/null
+      grep -lF "$TMP_ROOT_PHYSICAL" "$@" 2>/dev/null
+    } | sed -n '1p'
+  )"
+  test -n "$guide_path_leak_hit" || return 1
+  printf '%s\n' "$guide_path_leak_hit"
 }
 
 # The one interesting case in the exit-code contract ops.sh --help states: a
@@ -2806,11 +2832,19 @@ guide_session_lease_is_held() {
 
 # Runs one session command, records its status, and holds it to the exit-code
 # contract every other flow here is held to: a run that says it kept the
-# operation lease must exit 75, and a run that exits 75 must say so. The session
-# commands are the first ones that can end with the lease deliberately held
-# *without* being in that state -- infrastructure-plan holds it and exits 0 --
-# so putting them through the same assertion is what keeps that exception to
-# exactly the one message that names it.
+# operation lease must exit 75, and a run that exits 75 must say so.
+#
+# infrastructure-plan is the one command that ends with the lease deliberately
+# held and still exits 0, and it is worth being clear about what keeps that
+# exception narrow, because it is not this assertion. This assertion only knows
+# the two retention messages; the plan's hand-off message is a third string it
+# has never heard of, so the plan passes here the way any non-retaining run
+# does. What pins the plan is the standalone grep for
+# 'The operation lease is held for this session.' further down, together with
+# the group-wide check that this group contributed nothing to
+# GUIDE_RETAINED_LEASE_EXITS. A plan that started printing a *retention*
+# message would be caught here; a plan that stopped saying anything about the
+# lease at all would be caught there.
 guide_session_run() {
   if run_infrastructure_session_command "$@"; then
     session_status=0
@@ -3303,9 +3337,13 @@ test_stale_lease_recovery() {
       esac
     fi
   done
-  # Exactly one winner, asserted across the pair rather than inside either run:
-  # the point of the change is that two recoverers cannot both come away
-  # believing they hold the lease, and neither run alone can say that.
+  # Exactly one winner. This is implied by the two per-run assertions above --
+  # success must print the completion line, and the loser must not -- so it
+  # catches nothing they would let through today, and it is kept anyway rather
+  # than dressed up as independent. It is the only place the cross-run property
+  # is stated as a property, so relaxing either per-run assertion later does not
+  # quietly take the pair invariant with it, and the failure message names the
+  # thing that actually went wrong instead of one run's output.
   stale_lease_winners=0
   for stale_lease_outcome in success concurrent_recovery; do
     if grep -Fqx 'Operation lease recovery completed.' \
@@ -4886,12 +4924,18 @@ CAA team.example.com"
   done
 }
 
+# The capture name is a parameter because all five calls used to write the same
+# certificate-binding.out, so four of the five were overwritten before the
+# central sweep ever looked at them and only the last scenario's output was
+# swept. The inline grep below still guards this flow's own three values; the
+# names are what put the other four captures in front of the universal check.
 run_certificate_block() {
-  subject="$1"
-  certificate_id="$2"
-  binding_id="$3"
-  provisioning_state="$4"
-  output="$TMP_DIR/certificate-binding.out"
+  certificate_case="$1"
+  subject="$2"
+  certificate_id="$3"
+  binding_id="$4"
+  provisioning_state="$5"
+  output="$TMP_DIR/certificate-binding-$certificate_case.out"
 
   (
     SUBSCRIPTION_ID="00000000-0000-0000-0000-000000000000"
@@ -4930,14 +4974,14 @@ test_certificate_binding() {
   certificate_id="/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg-test/providers/Microsoft.App/managedEnvironments/env-test/managedCertificates/cert-one"
   other_certificate_id="/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg-test/providers/Microsoft.App/managedEnvironments/env-test/managedCertificates/cert-two"
 
-  run_certificate_block \
+  run_certificate_block normalized_subject \
     "CN=Drafts.Self-Hoster.Dev." \
     "$certificate_id" \
     "$certificate_id" \
     "Succeeded" ||
     fail "normalized CN certificate subject was not matched"
 
-  if run_certificate_block \
+  if run_certificate_block foreign_subject \
     "CN=other.example.com" \
     "$certificate_id" \
     "$certificate_id" \
@@ -4945,7 +4989,7 @@ test_certificate_binding() {
     fail "certificate verification accepted a different subject"
   fi
 
-  if run_certificate_block \
+  if run_certificate_block foreign_certificate_id \
     "CN=Drafts.Self-Hoster.Dev." \
     "$other_certificate_id" \
     "$certificate_id" \
@@ -4953,7 +4997,7 @@ test_certificate_binding() {
     fail "certificate verification accepted a different managed-certificate resource ID"
   fi
 
-  if run_certificate_block \
+  if run_certificate_block foreign_binding_id \
     "CN=Drafts.Self-Hoster.Dev." \
     "$certificate_id" \
     "$other_certificate_id" \
@@ -4961,7 +5005,7 @@ test_certificate_binding() {
     fail "certificate verification accepted a binding to a different certificate ID"
   fi
 
-  if run_certificate_block \
+  if run_certificate_block pending_certificate \
     "CN=Drafts.Self-Hoster.Dev." \
     "$certificate_id" \
     "$certificate_id" \
@@ -5248,6 +5292,16 @@ set -- \
   test_certificate_binding \
   test_deployed_smoke
 
+# The running total of captures swept, not the count for one group. Every group
+# writes its captures into the one $TMP_DIR and none of them are ever removed,
+# so the set this recounts after each group is cumulative and the last group's
+# count is the total. That accumulation is what the exact pin at the bottom is
+# pinning, and it is an assumption rather than a fact the code enforces: a group
+# that started cleaning up after itself, or a capture path that collided with an
+# earlier group's, would lower this number rather than raise it. The pin turns
+# either into a failure instead of a silently smaller sweep, which is the only
+# defence there is -- so a scenario added or removed means changing that number
+# deliberately.
 GUIDE_PRIVATE_OUTPUT_SWEPT=0
 guide_sweep_private_output() {
   guide_sweep_group="$1"
@@ -5258,24 +5312,17 @@ guide_sweep_private_output() {
   done
   GUIDE_PRIVATE_OUTPUT_SWEPT="$guide_sweep_count"
   test "$guide_sweep_count" -gt 0 || return 0
-  # Three greps over the whole set rather than three per capture: this runs
+  # Two batched checks over the whole set rather than two per capture: this runs
   # after every group, and per-file it would be some thirty thousand process
   # spawns in a CI job whose whole point is to be cheap enough to be required.
-  # grep -l names the first offender, which is all the message needs.
-  guide_sweep_hit="$(
-    grep -lE "$GUIDE_PRIVATE_OUTPUT_PATTERN" "$TMP_DIR"/*.out 2>/dev/null |
-      sed -n '1p'
-  )"
-  test -z "$guide_sweep_hit" ||
+  # Both are the meta-tested functions, so what runs here in bulk is the code the
+  # probes above proved rejects each shape of private value.
+  if guide_sweep_hit="$(guide_private_output_leaks "$TMP_DIR"/*.out)"; then
     fail "a private value reached ${guide_sweep_hit##*/}, seen after $guide_sweep_group"
-  guide_sweep_hit="$(
-    {
-      grep -lF "$TMP_ROOT" "$TMP_DIR"/*.out 2>/dev/null
-      grep -lF "$TMP_ROOT_PHYSICAL" "$TMP_DIR"/*.out 2>/dev/null
-    } | sed -n '1p'
-  )"
-  test -z "$guide_sweep_hit" ||
+  fi
+  if guide_sweep_hit="$(guide_private_path_leaks "$TMP_DIR"/*.out)"; then
     fail "a private harness path reached ${guide_sweep_hit##*/}, seen after $guide_sweep_group"
+  fi
 }
 
 # Meta-test the sweep before any of it is trusted. A pattern that matched
@@ -5287,26 +5334,67 @@ mkdir -p "$guide_sweep_probe_dir" ||
   fail "could not create the private-output probe directory"
 printf 'The active Azure subscription does not match the private expected value.\n' \
   > "$guide_sweep_probe_dir/clean"
-if guide_private_output_leaks "$guide_sweep_probe_dir/clean"; then
+if guide_private_output_leaks "$guide_sweep_probe_dir/clean" >/dev/null; then
   fail "the private-output sweep rejects a generic runbook message"
 fi
+if guide_private_path_leaks "$guide_sweep_probe_dir/clean" >/dev/null; then
+  fail "the private-path sweep rejects a generic runbook message"
+fi
+# One probe per alternative in the pattern, not one per shape of value. The
+# pattern replaced eight hand-written stanzas whose lists were not identical,
+# and an alternative that no probe reaches is an alternative that can be deleted
+# -- or mistyped into never matching -- with every group still green. Each probe
+# is written to match exactly one alternative, so removing that alternative from
+# the pattern turns this loop red rather than being absorbed by a neighbour.
 guide_sweep_probe_case=0
 for guide_sweep_probe_value in \
   'active subscription 00000000-0000-0000-0000-000000000000 mismatched' \
+  'recorded binding sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' \
   'state account patchpagestate is unavailable' \
+  'blob account patchpagedrafts is unavailable' \
+  'state key patchpage-prod.tfstate is missing' \
+  'container patchpage-operations is already leased' \
+  'server patchpage-db refused the connection' \
+  'app patchpage-app has no ready revision' \
+  'registry acrpatchpageabc123 login failed' \
+  'group rg-patchpage-tfstate not found' \
   'could not read rg-patchpage-workload' \
-  'image acrpatchpageabc123.azurecr.io/patchpage-server@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' \
+  'group rg-test not found' \
+  'container app app-test not found' \
+  'managed environment env-test not found' \
+  'hostname drafts.self-hoster.dev did not resolve' \
+  'apex A record 203.0.113.10 is wrong' \
+  'expected TXT record verification-id was absent' \
   'private-az-diagnostic account show' \
+  'private-tofu-diagnostic plan -input=false' \
+  'private-rollback-diagnostic containerapp show' \
+  'private-infra-az-diagnostic account show' \
+  'private-infra-tofu-diagnostic plan -input=false' \
   'token pp_abcdef' \
   'BlobEndpoint=x;AccountKey=secret'; do
   guide_sweep_probe_case=$((guide_sweep_probe_case + 1))
   printf '%s\n' "$guide_sweep_probe_value" \
     > "$guide_sweep_probe_dir/leak-$guide_sweep_probe_case"
-  guide_private_output_leaks "$guide_sweep_probe_dir/leak-$guide_sweep_probe_case" ||
+  guide_private_output_leaks "$guide_sweep_probe_dir/leak-$guide_sweep_probe_case" \
+    >/dev/null ||
     fail "the private-output sweep accepts a capture containing $guide_sweep_probe_value"
 done
-test "$guide_sweep_probe_case" -eq 7 ||
+test "$guide_sweep_probe_case" -eq 24 ||
   fail "the private-output sweep meta-test lost one of its cases"
+# The harness-root half, which subsumes the two hand-written "exposed the
+# private diagnostic path" assertions and had no meta-test of its own. Both
+# spellings are probed. On Linux they are the same string, and on macOS the
+# physical one contains the logical one, so this proves the pair catches either
+# spelling rather than proving each grep is separately load-bearing -- which is
+# the most the platform allows and is stated here rather than implied.
+printf 'diagnostics retained under %s/private-run\n' "$TMP_ROOT" \
+  > "$guide_sweep_probe_dir/path-leak-logical"
+guide_private_path_leaks "$guide_sweep_probe_dir/path-leak-logical" >/dev/null ||
+  fail "the private-path sweep accepts a capture naming the harness temporary root"
+printf 'diagnostics retained under %s/private-run\n' "$TMP_ROOT_PHYSICAL" \
+  > "$guide_sweep_probe_dir/path-leak-physical"
+guide_private_path_leaks "$guide_sweep_probe_dir/path-leak-physical" >/dev/null ||
+  fail "the private-path sweep accepts a capture naming the resolved harness temporary root"
 rm -rf "$guide_sweep_probe_dir"
 
 for guide_scenario_group in "$@"; do
@@ -5317,8 +5405,8 @@ done
 # Exact, so a scenario whose output stopped being captured -- or a group that
 # silently stopped running -- cannot leave the sweep passing over less than it
 # used to. Adding scenarios means updating this number.
-test "$GUIDE_PRIVATE_OUTPUT_SWEPT" -eq 546 ||
-  fail "the private-output sweep examined $GUIDE_PRIVATE_OUTPUT_SWEPT scenario captures, not the expected 546"
+test "$GUIDE_PRIVATE_OUTPUT_SWEPT" -eq 550 ||
+  fail "the private-output sweep examined $GUIDE_PRIVATE_OUTPUT_SWEPT scenario captures, not the expected 550"
 
 printf 'guide_commands_test: %s scenario groups passed, %s captures swept\n' \
   "$#" "$GUIDE_PRIVATE_OUTPUT_SWEPT"
