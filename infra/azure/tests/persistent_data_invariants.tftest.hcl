@@ -137,3 +137,68 @@ run "supports_alternate_recovery_settings" {
     error_message = "Expected the configured PostgreSQL backup-retention window."
   }
 }
+
+# --- management-lock scope, asserted behaviourally ----------------------------
+#
+# A lock's scope is another resource's computed `id`. Under the per-type
+# mock_resource defaults above, every azurerm_storage_account in the
+# configuration mocks to the same id, so "the lock's scope equals that id" holds
+# for a lock wired to any storage account: it pins the mock, not the wiring.
+#
+# override_resource is per *address*, which is what makes these two runs
+# possible. Each gives the two protected parents ids that appear nowhere else in
+# this configuration and that differ from each other, so an assertion that a
+# lock's scope equals one of them can only be satisfied by a lock wired to that
+# exact resource. Re-scoping either lock -- to the resource group, or to the
+# other protected resource -- turns the matching run red.
+#
+# The static checks in tests/guide_commands_test.sh stay. They cover what a
+# plan-time assertion still cannot see: `prevent_destroy` is a meta-argument and
+# is invisible here, and the static scope check reads the expression rather than
+# its value, so the two guards fail for different reasons.
+
+run "pins_drafts_lock_scope_to_the_drafts_storage_account" {
+  command = plan
+
+  override_resource {
+    target = azurerm_storage_account.drafts
+    values = {
+      id = "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg-lock-scope/providers/Microsoft.Storage/storageAccounts/stdraftsdistinct"
+    }
+  }
+
+  override_resource {
+    target = azurerm_postgresql_flexible_server.patchpage
+    values = {
+      id = "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg-lock-scope/providers/Microsoft.DBforPostgreSQL/flexibleServers/psql-distinct"
+    }
+  }
+
+  assert {
+    condition     = azurerm_management_lock.drafts_storage.scope == "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg-lock-scope/providers/Microsoft.Storage/storageAccounts/stdraftsdistinct"
+    error_message = "Expected the drafts deletion lock to be scoped to the drafts Storage account itself."
+  }
+}
+
+run "pins_postgres_lock_scope_to_the_postgres_server" {
+  command = plan
+
+  override_resource {
+    target = azurerm_storage_account.drafts
+    values = {
+      id = "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg-lock-scope/providers/Microsoft.Storage/storageAccounts/stdraftsdistinct"
+    }
+  }
+
+  override_resource {
+    target = azurerm_postgresql_flexible_server.patchpage
+    values = {
+      id = "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg-lock-scope/providers/Microsoft.DBforPostgreSQL/flexibleServers/psql-distinct"
+    }
+  }
+
+  assert {
+    condition     = azurerm_management_lock.patchpage_postgres.scope == "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg-lock-scope/providers/Microsoft.DBforPostgreSQL/flexibleServers/psql-distinct"
+    error_message = "Expected the PostgreSQL deletion lock to be scoped to the flexible server itself."
+  }
+}

@@ -12,6 +12,13 @@ locals {
   # precondition to this local, and lets server_image_invariants.tftest.hcl assert
   # the predicate directly through the server_image_is_managed_digest output.
   #
+  # #73 retried this under OpenTofu, whose override_resource is per-address, and
+  # the masking is still there: the postcondition reads a configured field, which
+  # override_resource refuses, and the one route that does isolate the
+  # precondition needs a `command = apply` run that prevent_destroy makes
+  # impossible to tear down. tests/guide_commands_test.sh records the exact
+  # errors next to the static check that remains the guard.
+  #
   # Guard indexes with try() so malformed images fail the predicate instead of
   # raising Invalid index during expression evaluation.
   #

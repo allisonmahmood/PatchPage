@@ -4115,15 +4115,47 @@ test_public_safe_runbook_static() {
   # Lifecycle prevent_destroy is a meta-argument and is invisible to plan-time
   # tofu test assertions. Statically require the expected blocks.
   #
-  # Management-lock scope wiring also cannot be asserted behaviorally under
-  # `tofu test`. A lock's scope is another resource's computed `id`, and
-  # mock_resource defaults supply one constant id per resource type, not per
-  # instance: every azurerm_storage_account in the configuration mocks to the
-  # same id. An assertion that the lock's scope equals that id therefore holds
-  # for a lock wired to any storage account, so it pins the mock rather than the
-  # wiring -- which is the only thing worth pinning here. Statically require each
-  # lock's scope to name the intended resource id instead. See #73, which
-  # revisits how much of this can move to a behavioral guard test.
+  # --- what #73 settled about moving these to behavioural guards ---------------
+  #
+  # Management-lock scope: moved, and this check is now the second layer rather
+  # than the only one. The obstacle was that mock_resource defaults supply one
+  # constant id per resource *type*, so every azurerm_storage_account in the
+  # configuration mocks to the same id and an assertion on the lock's scope
+  # pinned the mock instead of the wiring. OpenTofu's override_resource is
+  # per-address, which removes exactly that obstacle:
+  # tests/persistent_data_invariants.tftest.hcl now gives the two protected
+  # parents distinct ids and asserts each lock's scope against its own. Swapping
+  # the two locks' scopes turns both runs red, and re-scoping one to the resource
+  # group turns that one red. This static check stays because it reads the
+  # expression rather than its value, so the two fail for different reasons.
+  #
+  # Container App precondition isolation: not achievable, and the static pin
+  # below remains the only guard. `expect_failures` for
+  # azurerm_container_app.server is satisfied by the postcondition on the same
+  # resource, so deleting the precondition keeps such a run green -- verified,
+  # not assumed. Isolating it needs a run where the precondition fails while the
+  # postcondition holds, and neither route exists here:
+  #
+  #   * override_resource cannot supply one. The postcondition reads
+  #     self.template[0].container[0].image, which is configured rather than
+  #     computed, and OpenTofu refuses it -- "Non-computed field `image` is not
+  #     allowed to be overridden". Overriding the enclosing block fails first
+  #     with "Blocks can be overridden only by objects".
+  #   * Seeding prior state with a `command = apply` run would work -- with the
+  #     image ignored by lifecycle.ignore_changes, the planned image stays the
+  #     valid prior one while an invalid var.server_image fails the precondition,
+  #     and the run does go red when the precondition is deleted. But the file
+  #     cannot then be torn down: tofu test's cleanup destroy hits
+  #     prevent_destroy on six resources, fails unconditionally, exits 2 and
+  #     writes errored_test.tfstate into this directory. The guard that makes
+  #     the other half of this function necessary is what makes that route
+  #     unusable.
+  #
+  # Reaching the precondition behaviourally therefore means weakening a real
+  # protection to test another one, which is the wrong trade. The predicate
+  # itself stays independently asserted through the server_image_is_managed_digest
+  # output in tests/server_image_invariants.tftest.hcl; what only this static
+  # check can say is that the resource's precondition is still wired to it.
   azure_tf_dir="$ROOT/infra/azure"
   for prevent_destroy_resource in \
     'azurerm_storage_account.drafts' \
