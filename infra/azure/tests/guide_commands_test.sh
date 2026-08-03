@@ -7,6 +7,10 @@ README="$ROOT/infra/azure/README.md"
 TMP_ROOT="$(mktemp -d)"
 TMP_DIR="$TMP_ROOT/guide commands"
 mkdir -p "$TMP_DIR"
+# Both spellings of the harness root. On macOS mktemp hands back a /var/folders
+# path that is a symlink to /private/var/folders, and a runbook that resolved a
+# private directory with `pwd -P` would print the second one.
+TMP_ROOT_PHYSICAL="$(CDPATH= cd -- "$TMP_ROOT" && pwd -P)"
 
 # Set PP_KEEP_TMP=1 to keep the scenario command logs, stdout/stderr captures
 # and mock state for inspection; tests/canonicalize_guide_logs.sh turns what is
@@ -27,6 +31,42 @@ fail() {
 
 file_mode() {
   stat -c '%a' "$1" 2>/dev/null || stat -f '%Lp' "$1"
+}
+
+# --- the no-private-output sweep ---------------------------------------------
+#
+# Every documented command makes the same promise about its own output: an
+# operator watching it, and an AI agent reading it back, learn nothing about the
+# environment they did not already have to know in order to run it. Failure
+# messages are generic on purpose, and the private values are in the operator's
+# record rather than on the terminal.
+#
+# That promise used to be kept by a grep copied into eight scenario loops, each
+# with a slightly different pattern list and each covering only the flow it sat
+# in. A command that grew a new printf was covered if somebody remembered to
+# extend the right list; a command written next year was covered if somebody
+# remembered to write one. The promise is universal, so the check is now too:
+# the driver runs it over every scenario's captured stdout and stderr after
+# every group, and a new command is covered the moment its first scenario runs.
+#
+# The pattern is the union of the eight lists it replaces. The harness's own
+# temporary root is checked alongside it, which subsumes the two hand-written
+# "exposed the private diagnostic path" assertions -- a private diagnostic,
+# session or plan directory can only be somewhere under that root.
+#
+# What is deliberately not here: a bare 64-hex-character pattern. The workload
+# binding digest is 64 hex and must never be printed -- but so is the
+# infrastructure review token, which is printed on purpose and is the whole
+# mechanism of the second-operator approval. A universal ban would have to be a
+# ban on the approval flow. The release and rollback flows have no reason to
+# print any 64-hex string, so they keep that one conjunct in their own stanzas,
+# which is the only thing left in them.
+GUIDE_PRIVATE_OUTPUT_PATTERN='[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}|sha256:[0-9a-f]{64}|patchpagestate|patchpagedrafts|patchpage-prod\.tfstate|patchpage-operations|patchpage-db|patchpage-app|acrpatchpageabc123|rg-patchpage-tfstate|rg-patchpage-workload|rg-test|app-test|env-test|drafts\.self-hoster\.dev|203\.0\.113\.10|verification-id|private-(az|tofu|rollback|infra-az|infra-tofu)-diagnostic|pp_[A-Za-z0-9]|[Aa]ccount[Kk]ey'
+
+# Returns 0 when the given capture contains a private value, 1 when it is clean.
+# Reports status rather than calling fail so the check itself can be meta-tested.
+guide_private_output_leaks() {
+  grep -Eq "$GUIDE_PRIVATE_OUTPUT_PATTERN" "$1"
 }
 
 # The one interesting case in the exit-code contract ops.sh --help states: a
@@ -607,20 +647,10 @@ test_state_bootstrap() {
         grep -Fq 'Could not verify the dedicated state containers.' \
           "$TMP_DIR/state-$scenario.out" ||
           fail "state bootstrap did not reject the malformed container inventory row"
-        if grep -Eq \
-          '00000000-0000-0000-0000-000000000000|11111111-1111-1111-1111-111111111111|patchpagestate|rg-patchpage-tfstate|patchpage-prod\.tfstate' \
-          "$TMP_DIR/state-$scenario.out"; then
-          fail "state bootstrap exposed private identifiers after $scenario"
-        fi
         ;;
       *)
         test "$status" -ne 0 || fail "state bootstrap succeeded after $scenario"
         test ! -e "$backend" || fail "state bootstrap created backend config after $scenario"
-        if grep -Eq \
-          '00000000-0000-0000-0000-000000000000|11111111-1111-1111-1111-111111111111|patchpagestate|rg-patchpage-tfstate|patchpage-prod\.tfstate' \
-          "$TMP_DIR/state-$scenario.out"; then
-          fail "state bootstrap exposed private identifiers after $scenario"
-        fi
         ;;
     esac
     case "$scenario" in
@@ -991,14 +1021,6 @@ key                  = "patchpage-prod.tfstate"' ||
       test "$scenario" != "resume_target_complete_success" &&
       grep -q '^completed$' "$log"; then
       fail "deployment continued after $scenario"
-    fi
-    if grep -Eq \
-      '00000000-0000-0000-0000-000000000000|22222222-2222-2222-2222-222222222222|private-(az|tofu)-diagnostic' \
-      "$output"; then
-      fail "deployment exposed private identifiers or producer diagnostics after $scenario"
-    fi
-    if grep -Fq "$TMP_DIR/deploy-diagnostics-$scenario" "$output"; then
-      fail "deployment exposed the private OpenTofu diagnostic path"
     fi
     if test "$scenario" = "final_apply_failure"; then
       # A half-applied deployment is the same "stop, a second operator must
@@ -1526,10 +1548,13 @@ test_app_release() {
           fail "app release readiness failure omitted the retained-lease recovery warning after $scenario"
         ;;
     esac
-    if grep -Eq \
-      '00000000-0000-0000-0000-000000000000|patchpagestate|rg-patchpage-workload|[0-9a-f]{64}' \
-      "$output"; then
-      fail "app release exposed a private ID or workload-binding hash after $scenario"
+    # The identifiers are the driver's sweep now. What stays here is the bare
+    # 64-hex conjunct, which cannot be universal: the infrastructure review
+    # token is 64 hex and is printed on purpose. This flow has no such token and
+    # no reason to print any 64-hex string, so the workload binding digest
+    # reaching its output is a leak with no legitimate reading.
+    if grep -Eq '[0-9a-f]{64}' "$output"; then
+      fail "app release exposed a workload-binding hash after $scenario"
     fi
   done
   test "$((GUIDE_RETAINED_LEASE_EXITS - release_retained_start))" -ge 5 ||
@@ -1718,10 +1743,11 @@ test_app_rollback() {
         "$log" ||
         fail "rollback did not target only the expected Container App and digest"
     fi
-    if grep -Eq \
-      'private-rollback-diagnostic|00000000-0000-0000-0000-000000000000|22222222-2222-2222-2222-222222222222|acrpatchpageabc123|patchpagestate|[0-9a-f]{64}' \
-      "$output"; then
-      fail "rollback exposed private identifiers or producer diagnostics"
+    # As for app release: the identifiers and the producer diagnostics are the
+    # driver's sweep, and the bare 64-hex conjunct is what only this flow can
+    # say.
+    if grep -Eq '[0-9a-f]{64}' "$output"; then
+      fail "rollback exposed a workload-binding hash"
     fi
 
     if test "$scenario" = "success" ||
@@ -2642,9 +2668,6 @@ azurerm_container_app.server'
         fi
         ;;
     esac
-    if grep -Fq "$TMP_DIR/infrastructure-diagnostics-$scenario" "$output"; then
-      fail "infrastructure change exposed the private OpenTofu diagnostic path"
-    fi
     if test "$scenario" = "plan_failure"; then
       test -f "$diagnostic_path_file" ||
         fail "failed infrastructure change lost its private diagnostic location"
@@ -3121,11 +3144,6 @@ test_stale_lease_recovery() {
       test "$status" -ne 0 || fail "stale operation lease recovery accepted $scenario"
       if grep -q '^completed$' "$log"; then
         fail "stale operation lease recovery continued after $scenario"
-      fi
-      if grep -Eq \
-        '00000000-0000-0000-0000-000000000000|patchpagestate|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}' \
-        "$output"; then
-        fail "stale operation lease recovery exposed a private identifier after $scenario"
       fi
       case "$scenario" in
         operation_container_lookup_failure | operation_container_identity_mismatch | \
@@ -4383,11 +4401,6 @@ custom_domain_hostname"
       if grep -q '^completed$' "$TMP_DIR/custom-domain-output-$scenario.log"; then
         fail "custom-domain context continued after $scenario"
       fi
-      if grep -Eq \
-        '00000000-0000-0000-0000-000000000000|rg-test|app-test|env-test|203\.0\.113\.10|verification-id|drafts\.self-hoster\.dev' \
-        "$TMP_DIR/custom-domain-output-$scenario.out"; then
-        fail "custom-domain context exposed a private output after $scenario"
-      fi
     done
   done
   for scenario in account_set_failure account_show_failure subscription_mismatch; do
@@ -4397,17 +4410,13 @@ custom_domain_hostname"
     if grep -q '^completed$' "$TMP_DIR/custom-domain-output-$scenario.log"; then
       fail "custom-domain context continued after $scenario"
     fi
-    if grep -Eq \
-      '00000000-0000-0000-0000-000000000000|11111111-1111-1111-1111-111111111111|rg-test|app-test|env-test|203\.0\.113\.10|verification-id|drafts\.self-hoster\.dev' \
-      "$TMP_DIR/custom-domain-output-$scenario.out"; then
-      fail "custom-domain context exposed private deployment details after $scenario"
-    fi
   done
 }
 
 run_ingress_verification_block() {
   scenario="$1"
   log="$TMP_DIR/ingress-$scenario.log"
+  output="$TMP_DIR/ingress-$scenario.out"
   : > "$log"
 
   (
@@ -4423,7 +4432,7 @@ run_ingress_verification_block() {
     prepare_mock_state "$TMP_DIR/ingress-$scenario.mockstate"
 
     run_ops_command ingress-verification
-  ) >/dev/null 2>&1
+  ) >"$output" 2>&1
 }
 
 test_ingress_verification() {
@@ -4582,9 +4591,18 @@ test_hostname_mutation_guard() {
   done
 }
 
+# One apex run per (A-record set, AAAA scenario) pair, so its captures are
+# numbered. They exist for one reason: until this change these three blocks
+# threw their output away, which meant the flows with the *most* private values
+# in scope -- the hostname, the static IP, the domain verification ID -- were
+# the three the sweep could not see at all.
+GUIDE_APEX_CAPTURE=0
+
 run_apex_block() {
   a_records="$1"
   aaaa_scenario="$2"
+  GUIDE_APEX_CAPTURE=$((GUIDE_APEX_CAPTURE + 1))
+  output="$TMP_DIR/apex-$GUIDE_APEX_CAPTURE.out"
 
   (
     DNS_ZONE="drafts.self-hoster.dev"
@@ -4603,7 +4621,7 @@ run_apex_block() {
     prepare_mock_state "$TMP_DIR/apex.mockstate"
 
     run_ops_command apex-dns
-  ) >/dev/null 2>&1
+  ) >"$output" 2>&1
 }
 
 test_apex_dns() {
@@ -4629,6 +4647,7 @@ test_apex_dns() {
 run_caa_block() {
   scenario="$1"
   log="$TMP_DIR/caa-$scenario.log"
+  output="$TMP_DIR/caa-$scenario.out"
   : > "$log"
 
   (
@@ -4643,7 +4662,7 @@ run_caa_block() {
     prepare_mock_state "$TMP_DIR/caa-$scenario.mockstate"
 
     run_ops_command caa-policy
-  ) >/dev/null 2>&1
+  ) >"$output" 2>&1
 }
 
 test_caa_policy() {
@@ -5098,8 +5117,65 @@ set -- \
   test_certificate_binding \
   test_deployed_smoke
 
+GUIDE_PRIVATE_OUTPUT_SWEPT=0
+guide_sweep_private_output() {
+  guide_sweep_group="$1"
+  guide_sweep_count=0
+  for guide_sweep_capture in "$TMP_DIR"/*.out; do
+    test -f "$guide_sweep_capture" || continue
+    guide_sweep_count=$((guide_sweep_count + 1))
+    if guide_private_output_leaks "$guide_sweep_capture"; then
+      fail "a private value reached ${guide_sweep_capture##*/}, seen after $guide_sweep_group"
+    fi
+    if grep -Fq "$TMP_ROOT" "$guide_sweep_capture" ||
+      grep -Fq "$TMP_ROOT_PHYSICAL" "$guide_sweep_capture"; then
+      fail "a private harness path reached ${guide_sweep_capture##*/}, seen after $guide_sweep_group"
+    fi
+  done
+  GUIDE_PRIVATE_OUTPUT_SWEPT="$guide_sweep_count"
+}
+
+# Meta-test the sweep before any of it is trusted. A pattern that matched
+# nothing would let every capture through and every group would pass, so the
+# check is shown to reject one capture of each shape it exists to catch, and to
+# accept a message of the shape the runbooks actually print.
+guide_sweep_probe_dir="$TMP_DIR/private-output-probe"
+mkdir -p "$guide_sweep_probe_dir" ||
+  fail "could not create the private-output probe directory"
+printf 'The active Azure subscription does not match the private expected value.\n' \
+  > "$guide_sweep_probe_dir/clean"
+if guide_private_output_leaks "$guide_sweep_probe_dir/clean"; then
+  fail "the private-output sweep rejects a generic runbook message"
+fi
+guide_sweep_probe_case=0
+for guide_sweep_probe_value in \
+  'active subscription 00000000-0000-0000-0000-000000000000 mismatched' \
+  'state account patchpagestate is unavailable' \
+  'could not read rg-patchpage-workload' \
+  'image acrpatchpageabc123.azurecr.io/patchpage-server@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' \
+  'private-az-diagnostic account show' \
+  'token pp_abcdef' \
+  'BlobEndpoint=x;AccountKey=secret'; do
+  guide_sweep_probe_case=$((guide_sweep_probe_case + 1))
+  printf '%s\n' "$guide_sweep_probe_value" \
+    > "$guide_sweep_probe_dir/leak-$guide_sweep_probe_case"
+  guide_private_output_leaks "$guide_sweep_probe_dir/leak-$guide_sweep_probe_case" ||
+    fail "the private-output sweep accepts a capture containing $guide_sweep_probe_value"
+done
+test "$guide_sweep_probe_case" -eq 7 ||
+  fail "the private-output sweep meta-test lost one of its cases"
+rm -rf "$guide_sweep_probe_dir"
+
 for guide_scenario_group in "$@"; do
   "$guide_scenario_group"
+  guide_sweep_private_output "$guide_scenario_group"
 done
 
-printf 'guide_commands_test: %s scenario groups passed\n' "$#"
+# Exact, so a scenario whose output stopped being captured -- or a group that
+# silently stopped running -- cannot leave the sweep passing over less than it
+# used to. Adding scenarios means updating this number.
+test "$GUIDE_PRIVATE_OUTPUT_SWEPT" -eq 540 ||
+  fail "the private-output sweep examined $GUIDE_PRIVATE_OUTPUT_SWEPT scenario captures, not the expected 540"
+
+printf 'guide_commands_test: %s scenario groups passed, %s captures swept\n' \
+  "$#" "$GUIDE_PRIVATE_OUTPUT_SWEPT"
