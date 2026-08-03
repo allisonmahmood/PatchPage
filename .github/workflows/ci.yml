@@ -177,24 +177,38 @@ jobs:
   #     platform re-proves the same 95 runs against the same static binary --
   #     for 10x the billed minutes, which is what a macOS runner costs.
   #   * The harness half is the whole point, and it needs no OpenTofu at all: it
-  #     shims tofu, terraform, az, dig, jq, curl and openssl in
-  #     infra/azure/tests/mocks and puts that directory first on PATH. Installing
-  #     the real binary here would only create the chance of one being reached.
-  #     Verified locally by running the suite green with no tofu on PATH.
+  #     shims tofu, terraform, az, dig, curl, git, jq, mktemp, chmod, sleep, cat
+  #     and rm in infra/azure/tests/mocks and puts that directory first on PATH.
+  #     Installing the real binary here would only create the chance of one being
+  #     reached. Verified locally by running the suite green with no tofu on PATH.
+  #
+  # Two tools are the runner's own rather than shimmed. There is no openssl shim
+  # at all -- the digest helpers in infra/azure/lib run the real one -- and the
+  # jq shim delegates everything it does not special-case to the real jq. Both
+  # binaries ship in the macOS runner image, and macOS's LibreSSL accepts the
+  # `openssl dgst -sha256 -r` form those helpers use (checked against LibreSSL
+  # 3.3.6, which is what /usr/bin/openssl is on macOS).
   #
   # So this job is checkout plus the suite, and nothing else.
   #
   # No accommodation is made for the trap-listing assertion in `deployed smoke`,
-  # which used to be described as a macOS-only failure. It is not: the runbook
-  # installs a HUP trap, and POSIX says a signal ignored on entry to a
-  # non-interactive shell cannot be trapped, so the assertion fails in any
-  # process that inherited SIGHUP as SIG_IGN -- under `nohup`, or backgrounded
-  # from a non-interactive shell. Reproduced on macOS under both `nohup` and an
-  # explicit `trap '' HUP`, on both /bin/sh and dash, and green in the
-  # foreground on both. A `run:` step is a foreground process, so this leg
-  # exercises the trap assertion for real rather than skipping it. If it ever
-  # goes red here, the cause is the runner's process setup, not the platform --
-  # do not paper over it with a skip.
+  # which used to be described as a macOS-only failure. It is not the platform:
+  # the runbook installs a HUP trap, and POSIX permits a shell to refuse to trap
+  # a signal that was already SIG_IGN when it started, so the assertion fails in
+  # any process that inherited SIGHUP as SIG_IGN -- under `nohup`, or
+  # backgrounded from a non-interactive shell.
+  #
+  # Reproduced on macOS /bin/sh, which is bash 3.2, under both `nohup` and an
+  # explicit `trap '' HUP`, and green there in the foreground. dash is the
+  # counter-example and the reason the claim is scoped: it registers the HUP
+  # trap and reports it from `trap` even when it inherited SIG_IGN, so the
+  # assertion passes there either way. So this is a property of the shell's
+  # handling of inherited SIG_IGN, not of macOS, and bash 3.2 is where it bites.
+  #
+  # A `run:` step is a foreground process, so this leg exercises the trap
+  # assertion for real rather than skipping it. If it ever goes red here, the
+  # cause is the runner's process setup, not the platform -- do not paper over
+  # it with a skip.
   azure-shell-macos:
     runs-on: macos-latest
     steps:
