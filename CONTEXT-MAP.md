@@ -3,7 +3,7 @@
 ## Contexts
 
 - [Hosting](./apps/server/CONTEXT.md) — receives uploads and serves published pages; owns `@patchpage/db`, `@patchpage/storage`, `@patchpage/config`
-- Publishing — `packages/cli`, the `npx patchpage` package people use to put pages up (no `CONTEXT.md` yet; created when its first term resolves)
+- [Publishing](./packages/cli/CONTEXT.md) — `packages/cli` and the bundled skill, the `npx patchpage` package agents use to put pages up
 
 ## Relationships
 
