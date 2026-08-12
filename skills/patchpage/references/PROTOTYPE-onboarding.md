@@ -34,7 +34,8 @@ the state-dir path, and whether `style.md` exists. Use it to skip questions that
 already answered:
 
 - `style.md` exists → say what the current default style is and ask keep-or-redo.
-- A token is already stored → skip every deployment question; they already publish somewhere.
+- A token is already stored → they already publish; the welcome upload will use it, so
+  skip the publishing-key explanation in step 3.
 - Instance is non-official (env/flag/config) → they self-host; confirm rather than ask.
 
 ## The conversation
@@ -43,7 +44,7 @@ One question at a time. Plain words throughout — the user is not technical. Ne
 *token*, *instance*, *mint*, or *API* unless the user takes the own-server path. Refer to
 the token, when it must be mentioned at all, as their **publishing key**.
 
-### 1. Style — how should your pages look?
+### 1. Style — the only question
 
 Offer exactly two options:
 
@@ -58,19 +59,21 @@ Either way, write the result to `style.md` in the state dir (find the path in
 `status --json`). The file records the *choice*, so no future session re-asks. Format:
 see the style-file reference. A project's own house style always overrides this default.
 
-### 2. Where your pages live
+### 2. Where pages live — assumed, never asked
 
-Most users want the free official service, which needs no setup at all. Ask only:
+Pages go to PatchPage's free service. **Do not ask about hosting.** Anyone who deployed
+their own PatchPage knows they did, and will say so; everyone else would only be
+confused by the question. Mention the default in passing instead — "your pages will be
+published on PatchPage's free service, each with its own shareable link" — so the
+self-hoster has their cue to speak up.
 
-> "Your pages will be published on PatchPage's free service — each page gets its own
-> link you can share. Or, if you have your own PatchPage server, I can point at that
-> instead. Free service?"
-
-- **Free service** (almost everyone): nothing to do. Move on.
-- **Own server**: now, and only now, drop into operator vocabulary. Get the server URL,
-  then set the operator-issued token with
-  `npx --yes patchpage auth set --api-url '<url>'` (hidden prompt, or `--token-stdin`
-  in automation). Verify with `npx --yes patchpage whoami` before continuing.
+Only when the user *asserts* their own deployment — "we host our own", "use our server
+at …", any phrasing, at any point — switch to operator vocabulary: get the server URL,
+set the operator-issued token with
+`npx --yes patchpage auth set --api-url '<url>'` (hidden prompt, or `--token-stdin` in
+automation), and verify with `npx --yes patchpage whoami` before continuing. The probe
+covers the pre-configured case: if `status --json` shows a non-official instance, they
+already self-host — confirm it, don't re-ask.
 
 ### 3. Publish the welcome page
 
@@ -98,33 +101,30 @@ Close with what to say next time, in their words: "make this a patch page",
 
 ## Sample transcripts
 
-### Fast path — defaults all the way (four exchanges)
+### Fast path — default all the way (two exchanges)
 
-> **Agent**: Skill installed. Two quick questions and I'll publish your first page.
-> First — looks. Pages can use the PatchPage look (warm paper, bold ink, friendly), or I
-> can match your own website's style. Which would you like?
+> **Agent**: Skill installed. One quick question and I'll publish your first page.
+> Looks: pages can use the PatchPage look (warm paper, bold ink, friendly), or I can
+> match your own website's style. Which would you like?
 > **User**: default is fine
-> **Agent**: Done. And your pages will live on PatchPage's free service — each one gets
-> its own shareable link. That work, or do you run your own server?
-> **User**: free is fine
-> **Agent**: Publishing your welcome page now… Here it is:
-> `https://post.patchyhq.com/d/a1b2c3` — anyone with that link can see it; it isn't
-> listed anywhere. That first publish also created your publishing key, saved on this
-> machine — it's what lets you edit or delete your pages later. Next time you want a
-> page, just say "make this a patch page."
+> **Agent**: Done. Publishing your welcome page to PatchPage's free service now… Here
+> it is: `https://post.patchyhq.com/d/a1b2c3` — anyone with that link can see it; it
+> isn't listed anywhere. That first publish also created your publishing key, saved on
+> this machine — it's what lets you edit or delete your pages later. Next time you want
+> a page, just say "make this a patch page."
 
-### Custom path — style from website, own server
+### Custom path — style from website, user asserts their own server
 
-> **Agent**: First — looks. The PatchPage look, or match your website?
-> **User**: match my site, it's greenfieldpottery.com
-> **Agent**: Reading it… I see deep forest green on cream, serif headings, generous
-> space, and plain-spoken copy. I'll use that as your default look — sound right?
+> **Agent**: One quick question — looks. The PatchPage look, or match your website?
+> **User**: match my site, it's greenfieldpottery.com — and we run our own patchpage at
+> pages.greenfield.internal, I have a token from IT
+> **Agent**: Reading your site… I see deep forest green on cream, serif headings,
+> generous space, and plain-spoken copy. I'll use that as your default look — sound
+> right?
 > **User**: yes but the green should be darker, like the footer
-> **Agent**: Got it — footer green it is. Saved. Second: pages normally go to
-> PatchPage's free service, or I can point at your own server.
-> **User**: we run our own, it's at pages.greenfield.internal — I have a token from IT
-> **Agent**: I'll set that up — I'll ask for the token in a hidden prompt so it never
-> lands in the chat… Verified. Publishing your welcome page there now…
+> **Agent**: Got it — footer green it is. Saved. Now your server: I'll ask for the
+> token in a hidden prompt so it never lands in the chat… Verified. Publishing your
+> welcome page there now…
 
 ## Open item checked for this design
 
