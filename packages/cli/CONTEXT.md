@@ -25,8 +25,12 @@ The line the publishing flow prints when auto-mint fires: which instance, where 
 _Avoid_: warning (it reports success, not a problem)
 
 **Onboarding**:
-The agent-led first-time setup conversation — capturing the default style and deployment choice, then publishing the welcome draft. Asked for by the install snippet, or suggested after a mint announcement; always optional.
+The agent-led first-time setup conversation — one question capturing the default style, then publishing the welcome draft. Hosting is assumed to be the official instance and never asked; the own-instance path opens only when the user asserts their own deployment. Asked for by the install snippet, or suggested after a mint announcement; always optional.
 _Avoid_: signup, registration, setup wizard
+
+**Publishing key**:
+What an auth token is called in front of the user — "your publishing key, saved on this machine". *Token*, *instance*, and *mint* stay out of user-facing copy except on the own-instance path, where operator vocabulary is correct.
+_Avoid_: token (in user-facing copy), password, account
 
 **Draft cache**:
 The per-instance record linking a local file to the draft it produced, so republishing the same file updates that draft instead of creating a new one.
