@@ -277,7 +277,7 @@ try {
     env: cliEnv,
     input: `${bootstrapToken}\n`
   });
-  assert.equal(auth.stdout, "PatchPage credentials saved.\n");
+  assert.equal(auth.stdout, `PatchPage credentials saved for ${publicBaseUrl}.\n`);
   assert.equal(auth.stderr, "");
   assert.ok(!`${auth.stdout}${auth.stderr}`.includes(bootstrapToken), "token leaked in CLI output");
 
@@ -330,7 +330,12 @@ try {
     await checkedCall(() => readFile(path.join(cliStateDir, "drafts.json"), "utf8"))
   );
   assert.deepEqual(
-    Object.keys(shellDraftCache.files ?? {}),
+    Object.keys(shellDraftCache.hosts ?? {}),
+    [publicBaseUrl],
+    "the draft cache must be keyed by the instance the upload targeted"
+  );
+  assert.deepEqual(
+    Object.keys(shellDraftCache.hosts[publicBaseUrl].files ?? {}),
     [fixtureCachePath],
     "quoted POSIX sh upload must cache the resolved spaced artifact path"
   );

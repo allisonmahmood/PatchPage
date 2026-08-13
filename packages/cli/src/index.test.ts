@@ -19,6 +19,7 @@ import { afterEach, beforeAll, describe, expect, it } from "vitest";
 
 const packageDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const cliPath = path.join(packageDir, "dist/index.js");
+const DEFAULT_API_URL = "https://post.patchyhq.com";
 const argvPreloadUrl = pathToFileURL(
   path.join(packageDir, "test/record-argv.mjs")
 ).href;
@@ -60,10 +61,13 @@ describe("patchpage auth set", () => {
 
     expect(result.argv.join("\0")).not.toContain(token);
     expect(result.status).toBe(0);
-    expect(result.stdout).toBe("PatchPage credentials saved.\n");
+    expect(result.stdout).toBe(`PatchPage credentials saved for ${DEFAULT_API_URL}.\n`);
     expect(result.stderr).toBe("");
     expect(`${result.stdout}${result.stderr}`).not.toContain(token);
-    expect(readCredentials(result.stateDir)).toMatchObject({ apiToken: token });
+    expect(readHostCredential(result.stateDir)).toMatchObject({
+      token,
+      source: "auth-set"
+    });
   });
 
   it("rejects empty input from explicit stdin", () => {
@@ -109,10 +113,10 @@ describe("patchpage auth set", () => {
 
       expect(result.status).toBe(0);
       expect(result.output).toContain("PatchPage API token:");
-      expect(result.output).toContain("PatchPage credentials saved.");
+      expect(result.output).toContain(`PatchPage credentials saved for ${DEFAULT_API_URL}.`);
       expect(result.output).not.toContain(token);
       expect(result.terminalRestored).toBe(true);
-      expect(readCredentials(result.stateDir)).toMatchObject({ apiToken: token });
+      expect(readHostCredential(result.stateDir)).toMatchObject({ token });
     }
   );
 
@@ -240,14 +244,16 @@ describe("patchpage auth set", () => {
     () => {
       const stateDir = makeStateDir();
       const credentialsPath = path.join(stateDir, "credentials.json");
-      writeFileSync(credentialsPath, '{"apiToken":"old-token"}\n', { mode: 0o644 });
+      writeFileSync(credentialsPath, hostKeyedCredentials({ [DEFAULT_API_URL]: "old-token" }), {
+        mode: 0o644
+      });
       chmodSync(credentialsPath, 0o644);
 
       const result = runCli(["auth", "set", "--token-stdin"], "pp_replacement\n", stateDir);
 
       expect(result.status).toBe(0);
       expect(statSync(credentialsPath).mode & 0o777).toBe(0o600);
-      expect(readCredentials(stateDir)).toMatchObject({ apiToken: "pp_replacement" });
+      expect(readHostCredential(stateDir)).toMatchObject({ token: "pp_replacement" });
     }
   );
 
@@ -266,7 +272,7 @@ describe("patchpage auth set", () => {
       expect(readFileSync(symlinkTarget, "utf8")).toBe("leave this unchanged\n");
       expect(lstatSync(credentialsPath).isSymbolicLink()).toBe(false);
       expect(statSync(credentialsPath).mode & 0o777).toBe(0o600);
-      expect(readCredentials(stateDir)).toMatchObject({ apiToken: "pp_private" });
+      expect(readHostCredential(stateDir)).toMatchObject({ token: "pp_private" });
     }
   );
 
@@ -344,7 +350,7 @@ describe("patchpage auth set terminal boundary", () => {
     expect(`${result.stdout}${result.stderr}`).not.toContain(token);
     expect(result.argv.join("\0")).not.toContain(token);
     expectTerminalRestored(result.terminal);
-    expect(readCredentials(result.stateDir)).toMatchObject({ apiToken: token });
+    expect(readHostCredential(result.stateDir)).toMatchObject({ token });
   });
 
   it("restores cooked mode after EOF", () => {
@@ -463,7 +469,9 @@ describe("CLI auth guidance", () => {
 
     expect(result.status).toBe(1);
     expect(result.stdout).toBe("");
-    expect(result.stderr).toBe("Missing API token. Run: patchpage auth set\n");
+    expect(result.stderr).toBe(
+      "Missing API token for http://127.0.0.1:1. Run: patchpage auth set --api-url http://127.0.0.1:1\n"
+    );
     expect(result.stderr).not.toContain("<api-token>");
   });
 
@@ -554,20 +562,7 @@ describe("patchpage upload", () => {
       path.join(stateDir, "credentials.json"),
       "malformed stored credentials that anonymous mode must not read\n"
     );
-    const cachedState = {
-      files: {
-        [htmlPath]: {
-          draftId: cachedDraftId,
-          publicUrl: `http://example.test/d/${cachedDraftId}`,
-          latestVersionNumber: 3,
-          updatedAt: "2026-07-13T00:00:00.000Z"
-        }
-      }
-    };
-    writeFileSync(
-      draftCachePath,
-      `${JSON.stringify(cachedState, null, 2)}\n`
-    );
+    let cachedState: string;
     let authorization: string | undefined;
     let requestBody: Record<string, unknown> | undefined;
     const server = createServer(async (request, response) => {
@@ -592,26 +587,19 @@ describe("patchpage upload", () => {
     try {
       const address = server.address();
       if (!address || typeof address === "string") throw new Error("Expected a TCP test server");
+      const apiUrl = `http://127.0.0.1:${address.port}`;
+      cachedState = hostKeyedDraftCache({
+        [apiUrl]: { [htmlPath]: { draftId: cachedDraftId, latestVersionNumber: 3 } }
+      });
+      writeFileSync(draftCachePath, cachedState);
+
       const result = await runCliAsync(
-        [
-          "upload",
-          htmlPath,
-          "--anonymous",
-          "--api-url",
-          `http://127.0.0.1:${address.port}`
-        ],
+        ["upload", htmlPath, "--anonymous", "--api-url", apiUrl],
         { PATCHPAGE_API_TOKEN: "environment-token", ...cacheReadProbe },
         stateDir
       );
       const explicitNewResult = await runCliAsync(
-        [
-          "upload",
-          htmlPath,
-          "--anonymous",
-          "--new",
-          "--api-url",
-          `http://127.0.0.1:${address.port}`
-        ],
+        ["upload", htmlPath, "--anonymous", "--new", "--api-url", apiUrl],
         { PATCHPAGE_API_TOKEN: "environment-token", ...cacheReadProbe },
         stateDir
       );
@@ -619,9 +607,7 @@ describe("patchpage upload", () => {
       expect([result.status, explicitNewResult.status]).toEqual([0, 0]);
       expect(authorization).toBeUndefined();
       expect(requestBody).not.toHaveProperty("draftId");
-      expect(
-        JSON.parse(readFileSync(path.join(stateDir, "drafts.json"), "utf8"))
-      ).toEqual(cachedState);
+      expect(readFileSync(draftCachePath, "utf8")).toBe(cachedState);
       expect(existsSync(draftCacheReadMarker)).toBe(false);
     } finally {
       await new Promise<void>((resolve, reject) =>
@@ -707,14 +693,15 @@ describe("patchpage upload", () => {
     try {
       const address = server.address();
       if (!address || typeof address === "string") throw new Error("Expected a TCP test server");
-      const apiArgs = ["--api-url", `http://127.0.0.1:${address.port}`];
+      const apiUrl = `http://127.0.0.1:${address.port}`;
+      const apiArgs = ["--api-url", apiUrl];
 
       const environmentState = makeStateDir();
       const environmentHtml = path.join(environmentState, "environment.html");
       writeFileSync(environmentHtml, "<!doctype html><title>Environment</title>");
       writeFileSync(
         path.join(environmentState, "credentials.json"),
-        '{"apiToken":"stored-token"}\n'
+        hostKeyedCredentials({ [apiUrl]: "stored-token" })
       );
       const environmentResult = await runCliAsync(
         ["upload", environmentHtml, "--new", ...apiArgs],
@@ -727,7 +714,7 @@ describe("patchpage upload", () => {
       writeFileSync(storedHtml, "<!doctype html><title>Stored</title>");
       writeFileSync(
         path.join(storedState, "credentials.json"),
-        '{"apiToken":"stored-token"}\n'
+        hostKeyedCredentials({ [apiUrl]: "stored-token" })
       );
       const storedResult = await runCliAsync(
         ["upload", storedHtml, "--new", ...apiArgs],
@@ -738,20 +725,10 @@ describe("patchpage upload", () => {
       const anonymousState = makeStateDir();
       const anonymousHtml = path.join(anonymousState, "anonymous.html");
       writeFileSync(anonymousHtml, "<!doctype html><title>Automatic anonymous</title>");
-      const cachedState = {
-        files: {
-          [anonymousHtml]: {
-            draftId: "abcdefghijkl",
-            publicUrl: "http://example.test/d/abcdefghijkl",
-            latestVersionNumber: 2,
-            updatedAt: "2026-07-13T00:00:00.000Z"
-          }
-        }
-      };
-      writeFileSync(
-        path.join(anonymousState, "drafts.json"),
-        `${JSON.stringify(cachedState, null, 2)}\n`
-      );
+      const cachedState = hostKeyedDraftCache({
+        [apiUrl]: { [anonymousHtml]: { draftId: "abcdefghijkl", latestVersionNumber: 2 } }
+      });
+      writeFileSync(path.join(anonymousState, "drafts.json"), cachedState);
       const anonymousResult = await runCliAsync(
         ["upload", anonymousHtml, ...apiArgs],
         {},
@@ -769,9 +746,7 @@ describe("patchpage upload", () => {
         undefined
       ]);
       expect(requestBodies[2]).not.toHaveProperty("draftId");
-      expect(
-        JSON.parse(readFileSync(path.join(anonymousState, "drafts.json"), "utf8"))
-      ).toEqual(cachedState);
+      expect(readFileSync(path.join(anonymousState, "drafts.json"), "utf8")).toBe(cachedState);
     } finally {
       await new Promise<void>((resolve, reject) =>
         server.close((error) => (error ? reject(error) : resolve()))
@@ -800,13 +775,24 @@ describe("patchpage upload", () => {
     try {
       const address = server.address();
       if (!address || typeof address === "string") throw new Error("Expected a TCP test server");
+      const apiUrl = `http://127.0.0.1:${address.port}`;
+      const host = JSON.stringify(apiUrl);
       const invalidCredentials = [
         ["malformed", "not-json\n"],
         ["null-document", "null\n"],
-        ["missing-token", "{}\n"],
-        ["null-token", '{"apiToken":null}\n'],
-        ["number-token", '{"apiToken":42}\n'],
-        ["empty-token", '{"apiToken":""}\n']
+        ["array-document", "[]\n"],
+        ["missing-hosts", "{}\n"],
+        ["null-hosts", '{"hosts":null}\n'],
+        ["array-hosts", '{"hosts":[]}\n'],
+        ["string-host-entry", `{"hosts":{${host}:"pp_bare"}}\n`],
+        ["missing-token", `{"hosts":{${host}:{}}}\n`],
+        ["null-token", `{"hosts":{${host}:{"token":null}}}\n`],
+        ["number-token", `{"hosts":{${host}:{"token":42}}}\n`],
+        ["empty-token", `{"hosts":{${host}:{"token":""}}}\n`],
+        ["unknown-source", `{"hosts":{${host}:{"token":"pp_x","source":"guessed"}}}\n`],
+        ["number-updated-at", `{"hosts":{${host}:{"token":"pp_x","updatedAt":1}}}\n`],
+        // A corrupt entry for an unrelated instance still fails closed.
+        ["foreign-host-entry", `{"hosts":{"https://other.test":{"token":null}}}\n`]
       ];
 
       for (const [label, contents] of invalidCredentials) {
@@ -815,11 +801,7 @@ describe("patchpage upload", () => {
         writeFileSync(htmlPath, `<!doctype html><title>${label}</title>`);
         writeFileSync(path.join(stateDir, "credentials.json"), contents);
 
-        const result = await runCliAsync(
-          ["upload", htmlPath, "--api-url", `http://127.0.0.1:${address.port}`],
-          {},
-          stateDir
-        );
+        const result = await runCliAsync(["upload", htmlPath, "--api-url", apiUrl], {}, stateDir);
 
         expect(result.status, label).toBe(1);
         expect(result.stdout, label).toBe("");
@@ -915,18 +897,26 @@ describe("patchpage upload", () => {
     }
   });
 
-  it("does not downgrade a present empty environment credential to anonymous", async () => {
+  it("treats an empty environment token as unset rather than an empty Bearer header", async () => {
     const stateDir = makeStateDir();
     const htmlPath = path.join(stateDir, "empty-environment-token.html");
     writeFileSync(htmlPath, "<!doctype html><title>Empty environment token</title>");
     let requestCount = 0;
-    let authorization: string | undefined;
+    let authorization: string | undefined | null = null;
     const server = createServer((request, response) => {
       requestCount += 1;
       authorization = request.headers.authorization;
-      response.statusCode = 401;
+      response.statusCode = 201;
       response.setHeader("Content-Type", "application/json");
-      response.end(JSON.stringify({ ok: false, error: "Missing or invalid API token." }));
+      response.end(
+        JSON.stringify({
+          ok: true,
+          draftId: "mnopqrstuvwx",
+          publicUrl: "http://example.test/d/mnopqrstuvwx",
+          versionNumber: 1,
+          warnings: []
+        })
+      );
     });
     await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
 
@@ -939,10 +929,60 @@ describe("patchpage upload", () => {
         stateDir
       );
 
-      expect(result.status).toBe(1);
+      expect(result.status).toBe(0);
       expect(requestCount).toBe(1);
-      expect(authorization).toBeDefined();
+      expect(authorization).toBeUndefined();
       expect(existsSync(path.join(stateDir, "drafts.json"))).toBe(false);
+    } finally {
+      await new Promise<void>((resolve, reject) =>
+        server.close((error) => (error ? reject(error) : resolve()))
+      );
+    }
+  });
+
+  it("treats an empty environment API URL as unset and keeps the configured instance", async () => {
+    const stateDir = makeStateDir();
+    const htmlPath = path.join(stateDir, "empty-environment-url.html");
+    writeFileSync(htmlPath, "<!doctype html><title>Empty environment URL</title>");
+    let authorization: string | undefined;
+    const server = createServer((request, response) => {
+      authorization = request.headers.authorization;
+      response.statusCode = 201;
+      response.setHeader("Content-Type", "application/json");
+      response.end(
+        JSON.stringify({
+          ok: true,
+          draftId: "mnopqrstuvwx",
+          publicUrl: "http://example.test/d/mnopqrstuvwx",
+          versionNumber: 1,
+          warnings: []
+        })
+      );
+    });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+
+    try {
+      const address = server.address();
+      if (!address || typeof address === "string") throw new Error("Expected a TCP test server");
+      const apiUrl = `http://127.0.0.1:${address.port}`;
+      writeFileSync(
+        path.join(stateDir, "config.json"),
+        `${JSON.stringify({ apiUrl }, null, 2)}\n`
+      );
+      writeFileSync(
+        path.join(stateDir, "credentials.json"),
+        hostKeyedCredentials({ [apiUrl]: "configured-instance-token" })
+      );
+
+      const result = await runCliAsync(
+        ["upload", htmlPath],
+        { PATCHPAGE_API_URL: "" },
+        stateDir
+      );
+
+      expect(result.status).toBe(0);
+      expect(authorization).toBe("Bearer configured-instance-token");
+      expect(Object.keys(readDraftCache(stateDir).hosts)).toEqual([apiUrl]);
     } finally {
       await new Promise<void>((resolve, reject) =>
         server.close((error) => (error ? reject(error) : resolve()))
@@ -1100,23 +1140,6 @@ describe("patchpage upload", () => {
       htmlPath,
       "<!doctype html><html><head><title>Cached update</title></head><body></body></html>"
     );
-    writeFileSync(
-      path.join(stateDir, "drafts.json"),
-      `${JSON.stringify(
-        {
-          files: {
-            [htmlPath]: {
-              draftId,
-              publicUrl: `http://example.test/d/${draftId}`,
-              latestVersionNumber: 1,
-              updatedAt: "2026-07-13T00:00:00.000Z"
-            }
-          }
-        },
-        null,
-        2
-      )}\n`
-    );
     let requestCount = 0;
     let requestBody: Record<string, unknown> | undefined;
     const server = createServer(async (request, response) => {
@@ -1133,8 +1156,14 @@ describe("patchpage upload", () => {
     try {
       const address = server.address();
       if (!address || typeof address === "string") throw new Error("Expected a TCP test server");
+      const apiUrl = `http://127.0.0.1:${address.port}`;
+      writeFileSync(
+        path.join(stateDir, "drafts.json"),
+        hostKeyedDraftCache({ [apiUrl]: { [htmlPath]: { draftId, latestVersionNumber: 1 } } })
+      );
+
       const result = await runCliAsync(
-        ["upload", htmlPath, "--api-url", `http://127.0.0.1:${address.port}`],
+        ["upload", htmlPath, "--api-url", apiUrl],
         { PATCHPAGE_API_TOKEN: token },
         stateDir
       );
@@ -1153,6 +1182,312 @@ describe("patchpage upload", () => {
       );
     }
   });
+});
+
+describe("host-keyed local state", () => {
+  it("saves auth set credentials under the resolved instance and merges other instances", () => {
+    const stateDir = makeStateDir();
+    const firstUrl = "https://first.test";
+    const secondUrl = "https://second.test:8443";
+
+    const first = runCli(
+      ["auth", "set", "--token-stdin", "--api-url", firstUrl],
+      "pp_first\n",
+      stateDir
+    );
+    const second = runCli(
+      ["auth", "set", "--token-stdin", "--api-url", secondUrl],
+      "pp_second\n",
+      stateDir
+    );
+    // A trailing slash normalizes to the same host key, so this replaces the first entry.
+    const again = runCli(
+      ["auth", "set", "--token-stdin", "--api-url", `${firstUrl}/`],
+      "pp_first_again\n",
+      stateDir
+    );
+
+    expect([first.status, second.status, again.status]).toEqual([0, 0, 0]);
+    expect(first.stdout).toBe(`PatchPage credentials saved for ${firstUrl}.\n`);
+    expect(second.stdout).toBe(`PatchPage credentials saved for ${secondUrl}.\n`);
+    expect(again.stdout).toBe(`PatchPage credentials saved for ${firstUrl}.\n`);
+
+    const { hosts } = readCredentials(stateDir);
+    expect(Object.keys(hosts).sort()).toEqual([firstUrl, secondUrl].sort());
+    expect(hosts[firstUrl]).toMatchObject({ token: "pp_first_again", source: "auth-set" });
+    expect(hosts[secondUrl]).toMatchObject({ token: "pp_second", source: "auth-set" });
+    expect(typeof hosts[firstUrl]?.updatedAt).toBe("string");
+  });
+
+  it("saves auth set credentials under the instance the environment selects", () => {
+    const stateDir = makeStateDir();
+    const result = runCli(["auth", "set", "--token-stdin"], "pp_from_environment\n", stateDir, {
+      PATCHPAGE_API_URL: "https://environment.test"
+    });
+
+    expect(result.status).toBe(0);
+    expect(result.stdout).toBe("PatchPage credentials saved for https://environment.test.\n");
+    expect(Object.keys(readCredentials(stateDir).hosts)).toEqual(["https://environment.test"]);
+    // Without --api-url the instance choice is not persisted.
+    expect(existsSync(path.join(stateDir, "config.json"))).toBe(false);
+  });
+
+  it("never sends a token stored for one instance to another", async () => {
+    const token = "pp_first_instance_only";
+    const stateDir = makeStateDir();
+    const htmlPath = path.join(stateDir, "cross-instance.html");
+    writeFileSync(htmlPath, "<!doctype html><title>Cross instance</title>");
+    const configured = await startUploadServer(createOnly("aaaabbbbcccc"));
+    const other = await startUploadServer(createOnly("ddddeeeeffff"));
+
+    try {
+      writeFileSync(
+        path.join(stateDir, "credentials.json"),
+        hostKeyedCredentials({ [configured.apiUrl]: token })
+      );
+
+      const result = await runCliAsync(
+        ["upload", htmlPath, "--api-url", other.apiUrl],
+        {},
+        stateDir
+      );
+
+      expect(result.status).toBe(0);
+      expect(configured.requests).toEqual([]);
+      expect(other.requests).toHaveLength(1);
+      expect(other.requests[0]?.authorization).toBeUndefined();
+      expect(result.argv.join("\0")).not.toContain(token);
+      expect(`${result.stdout}${result.stderr}`).not.toContain(token);
+      // A credential-free upload stays create-only and writes no cache.
+      expect(existsSync(path.join(stateDir, "drafts.json"))).toBe(false);
+    } finally {
+      await configured.close();
+      await other.close();
+    }
+  });
+
+  it("keeps the draft cache per instance and never replays a draft ID across instances", async () => {
+    const stateDir = makeStateDir();
+    const htmlPath = path.join(stateDir, "shared.html");
+    writeFileSync(htmlPath, "<!doctype html><title>Shared</title>");
+    const first = await startUploadServer(createOrUpdate("aaaabbbbcccc"));
+    const second = await startUploadServer(createOrUpdate("ddddeeeeffff"));
+
+    try {
+      writeFileSync(
+        path.join(stateDir, "credentials.json"),
+        hostKeyedCredentials({
+          [first.apiUrl]: "first-instance-token",
+          [second.apiUrl]: "second-instance-token"
+        })
+      );
+
+      const created = await runCliAsync(
+        ["upload", htmlPath, "--api-url", first.apiUrl],
+        {},
+        stateDir
+      );
+      const crossed = await runCliAsync(
+        ["upload", htmlPath, "--api-url", second.apiUrl],
+        {},
+        stateDir
+      );
+      const updated = await runCliAsync(
+        ["upload", htmlPath, "--api-url", first.apiUrl],
+        {},
+        stateDir
+      );
+
+      expect([created.status, crossed.status, updated.status]).toEqual([0, 0, 0]);
+      expect(created.stdout).toContain("Uploaded draft");
+      expect(crossed.stdout).toContain("Uploaded draft");
+      expect(updated.stdout).toContain("Updated draft");
+
+      expect(first.requests.map((request) => request.authorization)).toEqual([
+        "Bearer first-instance-token",
+        "Bearer first-instance-token"
+      ]);
+      expect(second.requests.map((request) => request.authorization)).toEqual([
+        "Bearer second-instance-token"
+      ]);
+      expect(first.requests[0]?.body).not.toHaveProperty("draftId");
+      expect(second.requests[0]?.body).not.toHaveProperty("draftId");
+      expect(first.requests[1]?.body).toHaveProperty("draftId", "aaaabbbbcccc");
+
+      const cache = readDraftCache(stateDir);
+      expect(Object.keys(cache.hosts).sort()).toEqual([first.apiUrl, second.apiUrl].sort());
+      expect(cache.hosts[first.apiUrl]?.files[htmlPath]).toMatchObject({
+        draftId: "aaaabbbbcccc",
+        latestVersionNumber: 2
+      });
+      expect(cache.hosts[second.apiUrl]?.files[htmlPath]).toMatchObject({
+        draftId: "ddddeeeeffff",
+        latestVersionNumber: 1
+      });
+    } finally {
+      await first.close();
+      await second.close();
+    }
+  });
+
+  it("fails closed on a credentials file in the retired single-instance format", async () => {
+    const legacyToken = "pp_legacy_only_key";
+    const legacyContents = `{"apiToken":"${legacyToken}","updatedAt":"2026-07-13T00:00:00.000Z"}\n`;
+    const stateDir = makeStateDir();
+    const credentialsPath = path.join(stateDir, "credentials.json");
+    const htmlPath = path.join(stateDir, "legacy-credentials.html");
+    writeFileSync(htmlPath, "<!doctype html><title>Legacy credentials</title>");
+    writeFileSync(credentialsPath, legacyContents);
+    const server = await startUploadServer(createOnly("aaaabbbbcccc"));
+
+    try {
+      const upload = await runCliAsync(
+        ["upload", htmlPath, "--api-url", server.apiUrl],
+        {},
+        stateDir
+      );
+      const whoami = await runCliAsync(
+        ["whoami", "--api-url", server.apiUrl],
+        {},
+        stateDir
+      );
+      const authSet = runCli(
+        ["auth", "set", "--token-stdin", "--api-url", server.apiUrl],
+        "pp_replacement\n",
+        stateDir
+      );
+
+      const expected =
+        `Stored credentials use the retired single-instance format: ${credentialsPath}\n` +
+        "PatchPage now stores one token per instance and does not migrate the old file.\n" +
+        "Copy the token out of that file if you still need it, delete the file, then run: patchpage auth set\n";
+      for (const result of [upload, whoami, authSet]) {
+        expect(result.status).toBe(1);
+        expect(result.stdout).toBe("");
+        expect(result.stderr).toBe(expected);
+        expect(`${result.stdout}${result.stderr}`).not.toContain(legacyToken);
+      }
+      expect(server.requests).toEqual([]);
+      // Nothing is migrated, and nothing is destroyed: the old key survives.
+      expect(readFileSync(credentialsPath, "utf8")).toBe(legacyContents);
+    } finally {
+      await server.close();
+    }
+  });
+
+  it("fails closed on a draft cache in the retired single-instance format", async () => {
+    const stateDir = makeStateDir();
+    const draftsPath = path.join(stateDir, "drafts.json");
+    const htmlPath = path.join(stateDir, "legacy-cache.html");
+    writeFileSync(htmlPath, "<!doctype html><title>Legacy cache</title>");
+    const legacyContents = `${JSON.stringify(
+      {
+        files: {
+          [htmlPath]: {
+            draftId: "abcdefghijkl",
+            publicUrl: "http://example.test/d/abcdefghijkl",
+            latestVersionNumber: 1,
+            updatedAt: "2026-07-13T00:00:00.000Z"
+          }
+        }
+      },
+      null,
+      2
+    )}\n`;
+    writeFileSync(draftsPath, legacyContents);
+    const server = await startUploadServer(createOnly("aaaabbbbcccc"));
+
+    try {
+      const result = await runCliAsync(
+        ["upload", htmlPath, "--api-url", server.apiUrl],
+        { PATCHPAGE_API_TOKEN: "environment-token" },
+        stateDir
+      );
+
+      expect(result.status).toBe(1);
+      expect(result.stdout).toBe("");
+      expect(result.stderr).toBe(
+        `The stored draft cache uses the retired single-instance format: ${draftsPath}\n` +
+          "PatchPage now caches drafts per instance and does not migrate the old file.\n" +
+          "Delete that file to start a fresh cache. Drafts already published are unaffected.\n"
+      );
+      expect(server.requests).toEqual([]);
+      expect(readFileSync(draftsPath, "utf8")).toBe(legacyContents);
+    } finally {
+      await server.close();
+    }
+  });
+
+  it("fails closed on an unreadable or invalid draft cache", async () => {
+    const server = await startUploadServer(createOnly("aaaabbbbcccc"));
+
+    try {
+      const invalidStateDir = makeStateDir();
+      const invalidHtmlPath = path.join(invalidStateDir, "invalid-cache.html");
+      const invalidDraftsPath = path.join(invalidStateDir, "drafts.json");
+      writeFileSync(invalidHtmlPath, "<!doctype html><title>Invalid cache</title>");
+      writeFileSync(invalidDraftsPath, "not-json\n");
+      const invalid = await runCliAsync(
+        ["upload", invalidHtmlPath, "--api-url", server.apiUrl],
+        { PATCHPAGE_API_TOKEN: "environment-token" },
+        invalidStateDir
+      );
+
+      const unreadableStateDir = makeStateDir();
+      const unreadableHtmlPath = path.join(unreadableStateDir, "unreadable-cache.html");
+      const unreadableDraftsPath = path.join(unreadableStateDir, "drafts.json");
+      writeFileSync(unreadableHtmlPath, "<!doctype html><title>Unreadable cache</title>");
+      mkdirSync(unreadableDraftsPath);
+      const unreadable = await runCliAsync(
+        ["upload", unreadableHtmlPath, "--api-url", server.apiUrl],
+        { PATCHPAGE_API_TOKEN: "environment-token" },
+        unreadableStateDir
+      );
+
+      expect(invalid.status).toBe(1);
+      expect(invalid.stderr).toBe(
+        `The stored draft cache is invalid: ${invalidDraftsPath}\n` +
+          "Delete that file to start a fresh cache. Drafts already published are unaffected.\n"
+      );
+      expect(unreadable.status).toBe(1);
+      expect(unreadable.stderr).toBe(
+        `The stored draft cache could not be read: ${unreadableDraftsPath}\n` +
+          "Check permissions, or delete that file to start a fresh cache.\n"
+      );
+      expect(server.requests).toEqual([]);
+    } finally {
+      await server.close();
+    }
+  });
+
+  it.runIf(process.platform !== "win32")(
+    "creates the state dir owner-only and writes host-keyed state owner-only",
+    async () => {
+      const parentDir = makeStateDir();
+      const stateDir = path.join(parentDir, "nested state");
+      const htmlPath = path.join(parentDir, "permissions.html");
+      writeFileSync(htmlPath, "<!doctype html><title>Permissions</title>");
+      const server = await startUploadServer(createOnly("aaaabbbbcccc"));
+
+      try {
+        const auth = runCli(
+          ["auth", "set", "--token-stdin", "--api-url", server.apiUrl],
+          "pp_permissions\n",
+          stateDir
+        );
+        expect(auth.status).toBe(0);
+        expect(statSync(stateDir).mode & 0o777).toBe(0o700);
+        expect(statSync(path.join(stateDir, "credentials.json")).mode & 0o777).toBe(0o600);
+
+        const upload = await runCliAsync(["upload", htmlPath], {}, stateDir);
+        expect(upload.status).toBe(0);
+        expect(statSync(path.join(stateDir, "drafts.json")).mode & 0o777).toBe(0o600);
+        expect(Object.keys(readDraftCache(stateDir).hosts)).toEqual([server.apiUrl]);
+      } finally {
+        await server.close();
+      }
+    }
+  );
 });
 
 describe("PTY test driver", () => {
@@ -1175,11 +1510,17 @@ describe("PTY test driver", () => {
   });
 });
 
-function runCli(args: string[], input?: string, stateDir = makeStateDir()) {
-  const argvOutputPath = path.join(stateDir, "argv.json");
+function runCli(
+  args: string[],
+  input?: string,
+  stateDir = makeStateDir(),
+  envOverrides: NodeJS.ProcessEnv = {}
+) {
+  const argvOutputPath = path.join(makeStateDir(), "argv.json");
   const result = spawnSync(process.execPath, ["--import", argvPreloadUrl, cliPath, ...args], {
     encoding: "utf8",
     env: cliEnv({
+      ...envOverrides,
       PATCHPAGE_STATE_DIR: stateDir,
       PATCHPAGE_TEST_ARGV_RECORD: argvOutputPath
     }),
@@ -1240,6 +1581,80 @@ function runCliAsync(
   });
 }
 
+interface UploadRequest {
+  authorization: string | undefined;
+  body: Record<string, unknown>;
+}
+
+interface UploadResponse {
+  status: number;
+  body: Record<string, unknown>;
+}
+
+/**
+ * A hand-written loopback instance. Each returned server is a distinct host key
+ * because it listens on its own port.
+ */
+async function startUploadServer(respond: (request: UploadRequest) => UploadResponse) {
+  const requests: UploadRequest[] = [];
+  const server = createServer(async (incoming, response) => {
+    let raw = "";
+    for await (const chunk of incoming) raw += chunk;
+    const request: UploadRequest = {
+      authorization: incoming.headers.authorization,
+      body: JSON.parse(raw) as Record<string, unknown>
+    };
+    requests.push(request);
+    const { status, body } = respond(request);
+    response.statusCode = status;
+    response.setHeader("Content-Type", "application/json");
+    response.end(JSON.stringify(body));
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const address = server.address();
+  if (!address || typeof address === "string") throw new Error("Expected a TCP test server");
+
+  return {
+    apiUrl: `http://127.0.0.1:${address.port}`,
+    requests,
+    close: () =>
+      new Promise<void>((resolve, reject) =>
+        server.close((error) => (error ? reject(error) : resolve()))
+      )
+  };
+}
+
+function createOnly(draftId: string) {
+  return (): UploadResponse => ({
+    status: 201,
+    body: {
+      ok: true,
+      draftId,
+      publicUrl: `http://example.test/d/${draftId}`,
+      versionNumber: 1,
+      warnings: []
+    }
+  });
+}
+
+function createOrUpdate(createdDraftId: string) {
+  return (request: UploadRequest): UploadResponse => {
+    const requested = request.body.draftId;
+    const isUpdate = typeof requested === "string";
+    const draftId = isUpdate ? requested : createdDraftId;
+    return {
+      status: isUpdate ? 200 : 201,
+      body: {
+        ok: true,
+        draftId,
+        publicUrl: `http://example.test/d/${draftId}`,
+        versionNumber: isUpdate ? 2 : 1,
+        warnings: []
+      }
+    };
+  };
+}
+
 function cliEnv(overrides: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv {
   const env = { ...process.env };
   delete env.PATCHPAGE_API_TOKEN;
@@ -1260,11 +1675,71 @@ function makeStateDir(): string {
   return stateDir;
 }
 
-function readCredentials(stateDir: string): Record<string, unknown> {
-  return JSON.parse(readFileSync(path.join(stateDir, "credentials.json"), "utf8")) as Record<
-    string,
-    unknown
-  >;
+function readCredentials(stateDir: string): {
+  hosts: Record<string, Record<string, unknown>>;
+} {
+  return JSON.parse(readFileSync(path.join(stateDir, "credentials.json"), "utf8")) as {
+    hosts: Record<string, Record<string, unknown>>;
+  };
+}
+
+function readHostCredential(
+  stateDir: string,
+  host = DEFAULT_API_URL
+): Record<string, unknown> | undefined {
+  return readCredentials(stateDir).hosts[host];
+}
+
+function readDraftCache(stateDir: string): {
+  hosts: Record<string, { files: Record<string, Record<string, unknown>> }>;
+} {
+  return JSON.parse(readFileSync(path.join(stateDir, "drafts.json"), "utf8")) as {
+    hosts: Record<string, { files: Record<string, Record<string, unknown>> }>;
+  };
+}
+
+function hostKeyedCredentials(entries: Record<string, string>): string {
+  return `${JSON.stringify(
+    {
+      hosts: Object.fromEntries(
+        Object.entries(entries).map(([host, token]) => [
+          host,
+          { token, updatedAt: "2026-08-14T00:00:00.000Z", source: "auth-set" }
+        ])
+      )
+    },
+    null,
+    2
+  )}\n`;
+}
+
+function hostKeyedDraftCache(
+  hosts: Record<string, Record<string, { draftId: string; latestVersionNumber: number }>>
+): string {
+  return `${JSON.stringify(
+    {
+      hosts: Object.fromEntries(
+        Object.entries(hosts).map(([host, files]) => [
+          host,
+          {
+            files: Object.fromEntries(
+              Object.entries(files).map(([file, draft]) => [
+                file,
+                {
+                  draftId: draft.draftId,
+                  publicUrl: `${host}/d/${draft.draftId}`,
+                  latestVersionNumber: draft.latestVersionNumber,
+                  updatedAt: "2026-08-14T00:00:00.000Z"
+                }
+              ])
+            )
+          }
+        ])
+      )
+    },
+    null,
+    2
+  )}\n`;
 }
 
 function readArgv(file: string): string[] {

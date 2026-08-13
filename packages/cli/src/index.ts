@@ -23,32 +23,54 @@ import { sha256, validateHtml } from "@patchpage/core";
 const VERSION = typeof __PATCHPAGE_VERSION__ === "string" ? __PATCHPAGE_VERSION__ : "0.0.0-dev";
 const DEFAULT_API_URL = "https://post.patchyhq.com";
 const SELF_HOST_DOCS_URL = "https://github.com/allisonmahmood/PatchPage/blob/main/docs/SELF_HOSTING.md";
-const STATE_DIR = process.env.PATCHPAGE_STATE_DIR || path.join(os.homedir(), ".patchpage");
+const STATE_DIR = readEnv("PATCHPAGE_STATE_DIR") ?? path.join(os.homedir(), ".patchpage");
 const CONFIG_PATH = path.join(STATE_DIR, "config.json");
 const CREDENTIALS_PATH = path.join(STATE_DIR, "credentials.json");
 const DRAFTS_PATH = path.join(STATE_DIR, "drafts.json");
 
 class CliError extends Error {}
 
+/**
+ * A state file left over from the retired single-instance format. Fail-closed
+ * everywhere: the CLI never migrates one, because the token it holds is the
+ * only key to the drafts it created.
+ */
+class LegacyStateError extends CliError {}
+
+const INVALID_CREDENTIALS_ERROR =
+  "Stored credentials are invalid. Run: patchpage auth set to replace them.";
+const UNREADABLE_CREDENTIALS_ERROR =
+  "Stored credentials could not be read. Check permissions or run: patchpage auth set to replace them.";
+const INVALID_DRAFT_CACHE_ERROR = `The stored draft cache is invalid: ${DRAFTS_PATH}\nDelete that file to start a fresh cache. Drafts already published are unaffected.`;
+const UNREADABLE_DRAFT_CACHE_ERROR = `The stored draft cache could not be read: ${DRAFTS_PATH}\nCheck permissions, or delete that file to start a fresh cache.`;
+
 interface CliConfig {
   apiUrl?: string;
 }
 
-interface Credentials {
-  apiToken?: string;
+type CredentialSource = "mint" | "auth-set";
+
+interface HostCredential {
+  token: string;
   updatedAt?: string;
+  source?: CredentialSource;
 }
 
-interface DraftCache {
-  files?: Record<
-    string,
-    {
-      draftId: string;
-      publicUrl: string;
-      latestVersionNumber: number;
-      updatedAt: string;
-    }
-  >;
+/** credentials.json — one token per instance, keyed by normalized API URL. */
+interface CredentialStore {
+  hosts: Record<string, HostCredential>;
+}
+
+interface CachedDraft {
+  draftId: string;
+  publicUrl: string;
+  latestVersionNumber: number;
+  updatedAt: string;
+}
+
+/** drafts.json — the draft cache, scoped per instance. */
+interface DraftStore {
+  hosts: Record<string, { files: Record<string, CachedDraft> }>;
 }
 
 const program = new Command();
@@ -82,6 +104,10 @@ program
       );
     }
 
+    // Reject a retired state file before asking for a token, so a fail-closed
+    // state dir never costs the operator a prompt.
+    const credentials = readCredentialStoreForWrite();
+
     const tokenInput = options.tokenStdin
       ? readFileSync(process.stdin.fd, "utf8")
       : await promptForApiToken();
@@ -96,16 +122,15 @@ program
       });
     }
 
-    writeJson<Credentials>(
-      CREDENTIALS_PATH,
-      {
-        apiToken,
-        updatedAt: new Date().toISOString()
-      },
-      0o600
-    );
+    const apiUrl = resolveApiUrl(options.apiUrl);
+    credentials.hosts[apiUrl] = {
+      token: apiToken,
+      updatedAt: new Date().toISOString(),
+      source: "auth-set"
+    };
+    writeJson<CredentialStore>(CREDENTIALS_PATH, credentials, 0o600);
 
-    console.log("PatchPage credentials saved.");
+    console.log(`PatchPage credentials saved for ${apiUrl}.`);
   });
 
 program
@@ -184,8 +209,8 @@ program
         "Anonymous uploads are create-only; --draft requires credentials."
       );
     }
-    const drafts = anonymous ? null : readDrafts();
-    const knownDraft = drafts?.files?.[resolvedFile];
+    const drafts = anonymous ? null : readDraftStore();
+    const knownDraft = drafts?.hosts[apiUrl]?.files[resolvedFile];
     const draftId = anonymous
       ? null
       : options.new
@@ -232,14 +257,14 @@ program
     }
 
     if (drafts) {
-      drafts.files ||= {};
-      drafts.files[resolvedFile] = {
+      const hostDrafts = (drafts.hosts[apiUrl] ||= { files: {} });
+      hostDrafts.files[resolvedFile] = {
         draftId: body.draftId,
         publicUrl: body.publicUrl,
         latestVersionNumber: body.versionNumber,
         updatedAt: new Date().toISOString()
       };
-      writeJson(DRAFTS_PATH, drafts, 0o600);
+      writeJson<DraftStore>(DRAFTS_PATH, drafts, 0o600);
     }
 
     console.log(isUpdateAttempt ? "Updated draft" : "Uploaded draft");
@@ -272,16 +297,36 @@ program.parseAsync(process.argv).catch((error: unknown) => {
   process.exit(1);
 });
 
-function readAuth(apiUrlOverride?: string): { apiUrl: string; apiToken: string } {
+/**
+ * An unset environment variable and an empty one mean the same thing
+ * everywhere: nothing was configured.
+ */
+function readEnv(name: string): string | undefined {
+  const value = process.env[name];
+  return value === undefined || value === "" ? undefined : value;
+}
+
+/**
+ * The instance every other piece of state is keyed by: an explicit flag, then
+ * the environment, then the saved config, then the default. Exact string
+ * equality on this value is the host key — scheme and port differences are
+ * distinct instances by design.
+ */
+function resolveApiUrl(apiUrlOverride?: string): string {
   const config = readJson<CliConfig>(CONFIG_PATH, {});
-  const credentials = readJson<Credentials>(CREDENTIALS_PATH, {});
-  const apiUrl = normalizeApiUrl(
-    apiUrlOverride || process.env.PATCHPAGE_API_URL || config.apiUrl || DEFAULT_API_URL
+  return normalizeApiUrl(
+    apiUrlOverride || readEnv("PATCHPAGE_API_URL") || config.apiUrl || DEFAULT_API_URL
   );
-  const apiToken = process.env.PATCHPAGE_API_TOKEN || credentials.apiToken;
+}
+
+function readAuth(apiUrlOverride?: string): { apiUrl: string; apiToken: string } {
+  const apiUrl = resolveApiUrl(apiUrlOverride);
+  const apiToken = readEnv("PATCHPAGE_API_TOKEN") ?? readCredentialStore().hosts[apiUrl]?.token;
 
   if (!apiToken) {
-    throw new CliError(`Missing API token. Run: patchpage auth set${defaultHostHint(apiUrl)}`);
+    throw new CliError(
+      `Missing API token for ${apiUrl}. Run: patchpage auth set --api-url ${apiUrl}${defaultHostHint(apiUrl)}`
+    );
   }
 
   return { apiUrl, apiToken };
@@ -291,53 +336,151 @@ function readUploadAuth(
   apiUrlOverride: string | undefined,
   forceAnonymous: boolean
 ): { apiUrl: string; apiToken: string | null; anonymous: boolean } {
-  const config = readJson<CliConfig>(CONFIG_PATH, {});
-  const apiUrl = normalizeApiUrl(
-    apiUrlOverride || process.env.PATCHPAGE_API_URL || config.apiUrl || DEFAULT_API_URL
-  );
+  const apiUrl = resolveApiUrl(apiUrlOverride);
   if (forceAnonymous) return { apiUrl, apiToken: null, anonymous: true };
 
-  if (process.env.PATCHPAGE_API_TOKEN !== undefined) {
-    return { apiUrl, apiToken: process.env.PATCHPAGE_API_TOKEN, anonymous: false };
+  const environmentToken = readEnv("PATCHPAGE_API_TOKEN");
+  if (environmentToken !== undefined) {
+    return { apiUrl, apiToken: environmentToken, anonymous: false };
   }
-  const credentials = readUploadCredentials();
-  if (credentials.apiToken !== undefined) {
-    return { apiUrl, apiToken: credentials.apiToken, anonymous: false };
+  const stored = readCredentialStore().hosts[apiUrl];
+  if (stored !== undefined) {
+    return { apiUrl, apiToken: stored.token, anonymous: false };
   }
   return { apiUrl, apiToken: null, anonymous: true };
 }
 
-function readUploadCredentials(): Credentials {
+function readCredentialStore(): CredentialStore {
+  const document = readStateDocument(
+    CREDENTIALS_PATH,
+    UNREADABLE_CREDENTIALS_ERROR,
+    INVALID_CREDENTIALS_ERROR
+  );
+  if (document === undefined) return { hosts: {} };
+
+  const root = asRecord(document);
+  if (!root) throw new CliError(INVALID_CREDENTIALS_ERROR);
+  if ("apiToken" in root) {
+    throw new LegacyStateError(
+      `Stored credentials use the retired single-instance format: ${CREDENTIALS_PATH}\n` +
+        "PatchPage now stores one token per instance and does not migrate the old file.\n" +
+        "Copy the token out of that file if you still need it, delete the file, then run: patchpage auth set"
+    );
+  }
+  const hosts = asRecord(root.hosts);
+  if (!hosts) throw new CliError(INVALID_CREDENTIALS_ERROR);
+
+  const store: CredentialStore = { hosts: {} };
+  for (const [host, value] of Object.entries(hosts)) {
+    const entry = asRecord(value);
+    if (!entry) throw new CliError(INVALID_CREDENTIALS_ERROR);
+    const { token, updatedAt, source } = entry;
+    if (typeof token !== "string" || token.length === 0) {
+      throw new CliError(INVALID_CREDENTIALS_ERROR);
+    }
+    if (updatedAt !== undefined && typeof updatedAt !== "string") {
+      throw new CliError(INVALID_CREDENTIALS_ERROR);
+    }
+    if (source !== undefined && source !== "mint" && source !== "auth-set") {
+      throw new CliError(INVALID_CREDENTIALS_ERROR);
+    }
+    store.hosts[host] = { token, updatedAt, source };
+  }
+  return store;
+}
+
+/**
+ * `auth set` is the documented way to replace credentials it cannot read, so a
+ * corrupt file is overwritten rather than fatal. A retired flat file still
+ * fails closed: it holds a live token, and dropping it silently would strand
+ * the drafts that token controls.
+ */
+function readCredentialStoreForWrite(): CredentialStore {
+  try {
+    return readCredentialStore();
+  } catch (error) {
+    if (error instanceof LegacyStateError) throw error;
+    return { hosts: {} };
+  }
+}
+
+function readDraftStore(): DraftStore {
+  const document = readStateDocument(
+    DRAFTS_PATH,
+    UNREADABLE_DRAFT_CACHE_ERROR,
+    INVALID_DRAFT_CACHE_ERROR
+  );
+  if (document === undefined) return { hosts: {} };
+
+  const root = asRecord(document);
+  if (!root) throw new CliError(INVALID_DRAFT_CACHE_ERROR);
+  if ("files" in root) {
+    throw new LegacyStateError(
+      `The stored draft cache uses the retired single-instance format: ${DRAFTS_PATH}\n` +
+        "PatchPage now caches drafts per instance and does not migrate the old file.\n" +
+        "Delete that file to start a fresh cache. Drafts already published are unaffected."
+    );
+  }
+  const hosts = asRecord(root.hosts);
+  if (!hosts) throw new CliError(INVALID_DRAFT_CACHE_ERROR);
+
+  const store: DraftStore = { hosts: {} };
+  for (const [host, value] of Object.entries(hosts)) {
+    const entry = asRecord(value);
+    if (!entry) throw new CliError(INVALID_DRAFT_CACHE_ERROR);
+    const files = entry.files === undefined ? {} : asRecord(entry.files);
+    if (!files) throw new CliError(INVALID_DRAFT_CACHE_ERROR);
+
+    const parsed: Record<string, CachedDraft> = {};
+    for (const [file, cached] of Object.entries(files)) {
+      const draft = asRecord(cached);
+      if (
+        !draft ||
+        typeof draft.draftId !== "string" ||
+        draft.draftId.length === 0 ||
+        typeof draft.publicUrl !== "string" ||
+        typeof draft.latestVersionNumber !== "number" ||
+        typeof draft.updatedAt !== "string"
+      ) {
+        throw new CliError(INVALID_DRAFT_CACHE_ERROR);
+      }
+      parsed[file] = {
+        draftId: draft.draftId,
+        publicUrl: draft.publicUrl,
+        latestVersionNumber: draft.latestVersionNumber,
+        updatedAt: draft.updatedAt
+      };
+    }
+    store.hosts[host] = { files: parsed };
+  }
+  return store;
+}
+
+/** Returns undefined when the file does not exist; throws on anything else. */
+function readStateDocument(
+  file: string,
+  unreadableError: string,
+  invalidError: string
+): unknown | undefined {
   let serialized: string;
   try {
-    serialized = readFileSync(CREDENTIALS_PATH, "utf8");
+    serialized = readFileSync(file, "utf8");
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") return {};
-    throw new CliError(
-      "Stored credentials could not be read. Check permissions or run: patchpage auth set to replace them."
-    );
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+    throw new CliError(unreadableError);
   }
 
-  let value: unknown;
   try {
-    value = JSON.parse(serialized);
+    return JSON.parse(serialized) as unknown;
   } catch {
-    throw new CliError(
-      "Stored credentials are invalid. Run: patchpage auth set to replace them."
-    );
+    throw new CliError(invalidError);
   }
+}
 
-  const apiToken =
-    value && typeof value === "object" && !Array.isArray(value)
-      ? (value as Record<string, unknown>).apiToken
-      : undefined;
-  if (typeof apiToken !== "string" || apiToken.length === 0) {
-    throw new CliError(
-      "Stored credentials are invalid. Run: patchpage auth set to replace them."
-    );
-  }
-
-  return { apiToken };
+function asRecord(value: unknown): Record<string, unknown> | null {
+  return value !== null && typeof value === "object" && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : null;
 }
 
 function defaultHostHint(apiUrl: string): string {
@@ -483,10 +626,6 @@ function parseApiToken(input: string, allowTrailingLineEnding: boolean): string 
   }
 
   return apiToken;
-}
-
-function readDrafts(): DraftCache {
-  return readJson<DraftCache>(DRAFTS_PATH, { files: {} });
 }
 
 function readJson<T>(file: string, fallback: T): T {
