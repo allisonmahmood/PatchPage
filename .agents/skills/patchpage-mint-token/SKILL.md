@@ -190,9 +190,12 @@ default host.
 
 ## Revoking tokens
 
-There is no list or revoke API endpoint yet. Remove the token's row from the `api_tokens`
-table (postgres driver) or its entry in the JSON state file (json driver); both drivers
-read the store on every request, so the change takes effect immediately.
+There is no list or revoke API endpoint yet. Revoke by setting the token's `revoked_at`
+timestamp — `UPDATE api_tokens SET revoked_at = now() WHERE id = '...'` (postgres driver)
+or setting `revokedAt` on its entry in the JSON state file (json driver); both drivers
+read the store on every request, so the change takes effect immediately. Never DELETE the
+row: `draft_versions` references it, so postgres rejects the delete for any token that has
+uploaded — and revocation is a state we keep for the audit trail, not an erasure.
 
 ## Pitfalls
 
