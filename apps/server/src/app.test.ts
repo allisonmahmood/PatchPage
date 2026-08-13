@@ -1783,7 +1783,141 @@ describe("PatchPage server", () => {
     await app.close();
     await db.close();
   });
+
+  it("serves drafts noindexed, unwatched, and open to machines", async () => {
+    const served = await createServedDraft("serving-guarantees");
+
+    for (const url of [served.latestUrl, served.versionUrl]) {
+      const anonymous = await served.app.inject({ method: "GET", url });
+      expect(anonymous.statusCode).toBe(200);
+      expect(anonymous.headers["x-robots-tag"]).toBe("noindex");
+      expect(anonymous.headers["set-cookie"]).toBeUndefined();
+      expect(anonymous.headers["www-authenticate"]).toBeUndefined();
+      expect(anonymous.body).toContain("Serving Guarantees");
+    }
+
+    // No auth or session on the serving host: reader credentials are neither
+    // required nor consulted, and a bad one never turns into a challenge.
+    const credentialed = await served.app.inject({
+      method: "GET",
+      url: served.latestUrl,
+      headers: { authorization: "Bearer not-a-real-token", cookie: "session=whatever" }
+    });
+    expect(credentialed.statusCode).toBe(200);
+    expect(credentialed.headers["set-cookie"]).toBeUndefined();
+    expect(credentialed.headers["www-authenticate"]).toBeUndefined();
+    expect(credentialed.body).toContain("Serving Guarantees");
+
+    const missing = await served.app.inject({ method: "GET", url: "/d/doesnotexist1" });
+    expect(missing.statusCode).toBe(404);
+    expect(missing.headers["x-robots-tag"]).toBe("noindex");
+    expect(missing.headers["set-cookie"]).toBeUndefined();
+
+    await served.close();
+  });
+
+  it("caches version URLs immutably, latest-draft URLs briefly, and everything else never", async () => {
+    const served = await createServedDraft("serving-cache-headers");
+
+    const latest = await served.app.inject({ method: "GET", url: served.latestUrl });
+    expect(latest.statusCode).toBe(200);
+    expect(latest.headers["cache-control"]).toBe("public, max-age=60");
+
+    const version = await served.app.inject({ method: "GET", url: served.versionUrl });
+    expect(version.statusCode).toBe(200);
+    expect(version.headers["cache-control"]).toBe("public, max-age=31536000, immutable");
+
+    const missingVersion = await served.app.inject({
+      method: "GET",
+      url: `/d/${served.draftId}/v/9`
+    });
+    expect(missingVersion.statusCode).toBe(404);
+    expect(missingVersion.headers["cache-control"]).toBe("no-store");
+
+    const missingDraft = await served.app.inject({ method: "GET", url: "/d/doesnotexist1" });
+    expect(missingDraft.statusCode).toBe(404);
+    expect(missingDraft.headers["cache-control"]).toBe("no-store");
+
+    // Everything that is not a served draft — API routes included — stays uncached.
+    const uncachedResponses = [
+      await served.app.inject({
+        method: "GET",
+        url: "/api/me",
+        headers: { authorization: "Bearer dev-token" }
+      }),
+      await served.app.inject({ method: "GET", url: "/api/me" }),
+      await served.app.inject({
+        method: "POST",
+        url: "/api/uploads",
+        headers: { authorization: "Bearer dev-token" },
+        payload: { html: "<!doctype html><html><head><title>Second</title></head><body></body></html>" }
+      }),
+      await served.app.inject({ method: "GET", url: "/healthz" }),
+      await served.app.inject({ method: "GET", url: "/" })
+    ];
+    for (const response of uncachedResponses) {
+      expect(response.headers["cache-control"]).toBe("no-store");
+    }
+
+    await served.close();
+  });
+
+  it("locks the draft content security policy with no script sources", async () => {
+    const served = await createServedDraft("serving-csp");
+
+    for (const url of [served.latestUrl, served.versionUrl]) {
+      const response = await served.app.inject({ method: "GET", url });
+      expect(response.statusCode).toBe(200);
+      expect(response.headers["content-security-policy"]).toBe(
+        "default-src 'none'; style-src 'unsafe-inline'; img-src https: data:; " +
+          "frame-src 'self' about:; base-uri 'none'; form-action 'none'"
+      );
+      expect(response.headers["content-security-policy"]).not.toContain("script");
+      expect(response.body).not.toContain("<script");
+    }
+
+    await served.close();
+  });
 });
+
+interface ServedDraft {
+  app: ReturnType<typeof createApp>;
+  draftId: string;
+  latestUrl: string;
+  versionUrl: string;
+  close: () => Promise<void>;
+}
+
+async function createServedDraft(label: string): Promise<ServedDraft> {
+  const safeLabel = label.replaceAll(/[^a-z0-9]/gi, "-");
+  const config = testConfig();
+  const db = new JsonFilePatchPageDb(path.join(tempDir, `${safeLabel}-db.json`));
+  await db.initialize("dev-token");
+  const storage = new FileSystemHtmlStorage(path.join(tempDir, `${safeLabel}-drafts`));
+  const app = createApp({ config, db, storage });
+
+  const upload = await app.inject({
+    method: "POST",
+    url: "/api/uploads",
+    headers: { authorization: "Bearer dev-token" },
+    payload: {
+      html: "<!doctype html><html><head><title>Serving Guarantees</title></head><body><p>Served.</p></body></html>"
+    }
+  });
+  expect(upload.statusCode).toBe(201);
+  const body = upload.json() as { draftId: string; versionNumber: number };
+
+  return {
+    app,
+    draftId: body.draftId,
+    latestUrl: `/d/${body.draftId}`,
+    versionUrl: `/d/${body.draftId}/v/${body.versionNumber}`,
+    close: async () => {
+      await app.close();
+      await db.close();
+    }
+  };
+}
 
 interface SourceIpAttribution {
   versionSourceIp: string | null | undefined;

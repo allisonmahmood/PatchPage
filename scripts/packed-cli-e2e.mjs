@@ -2557,10 +2557,17 @@ async function fetchViewer(url) {
 }
 
 function assertViewer(viewer, draftId, versionNumber, marker) {
+  // Serving guarantees: cache policy is keyed to URL shape. A version URL names
+  // content that can never change; the latest-draft URL follows the draft.
+  const versionUrl = /\/v\/\d+$/.test(new URL(viewer.response.url).pathname);
   assert.equal(viewer.response.status, 200);
   assert.equal(viewer.response.headers.get("content-security-policy"), expectedViewerCsp);
   assert.equal(viewer.response.headers.get("x-content-type-options"), "nosniff");
-  assert.equal(viewer.response.headers.get("cache-control"), "no-store");
+  assert.equal(viewer.response.headers.get("x-robots-tag"), "noindex");
+  assert.equal(
+    viewer.response.headers.get("cache-control"),
+    versionUrl ? "public, max-age=31536000, immutable" : "public, max-age=60"
+  );
   assert.equal(viewer.response.headers.get("content-type"), "text/html");
   assert.ok(viewer.body.includes('sandbox=""'), "viewer iframe lost its empty sandbox");
   assert.ok(
