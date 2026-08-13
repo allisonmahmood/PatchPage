@@ -24,6 +24,10 @@ _Avoid_: soft delete, archival, retention (for the act of deleting — retention
 A draft exempted from expiry by an operator, for pages the instance itself maintains (welcome page, docs). Pinning is an admin-only act; a pinned draft is otherwise an ordinary draft.
 _Avoid_: permanent draft, system page
 
+**Revocation**:
+An operator's act of permanently disabling an auth token. Revoked is a state the token enters, never a deletion — the record of where and when it was minted survives for later review. A revoked token can do nothing; its drafts stay up until draft expiry, but their clock only runs down from that moment: visits no longer top it up, and nothing self-service can touch them again.
+_Avoid_: ban, token deletion
+
 **Report**:
 A reader's flag on a served draft asking the operator to review it. Filing one is acknowledged immediately and has no automatic consequence; disabling, deleting, or revoking is always an operator decision.
 _Avoid_: takedown request (a report may lead to a takedown; it is not one)
