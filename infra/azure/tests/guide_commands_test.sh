@@ -4912,6 +4912,97 @@ test_public_safe_runbook_static() {
     fi
   done
 
+  # Which action group each cost trigger is pointed at.
+  #
+  # Exactly the gap the lock scopes above have, for exactly the same reason.
+  # Under the per-type mock_resource defaults in the tftest suites, every
+  # azurerm_monitor_action_group mocks to one id, so a plan assertion that "the
+  # egress tripwire fires the kill action group" is equally satisfied by a
+  # tripwire wired to the notice group. tests/cost_posture.tftest.hcl closes
+  # that behaviourally with per-address override_resource ids; this closes it
+  # again by reading the expression rather than its value, and the two fail for
+  # different reasons.
+  #
+  # Three entries, and the third is the one that matters most. The blob size
+  # alarm must notify and must never kill: 50 GiB of stored drafts is a slow,
+  # cheap, recoverable problem, and quietly repointing that alarm at the kill
+  # group would convert an operator's reading task into an outage. Stating the
+  # non-kill wiring here means it cannot drift silently in either direction.
+  #
+  # resource|attribute|expected_expression
+  for cost_trigger_spec in \
+    'azurerm_monitor_metric_alert.egress_tripwire|action_group_id|azurerm_monitor_action_group.kill_switch.id' \
+    'azurerm_consumption_budget_subscription.circuit_breaker|contact_groups|[azurerm_monitor_action_group.kill_switch.id]' \
+    'azurerm_monitor_metric_alert.blob_capacity|action_group_id|azurerm_monitor_action_group.operator_notice.id'; do
+    trigger_resource="${cost_trigger_spec%%|*}"
+    trigger_remainder="${cost_trigger_spec#*|}"
+    trigger_attribute="${trigger_remainder%%|*}"
+    expected_target="${trigger_remainder#*|}"
+    resource_type="${trigger_resource%%.*}"
+    resource_name="${trigger_resource#*.}"
+    if ! awk -v rtype="$resource_type" -v rname="$resource_name" \
+      -v attr="$trigger_attribute" -v expected="$expected_target" '
+      $0 == ("resource \"" rtype "\" \"" rname "\" {") {
+        in_resource = 1
+        depth = 1
+        next
+      }
+      in_resource {
+        line = $0
+        opens = gsub(/\{/, "{", line)
+        line = $0
+        closes = gsub(/\}/, "}", line)
+        depth += opens - closes
+        if (match($0, "^[[:space:]]*" attr "[[:space:]]*=[[:space:]]*")) {
+          rest = substr($0, RSTART + RLENGTH)
+          gsub(/[[:space:]]+$/, "", rest)
+          if (rest == expected) {
+            found = 1
+          }
+        }
+        if (depth <= 0) {
+          exit !found
+        }
+      }
+      END {
+        if (!in_resource || !found) exit 1
+      }
+    ' "$azure_tf_dir"/*.tf; then
+      fail "cost trigger $trigger_resource does not point $trigger_attribute at $expected_target"
+    fi
+  done
+
+  # The kill switch's privilege, which is the whole of what makes it
+  # fail-closed. The role carries stop and not start, so the automation is
+  # mechanically unable to bring the service back and restoring it is an
+  # operator decision in the permission model rather than only in the runbook's
+  # prose. cost_posture.tftest.hcl asserts the action list; this states the
+  # absent action by name, so a future edit that adds start has to delete a line
+  # that says why it must not.
+  if awk '
+    $0 == "resource \"azurerm_role_definition\" \"kill_switch\" {" {
+      in_resource = 1
+      depth = 1
+      next
+    }
+    in_resource {
+      line = $0
+      opens = gsub(/\{/, "{", line)
+      line = $0
+      closes = gsub(/\}/, "}", line)
+      depth += opens - closes
+      if ($0 ~ /containerApps\/start\/action/) {
+        found_start = 1
+      }
+      if (depth <= 0) {
+        exit found_start ? 0 : 1
+      }
+    }
+    END { exit found_start ? 0 : 1 }
+  ' "$azure_tf_dir"/*.tf; then
+    fail "the kill switch role grants a Container App start action; restoring service must stay an operator decision"
+  fi
+
   # The Container App create-time server_image gate is invisible to plan-time
   # `tofu test`: expect_failures on azurerm_container_app.server is satisfied by
   # the postcondition, so deleting or neutering the precondition alone stays green.

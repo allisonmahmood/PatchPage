@@ -72,3 +72,14 @@ output "bootstrap_api_token" {
 output "server_image_is_managed_digest" {
   value = local.server_image_is_managed_digest
 }
+
+# The kill switch's two names, so the fire drill in README.md can be followed
+# without guessing at them. Neither is sensitive: the capability is the webhook
+# URI, which is deliberately not an output here or anywhere else.
+output "kill_switch_automation_account_name" {
+  value = azurerm_automation_account.kill_switch.name
+}
+
+output "kill_switch_runbook_name" {
+  value = azurerm_automation_runbook.kill_switch.name
+}
