@@ -43,7 +43,7 @@ npm install -g patchpage
 
 ### `patchpage auth set [--token-stdin] [--api-url <url>]`
 
-Save an API token to local state, under the instance it resolves for: `--api-url`, else `PATCHPAGE_API_URL`, else the stored config, else the default host. Saving a token for one instance leaves tokens saved for other instances untouched. By default, `auth set` requires a terminal and reads the token from a non-echoing prompt. Pass `--api-url` to also store the base URL of a self-hosted instance, so later commands don't need the flag.
+Save an API token to local state, under the instance it resolves for: `--api-url`, else `PATCHPAGE_API_URL`, else the stored config, else the default instance. Saving a token for one instance leaves tokens saved for other instances untouched. By default, `auth set` requires a terminal and reads the token from a non-echoing prompt. Pass `--api-url` to also store the base URL of a self-hosted instance, so later commands don't need the flag.
 
 ```sh
 patchpage auth set --api-url https://post.example.com

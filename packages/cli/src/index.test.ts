@@ -777,25 +777,25 @@ describe("patchpage upload", () => {
       if (!address || typeof address === "string") throw new Error("Expected a TCP test server");
       const apiUrl = `http://127.0.0.1:${address.port}`;
       const host = JSON.stringify(apiUrl);
-      const invalidCredentials = [
+      // Nothing host-keyed survives parsing, so the whole document is rejected.
+      const invalidDocuments = [
         ["malformed", "not-json\n"],
         ["null-document", "null\n"],
         ["array-document", "[]\n"],
         ["missing-hosts", "{}\n"],
         ["null-hosts", '{"hosts":null}\n'],
-        ["array-hosts", '{"hosts":[]}\n'],
+        ["array-hosts", '{"hosts":[]}\n']
+      ];
+      // The map is intact; only this instance's own entry is unusable.
+      const invalidEntries = [
         ["string-host-entry", `{"hosts":{${host}:"pp_bare"}}\n`],
         ["missing-token", `{"hosts":{${host}:{}}}\n`],
         ["null-token", `{"hosts":{${host}:{"token":null}}}\n`],
         ["number-token", `{"hosts":{${host}:{"token":42}}}\n`],
-        ["empty-token", `{"hosts":{${host}:{"token":""}}}\n`],
-        ["unknown-source", `{"hosts":{${host}:{"token":"pp_x","source":"guessed"}}}\n`],
-        ["number-updated-at", `{"hosts":{${host}:{"token":"pp_x","updatedAt":1}}}\n`],
-        // A corrupt entry for an unrelated instance still fails closed.
-        ["foreign-host-entry", `{"hosts":{"https://other.test":{"token":null}}}\n`]
+        ["empty-token", `{"hosts":{${host}:{"token":""}}}\n`]
       ];
 
-      for (const [label, contents] of invalidCredentials) {
+      for (const [label, contents] of invalidDocuments) {
         const stateDir = makeStateDir();
         const htmlPath = path.join(stateDir, `${label}.html`);
         writeFileSync(htmlPath, `<!doctype html><title>${label}</title>`);
@@ -807,6 +807,22 @@ describe("patchpage upload", () => {
         expect(result.stdout, label).toBe("");
         expect(result.stderr, label).toBe(
           "Stored credentials are invalid. Run: patchpage auth set to replace them.\n"
+        );
+        expect(existsSync(path.join(stateDir, "drafts.json")), label).toBe(false);
+      }
+
+      for (const [label, contents] of invalidEntries) {
+        const stateDir = makeStateDir();
+        const htmlPath = path.join(stateDir, `${label}.html`);
+        writeFileSync(htmlPath, `<!doctype html><title>${label}</title>`);
+        writeFileSync(path.join(stateDir, "credentials.json"), contents);
+
+        const result = await runCliAsync(["upload", htmlPath, "--api-url", apiUrl], {}, stateDir);
+
+        expect(result.status, label).toBe(1);
+        expect(result.stdout, label).toBe("");
+        expect(result.stderr, label).toBe(
+          `Stored credentials for ${apiUrl} are invalid. Run: patchpage auth set --api-url ${apiUrl} to replace them.\n`
         );
         expect(existsSync(path.join(stateDir, "drafts.json")), label).toBe(false);
       }
@@ -1328,6 +1344,149 @@ describe("host-keyed local state", () => {
       await first.close();
       await second.close();
     }
+  });
+
+  it("keeps every other instance's token when auth set follows an invalid-entry error", () => {
+    const stateDir = makeStateDir();
+    const credentialsPath = path.join(stateDir, "credentials.json");
+    const liveToken = "pp_sibling_live_token";
+    const brokenEntry = { token: null };
+    writeFileSync(
+      credentialsPath,
+      `${JSON.stringify(
+        {
+          hosts: {
+            "https://good.test": {
+              token: liveToken,
+              updatedAt: "2026-08-14T00:00:00.000Z",
+              source: "auth-set"
+            },
+            "https://broken.test": brokenEntry
+          }
+        },
+        null,
+        2
+      )}\n`
+    );
+
+    const result = runCli(
+      ["auth", "set", "--token-stdin", "--api-url", "https://third.test"],
+      "pp_third\n",
+      stateDir
+    );
+
+    expect(result.status).toBe(0);
+    const { hosts } = readCredentials(stateDir);
+    expect(Object.keys(hosts).sort()).toEqual([
+      "https://broken.test",
+      "https://good.test",
+      "https://third.test"
+    ]);
+    // The healthy sibling's live token survives the write.
+    expect(hosts["https://good.test"]).toMatchObject({ token: liveToken, source: "auth-set" });
+    // The unusable entry is not destroyed either; it is carried across verbatim.
+    expect(hosts["https://broken.test"]).toEqual(brokenEntry);
+    expect(hosts["https://third.test"]).toMatchObject({
+      token: "pp_third",
+      source: "auth-set"
+    });
+    expect(`${result.stdout}${result.stderr}`).not.toContain(liveToken);
+  });
+
+  it("repairs one instance's invalid entry without disturbing another's", () => {
+    const stateDir = makeStateDir();
+    const liveToken = "pp_untouched_live_token";
+    writeFileSync(
+      path.join(stateDir, "credentials.json"),
+      `${JSON.stringify(
+        {
+          hosts: {
+            "https://good.test": { token: liveToken, source: "auth-set" },
+            "https://broken.test": { token: "" }
+          }
+        },
+        null,
+        2
+      )}\n`
+    );
+
+    const result = runCli(
+      ["auth", "set", "--token-stdin", "--api-url", "https://broken.test"],
+      "pp_repaired\n",
+      stateDir
+    );
+
+    expect(result.status).toBe(0);
+    const { hosts } = readCredentials(stateDir);
+    expect(hosts["https://broken.test"]).toMatchObject({
+      token: "pp_repaired",
+      source: "auth-set"
+    });
+    expect(hosts["https://good.test"]).toMatchObject({ token: liveToken });
+  });
+
+  it("does not let one instance's invalid entry block another instance", async () => {
+    const stateDir = makeStateDir();
+    const htmlPath = path.join(stateDir, "unaffected.html");
+    writeFileSync(htmlPath, "<!doctype html><title>Unaffected</title>");
+    const server = await startUploadServer(createOnly("aaaabbbbcccc"));
+
+    try {
+      writeFileSync(
+        path.join(stateDir, "credentials.json"),
+        `${JSON.stringify(
+          {
+            hosts: {
+              [server.apiUrl]: { token: "pp_usable", source: "auth-set" },
+              "https://broken.test": { token: null }
+            }
+          },
+          null,
+          2
+        )}\n`
+      );
+
+      // The draft cache carries the same kind of unrelated damage.
+      const brokenCacheEntry = { files: { "/gone.html": { draftId: 42 } } };
+      writeFileSync(
+        path.join(stateDir, "drafts.json"),
+        `${JSON.stringify({ hosts: { "https://broken.test": brokenCacheEntry } }, null, 2)}\n`
+      );
+
+      const result = await runCliAsync(
+        ["upload", htmlPath, "--api-url", server.apiUrl],
+        {},
+        stateDir
+      );
+
+      expect(result.status).toBe(0);
+      expect(result.stderr).toBe("");
+      expect(server.requests[0]?.authorization).toBe("Bearer pp_usable");
+
+      const cache = readDraftCache(stateDir);
+      expect(Object.keys(cache.hosts).sort()).toEqual(
+        ["https://broken.test", server.apiUrl].sort()
+      );
+      expect(cache.hosts[server.apiUrl]?.files[htmlPath]).toMatchObject({
+        draftId: "aaaabbbbcccc"
+      });
+      // The neighbour's unusable entry is preserved, not rewritten or dropped.
+      expect(cache.hosts["https://broken.test"]).toEqual(brokenCacheEntry);
+    } finally {
+      await server.close();
+    }
+  });
+
+  it("names the default instance's own next action instead of a competing auth set", () => {
+    const result = runCli(["whoami"]);
+
+    expect(result.status).toBe(1);
+    expect(result.stdout).toBe("");
+    expect(result.stderr).toContain(`Missing API token for ${DEFAULT_API_URL}.`);
+    expect(result.stderr).toContain("does not issue public tokens");
+    expect(result.stderr).toContain("--api-url or PATCHPAGE_API_URL");
+    // The instance that issues no tokens is never offered as an auth set target.
+    expect(result.stderr).not.toContain(`patchpage auth set --api-url ${DEFAULT_API_URL}`);
   });
 
   it("fails closed on a credentials file in the retired single-instance format", async () => {
