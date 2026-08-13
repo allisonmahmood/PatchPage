@@ -4,7 +4,74 @@ import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { sha256 } from "@patchpage/core";
 import { JsonFilePatchPageDb } from "./json-db.js";
+import { SCHEMA_MIGRATION_IDS, SCHEMA_MIGRATIONS } from "./migrations.js";
+import type { SchemaMigration } from "./migrations.js";
+
+/**
+ * A state file at the schema deployed before migrations existed: the five row
+ * collections, no ledger. New fields are added by migrating this forward.
+ */
+function deployedSchemaFixture(): Record<string, unknown> {
+  return {
+    accounts: [
+      {
+        id: "acct_legacy",
+        name: "Legacy Account",
+        createdAt: "2026-01-01T00:00:00.000Z",
+        updatedAt: "2026-01-01T00:00:00.000Z"
+      }
+    ],
+    apiTokens: [
+      {
+        id: "tok_legacy",
+        accountId: "acct_legacy",
+        name: "Legacy API Token",
+        tokenHash: sha256("legacy-token"),
+        scopes: ["upload"],
+        createdAt: "2026-01-01T00:00:00.000Z",
+        lastUsedAt: null,
+        revokedAt: null
+      }
+    ],
+    drafts: [
+      {
+        id: "legacydraft1",
+        accountId: "acct_legacy",
+        title: "Legacy draft",
+        visibility: "unlisted",
+        currentVersionId: "ver_legacy_one",
+        repoOrg: null,
+        repoName: null,
+        createdAt: "2026-01-01T00:00:00.000Z",
+        updatedAt: "2026-01-01T00:00:00.000Z",
+        deletedAt: null,
+        disabledAt: null,
+        disabledReason: null
+      }
+    ],
+    draftVersions: [
+      {
+        id: "ver_legacy_one",
+        draftId: "legacydraft1",
+        versionNumber: 1,
+        objectKey: "drafts/legacydraft1/versions/ver_legacy_one.html",
+        contentHash: "sha256:one",
+        fileSize: 11,
+        createdByApiTokenId: "tok_legacy",
+        sourceIp: null,
+        userAgent: null,
+        cliVersion: null,
+        gitBranch: null,
+        gitCommitSha: null,
+        originalFilename: "legacy.html",
+        createdAt: "2026-01-01T00:00:00.000Z"
+      }
+    ],
+    uploadEvents: []
+  };
+}
 
 const {
   chmod,
@@ -64,6 +131,83 @@ describe("JsonFilePatchPageDb", () => {
     const lookup = await db.findDraftVersion("abcdefghijkl");
     expect(lookup.draft?.title).toBe("First draft");
     expect(lookup.version?.objectKey).toBe("drafts/abcdefghijkl/versions/ver_one.html");
+  });
+
+  it("adopts a state file written before the migration ledger existed", async () => {
+    const filePath = path.join(tempDir, "db.json");
+    await writeFile(filePath, `${JSON.stringify(deployedSchemaFixture(), null, 2)}\n`, "utf8");
+
+    const db = new JsonFilePatchPageDb(filePath);
+    await db.initialize(null);
+
+    expect(await db.listAppliedMigrations()).toEqual([...SCHEMA_MIGRATION_IDS]);
+    const stored = JSON.parse(await readFile(filePath, "utf8")) as {
+      schemaMigrations: string[];
+      drafts: Array<{ id: string; title: string }>;
+    };
+    expect(stored.schemaMigrations).toEqual([...SCHEMA_MIGRATION_IDS]);
+    expect(stored.drafts.map((draft) => draft.title)).toEqual(["Legacy draft"]);
+
+    const auth = await db.findApiTokenByToken("legacy-token");
+    expect(auth?.accountId).toBe("acct_legacy");
+    const lookup = await db.findDraftVersion("legacydraft1");
+    expect(lookup.version?.versionNumber).toBe(1);
+    const updated = await db.recordUpload({
+      intent: "update",
+      draftId: "legacydraft1",
+      versionId: "ver_legacy_two",
+      accountId: "acct_legacy",
+      apiTokenId: "tok_legacy",
+      title: "Updated legacy draft",
+      objectKey: "drafts/legacydraft1/versions/ver_legacy_two.html",
+      contentHash: "sha256:two",
+      fileSize: 12,
+      filename: "legacy.html",
+      metadata: { cliVersion: "test" },
+      sourceIp: null,
+      userAgent: "vitest"
+    });
+    expect(updated.versionNumber).toBe(2);
+  });
+
+  it("default-fills stored rows with the fields a later schema version adds", async () => {
+    const filePath = path.join(tempDir, "db.json");
+    await writeFile(filePath, `${JSON.stringify(deployedSchemaFixture(), null, 2)}\n`, "utf8");
+    const reviewNoteMigration: SchemaMigration = {
+      id: "9999_probe_drafts_review_note",
+      json(state) {
+        const drafts = state.drafts;
+        if (!Array.isArray(drafts)) return;
+        for (const draft of drafts) {
+          if (draft && typeof draft === "object" && !("reviewNote" in draft)) {
+            (draft as Record<string, unknown>).reviewNote = null;
+          }
+        }
+      }
+    };
+
+    const upgraded = new JsonFilePatchPageDb(filePath, {
+      migrations: [...SCHEMA_MIGRATIONS, reviewNoteMigration]
+    });
+    await upgraded.initialize(null);
+
+    const stored = JSON.parse(await readFile(filePath, "utf8")) as {
+      schemaMigrations: string[];
+      drafts: Array<{ id: string; reviewNote: string | null }>;
+    };
+    expect(stored.schemaMigrations).toEqual([
+      ...SCHEMA_MIGRATION_IDS,
+      "9999_probe_drafts_review_note"
+    ]);
+    expect(stored.drafts).toEqual([
+      expect.objectContaining({ id: "legacydraft1", reviewNote: null })
+    ]);
+
+    // The row guards accept the migrated shape, and a handle still running the
+    // older schema keeps reading rows a newer one wrote.
+    expect((await upgraded.findDraftVersion("legacydraft1")).draft?.title).toBe("Legacy draft");
+    const older = new JsonFilePatchPageDb(filePath);
+    expect((await older.findDraftVersion("legacydraft1")).draft?.title).toBe("Legacy draft");
   });
 
   it("preserves concurrent uploads made through database instances sharing one file", async () => {

@@ -1,13 +1,17 @@
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import pg from "pg";
 import { describe, expect, it } from "vitest";
 import { newDraftId, newInternalId, randomToken } from "@patchpage/core";
 import { JsonFilePatchPageDb } from "./json-db.js";
+import { SCHEMA_MIGRATION_IDS, SCHEMA_MIGRATIONS } from "./migrations.js";
 import { PostgresPatchPageDb } from "./postgres-db.js";
 import { isUploadTargetError } from "./types.js";
+import type { JsonMigrationState, SchemaMigration } from "./migrations.js";
 import type {
   ApiTokenAuth,
+  DbDriverOptions,
   PatchPageDb,
   RecordUploadInput,
   RecordUploadResult
@@ -20,7 +24,35 @@ interface ContractHarness {
   db: PatchPageDb;
   peerDb: PatchPageDb;
   auth: ApiTokenAuth;
+  /** Another handle on the same store, optionally running a different schema. */
+  openDb(options?: DbDriverOptions): PatchPageDb;
+  /** Leaves the live schema in place but forgets it was ever migrated. */
+  forgetMigrationLedger(): Promise<void>;
+  /** Undoes the probe migration so the store stays reusable across runs. */
+  revertProbeMigration(): Promise<void>;
   close(): Promise<void>;
+}
+
+// An additive migration that exists only to be exercised: it adds one nullable
+// field on both drivers, so the shipped schema stays free of a placeholder
+// column that no ticket asked for.
+const PROBE_MIGRATION_ID = "9999_probe_drafts_review_note";
+const PROBE_MIGRATION: SchemaMigration = {
+  id: PROBE_MIGRATION_ID,
+  postgres: "ALTER TABLE drafts ADD COLUMN IF NOT EXISTS review_note TEXT;",
+  json(state: JsonMigrationState) {
+    const drafts = state.drafts;
+    if (!Array.isArray(drafts)) return;
+    for (const draft of drafts) {
+      if (draft && typeof draft === "object" && !("reviewNote" in draft)) {
+        (draft as Record<string, unknown>).reviewNote = null;
+      }
+    }
+  }
+};
+
+function shippedLedgerEntries(applied: string[]): string[] {
+  return applied.filter((id) => SCHEMA_MIGRATION_IDS.includes(id));
 }
 
 type ContractHarnessFactory = () => Promise<ContractHarness>;
@@ -33,6 +65,89 @@ function describeUploadContract(
   const suite = enabled ? describe : describe.skip;
 
   suite(`${driverName} draft upload contract`, () => {
+    it("records every shipped migration once, in order, and re-migrates as a no-op", async () => {
+      const harness = await createHarness();
+      const draftId = newDraftId();
+
+      try {
+        const applied = await harness.db.listAppliedMigrations();
+        expect(shippedLedgerEntries(applied)).toEqual([...SCHEMA_MIGRATION_IDS]);
+        expect(new Set(applied).size).toBe(applied.length);
+
+        await harness.db.initialize(null);
+        await harness.peerDb.initialize(null);
+
+        expect(await harness.db.listAppliedMigrations()).toEqual(applied);
+        const created = await harness.db.recordUpload(
+          uploadInput("create", draftId, harness.auth)
+        );
+        expect(created.versionNumber).toBe(1);
+      } finally {
+        await harness.close();
+      }
+    });
+
+    it("adopts a database left at the pre-migration deployed schema", async () => {
+      const harness = await createHarness();
+      const draftId = newDraftId();
+
+      try {
+        await harness.db.recordUpload(uploadInput("create", draftId, harness.auth));
+        await harness.forgetMigrationLedger();
+
+        const adopted = harness.openDb();
+        await adopted.initialize(null);
+
+        expect(shippedLedgerEntries(await adopted.listAppliedMigrations())).toEqual([
+          ...SCHEMA_MIGRATION_IDS
+        ]);
+        const preserved = await adopted.findDraftVersion(draftId);
+        expect(preserved.draft?.id).toBe(draftId);
+        expect(preserved.version?.versionNumber).toBe(1);
+
+        const updated = await adopted.recordUpload(
+          uploadInput("update", draftId, harness.auth)
+        );
+        expect(updated.versionNumber).toBe(2);
+      } finally {
+        await harness.close();
+      }
+    });
+
+    it("applies an additive migration to an already-migrated database", async () => {
+      const harness = await createHarness();
+      const draftId = newDraftId();
+
+      try {
+        await harness.db.recordUpload(uploadInput("create", draftId, harness.auth));
+
+        const upgraded = harness.openDb({
+          migrations: [...SCHEMA_MIGRATIONS, PROBE_MIGRATION]
+        });
+        await upgraded.initialize(null);
+
+        const applied = await upgraded.listAppliedMigrations();
+        expect(shippedLedgerEntries(applied)).toEqual([...SCHEMA_MIGRATION_IDS]);
+        expect(applied.at(-1)).toBe(PROBE_MIGRATION_ID);
+
+        const preserved = await upgraded.findDraftVersion(draftId);
+        expect(preserved.draft?.id).toBe(draftId);
+        const updated = await upgraded.recordUpload(
+          uploadInput("update", draftId, harness.auth)
+        );
+        expect(updated.versionNumber).toBe(2);
+
+        await upgraded.initialize(null);
+        expect(await upgraded.listAppliedMigrations()).toEqual(applied);
+
+        // A handle still running the older schema keeps reading migrated rows.
+        expect((await harness.db.findDraftVersion(draftId)).draft?.id).toBe(draftId);
+      } finally {
+        await harness.revertProbeMigration();
+        await harness.close();
+      }
+    });
+
     it("initializes a non-authenticating anonymous upload principal idempotently", async () => {
       const harness = await createHarness();
       const draftId = newDraftId();
@@ -361,8 +476,15 @@ postgresSuite("Postgres rollback error handling", () => {
 async function createJsonHarness(): Promise<ContractHarness> {
   const tempDir = await mkdtemp(path.join(os.tmpdir(), "patchpage-upload-contract-"));
   const filePath = path.join(tempDir, "db.json");
-  const db = new JsonFilePatchPageDb(filePath);
-  const peerDb = new JsonFilePatchPageDb(filePath);
+  const opened: PatchPageDb[] = [];
+  const openDb = (options: DbDriverOptions = {}): PatchPageDb => {
+    const opening = new JsonFilePatchPageDb(filePath, options);
+    opened.push(opening);
+    return opening;
+  };
+
+  const db = openDb();
+  const peerDb = openDb();
   const token = randomToken();
   await db.initialize(token);
   const auth = await db.findApiTokenByToken(token);
@@ -372,27 +494,61 @@ async function createJsonHarness(): Promise<ContractHarness> {
     db,
     peerDb,
     auth,
+    openDb,
+    async forgetMigrationLedger() {
+      const stored = JSON.parse(await readFile(filePath, "utf8")) as Record<string, unknown>;
+      delete stored.schemaMigrations;
+      await writeFile(filePath, `${JSON.stringify(stored, null, 2)}\n`, "utf8");
+    },
+    async revertProbeMigration() {
+      // The temporary state file is discarded wholesale on close.
+    },
     async close() {
-      await Promise.all([db.close(), peerDb.close()]);
+      await Promise.all(opened.map((opening) => opening.close()));
       await rm(tempDir, { recursive: true, force: true });
     }
   };
 }
 
 async function createPostgresHarness(connectionString: string): Promise<ContractHarness> {
-  const db = new PostgresPatchPageDb(connectionString);
-  const peerDb = new PostgresPatchPageDb(connectionString);
+  const opened: PatchPageDb[] = [];
+  const openDb = (options: DbDriverOptions = {}): PatchPageDb => {
+    const opening = new PostgresPatchPageDb(connectionString, options);
+    opened.push(opening);
+    return opening;
+  };
+
+  const db = openDb();
+  const peerDb = openDb();
   const token = randomToken();
   await db.initialize(token);
   const auth = await db.findApiTokenByToken(token);
   if (!auth) throw new Error("Expected bootstrap authentication.");
 
+  const runSql = async (sql: string, values: unknown[] = []): Promise<void> => {
+    const client = new pg.Client({ connectionString });
+    await client.connect();
+    try {
+      await client.query(sql, values);
+    } finally {
+      await client.end();
+    }
+  };
+
   return {
     db,
     peerDb,
     auth,
+    openDb,
+    async forgetMigrationLedger() {
+      await runSql("DROP TABLE IF EXISTS schema_migrations");
+    },
+    async revertProbeMigration() {
+      await runSql("ALTER TABLE drafts DROP COLUMN IF EXISTS review_note");
+      await runSql("DELETE FROM schema_migrations WHERE id = $1", [PROBE_MIGRATION_ID]);
+    },
     async close() {
-      await Promise.all([db.close(), peerDb.close()]);
+      await Promise.all(opened.map((opening) => opening.close()));
     }
   };
 }

@@ -18,11 +18,18 @@ import {
   ANONYMOUS_INTERNAL_TOKEN_HASH,
   ANONYMOUS_UPLOAD_PRINCIPAL
 } from "./internal-principals.js";
+import {
+  applyJsonMigrations,
+  JSON_MIGRATION_LEDGER_KEY,
+  SCHEMA_MIGRATIONS
+} from "./migrations.js";
 import { UploadTargetError } from "./types.js";
+import type { JsonMigrationState, SchemaMigration } from "./migrations.js";
 import type {
   AnonymousUploadPrincipal,
   ApiTokenAuth,
   CreateApiTokenInput,
+  DbDriverOptions,
   DraftRecord,
   DraftModerationOptions,
   DraftVersionLookup,
@@ -64,11 +71,17 @@ interface UploadEventRow {
 }
 
 interface JsonDbState {
+  schemaMigrations: string[];
   accounts: AccountRow[];
   apiTokens: ApiTokenRow[];
   drafts: DraftRecord[];
   draftVersions: DraftVersionRecord[];
   uploadEvents: UploadEventRow[];
+}
+
+interface LoadedJsonDbState {
+  state: JsonDbState;
+  migrated: boolean;
 }
 
 interface StateMutationResult<T> {
@@ -83,9 +96,11 @@ const utf8Decoder = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
 
 export class JsonFilePatchPageDb implements PatchPageDb {
   private readonly filePath: string;
+  private readonly migrations: readonly SchemaMigration[];
 
-  constructor(filePath: string) {
+  constructor(filePath: string, options: DbDriverOptions = {}) {
     this.filePath = path.resolve(filePath);
+    this.migrations = options.migrations ?? SCHEMA_MIGRATIONS;
   }
 
   async initialize(bootstrapApiToken: string | null): Promise<void> {
@@ -94,6 +109,11 @@ export class JsonFilePatchPageDb implements PatchPageDb {
       ensureBootstrapState(state, bootstrapApiToken);
       return { value: undefined, changed: true };
     });
+  }
+
+  async listAppliedMigrations(): Promise<string[]> {
+    const state = await this.readState();
+    return [...state.schemaMigrations];
   }
 
   async getAnonymousUploadPrincipal(): Promise<AnonymousUploadPrincipal> {
@@ -318,14 +338,19 @@ export class JsonFilePatchPageDb implements PatchPageDb {
   ): Promise<T> {
     const mutationIdentities = await canonicalMutationIdentities(this.filePath);
     return serializeJsonMutation(mutationIdentities, async () => {
-      const state = await this.readState();
+      const { state, migrated } = await this.loadState();
       const result = mutate(state);
-      if (result.changed) await this.writeState(state);
+      // A migration applied on read is only durable once something writes.
+      if (result.changed || migrated) await this.writeState(state);
       return result.value;
     });
   }
 
   private async readState(): Promise<JsonDbState> {
+    return (await this.loadState()).state;
+  }
+
+  private async loadState(): Promise<LoadedJsonDbState> {
     await assertNoSymlinkAncestors(this.filePath);
     await inspectDatabaseFilePath(this.filePath);
 
@@ -333,7 +358,9 @@ export class JsonFilePatchPageDb implements PatchPageDb {
     try {
       bytes = await readFile(this.filePath);
     } catch (error) {
-      if (hasErrorCode(error, "ENOENT")) return emptyState();
+      if (hasErrorCode(error, "ENOENT")) {
+        return { state: this.migrateState(emptyState()).state, migrated: true };
+      }
       throw error;
     }
 
@@ -344,18 +371,37 @@ export class JsonFilePatchPageDb implements PatchPageDb {
       throw new Error("JSON metadata file is not valid UTF-8.");
     }
 
-    let state: unknown;
+    let parsed: unknown;
     try {
-      state = JSON.parse(serialized);
+      parsed = JSON.parse(serialized);
     } catch {
       throw new Error("JSON metadata file contains malformed JSON.");
     }
+
+    if (!isRecord(parsed)) {
+      throw new Error("JSON metadata file has an invalid state shape.");
+    }
+
+    const { state, changed } = this.migrateState(parsed);
+    return { state, migrated: changed };
+  }
+
+  /**
+   * Brings a persisted state up to the current schema, then guards it. Guards
+   * describe the current schema only — migrations are what make a state written
+   * by an earlier version readable, by default-filling the fields it lacks.
+   */
+  private migrateState(parsed: JsonMigrationState): {
+    state: JsonDbState;
+    changed: boolean;
+  } {
+    const { state, changed } = applyJsonMigrations(parsed, this.migrations);
 
     if (!isJsonDbState(state)) {
       throw new Error("JSON metadata file has an invalid state shape.");
     }
 
-    return state;
+    return { state, changed };
   }
 
   private async writeState(state: JsonDbState): Promise<void> {
@@ -721,6 +767,7 @@ function isJsonDbState(value: unknown): value is JsonDbState {
   if (!isRecord(value)) return false;
 
   return (
+    isStringArray(value[JSON_MIGRATION_LEDGER_KEY]) &&
     Array.isArray(value.accounts) &&
     value.accounts.every(isAccountRow) &&
     Array.isArray(value.apiTokens) &&
@@ -827,14 +874,10 @@ function isNullableString(value: unknown): value is string | null {
   return value === null || typeof value === "string";
 }
 
-function emptyState(): JsonDbState {
-  return {
-    accounts: [],
-    apiTokens: [],
-    drafts: [],
-    draftVersions: [],
-    uploadEvents: []
-  };
+// A database that does not exist yet is an empty state at schema version zero:
+// the migrations build its collections, exactly as they do for a stored one.
+function emptyState(): JsonMigrationState {
+  return {};
 }
 
 function ensureBootstrapState(state: JsonDbState, bootstrapApiToken: string | null): void {

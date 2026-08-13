@@ -363,7 +363,7 @@ pnpm db:migrate
 )
 ```
 
-This creates the `accounts`, `api_tokens`, `drafts`, `draft_versions`, and `upload_events` tables (idempotently), initializes the dedicated internal anonymous owner/audit actor without a usable bearer credential, and — when `PATCHPAGE_BOOTSTRAP_API_TOKEN` is set — provisions a bootstrap account and a bootstrap API token with `admin` and `upload` scopes. The `json` driver applies the same initialization automatically on startup, so no separate migration is needed for it.
+This runs the ordered schema migrations, recording each one in a `schema_migrations` ledger table so re-running is a no-op from any prior state — including a database created before that ledger existed. Together they create the `accounts`, `api_tokens`, `drafts`, `draft_versions`, and `upload_events` tables and their indexes. It then initializes the dedicated internal anonymous owner/audit actor without a usable bearer credential and — when `PATCHPAGE_BOOTSTRAP_API_TOKEN` is set — provisions a bootstrap account and a bootstrap API token with `admin` and `upload` scopes. The `json` driver applies the same migrations and initialization automatically on startup, so no separate migration is needed for it. Adding a migration is documented in `packages/db/README.md`.
 
 ## Running the server
 
