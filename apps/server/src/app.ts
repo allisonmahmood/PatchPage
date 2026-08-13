@@ -27,6 +27,12 @@ import {
   type RateLimitDecision
 } from "./rate-limit.js";
 import { renderDraftWrapper, renderHome, renderNotFound } from "./render.js";
+import {
+  DRAFT_CONTENT_SECURITY_POLICY,
+  DRAFT_ROBOTS_TAG,
+  NO_STORE_CACHE_CONTROL,
+  servedDraftCacheControl
+} from "./serving-headers.js";
 
 export interface CreateAppOptions {
   config: ServerConfig;
@@ -104,7 +110,10 @@ export function createApp(options: CreateAppOptions): FastifyInstance {
 
   app.addHook("onSend", async (_request, reply) => {
     reply.header("X-Content-Type-Options", "nosniff");
-    reply.header("Cache-Control", "no-store");
+    // Served drafts set their own cache policy; everything else stays uncached.
+    if (!reply.hasHeader("Cache-Control")) {
+      reply.header("Cache-Control", NO_STORE_CACHE_CONTROL);
+    }
   });
 
   app.addHook(
@@ -322,23 +331,16 @@ async function renderDraft(
   versionNumber: number | undefined,
   reply: FastifyReply
 ): Promise<void> {
+  reply.header("X-Robots-Tag", DRAFT_ROBOTS_TAG);
+
   const { draft, version } = await options.db.findDraftVersion(draftId, versionNumber);
   if (!draft || !version) {
     return reply.status(404).type("text/html").send(renderNotFound());
   }
 
   const html = await options.storage.getHtmlObject(version.objectKey);
-  reply.header(
-    "Content-Security-Policy",
-    [
-      "default-src 'none'",
-      "style-src 'unsafe-inline'",
-      "img-src https: data:",
-      "frame-src 'self' about:",
-      "base-uri 'none'",
-      "form-action 'none'"
-    ].join("; ")
-  );
+  reply.header("Content-Security-Policy", DRAFT_CONTENT_SECURITY_POLICY);
+  reply.header("Cache-Control", servedDraftCacheControl(versionNumber));
   return reply.type("text/html").send(
     renderDraftWrapper({
       draft,
