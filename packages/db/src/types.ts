@@ -1,4 +1,5 @@
 import type { DraftVisibility, UploadMetadata } from "@patchpage/core";
+import type { SchemaMigration } from "./migrations.js";
 
 export interface ApiTokenAuth {
   id: string;
@@ -102,8 +103,18 @@ export interface DraftModerationOptions {
   canModerateAnonymous?: boolean;
 }
 
+export interface DbDriverOptions {
+  /**
+   * The ordered migration list to run. Defaults to the shipped
+   * `SCHEMA_MIGRATIONS`; overridden to exercise a migration end to end.
+   */
+  migrations?: readonly SchemaMigration[];
+}
+
 export interface PatchPageDb {
   initialize(bootstrapApiToken: string | null): Promise<void>;
+  /** The applied migration IDs this database records, in apply order. */
+  listAppliedMigrations(): Promise<string[]>;
   getAnonymousUploadPrincipal(): Promise<AnonymousUploadPrincipal>;
   findApiTokenByToken(token: string): Promise<ApiTokenAuth | null>;
   createApiToken(input: CreateApiTokenInput): Promise<{ id: string; name: string }>;

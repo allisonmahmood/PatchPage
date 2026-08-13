@@ -1,95 +1,173 @@
-import {
-  ANONYMOUS_INTERNAL_REVOKED_AT,
-  ANONYMOUS_INTERNAL_TOKEN_HASH,
-  ANONYMOUS_UPLOAD_PRINCIPAL
-} from "./internal-principals.js";
+/**
+ * The ordered schema-migration list both drivers share.
+ *
+ * A migration is one additive schema step with an optional part per driver:
+ * `postgres` is idempotent DDL, `json` is an idempotent transform that
+ * default-fills the new fields on rows written by any earlier schema version.
+ * A step may be omitted when a driver has nothing to do — a Postgres index has
+ * no JSON analogue, and a JSON default-fill is a Postgres column default.
+ *
+ * Both drivers keep a ledger of applied migration IDs (the `schema_migrations`
+ * table, the `schemaMigrations` array), so a migration runs once and re-running
+ * from any prior state is a no-op. Every step must still be idempotent on its
+ * own: a database deployed before this ledger existed reaches the ledger by
+ * having the baseline replayed over its live schema.
+ *
+ * See `packages/db/README.md` for how to add one.
+ */
+export interface SchemaMigration {
+  /** Ordered, immutable once merged. Zero-padded so ID order is apply order. */
+  readonly id: string;
+  /** Idempotent DDL. Omit when the migration does not touch Postgres. */
+  readonly postgres?: string;
+  /**
+   * Idempotent in-place transform of the parsed JSON state. Runs before the
+   * row guards, so it is what teaches them a row shape they don't know yet.
+   * Omit when the migration does not touch the JSON driver.
+   */
+  readonly json?: (state: JsonMigrationState) => void;
+}
 
-export const POSTGRES_SCHEMA_SQL = `
-CREATE TABLE IF NOT EXISTS accounts (
-  id TEXT PRIMARY KEY,
-  name TEXT NOT NULL,
-  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-  updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+/**
+ * The JSON state as a migration sees it: parsed but not yet guarded, so every
+ * field is untrusted. Migrations read defensively and write concrete values.
+ */
+export type JsonMigrationState = Record<string, unknown>;
+
+/** The name of the JSON state's migration ledger. */
+export const JSON_MIGRATION_LEDGER_KEY = "schemaMigrations";
+
+const JSON_ROW_COLLECTIONS = [
+  "accounts",
+  "apiTokens",
+  "drafts",
+  "draftVersions",
+  "uploadEvents"
+] as const;
+
+export const SCHEMA_MIGRATIONS: readonly SchemaMigration[] = [
+  {
+    id: "0001_baseline_schema",
+    postgres: `
+      CREATE TABLE IF NOT EXISTS accounts (
+        id TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+      );
+
+      CREATE TABLE IF NOT EXISTS api_tokens (
+        id TEXT PRIMARY KEY,
+        account_id TEXT NOT NULL REFERENCES accounts(id),
+        name TEXT NOT NULL,
+        token_hash TEXT NOT NULL UNIQUE,
+        scopes JSONB NOT NULL DEFAULT '["upload"]'::jsonb,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        last_used_at TIMESTAMPTZ,
+        revoked_at TIMESTAMPTZ
+      );
+
+      CREATE TABLE IF NOT EXISTS drafts (
+        id TEXT PRIMARY KEY,
+        account_id TEXT NOT NULL REFERENCES accounts(id),
+        title TEXT NOT NULL,
+        visibility TEXT NOT NULL DEFAULT 'unlisted',
+        current_version_id TEXT,
+        repo_org TEXT,
+        repo_name TEXT,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        deleted_at TIMESTAMPTZ,
+        disabled_at TIMESTAMPTZ,
+        disabled_reason TEXT
+      );
+
+      CREATE TABLE IF NOT EXISTS draft_versions (
+        id TEXT PRIMARY KEY,
+        draft_id TEXT NOT NULL REFERENCES drafts(id),
+        version_number INTEGER NOT NULL,
+        object_key TEXT NOT NULL,
+        content_hash TEXT NOT NULL,
+        file_size INTEGER NOT NULL,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        created_by_api_token_id TEXT NOT NULL REFERENCES api_tokens(id),
+        source_ip TEXT,
+        user_agent TEXT,
+        cli_version TEXT,
+        git_branch TEXT,
+        git_commit_sha TEXT,
+        original_filename TEXT,
+        UNIQUE (draft_id, version_number)
+      );
+
+      CREATE TABLE IF NOT EXISTS upload_events (
+        id TEXT PRIMARY KEY,
+        draft_id TEXT NOT NULL REFERENCES drafts(id),
+        draft_version_id TEXT REFERENCES draft_versions(id),
+        api_token_id TEXT NOT NULL REFERENCES api_tokens(id),
+        event_type TEXT NOT NULL,
+        source_ip TEXT,
+        user_agent TEXT,
+        metadata_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+      );
+
+      CREATE INDEX IF NOT EXISTS draft_versions_draft_id_idx ON draft_versions(draft_id);
+      CREATE INDEX IF NOT EXISTS upload_events_draft_id_idx ON upload_events(draft_id);
+    `,
+    json(state) {
+      for (const collection of JSON_ROW_COLLECTIONS) {
+        if (!Array.isArray(state[collection])) state[collection] = [];
+      }
+    }
+  },
+  {
+    id: "0002_drafts_account_id_index",
+    // Ownership lookups (a principal's live drafts) scan by account today.
+    // JSON has no index concept, so this migration has no JSON step.
+    postgres: `CREATE INDEX IF NOT EXISTS drafts_account_id_idx ON drafts(account_id);`
+  }
+];
+
+/** Every shipped migration ID, in apply order. */
+export const SCHEMA_MIGRATION_IDS: readonly string[] = SCHEMA_MIGRATIONS.map(
+  (migration) => migration.id
 );
 
-CREATE TABLE IF NOT EXISTS api_tokens (
-  id TEXT PRIMARY KEY,
-  account_id TEXT NOT NULL REFERENCES accounts(id),
-  name TEXT NOT NULL,
-  token_hash TEXT NOT NULL UNIQUE,
-  scopes JSONB NOT NULL DEFAULT '["upload"]'::jsonb,
-  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-  last_used_at TIMESTAMPTZ,
-  revoked_at TIMESTAMPTZ
-);
+export interface JsonMigrationResult {
+  state: JsonMigrationState;
+  changed: boolean;
+}
 
-CREATE TABLE IF NOT EXISTS drafts (
-  id TEXT PRIMARY KEY,
-  account_id TEXT NOT NULL REFERENCES accounts(id),
-  title TEXT NOT NULL,
-  visibility TEXT NOT NULL DEFAULT 'unlisted',
-  current_version_id TEXT,
-  repo_org TEXT,
-  repo_name TEXT,
-  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-  updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-  deleted_at TIMESTAMPTZ,
-  disabled_at TIMESTAMPTZ,
-  disabled_reason TEXT
-);
+/**
+ * Brings a parsed JSON state up to the current schema in place, recording each
+ * applied migration in the ledger. Runs before the row guards: a state written
+ * by an earlier schema version becomes guard-valid here or not at all.
+ */
+export function applyJsonMigrations(
+  state: JsonMigrationState,
+  migrations: readonly SchemaMigration[] = SCHEMA_MIGRATIONS
+): JsonMigrationResult {
+  const persistedLedger = state[JSON_MIGRATION_LEDGER_KEY];
+  const ledger = readJsonLedger(state);
+  const applied = new Set(ledger);
+  // A missing or partly unreadable ledger is itself a change worth persisting.
+  let changed = !Array.isArray(persistedLedger) || persistedLedger.length !== ledger.length;
 
-CREATE TABLE IF NOT EXISTS draft_versions (
-  id TEXT PRIMARY KEY,
-  draft_id TEXT NOT NULL REFERENCES drafts(id),
-  version_number INTEGER NOT NULL,
-  object_key TEXT NOT NULL,
-  content_hash TEXT NOT NULL,
-  file_size INTEGER NOT NULL,
-  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-  created_by_api_token_id TEXT NOT NULL REFERENCES api_tokens(id),
-  source_ip TEXT,
-  user_agent TEXT,
-  cli_version TEXT,
-  git_branch TEXT,
-  git_commit_sha TEXT,
-  original_filename TEXT,
-  UNIQUE (draft_id, version_number)
-);
+  for (const migration of migrations) {
+    if (applied.has(migration.id)) continue;
+    migration.json?.(state);
+    ledger.push(migration.id);
+    applied.add(migration.id);
+    changed = true;
+  }
 
-CREATE TABLE IF NOT EXISTS upload_events (
-  id TEXT PRIMARY KEY,
-  draft_id TEXT NOT NULL REFERENCES drafts(id),
-  draft_version_id TEXT REFERENCES draft_versions(id),
-  api_token_id TEXT NOT NULL REFERENCES api_tokens(id),
-  event_type TEXT NOT NULL,
-  source_ip TEXT,
-  user_agent TEXT,
-  metadata_json JSONB NOT NULL DEFAULT '{}'::jsonb,
-  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
-);
+  state[JSON_MIGRATION_LEDGER_KEY] = ledger;
+  return { state, changed };
+}
 
-CREATE INDEX IF NOT EXISTS draft_versions_draft_id_idx ON draft_versions(draft_id);
-CREATE INDEX IF NOT EXISTS upload_events_draft_id_idx ON upload_events(draft_id);
-
-INSERT INTO accounts (id, name)
-VALUES ('${ANONYMOUS_UPLOAD_PRINCIPAL.accountId}', 'Anonymous Uploads')
-ON CONFLICT (id) DO UPDATE
-SET name = EXCLUDED.name,
-    updated_at = now();
-
-INSERT INTO api_tokens (id, account_id, name, token_hash, scopes, revoked_at)
-VALUES (
-  '${ANONYMOUS_UPLOAD_PRINCIPAL.apiTokenId}',
-  '${ANONYMOUS_UPLOAD_PRINCIPAL.accountId}',
-  'Anonymous Upload Audit Actor',
-  '${ANONYMOUS_INTERNAL_TOKEN_HASH}',
-  '[]'::jsonb,
-  '${ANONYMOUS_INTERNAL_REVOKED_AT}'::timestamptz
-)
-ON CONFLICT (id) DO UPDATE
-SET account_id = EXCLUDED.account_id,
-    name = EXCLUDED.name,
-    token_hash = EXCLUDED.token_hash,
-    scopes = EXCLUDED.scopes,
-    revoked_at = EXCLUDED.revoked_at;
-`;
+function readJsonLedger(state: JsonMigrationState): string[] {
+  const ledger = state[JSON_MIGRATION_LEDGER_KEY];
+  if (!Array.isArray(ledger)) return [];
+  return ledger.filter((id): id is string => typeof id === "string");
+}

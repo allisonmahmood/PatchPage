@@ -1,15 +1,18 @@
 import pg from "pg";
 import { newInternalId, sha256 } from "@patchpage/core";
 import {
+  ANONYMOUS_INTERNAL_REVOKED_AT,
   ANONYMOUS_INTERNAL_TOKEN_HASH,
   ANONYMOUS_UPLOAD_PRINCIPAL
 } from "./internal-principals.js";
-import { POSTGRES_SCHEMA_SQL } from "./migrations.js";
+import { SCHEMA_MIGRATIONS } from "./migrations.js";
 import { UploadTargetError } from "./types.js";
+import type { SchemaMigration } from "./migrations.js";
 import type {
   AnonymousUploadPrincipal,
   ApiTokenAuth,
   CreateApiTokenInput,
+  DbDriverOptions,
   DraftRecord,
   DraftModerationOptions,
   DraftVersionLookup,
@@ -22,18 +25,35 @@ import type {
 
 const { Pool } = pg;
 
+// A fixed key so concurrent instances serialize their migration runs instead of
+// racing on `CREATE TABLE IF NOT EXISTS`, which is not race-free in Postgres.
+const MIGRATION_ADVISORY_LOCK_KEY = 5150324118422001n;
+
 export class PostgresPatchPageDb implements PatchPageDb {
   private readonly pool: pg.Pool;
+  private readonly migrations: readonly SchemaMigration[];
 
-  constructor(connectionString: string) {
+  constructor(connectionString: string, options: DbDriverOptions = {}) {
     this.pool = new Pool({ connectionString });
+    this.migrations = options.migrations ?? SCHEMA_MIGRATIONS;
   }
 
   async initialize(bootstrapApiToken: string | null): Promise<void> {
-    await this.pool.query(POSTGRES_SCHEMA_SQL);
+    await this.migrate();
+    await this.ensureAnonymousUploadPrincipal();
     if (bootstrapApiToken) {
       await this.ensureBootstrapToken(bootstrapApiToken);
     }
+  }
+
+  async listAppliedMigrations(): Promise<string[]> {
+    const ledgerExists = await this.pool.query(
+      "SELECT to_regclass('schema_migrations') IS NOT NULL AS present"
+    );
+    if (!ledgerExists.rows[0]?.present) return [];
+
+    const result = await this.pool.query("SELECT id FROM schema_migrations ORDER BY id");
+    return result.rows.map((row) => String(row.id));
   }
 
   async getAnonymousUploadPrincipal(): Promise<AnonymousUploadPrincipal> {
@@ -352,6 +372,83 @@ export class PostgresPatchPageDb implements PatchPageDb {
 
   async close(): Promise<void> {
     await this.pool.end();
+  }
+
+  private async migrate(): Promise<void> {
+    const client = await this.pool.connect();
+    try {
+      await client.query("SELECT pg_advisory_lock($1)", [
+        MIGRATION_ADVISORY_LOCK_KEY.toString()
+      ]);
+      await client.query(`
+        CREATE TABLE IF NOT EXISTS schema_migrations (
+          id TEXT PRIMARY KEY,
+          applied_at TIMESTAMPTZ NOT NULL DEFAULT now()
+        );
+      `);
+
+      const applied = new Set(
+        (await client.query("SELECT id FROM schema_migrations")).rows.map((row) =>
+          String(row.id)
+        )
+      );
+
+      for (const migration of this.migrations) {
+        if (applied.has(migration.id)) continue;
+
+        // One transaction per step: Postgres DDL is transactional, so a failed
+        // step leaves neither half-applied schema nor a ledger row claiming it.
+        await client.query("BEGIN");
+        try {
+          if (migration.postgres) await client.query(migration.postgres);
+          await client.query(
+            "INSERT INTO schema_migrations (id) VALUES ($1) ON CONFLICT (id) DO NOTHING",
+            [migration.id]
+          );
+          await client.query("COMMIT");
+        } catch (error) {
+          await client.query("ROLLBACK").catch(() => undefined);
+          throw new Error(`Schema migration ${migration.id} failed.`, { cause: error });
+        }
+      }
+    } finally {
+      await client
+        .query("SELECT pg_advisory_unlock($1)", [MIGRATION_ADVISORY_LOCK_KEY.toString()])
+        .catch(() => undefined);
+      client.release();
+    }
+  }
+
+  private async ensureAnonymousUploadPrincipal(): Promise<void> {
+    await this.pool.query(
+      `
+        INSERT INTO accounts (id, name)
+        VALUES ($1, 'Anonymous Uploads')
+        ON CONFLICT (id) DO UPDATE
+        SET name = EXCLUDED.name,
+            updated_at = now()
+      `,
+      [ANONYMOUS_UPLOAD_PRINCIPAL.accountId]
+    );
+
+    await this.pool.query(
+      `
+        INSERT INTO api_tokens (id, account_id, name, token_hash, scopes, revoked_at)
+        VALUES ($1, $2, 'Anonymous Upload Audit Actor', $3, '[]'::jsonb, $4::timestamptz)
+        ON CONFLICT (id) DO UPDATE
+        SET account_id = EXCLUDED.account_id,
+            name = EXCLUDED.name,
+            token_hash = EXCLUDED.token_hash,
+            scopes = EXCLUDED.scopes,
+            revoked_at = EXCLUDED.revoked_at
+      `,
+      [
+        ANONYMOUS_UPLOAD_PRINCIPAL.apiTokenId,
+        ANONYMOUS_UPLOAD_PRINCIPAL.accountId,
+        ANONYMOUS_INTERNAL_TOKEN_HASH,
+        ANONYMOUS_INTERNAL_REVOKED_AT
+      ]
+    );
   }
 
   private async ensureBootstrapToken(token: string): Promise<void> {
