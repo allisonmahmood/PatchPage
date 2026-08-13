@@ -25,8 +25,12 @@ The line the publishing flow prints when auto-mint fires: which instance, where 
 _Avoid_: warning (it reports success, not a problem)
 
 **Onboarding**:
-The agent-led first-time setup conversation — one question capturing the default style, then publishing the welcome draft. Hosting is assumed to be the official instance and never asked; the own-instance path opens only when the user asserts their own deployment. Asked for by the install snippet, or suggested after a mint announcement; always optional.
+The agent-led first-time setup conversation — one question capturing the default style, then publishing the welcome draft. Hosting is assumed to be the official instance and never asked; the own-instance path opens only when the user asserts their own deployment. Asked for by the setup prompt, or suggested after a mint announcement; always optional.
 _Avoid_: signup, registration, setup wizard
+
+**Setup prompt**:
+The copy-paste block on the website and README that a user hands their agent to get started: install the skill, run onboarding through to the welcome draft, and establish the "make this a PatchPage" habit. Its onboarding sentence is the sole primary trigger — installing the skill runs nothing by itself. Written to be readable by the human pasting it, so it doubles as a plain description of what they are authorizing.
+_Avoid_: install snippet (older internal name), install command (only one of its parts)
 
 **Publishing key**:
 What an auth token is called in front of the user — "your publishing key, saved on this machine". *Token*, *instance*, and *mint* stay out of user-facing copy except on the own-instance path, where operator vocabulary is correct.
