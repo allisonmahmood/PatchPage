@@ -30,9 +30,9 @@ export const DRAFT_CONTENT_SECURITY_POLICY = [
 /** Everything that is not a served draft — API routes included — stays uncached. */
 export const NO_STORE_CACHE_CONTROL = "no-store";
 
-export const LATEST_DRAFT_CACHE_CONTROL = "public, max-age=60";
+const LATEST_DRAFT_CACHE_CONTROL = "public, max-age=60";
 
-export const DRAFT_VERSION_CACHE_CONTROL = "public, max-age=31536000, immutable";
+const DRAFT_VERSION_CACHE_CONTROL = "public, max-age=31536000, immutable";
 
 export function servedDraftCacheControl(versionNumber: number | undefined): string {
   return versionNumber === undefined ? LATEST_DRAFT_CACHE_CONTROL : DRAFT_VERSION_CACHE_CONTROL;

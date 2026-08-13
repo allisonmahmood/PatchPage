@@ -1784,7 +1784,7 @@ describe("PatchPage server", () => {
     await db.close();
   });
 
-  it("serves drafts noindexed, uncookied, and open to every reader", async () => {
+  it("serves drafts noindexed, unwatched, and open to machines", async () => {
     const served = await createServedDraft("serving-guarantees");
 
     for (const url of [served.latestUrl, served.versionUrl]) {
@@ -1816,7 +1816,7 @@ describe("PatchPage server", () => {
     await served.close();
   });
 
-  it("caches version URLs immutably, latest-draft URLs briefly, and API routes never", async () => {
+  it("caches version URLs immutably, latest-draft URLs briefly, and everything else never", async () => {
     const served = await createServedDraft("serving-cache-headers");
 
     const latest = await served.app.inject({ method: "GET", url: served.latestUrl });
@@ -1838,7 +1838,8 @@ describe("PatchPage server", () => {
     expect(missingDraft.statusCode).toBe(404);
     expect(missingDraft.headers["cache-control"]).toBe("no-store");
 
-    const uncachedApiResponses = [
+    // Everything that is not a served draft — API routes included — stays uncached.
+    const uncachedResponses = [
       await served.app.inject({
         method: "GET",
         url: "/api/me",
@@ -1854,7 +1855,7 @@ describe("PatchPage server", () => {
       await served.app.inject({ method: "GET", url: "/healthz" }),
       await served.app.inject({ method: "GET", url: "/" })
     ];
-    for (const response of uncachedApiResponses) {
+    for (const response of uncachedResponses) {
       expect(response.headers["cache-control"]).toBe("no-store");
     }
 
@@ -1888,10 +1889,11 @@ interface ServedDraft {
 }
 
 async function createServedDraft(label: string): Promise<ServedDraft> {
+  const safeLabel = label.replaceAll(/[^a-z0-9]/gi, "-");
   const config = testConfig();
-  const db = new JsonFilePatchPageDb(path.join(tempDir, `${label}-db.json`));
+  const db = new JsonFilePatchPageDb(path.join(tempDir, `${safeLabel}-db.json`));
   await db.initialize("dev-token");
-  const storage = new FileSystemHtmlStorage(path.join(tempDir, `${label}-drafts`));
+  const storage = new FileSystemHtmlStorage(path.join(tempDir, `${safeLabel}-drafts`));
   const app = createApp({ config, db, storage });
 
   const upload = await app.inject({
