@@ -31,3 +31,11 @@ _Avoid_: ban, token deletion
 **Report**:
 A reader's flag on a served draft asking the operator to review it. Filing one is acknowledged immediately and has no automatic consequence; disabling, deleting, or revoking is always an operator decision.
 _Avoid_: takedown request (a report may lead to a takedown; it is not one)
+
+**Circuit breaker**:
+The spend threshold beyond which the instance is no longer willing to operate. Crossing it fires the kill switch automatically; no human confirms first.
+_Avoid_: budget alert (an alert informs; the breaker acts)
+
+**Kill switch**:
+The automated act that takes the public instance fully offline — serving and uploads both — the moment the circuit breaker trips. Fail-closed by design: the instance goes dark rather than absorbing unbounded cost. Bringing it back is always an operator decision.
+_Avoid_: maintenance mode, degraded mode (the kill switch is total, not partial)
