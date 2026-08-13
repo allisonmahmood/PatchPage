@@ -27,9 +27,18 @@ ledger existed reaches it by having the baseline replayed over its live schema,
 which is why **every step must be idempotent on its own** even though the ledger
 normally prevents a second run.
 
-`initialize()` migrates, then seeds (the anonymous upload principal, the
-bootstrap token). Seeding is not a migration: it re-runs on every startup and
+`initialize()` migrates, then seeds (the dedicated internal owner/audit actor,
+the bootstrap token). Seeding is not a migration: it re-runs on every startup and
 must stay idempotent.
+
+Two objects are easy to confuse, so they are named here. **`0002_drafts_account_id_index`
+is the shipped additive migration** — it ships permanently and is not superseded
+by the expiry columns; it exists because ownership lookups scan `drafts` by
+account. The **probe migrations in `src/migration-fixtures.fixture.ts` are
+test-only** and never ship: they exercise a column-level additive step on both
+drivers so the shipped schema needs no placeholder column. A later agent should
+not treat a probe as the pattern to copy for a real column — copy `0002` and the
+steps below.
 
 ### Postgres
 
@@ -71,11 +80,15 @@ never rewrites the file.
    `src/types.ts` and the Postgres row mappers in `src/postgres-db.ts`.
 6. **Test it through the contract suite.** Add the behavior your columns enable
    to `src/upload-contract.test.ts`, which runs on JSON always and on Postgres
-   when `PATCHPAGE_TEST_DATABASE_URL` is set. The mechanism itself is covered by
-   "records every shipped migration once, in order, and re-migrates as a no-op",
-   "adopts a database left at the pre-migration deployed schema", and "applies
-   an additive migration to an already-migrated database" — you do not need to
-   re-prove those.
+   when `PATCHPAGE_TEST_DATABASE_URL` is set. Assert through the port only —
+   never by reading the state file or selecting the column directly. The
+   mechanism itself is already covered ("records every shipped migration once,
+   in order, and re-migrates as a no-op", "resumes from a partly applied
+   ledger", "adopts a database created before this mechanism existed", "applies
+   an additive migration to an already-migrated database", "fails an additive
+   migration whose predecessor never ran", and the JSON guard-inversion case
+   "reads rows written by an earlier schema version only after they migrate"),
+   so you do not need to re-prove any of it.
 7. **Run both drivers** before opening the PR:
 
    ```sh
