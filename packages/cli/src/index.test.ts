@@ -1363,7 +1363,7 @@ describe("auto-mint on first upload", () => {
     }
   });
 
-  it("fails hard when the network has exhausted its daily mints", async () => {
+  it("fails hard when the network has exhausted its rolling-window mints", async () => {
     const stateDir = makeStateDir();
     const htmlPath = path.join(stateDir, "mint-quota.html");
     writeFileSync(htmlPath, "<!doctype html><title>Mint quota</title>");
@@ -1383,8 +1383,9 @@ describe("auto-mint on first upload", () => {
       expect(result.stdout).toBe("");
       expect(result.stderr).toBe(
         `Could not get a publishing token: ${server.apiUrl} has reached its limit of new tokens ` +
-          "for your network today.\nCopy an existing token from another machine and save it " +
-          `with: patchpage auth set --api-url ${server.apiUrl}, or try again tomorrow.\n`
+          "for your network over the last 24 hours.\nCopy an existing token from another " +
+          `machine and save it with: patchpage auth set --api-url ${server.apiUrl}, or try ` +
+          "again once the oldest of those mints is 24 hours old.\n"
       );
       expect(server.mints).toHaveLength(1);
       expect(server.requests).toEqual([]);
