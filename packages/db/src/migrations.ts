@@ -160,6 +160,34 @@ export const SCHEMA_MIGRATIONS: readonly SchemaMigration[] = [
         if (typeof row.expiresAt !== "string") row.expiresAt = backfill;
       }
     }
+  },
+  {
+    id: "0004_drafts_pinned_at",
+    // The pin: when an operator exempted this draft from expiry, or NULL for an
+    // ordinary one. Nullable with no backfill on purpose — "unpinned" is the
+    // absence of a pin, so every pre-existing draft is already correct, and the
+    // spec's "nothing pre-existing is pinned" needs no work to hold.
+    //
+    // The partial index is the sweep's: it scans by anchor over unpinned rows
+    // only, which is exactly the set the sweep may take.
+    postgres: `
+      ALTER TABLE drafts ADD COLUMN IF NOT EXISTS pinned_at TIMESTAMPTZ;
+      CREATE INDEX IF NOT EXISTS drafts_expiry_sweep_idx
+        ON drafts(expires_at) WHERE pinned_at IS NULL;
+    `,
+    json(state) {
+      const drafts = state.drafts;
+      if (!Array.isArray(drafts)) return;
+
+      for (const draft of drafts) {
+        if (!draft || typeof draft !== "object") continue;
+        const row = draft as Record<string, unknown>;
+        // The guard requires the key, and a Postgres NULL is a JSON null.
+        if (typeof row.pinnedAt !== "string" && row.pinnedAt !== null) {
+          row.pinnedAt = null;
+        }
+      }
+    }
   }
 ];
 

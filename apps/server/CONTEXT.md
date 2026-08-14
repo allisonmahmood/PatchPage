@@ -20,6 +20,10 @@ _Avoid_: account (in product language)
 The guardrail that removes a draft for good when its retention clock runs out. An upload resets the clock to the full window; a visit tops the remaining time up to the visit-extension window. Expiry is a hard delete — content and record both gone, no recovery — and applies to every draft regardless of who owns it, unless the draft is pinned.
 _Avoid_: soft delete, archival, retention (for the act of deleting — retention is the clock, expiry is the consequence)
 
+**Expiry sweep**:
+The job that carries draft expiry out: it takes every draft whose clock has run out and no pin holds, deletes the record and the content behind it, and leaves nothing to restore. It runs in the serving process against the same clock the rest of the instance reads, is safe to run repeatedly and while serving, and is the moment a draft stops costing storage and stops counting against its creator's quota. A draft is expired the moment its clock runs out; the sweep is only when the row and the bytes actually go.
+_Avoid_: cleanup job, garbage collection, reaper, purge
+
 **Visit**:
 One successful serving of a draft page, at either its latest or a version URL. A visit is the only thing besides an upload that moves a retention clock, and it only ever moves it forward: with less than the visit-extension window left it tops the draft up to exactly that window, and otherwise changes nothing at all. A visit never brings back a draft that has already expired.
 _Avoid_: view, hit, page load (a visit is a serving that succeeded, not a request that arrived)
@@ -33,7 +37,7 @@ The ceiling on live drafts one token may hold at once. Counted from the database
 _Avoid_: draft limit (ambiguous with the per-minute create limit), storage quota (this counts drafts, not bytes)
 
 **Pinned draft**:
-A draft exempted from expiry by an operator, for pages the instance itself maintains (welcome page, docs). Pinning is an admin-only act; a pinned draft is otherwise an ordinary draft.
+A draft exempted from expiry by an operator, for pages the instance itself maintains (welcome page, docs). Pinning is an admin-only act; a pinned draft is otherwise an ordinary draft — served, updatable by its owner, counted against its creator's quota. The clock keeps running underneath the pin and visits keep topping it up, so unpinning hands the draft back to whatever time it had left: a page still being read keeps its visit window, and one nobody has read in months expires at once. A pin only ever holds a draft that is in service: deleting or disabling one ends its pin, and a draft already deleted or disabled cannot be pinned — moderation and deletion outrank a pin, so neither can leave content the sweep may never take.
 _Avoid_: permanent draft, system page
 
 **Revocation**:

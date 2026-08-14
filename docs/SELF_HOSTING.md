@@ -262,6 +262,36 @@ A create that would exceed the quota is rejected with HTTP `403` and JSON `{ "ok
 
 Unlike the buckets above, this ceiling is not process-local: it is recounted from the metadata store on every create, so restarting or scaling the server does not reset it.
 
+### Draft expiry and pinned drafts
+
+Every draft carries a retention clock. Publishing a new version restarts it at 90 days, and serving a draft with less than 30 days left tops it back up to 30 — so a page that is still read stays up, and one that nobody visits runs out. A draft whose clock has run out immediately stops serving (`404`) and is refused as an update target.
+
+Expiry is a **hard delete**. An in-process sweep runs hourly, and once at startup, in the same process that serves pages: it deletes the expired draft's record, its versions, its upload events, and the stored HTML behind them. No copy is kept anywhere and there is no restore — republishing is the only way back, and it produces a new draft with a new URL. Deleted and disabled drafts age out the same way, which is what eventually frees their storage. The sweep is safe to run while serving and takes at most 1000 drafts per run, so a large backlog drains across several runs.
+
+Because the record is deleted before its stored objects, a crash mid-sweep can leave an unreachable HTML object behind. Nothing serves it and no later run will find it, so reclaim it from `PATCHPAGE_STORAGE_DIR` (or your blob container) by hand if you care about the bytes.
+
+An expired draft still counts against its creator's [draft quota](#per-token-draft-quotas) until the sweep removes it, because its row and its content are both still there.
+
+To exempt a page the instance itself maintains — a welcome page, your own docs — pin it with an `admin`-scoped token:
+
+```sh
+# Keep the credential out of argv: put the header in an owner-only file first.
+PIN_TMP_DIR="$(mktemp -d)" && chmod 700 "$PIN_TMP_DIR"
+(umask 077; printf 'Authorization: Bearer %s\n' "$ADMIN_TOKEN" \
+  > "$PIN_TMP_DIR/auth.headers")
+
+curl --fail --silent --show-error --request POST \
+  --header "@$PIN_TMP_DIR/auth.headers" \
+  "$API_URL/api/drafts/$DRAFT_ID/pin"
+# {"ok":true,"pinned":true}
+
+rm -rf "$PIN_TMP_DIR"
+```
+
+`POST /api/drafts/:draftId/unpin` reverses it. Both return `404` for a draft that is not there, and `403` for a token without the `admin` scope — including the token that created the draft. A pinned draft is never expired and never swept, however long it sits; in every other respect it is ordinary. Its clock keeps running underneath the pin and visits keep topping it up, so unpinning hands it back to whatever time it had left: a page still being read keeps its 30-day visit window, and one nobody has read in months expires at once.
+
+A pin only ever holds a page that is **in service**. Deleting or disabling a draft ends its pin, and pinning a draft that is already deleted or disabled returns `404` — so a pin can never keep a moderated or withdrawn page's storage alive. Unpinning works on any draft that still has a row, which means a pin can never get stuck out of reach.
+
 ### JSON metadata durability
 
 The `json` driver supports one PatchPage Node process. Within that process, database objects targeting the same backing-directory filesystem identity — including containing-directory bind-mount aliases and case aliases on case-insensitive filesystems — share one mutation serializer, even before the final file exists. Queue identity includes every existing ancestor, so creating a missing parent cannot move a later mutation onto a different queue. Each mutation completes its read, state-shape validation, update, and commit before the next mutation starts. This coordination is strictly process-local; the driver does not provide interprocess locking.

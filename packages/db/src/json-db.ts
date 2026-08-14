@@ -18,7 +18,7 @@ import {
   JSON_MIGRATION_LEDGER_KEY,
   SCHEMA_MIGRATIONS
 } from "./migrations.js";
-import { expiryAfterUpload, expiryAfterVisit, hasExpired } from "./retention.js";
+import { expiryAfterUpload, expiryAfterVisit, isExpired } from "./retention.js";
 import { UploadTargetError } from "./types.js";
 import type { JsonMigrationState, SchemaMigration } from "./migrations.js";
 import type {
@@ -243,6 +243,7 @@ export class JsonFilePatchPageDb implements PatchPageDb {
           createdAt: now,
           updatedAt: now,
           expiresAt,
+          pinnedAt: null,
           deletedAt: null,
           disabledAt: null,
           disabledReason: null
@@ -298,10 +299,7 @@ export class JsonFilePatchPageDb implements PatchPageDb {
     const draft =
       state.drafts.find(
         (row) =>
-          row.id === draftId &&
-          !row.deletedAt &&
-          !row.disabledAt &&
-          !hasExpired(row.expiresAt, now)
+          row.id === draftId && !row.deletedAt && !row.disabledAt && !isExpired(row, now)
       ) || null;
     if (!draft) return { draft: null, version: null };
 
@@ -322,11 +320,63 @@ export class JsonFilePatchPageDb implements PatchPageDb {
         null;
       // A visit that changes nothing must not write: outside the top-up window,
       // serving a draft stays a pure read of the state file.
-      const toppedUp = draft ? expiryAfterVisit(draft.expiresAt, now) : null;
+      const toppedUp = draft ? expiryAfterVisit(draft, now) : null;
       if (!draft || !toppedUp) return { value: undefined, changed: false };
 
       draft.expiresAt = toppedUp;
       return { value: undefined, changed: true };
+    });
+  }
+
+  async setDraftPinned(draftId: string, pinned: boolean): Promise<boolean> {
+    return this.mutateState((state) => {
+      // Pinning needs a draft in service; unpinning takes whatever row is left,
+      // so a pin can never be stuck on a draft that has since been taken down.
+      const draft =
+        state.drafts.find(
+          (row) =>
+            row.id === draftId && (!pinned || (!row.deletedAt && !row.disabledAt))
+        ) || null;
+      if (!draft) return { value: false, changed: false };
+
+      draft.pinnedAt = pinned ? this.nowIso() : null;
+      return { value: true, changed: true };
+    });
+  }
+
+  async listExpiredDraftIds(limit: number): Promise<string[]> {
+    if (limit <= 0) return [];
+
+    const state = await this.readState();
+    const now = this.clock();
+    return state.drafts
+      .filter((draft) => isExpired(draft, now))
+      .sort((left, right) => Date.parse(left.expiresAt) - Date.parse(right.expiresAt))
+      .slice(0, limit)
+      .map((draft) => draft.id);
+  }
+
+  async deleteExpiredDraft(draftId: string): Promise<string[] | null> {
+    return this.mutateState<string[] | null>((state) => {
+      const now = this.clock();
+      const draft = state.drafts.find((row) => row.id === draftId) || null;
+      // Re-read under the mutation lock rather than trusting the listing: a pin
+      // may have landed in between, and a pinned draft is not expired.
+      if (!draft || !isExpired(draft, now)) return { value: null, changed: false };
+
+      const objectKeys = state.draftVersions
+        .filter((version) => version.draftId === draftId)
+        .map((version) => version.objectKey);
+
+      // Everything that points at the draft goes with it. Upload events name
+      // both the draft and its versions, so they cannot outlive either.
+      state.uploadEvents = state.uploadEvents.filter((event) => event.draftId !== draftId);
+      state.draftVersions = state.draftVersions.filter(
+        (version) => version.draftId !== draftId
+      );
+      state.drafts = state.drafts.filter((row) => row.id !== draftId);
+
+      return { value: objectKeys, changed: true };
     });
   }
 
@@ -349,6 +399,8 @@ export class JsonFilePatchPageDb implements PatchPageDb {
       draft.disabledAt = this.nowIso();
       draft.disabledReason = reason;
       draft.updatedAt = draft.disabledAt;
+      // Out of service, so out of pin: moderation outranks an expiry exemption.
+      draft.pinnedAt = null;
       return { value: true, changed: true };
     });
   }
@@ -370,6 +422,8 @@ export class JsonFilePatchPageDb implements PatchPageDb {
 
       draft.deletedAt = this.nowIso();
       draft.updatedAt = draft.deletedAt;
+      // A deleted draft keeps no pin, so its storage still ages out.
+      draft.pinnedAt = null;
       return { value: true, changed: true };
     });
   }
@@ -865,6 +919,7 @@ function isDraftRecord(value: unknown): value is DraftRecord {
     typeof value.createdAt === "string" &&
     typeof value.updatedAt === "string" &&
     typeof value.expiresAt === "string" &&
+    isNullableString(value.pinnedAt) &&
     isNullableString(value.deletedAt) &&
     isNullableString(value.disabledAt) &&
     isNullableString(value.disabledReason)
@@ -985,7 +1040,7 @@ function assertUploadTarget(
     existingDraft.accountId !== input.accountId ||
     existingDraft.deletedAt ||
     existingDraft.disabledAt ||
-    hasExpired(existingDraft.expiresAt, now)
+    isExpired(existingDraft, now)
   ) {
     throw new UploadTargetError("draft_unavailable");
   }

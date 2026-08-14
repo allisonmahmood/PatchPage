@@ -8,11 +8,38 @@ in `src/upload-contract.test.ts`.
 ## The retention clock
 
 Every draft carries one expiry anchor, `expiresAt`, and `src/retention.ts` owns
-the three rules that act on it: an upload restarts the full window, a visit tops
-the remaining time up to the visit window when less than that remains, and a
-draft is expired the moment `expiresAt` is past. Expired drafts are absent from
-`findDraftVersion` and refused as update targets, exactly as deleted and disabled
-ones are — the row itself stays until a sweep removes it.
+the rules that act on it: an upload restarts the full window, a visit tops the
+remaining time up to the visit window when less than that remains, a draft is
+expired the moment `expiresAt` is past — and a **pinned** draft (`pinnedAt` set)
+is never expired, however far past its anchor now is. `isExpired` is the one
+answer everything keys on, and it needs no term for deleted or disabled drafts
+because a pin only ever sits on a draft in service: `deleteDraft` and
+`disableDraft` clear the pin, and `setDraftPinned` refuses to pin a draft that is
+already deleted or disabled — while unpinning takes any row still there, so a pin
+can never be stuck on a draft the operator has since taken down. Without that
+invariant, a pinned-then-deleted draft would be exempt from the sweep forever.
+Expired drafts are absent from `findDraftVersion` and
+refused as update targets, exactly as deleted and disabled ones are; the row
+itself stays until the sweep removes it.
+
+## The expiry sweep
+
+Expiry is a hard delete, and `listExpiredDraftIds` plus `deleteExpiredDraft` are
+how it happens: the first names drafts whose clock has run out with no pin on
+them, the second takes one — its upload events, its versions, and the draft row,
+in the order the foreign keys require — and answers with the storage keys those
+versions held so the caller can delete the content too. There is no recovery.
+
+The record goes before the content on purpose. Once the row is gone its objects
+are unreachable, so a failure between the two leaks storage; the other order
+risks a live draft whose content vanished. `deleteExpiredDraft` re-checks expiry
+under a row lock, so a pin landing mid-sweep saves the draft rather than racing
+it, and answers `null` when there was nothing to take.
+
+The sweep is what frees storage *and* quota in one event: an expired draft still
+counts against `countLiveDraftsByCreatorApiToken` until its row is gone. Who
+calls the sweep, and how often, is the hosting app's business — see
+`apps/server/src/expiry-sweep.ts`.
 
 Both drivers answer to those functions, and the contract suite is what holds them
 to the same answers; the Postgres driver restates the visit rule as one SQL
@@ -57,10 +84,11 @@ Seeding is not a migration: it re-runs on every startup and must stay idempotent
 (The retired anonymous owner/audit actor used to be seeded here too; the
 trust-model cutover removed it, and no sentinel principal is seeded now.)
 
-Two objects are easy to confuse, so they are named here. **`0002_drafts_account_id_index`
-and `0003_drafts_expiry_columns` are the shipped additive migrations** — both
-ship permanently and neither supersedes the other; `0002` exists because
-ownership lookups scan `drafts` by account. The **probe migrations in
+Two objects are easy to confuse, so they are named here. **`0002_drafts_account_id_index`,
+`0003_drafts_expiry_columns`, and `0004_drafts_pinned_at` are the shipped additive
+migrations** — each ships permanently and none supersedes another; `0002` exists
+because ownership lookups scan `drafts` by account, and `0004` adds the pin plus
+the partial index the sweep scans. The **probe migrations in
 `src/migration-fixtures.fixture.ts` are test-only** and never ship: they exercise
 a column-level additive step on both drivers without putting a placeholder column
 in the shipped schema. A later agent should not treat a probe as the pattern to

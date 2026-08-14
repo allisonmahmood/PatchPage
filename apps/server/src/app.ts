@@ -19,6 +19,7 @@ import {
   validateHtml
 } from "@patchpage/core";
 import type { UploadMetadata } from "@patchpage/core";
+import { createExpirySweep, type ExpirySweepResult } from "./expiry-sweep.js";
 import { getDraftPublicUrl } from "./public-url.js";
 import {
   createRateLimiters,
@@ -53,6 +54,15 @@ interface TokenBody {
 }
 
 declare module "fastify" {
+  interface FastifyInstance {
+    /**
+     * Runs the expiry sweep once, against this app's clock. The app owns it so
+     * that winding the clock forward and sweeping is one seam, and so that the
+     * only thing left to schedule is the calling.
+     */
+    sweepExpiredDrafts(): Promise<ExpirySweepResult>;
+  }
+
   interface FastifyRequest {
     auth?: ApiTokenAuth;
     authState?: ApiRequestAuthState;
@@ -86,6 +96,13 @@ type ApiRequestTargetPolicy =
     };
 
 const FASTIFY_DEFAULT_MAX_PARAM_LENGTH = 100;
+/**
+ * The `POST /api/drafts/:draftId/<suffix>` routes that exist. An overlong
+ * parameter on one of these is a too-long target; on anything else it is a
+ * route that was never there. Adding a route here without adding it below
+ * turns its overlong-parameter answer into a 404.
+ */
+const REGISTERED_DRAFT_POST_SUFFIXES = new Set(["disable", "pin", "unpin"]);
 const PRE_ROUTING_API_ERROR_TARGET = "/api/__patchpage_pre_routing_error__";
 const preRoutingApiErrorStatus = Symbol("preRoutingApiErrorStatus");
 
@@ -122,6 +139,13 @@ export function createApp(options: CreateAppOptions): FastifyInstance {
 
   const protectedApi = (requiredScope?: string, hookOptions: ProtectedApiHookOptions = {}) =>
     protectedApiRouteHook(requiredScope, hookOptions);
+
+  const expirySweep = createExpirySweep({
+    db: options.db,
+    storage: options.storage,
+    log: app.log
+  });
+  app.decorate("sweepExpiredDrafts", () => expirySweep.run());
 
   app.get("/", async (_request, reply) => {
     return reply.type("text/html").send(renderHome({ publicBaseUrl: options.config.publicBaseUrl }));
@@ -287,6 +311,28 @@ export function createApp(options: CreateAppOptions): FastifyInstance {
       return { ok: true };
     }
   );
+
+  // Pinning is an operator's act on the instance's own pages, so it is
+  // admin-scoped and unowned: an admin pins any draft, whoever holds it. The
+  // pin exempts the draft from expiry and changes nothing else about it.
+  //
+  // A pin only holds a draft that is in service, so pinning a deleted or
+  // disabled one is a 404 — while unpinning works on anything still there.
+  for (const route of [
+    { suffix: "pin", pinned: true },
+    { suffix: "unpin", pinned: false }
+  ] as const) {
+    app.post(
+      `/api/drafts/:draftId/${route.suffix}`,
+      { onRequest: protectedApi("admin") },
+      async (request, reply) => {
+        const draftId = (request.params as { draftId: string }).draftId;
+        const applied = await options.db.setDraftPinned(draftId, route.pinned);
+        if (!applied) return reply.status(404).send({ ok: false, error: "Draft not found." });
+        return { ok: true, pinned: route.pinned };
+      }
+    );
+  }
 
   app.delete(
     "/api/drafts/:draftId",
@@ -497,11 +543,11 @@ function registeredApiParamRoutingErrorStatus(
   }
 
   if (method === "POST") {
-    const exactDisableRoute =
+    const exactRegisteredRoute =
       rawSuffix !== undefined &&
       extraSegments.length === 0 &&
-      decodeURI(rawSuffix) === "disable";
-    return exactDisableRoute ? 414 : 404;
+      REGISTERED_DRAFT_POST_SUFFIXES.has(decodeURI(rawSuffix));
+    return exactRegisteredRoute ? 414 : 404;
   }
 
   return rawSuffix === undefined ? 414 : 404;

@@ -20,6 +20,17 @@ import type {
 
 const { Pool } = pg;
 
+/**
+ * "Not expired" as one SQL predicate, restating `isExpired` from `retention.ts`:
+ * a pin exempts the draft outright, and otherwise the anchor must not be past.
+ * The argument names the placeholder carrying the clock's reading, which every
+ * query using this must bind — and the contract suite is what holds this
+ * predicate and the TypeScript rule to the same answers.
+ */
+function notExpired(clockParameter: number): string {
+  return `(drafts.pinned_at IS NOT NULL OR drafts.expires_at >= $${clockParameter}::timestamptz)`;
+}
+
 // A fixed key so concurrent instances serialize their migration runs instead of
 // racing on `CREATE TABLE IF NOT EXISTS`, which is not race-free in Postgres.
 const MIGRATION_ADVISORY_LOCK_KEY = 5150324118422001n;
@@ -142,7 +153,7 @@ export class PostgresPatchPageDb implements PatchPageDb {
                 AND account_id = $2
                 AND deleted_at IS NULL
                 AND disabled_at IS NULL
-                AND expires_at >= $3::timestamptz
+                AND ${notExpired(3)}
             `,
             [input.draftId, input.accountId, this.nowIso()]
           )
@@ -177,7 +188,7 @@ export class PostgresPatchPageDb implements PatchPageDb {
               AND account_id = $2
               AND deleted_at IS NULL
               AND disabled_at IS NULL
-              AND expires_at >= $3::timestamptz
+              AND ${notExpired(3)}
             FOR UPDATE
           `,
           [input.draftId, input.accountId, this.nowIso()]
@@ -315,7 +326,7 @@ export class PostgresPatchPageDb implements PatchPageDb {
         WHERE id = $1
           AND deleted_at IS NULL
           AND disabled_at IS NULL
-          AND expires_at >= $2::timestamptz
+          AND ${notExpired(2)}
         LIMIT 1
       `,
       [draftId, this.nowIso()]
@@ -348,7 +359,8 @@ export class PostgresPatchPageDb implements PatchPageDb {
     // One predicate says both halves of the visit rule: `expires_at` below the
     // topped-up anchor is exactly "less than the visit-extension window
     // remains", and it is also exactly "this move does not shorten the clock".
-    // The lower bound keeps a visit from reviving an already-expired draft.
+    // The not-expired term keeps a visit from reviving an expired draft — and,
+    // because a pin means not expired, keeps topping a pinned draft up.
     await this.pool.query(
       `
         UPDATE drafts
@@ -356,7 +368,7 @@ export class PostgresPatchPageDb implements PatchPageDb {
         WHERE id = $1
           AND deleted_at IS NULL
           AND disabled_at IS NULL
-          AND expires_at >= $3::timestamptz
+          AND ${notExpired(3)}
           AND expires_at < $2::timestamptz
       `,
       [
@@ -365,6 +377,89 @@ export class PostgresPatchPageDb implements PatchPageDb {
         new Date(now).toISOString()
       ]
     );
+  }
+
+  async setDraftPinned(draftId: string, pinned: boolean): Promise<boolean> {
+    // Two statements rather than one predicate carrying a boolean: pinning
+    // needs a draft in service, and unpinning takes whatever row is left, so a
+    // pin can never be stuck on a draft that has since been taken down.
+    const result = pinned
+      ? await this.pool.query(
+          `
+            UPDATE drafts
+            SET pinned_at = $2::timestamptz
+            WHERE id = $1
+              AND deleted_at IS NULL
+              AND disabled_at IS NULL
+            RETURNING id
+          `,
+          [draftId, this.nowIso()]
+        )
+      : await this.pool.query(
+          "UPDATE drafts SET pinned_at = NULL WHERE id = $1 RETURNING id",
+          [draftId]
+        );
+    return Boolean(result.rowCount);
+  }
+
+  async listExpiredDraftIds(limit: number): Promise<string[]> {
+    if (limit <= 0) return [];
+
+    const result = await this.pool.query(
+      `
+        SELECT id
+        FROM drafts
+        WHERE NOT ${notExpired(1)}
+        ORDER BY expires_at ASC
+        LIMIT $2
+      `,
+      [this.nowIso(), limit]
+    );
+    return result.rows.map((row) => String(row.id));
+  }
+
+  async deleteExpiredDraft(draftId: string): Promise<string[] | null> {
+    const client = await this.pool.connect();
+    try {
+      await client.query("BEGIN");
+
+      // The row lock plus the re-check is what makes a concurrent pin safe: a
+      // pin either lands before this and the draft is no longer expired, or it
+      // waits here and finds nothing left to pin.
+      const target = await client.query(
+        `
+          SELECT id
+          FROM drafts
+          WHERE id = $1
+            AND NOT ${notExpired(2)}
+          FOR UPDATE
+        `,
+        [draftId, this.nowIso()]
+      );
+      if (!target.rowCount) {
+        await client.query("ROLLBACK");
+        return null;
+      }
+
+      const versions = await client.query(
+        "SELECT object_key FROM draft_versions WHERE draft_id = $1",
+        [draftId]
+      );
+
+      // Foreign keys decide the order: upload events name both the draft and
+      // its versions, versions name the draft, and the draft goes last.
+      await client.query("DELETE FROM upload_events WHERE draft_id = $1", [draftId]);
+      await client.query("DELETE FROM draft_versions WHERE draft_id = $1", [draftId]);
+      await client.query("DELETE FROM drafts WHERE id = $1", [draftId]);
+
+      await client.query("COMMIT");
+      return versions.rows.map((row) => String(row.object_key));
+    } catch (error) {
+      await client.query("ROLLBACK").catch(() => undefined);
+      throw error;
+    } finally {
+      client.release();
+    }
   }
 
   async disableDraft(
@@ -376,7 +471,9 @@ export class PostgresPatchPageDb implements PatchPageDb {
     const result = await this.pool.query(
       `
         UPDATE drafts
-        SET disabled_at = now(), disabled_reason = $3, updated_at = now()
+        SET disabled_at = now(), disabled_reason = $3, updated_at = now(),
+            -- Out of service, so out of pin: moderation outranks an exemption.
+            pinned_at = NULL
         WHERE id = $1
           AND (account_id = $2 OR $4)
           AND deleted_at IS NULL
@@ -395,7 +492,9 @@ export class PostgresPatchPageDb implements PatchPageDb {
     const result = await this.pool.query(
       `
         UPDATE drafts
-        SET deleted_at = now(), updated_at = now()
+        SET deleted_at = now(), updated_at = now(),
+            -- A deleted draft keeps no pin, so its storage still ages out.
+            pinned_at = NULL
         WHERE id = $1
           AND (account_id = $2 OR $3)
           AND deleted_at IS NULL
@@ -490,6 +589,7 @@ function mapDraft(row: any): DraftRecord {
     createdAt: toIso(row.created_at),
     updatedAt: toIso(row.updated_at),
     expiresAt: toIso(row.expires_at),
+    pinnedAt: row.pinned_at ? toIso(row.pinned_at) : null,
     deletedAt: row.deleted_at ? toIso(row.deleted_at) : null,
     disabledAt: row.disabled_at ? toIso(row.disabled_at) : null,
     disabledReason: row.disabled_reason
