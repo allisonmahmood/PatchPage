@@ -191,8 +191,30 @@ run "kill_switch_stops_the_server_and_cannot_start_it" {
   }
 
   assert {
-    condition     = azurerm_automation_runbook.kill_switch.runbook_type == "PowerShell"
-    error_message = "Expected the kill switch runbook to be a PowerShell runbook."
+    condition     = azurerm_automation_runbook.kill_switch.runbook_type == "PowerShell72"
+    error_message = "Expected the kill switch runbook to run on PowerShell 7.2 rather than the legacy 5.1 runtime."
+  }
+
+  # The module the runbook cannot run without, imported explicitly rather than
+  # inherited from whatever the Automation account happens to ship. Relying on
+  # the defaults fails in the worst possible way: not at apply, but at the
+  # moment the kill switch is asked to run, with both triggers firing into an
+  # erroring job while the instance stays up and keeps spending.
+  assert {
+    condition     = azurerm_automation_powershell72_module.az_accounts.name == "Az.Accounts"
+    error_message = "Expected Az.Accounts to be imported explicitly; Connect-AzAccount and Invoke-AzRestMethod both come from it."
+  }
+
+  assert {
+    condition     = azurerm_automation_powershell72_module.az_accounts.automation_account_id == azurerm_automation_account.kill_switch.id
+    error_message = "Expected Az.Accounts to be imported into the kill switch Automation account."
+  }
+
+  # Pinned to an exact published version, so the import either succeeds at apply
+  # or fails loudly there.
+  assert {
+    condition     = strcontains(azurerm_automation_powershell72_module.az_accounts.module_link[0].uri, "/Az.Accounts/5.5.2")
+    error_message = "Expected the Az.Accounts import to pin an exact PowerShell Gallery version."
   }
 
   # The runbook calls the Container Apps stop operation and never the start one.
@@ -412,7 +434,7 @@ run "sets_the_egress_tripwire_at_a_hundred_gibibytes_a_day" {
   }
 
   # A rolling day, re-evaluated every quarter hour: being near-real-time is
-  # this trigger's whole reason to exist next to the lagging budget alert.
+  # this trigger's whole reason to exist next to the lagging circuit breaker.
   assert {
     condition     = azurerm_monitor_metric_alert.egress_tripwire.window_size == "P1D"
     error_message = "Expected the egress tripwire to measure a rolling day."
@@ -442,12 +464,12 @@ run "supports_a_self_hosters_own_thresholds" {
   command = plan
 
   variables {
-    monthly_budget_amount         = 40
-    monthly_cost_target_amount    = 10
-    egress_tripwire_bytes_per_day = 10737418240
-    blob_capacity_alarm_bytes     = 5368709120
-    storage_replication_type      = "ZRS"
-    operator_alert_email          = "ops@self-hoster.dev"
+    monthly_circuit_breaker_amount = 40
+    monthly_cost_target_amount     = 10
+    egress_tripwire_bytes_per_day  = 10737418240
+    blob_capacity_alarm_bytes      = 5368709120
+    storage_replication_type       = "ZRS"
+    operator_alert_email           = "ops@self-hoster.dev"
   }
 
   assert {
@@ -523,8 +545,8 @@ run "rejects_a_cost_target_at_or_above_the_circuit_breaker" {
   command = plan
 
   variables {
-    monthly_budget_amount      = 200
-    monthly_cost_target_amount = 200
+    monthly_circuit_breaker_amount = 200
+    monthly_cost_target_amount     = 200
   }
 
   expect_failures = [var.monthly_cost_target_amount]

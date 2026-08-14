@@ -434,15 +434,15 @@ variable "anonymous_create_rate_limit_per_minute" {
 # the guardrails to their own bill, but the defaults are the public instance's
 # ratified posture and changing them is a decision, not a tuning exercise.
 
-variable "monthly_budget_amount" {
+variable "monthly_circuit_breaker_amount" {
   description = "Monthly spend, in the billing account's currency, at which the circuit breaker fires the kill switch and the instance goes dark."
   type        = number
   default     = 200
   nullable    = false
 
   validation {
-    condition     = var.monthly_budget_amount > 0
-    error_message = "monthly_budget_amount must be greater than zero."
+    condition     = var.monthly_circuit_breaker_amount > 0
+    error_message = "monthly_circuit_breaker_amount must be greater than zero."
   }
 }
 
@@ -460,8 +460,8 @@ variable "monthly_cost_target_amount" {
   validation {
     # A target at or above the breaker would collapse the advisory notice and
     # the outage into one event, which defeats having a target at all.
-    condition     = var.monthly_cost_target_amount < var.monthly_budget_amount
-    error_message = "monthly_cost_target_amount must be below monthly_budget_amount so the advisory notice arrives before the circuit breaker fires."
+    condition     = var.monthly_cost_target_amount < var.monthly_circuit_breaker_amount
+    error_message = "monthly_cost_target_amount must be below monthly_circuit_breaker_amount so the advisory notice arrives before the circuit breaker fires."
   }
 }
 
@@ -527,5 +527,17 @@ variable "operator_alert_email" {
   validation {
     condition     = var.operator_alert_email == null ? true : can(regex("^[^@[:space:]]+@[^@[:space:]]+\\.[^@[:space:]]+$", var.operator_alert_email))
     error_message = "operator_alert_email must be null or a single email address."
+  }
+}
+
+variable "kill_switch_az_accounts_version" {
+  description = "Az.Accounts version imported into the kill switch Automation account. Connect-AzAccount and Invoke-AzRestMethod both come from this module, so the runbook cannot run without it. Pinned rather than left to the account's defaults so a missing module fails at apply instead of during an incident; bump it deliberately when the pinned version ages out of support."
+  type        = string
+  default     = "5.5.2"
+  nullable    = false
+
+  validation {
+    condition     = can(regex("^[0-9]+\\.[0-9]+\\.[0-9]+$", var.kill_switch_az_accounts_version))
+    error_message = "kill_switch_az_accounts_version must be an exact three-part version, as published on the PowerShell Gallery."
   }
 }

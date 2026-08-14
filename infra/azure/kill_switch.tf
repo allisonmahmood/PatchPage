@@ -10,19 +10,22 @@
 # "PatchPage-KillSwitch" -- reached through one action group. Two independent
 # triggers point at that same action group:
 #
-#   1. Budget alert. azurerm_consumption_budget_subscription.circuit_breaker,
-#      Actual (not Forecasted) spend, at 100% of the $200 monthly budget. Actual
-#      spend is deliberate: it accepts Azure's cost-data lag (hours, sometimes
-#      most of a day) in exchange for never going dark on a forecast that a
-#      quiet afternoon would have falsified.
+#   1. The circuit breaker itself. azurerm_consumption_budget_subscription
+#      .circuit_breaker, Actual (not Forecasted) spend, at 100% of the $200
+#      threshold. Azure's consumption budget is the mechanism, but the thing it
+#      implements is a breaker, not an alert: crossing it acts rather than
+#      informs, with no human confirming first. Actual spend is deliberate --
+#      it accepts Azure's cost-data lag (hours, sometimes most of a day) in
+#      exchange for never going dark on a forecast that a quiet afternoon would
+#      have falsified.
 #   2. Egress tripwire. azurerm_monitor_metric_alert.egress_tripwire, on the
 #      Container App metric `TxBytes` (portal name "Network Out Bytes",
 #      namespace Microsoft.App/containerApps), Total aggregation over a rolling
 #      P1D window evaluated every PT15M, threshold ~100 GiB. TxBytes is the
 #      bytes the app actually put on the wire, which is the quantity that turns
 #      into a bandwidth bill and the one a scraped-draft flood would move first.
-#      It is near-real-time where the budget alert is not, which is the whole
-#      reason there are two triggers rather than one.
+#      It is near-real-time where the spend threshold is not, which is the
+#      whole reason there are two triggers rather than one.
 #
 # Either trigger alone fires the kill. Neither depends on the other, and the
 # egress one is not derived from cost data, so a billing-pipeline stall cannot
@@ -59,9 +62,9 @@
 #     already pin the absence of IP restrictions. Rate limits and expiry are the
 #     abuse controls, not interrogation.
 #   * Escalation lever order when the cheap layers are outrun: friction (rate
-#     limits, quotas) -> money (raise the budget deliberately) -> expiry
-#     (shorten the draft clock). Reaching for money before friction is how a
-#     free service becomes an expensive one.
+#     limits, quotas) -> money (raise the circuit breaker deliberately) ->
+#     expiry (shorten the draft clock). Reaching for money before friction is
+#     how a free service becomes an expensive one.
 #   * Blob storage is LRS, not GRS (see variables.tf), with a 50 GiB total-size
 #     alarm below. Drafts are cheap to re-publish and expire on a 90-day clock;
 #     paying a geo-redundancy premium to protect them is not the trade this
@@ -78,7 +81,7 @@ locals {
   # budget amount, so the ~$100 target is expressed as its share of the $200
   # circuit breaker. Deriving it keeps the two numbers from drifting apart:
   # move the budget and the advisory notice moves with it.
-  cost_target_threshold_percent = (var.monthly_cost_target_amount / var.monthly_budget_amount) * 100
+  cost_target_threshold_percent = (var.monthly_cost_target_amount / var.monthly_circuit_breaker_amount) * 100
 
   # An operator email is optional so a self-hoster can apply this stack without
   # inventing one. When it is unset both action groups still exist and still
@@ -132,13 +135,44 @@ resource "azurerm_role_assignment" "kill_switch_stop" {
   principal_id       = azurerm_automation_account.kill_switch.identity[0].principal_id
 }
 
+# The one module the runbook needs, pinned rather than assumed.
+#
+# Connect-AzAccount and Invoke-AzRestMethod both live in Az.Accounts. New
+# Automation accounts do ship default Az modules, so relying on them would
+# probably work -- but "probably" is the wrong standard for this particular
+# dependency. A missing or moved module does not fail loudly at apply; it fails
+# at the moment the kill switch is asked to run, which is the one moment the
+# instance is burning money. Both triggers would fire into a job that errors,
+# and the instance would stay up.
+#
+# Pinning it converts that silent runtime failure into a loud apply-time one,
+# and takes a line off the operator's pre-live checklist. The cost is that the
+# version goes stale on its own schedule; see the variable's description.
+resource "azurerm_automation_powershell72_module" "az_accounts" {
+  name                  = "Az.Accounts"
+  automation_account_id = azurerm_automation_account.kill_switch.id
+
+  module_link {
+    uri = "https://www.powershellgallery.com/api/v2/package/Az.Accounts/${var.kill_switch_az_accounts_version}"
+  }
+}
+
 resource "azurerm_automation_runbook" "kill_switch" {
   name                    = "PatchPage-KillSwitch"
   location                = azurerm_resource_group.patchpage.location
   resource_group_name     = azurerm_resource_group.patchpage.name
   automation_account_name = azurerm_automation_account.kill_switch.name
-  runbook_type            = "PowerShell"
-  description             = "Total fail-closed kill switch: stops the PatchPage Container App, taking serving and uploads off together. Restoring service is an operator decision."
+
+  # PowerShell 7.2 rather than 5.1: 5.1 is the legacy runtime and its Az module
+  # story is the one being wound down, so a kill switch that has to work years
+  # from now is better off on the runtime Azure is still investing in.
+  runbook_type = "PowerShell72"
+
+  # The runbook is useless without the module, and Automation imports modules
+  # asynchronously, so state the ordering rather than letting a first apply
+  # publish a runbook that cannot yet run.
+  depends_on  = [azurerm_automation_powershell72_module.az_accounts]
+  description = "Total fail-closed kill switch: stops the PatchPage Container App, taking serving and uploads off together. Restoring service is an operator decision."
 
   # Verbose and progress streams stay off. A kill-switch job's output is read by
   # an operator during an incident and should say what happened and nothing
@@ -219,14 +253,14 @@ resource "azurerm_monitor_action_group" "operator_notice" {
 resource "azurerm_consumption_budget_subscription" "circuit_breaker" {
   name            = "budget-patchpage-${var.environment_name}"
   subscription_id = "/subscriptions/${var.subscription_id}"
-  amount          = var.monthly_budget_amount
+  amount          = var.monthly_circuit_breaker_amount
   time_grain      = "Monthly"
 
   time_period {
     start_date = var.budget_start_date
   }
 
-  # The circuit breaker. Actual spend, at the full budget, wired to the kill
+  # The circuit breaker. Actual spend, at the full threshold, wired to the kill
   # action group.
   notification {
     enabled        = true
@@ -258,10 +292,10 @@ resource "azurerm_monitor_metric_alert" "egress_tripwire" {
   severity            = 0
 
   # A rolling day, re-evaluated every quarter hour. The window is a day because
-  # the budget it protects is a monthly one and a day of unbounded egress is the
-  # unit of damage worth stopping; the frequency is 15 minutes because being
-  # near-real-time is this trigger's entire reason to exist alongside the budget
-  # alert, which is not.
+  # the spend threshold it protects is a monthly one and a day of unbounded
+  # egress is the unit of damage worth stopping; the frequency is 15 minutes
+  # because being near-real-time is this trigger's entire reason to exist
+  # alongside the circuit breaker, which reads lagging cost data.
   window_size = "P1D"
   frequency   = "PT15M"
 

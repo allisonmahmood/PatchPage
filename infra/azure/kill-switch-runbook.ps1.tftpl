@@ -20,8 +20,8 @@
         decision" by convention; the automation is mechanically incapable of it.
 
     Invoked by an Azure Monitor action group webhook. Both triggers -- the $200
-    actual-spend budget alert and the ~100 GiB/day egress tripwire -- point at
-    that one action group, so both arrive here. The runbook is idempotent:
+    actual-spend circuit breaker and the ~100 GiB/day egress tripwire -- point
+    at that one action group, so both arrive here. The runbook is idempotent:
     stopping an already-stopped app succeeds, so a second trigger firing while
     the instance is already dark is harmless.
 #>

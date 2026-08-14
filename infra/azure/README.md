@@ -453,14 +453,18 @@ The public instance targets roughly $100/month. The circuit breaker is $200/mont
 
 **Two independent triggers point at it**, both through the single action group `ag-patchpage-kill-switch-<environment>`:
 
-- **The budget alert.** A subscription consumption budget at `monthly_budget_amount` (default 200), notifying at 100% of **actual** spend. Actual rather than forecast is deliberate: it accepts Azure's cost-data lag, which can be most of a day, in exchange for never going dark on a projection that a quiet afternoon would have falsified.
+- **The spend threshold — the circuit breaker itself.** A subscription consumption budget at `monthly_circuit_breaker_amount` (default 200), acting at 100% of **actual** spend. Azure's consumption budget is the mechanism, but what it implements here is a breaker rather than an alert: crossing it acts, and no human confirms first. Actual rather than forecast is deliberate — it accepts Azure's cost-data lag, which can be most of a day, in exchange for never going dark on a projection that a quiet afternoon would have falsified.
 - **The egress tripwire.** A metric alert on the Container App metric `TxBytes` (portal name "Network Out Bytes", namespace `Microsoft.App/containerApps`), `Total` aggregation over a rolling `P1D` window evaluated every `PT15M`, firing above `egress_tripwire_bytes_per_day` (default 100 GiB). `TxBytes` is the bytes the app actually put on the wire. This trigger reads no cost data at all, so a stalled billing pipeline cannot silence both.
 
 Either one alone fires the kill. The runbook is idempotent, so the second trigger arriving while the instance is already dark is harmless.
 
+**What the egress tripwire does and does not see.** It measures the Container App's outbound bytes, and nothing else. That is the whole egress path today, because every draft is served by the app reading from private Blob storage — nothing is fetched by a reader directly from the storage account. #97 originally scoped a storage-account bytes-out metric alongside this one; #106 and #117 collapsed that to a single named tripwire, which is what is implemented here. Record the consequence: **any future change that lets bytes reach readers without passing through the Container App — a CDN, a reverse proxy, public blob access, or SAS-URL redirects — leaves the instance with no egress tripwire at all** until this alert is extended or joined by a storage-account one. That is one of the reasons "no CDN and no reverse proxy" is a standing invariant rather than a preference.
+
 **Restore is an operator decision, enforced as a permission.** The Automation account's identity holds a custom role whose entire permission set is `Microsoft.App/containerApps/read` and `Microsoft.App/containerApps/stop/action`. There is no start action, no write, and no reach outside that one Container App. The automation is mechanically unable to bring the service back. `tofu apply` will not restore it either — running status is not a field this configuration manages, so a stopped app stays stopped across applies.
 
 **The blob size alarm is not a kill trigger.** A metric alert on `BlobCapacity` (namespace `Microsoft.Storage/storageAccounts/blobServices`, `Average` over `P1D`) fires above `blob_capacity_alarm_bytes` (default 50 GiB) into the notification-only action group. Stored bytes are a slow, cheap, recoverable problem that the 90-day draft expiry is already draining; the response is an operator looking at what is accumulating, not an outage.
+
+Both thresholds are **binary** units — 50 GiB (53,687,091,200 bytes) and 100 GiB (107,374,182,400 bytes) — where the spec writes "50 GB" and "~100 GB/day". That is a deliberate 7% reading of an unhedged number, taken because Azure reports and displays storage and network figures in binary units: 50 GiB shows in the portal as exactly `50 GiB`, where the decimal 50,000,000,000 shows as `46.57 GiB` and reads like a typo an operator would be tempted to "fix". Neither alarm has a consequence that 7% changes — one notifies, and the other is a tripwire whose job is to catch a runaway, not to bill anyone. If you would rather match the spec's decimal numbers exactly, set `blob_capacity_alarm_bytes = 50000000000` and `egress_tripwire_bytes_per_day = 100000000000`; nothing else has to change.
 
 ### Standing invariants
 
@@ -469,18 +473,19 @@ These are properties of the deployment, not preferences. Changing any of them is
 - **Replicas are min 1 / max 1.** This is a correctness precondition, not a capacity setting: the rate limiter counts in one process's memory, so every per-minute limit is per replica. Any change that raises `max_replicas` above 1 must replace the in-memory limiter with a shared-store one **in the same change**. Raising the count first is not a smaller step; it is a silent quota outage.
 - **No CDN and no reverse proxy at launch.** The instance serves its own bytes, which is exactly why the egress tripwire is load-bearing — there is no cache layer between a hot draft and the bandwidth bill.
 - **No WAF, no bot-blocking, no challenges or human-checks on draft URLs.** Draft links must stay fetchable by agents. Rate limits and expiry are the abuse controls; the ingress postconditions already pin the absence of IP restrictions.
-- **Escalation lever order when the cheap layers are outrun: friction, then money, then expiry.** Tighten rate limits and quotas first, raise the budget deliberately second, shorten the draft clock last. Reaching for money first is how a free service becomes an expensive one.
+- **Escalation lever order when the cheap layers are outrun: friction, then money, then expiry.** Tighten rate limits and quotas first, raise the circuit breaker deliberately second, shorten the draft clock last. Reaching for money first is how a free service becomes an expensive one.
 
 ### Before this is live
 
-The Terraform is complete, but five things need an operator:
+The Terraform is complete, but four things need an operator:
 
 0. **Check you can create a custom role.** The kill switch's least-privilege role is an `azurerm_role_definition`, which needs `Microsoft.Authorization/roleDefinitions/write` — Owner or User Access Administrator on the subscription. This is a right beyond the role *assignments* the stack already creates, so an apply that has worked before can fail here. If your tenant forbids custom roles, the fallback is `Contributor` scoped to the single Container App; that widens the blast radius from "can stop this app" to "can delete this app", so make it a deliberate, recorded change rather than a quick unblock.
 
 1. **Set `budget_start_date` to the first of the month you apply in.** Azure rejects a start date that is not the first of a month, and rejects one too far in the past when a budget is first created. The default will go stale.
-2. **Set `operator_alert_email`.** Without it both action groups still exist and the kill switch still fires — it does not depend on anyone reading mail — but you will learn the instance went dark from the Azure Monitor alert history rather than from a message.
-3. **Confirm the Automation account can run the runbook.** It needs the `Az.Accounts` module for `Connect-AzAccount -Identity` and `Invoke-AzRestMethod`. New Automation accounts generally ship with it; verify rather than assume, because a missing module turns the kill switch into a failed job.
-4. **Diarise `kill_switch_webhook_expiry`.** Azure caps Automation webhook lifetime at ten years and the default is set near that cap. Past that date the alerts still fire and the runbook still exists, but nothing invokes it. Rotating it before it lapses is a standing chore.
+2. **Set `operator_alert_email`, then complete Azure's verification for it.** Azure now sends a one-time verification to new action-group email receivers, and an unverified address receives nothing. So "I configured the address" is not the same as "I will be told" — send a test notification from the action group and confirm it arrives. Without a working address both action groups still exist and the kill switch still fires — it does not depend on anyone reading mail — but you would learn the instance went dark from the Azure Monitor alert history rather than from a message.
+3. **Diarise `kill_switch_webhook_expiry`.** Azure caps Automation webhook lifetime at ten years and the default is set near that cap. Past that date both triggers still fire and the runbook still exists, but nothing invokes it — a silent single point of failure shared by both triggers, and the one failure mode in this design that neither trigger's independence protects against. An expired webhook cannot be revived; rotation means recreating it, which changes the URI the action group calls, so do it as a planned apply rather than under pressure.
+
+The `Az.Accounts` module the runbook needs is no longer on this list: `kill_switch.tf` imports it explicitly at a pinned version (`kill_switch_az_accounts_version`) rather than relying on the Automation account's defaults, so a missing module now fails at apply instead of during an incident. What remains is to bump that pin deliberately when the version ages out of support.
 
 The metric names and namespaces above are validated by Azure at apply time rather than by this repository's tests, so a typo surfaces as a failed apply rather than as an alert that never fires. That is deliberate: `skip_metric_validation` is left off.
 
@@ -490,7 +495,7 @@ Rehearse this before the instance goes public, and after any change to `kill_swi
 
 Read the two names the drill needs from the OpenTofu outputs first (`kill_switch_automation_account_name`, `kill_switch_runbook_name`, `resource_group_name`, `container_app_name`).
 
-**1. Fire the kill action.** Start the runbook directly. Doing it through the portal's "Test action group" on the kill action group is better where available, because it exercises the webhook hop too.
+**1. Fire the kill action.** Prefer the portal's "Test action group" on the kill action group: it exercises the webhook hop, which is the part with an expiry on it and the part no other step covers. Starting the runbook directly is the fallback — note that `az automation runbook start` comes from the Azure CLI's **experimental** `automation` extension, so treat a CLI-side failure here as a tooling problem rather than evidence about the kill switch.
 
 ```txt
 az automation runbook start \
