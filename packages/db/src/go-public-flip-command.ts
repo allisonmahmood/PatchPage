@@ -14,6 +14,19 @@
  *
  * The runbook is `docs/GO_PUBLIC_FLIP.md`. Nothing here decides anything the
  * runbook does not state; this is the part of it a machine can run.
+ *
+ * **What it prints, and why that is safe.** Api-token *identifiers* and their
+ * internal *names* — `tok_…` and "Teammate one" — never the plaintext token or
+ * its hash, neither of which this command reads or can reach. An identifier
+ * authenticates nothing: no endpoint accepts one as a credential, and the admin
+ * moderation loop already returns them over the API. The operator needs them
+ * on screen to check the flip against their private token record, which is the
+ * whole point of inspecting before applying.
+ *
+ * CodeQL's `js/clear-text-logging` flags these anyway, because the identifiers
+ * have "token" in their name. The suppressions below are per-line rather than
+ * repository-wide so that a future line here that really did log a secret would
+ * still be caught. Keep them attached to the specific `log` calls.
  */
 
 import { getServerConfig } from "@patchpage/config";
@@ -187,6 +200,7 @@ export async function runGoPublicFlipCommand(
   try {
     if (!parsed.apply) {
       log("PatchPage go-public flip — INSPECTION ONLY, nothing written.");
+      // codeql[js/clear-text-logging] -- api-token IDs, not tokens. See above.
       log(
         `Would re-home: ${
           parsed.reHomeApiTokenIds.join(", ") ||
@@ -194,6 +208,7 @@ export async function runGoPublicFlipCommand(
         }`
       );
       log("");
+      // codeql[js/clear-text-logging] -- api-token IDs and names, not tokens.
       for (const line of renderInspection(await db.inspectGoPublicFlip())) log(line);
       log("");
       log("Rerun with --apply to perform the flip. See docs/GO_PUBLIC_FLIP.md.");
@@ -205,9 +220,11 @@ export async function runGoPublicFlipCommand(
     });
     log("PatchPage go-public flip — APPLIED.");
     log("");
+    // codeql[js/clear-text-logging] -- api-token IDs and names, not tokens.
     for (const line of renderOutcome(outcome)) log(line);
     log("");
     log("The database as the flip left it:");
+    // codeql[js/clear-text-logging] -- api-token IDs and names, not tokens.
     for (const line of renderInspection(outcome.after)) log(line);
     log("");
     log("Next: flip PATCHPAGE_ALLOW_SELF_SERVICE_TOKENS, then publish and pin the");
