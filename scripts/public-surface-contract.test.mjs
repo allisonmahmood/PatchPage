@@ -12,6 +12,8 @@ const surfacePaths = {
   cliReadme: "packages/cli/README.md",
   selfHosting: "docs/SELF_HOSTING.md",
   skill: "skills/patchpage/SKILL.md",
+  onboarding: "skills/patchpage/references/onboarding.md",
+  welcomeDraft: "skills/patchpage/references/welcome-draft.html",
   operatorSkill: ".agents/skills/patchpage-mint-token/SKILL.md",
   showcase: "examples/plan.html"
 };
@@ -51,7 +53,7 @@ assert.ok(
   `${surfacePaths.showcase} is missing the exact runtime sentence`
 );
 
-for (const name of ["rootReadme", "cliReadme", "selfHosting", "skill", "showcase"]) {
+for (const name of ["rootReadme", "cliReadme", "selfHosting", "showcase"]) {
   const source = surfaces[name];
   const text = visibleText(source);
   assert.match(
@@ -79,7 +81,7 @@ for (const name of ["rootReadme", "cliReadme", "selfHosting", "skill", "showcase
   }
 }
 
-for (const name of ["rootReadme", "cliReadme", "skill", "showcase"]) {
+for (const name of ["rootReadme", "cliReadme", "showcase"]) {
   const text = visibleText(surfaces[name]);
   assert.match(
     text,
@@ -101,7 +103,141 @@ for (const name of ["rootReadme", "cliReadme", "skill", "showcase"]) {
   );
 }
 
-for (const name of ["rootReadme", "cliReadme", "selfHosting", "skill", "operatorSkill"]) {
+// The bundled skill ships the signup-less contract: every upload carries a publishing
+// key, the first one is minted automatically, and no anonymous-era instruction survives.
+{
+  const text = visibleText(surfaces.skill);
+  assert.doesNotMatch(
+    text,
+    /anonymous/i,
+    `${surfacePaths.skill} must carry no anonymous-era instructions`
+  );
+  for (const contradiction of forbiddenClaimPatterns) {
+    assert.doesNotMatch(
+      text,
+      contradiction,
+      `${surfacePaths.skill} contradicts the finalized publishing-key contract`
+    );
+  }
+  assert.match(
+    text,
+    /public(?:,\s*| and )unlisted|public but unlisted/i,
+    `${surfacePaths.skill} must describe viewer links as public and unlisted`
+  );
+  assert.match(
+    text,
+    /https:\/\/post\.patchyhq\.com/i,
+    `${surfacePaths.skill} must name the default instance`
+  );
+  assert.match(
+    text,
+    /official free service|free service[^.]{0,80}no signup|no signup/i,
+    `${surfacePaths.skill} must describe the default instance as the signup-less free service`
+  );
+  assertTermsNear(
+    text,
+    /publishing key/i,
+    [/\bmints?\b/i, /first[^.]{0,24}upload/i, /announcement/i],
+    { label: `${surfacePaths.skill} auto-mint on first upload`, radius: 420 }
+  );
+  assert.match(
+    text,
+    /(?:rejects?|rejected)[^.]{0,120}(?:never|does not|do not)[^.]{0,60}mints?/i,
+    `${surfacePaths.skill} must state that a rejected key is an error, never a re-mint`
+  );
+  assert.match(
+    text,
+    /own (?:instance|deployment)/i,
+    `${surfacePaths.skill} must keep the own-instance path`
+  );
+  assertTermsNear(text, /auth set/i, [/operator/i, /token/i], {
+    label: `${surfacePaths.skill} own-instance operator-token flow`,
+    radius: 600
+  });
+  for (const reference of ["references/onboarding.md", "references/style-file.md"]) {
+    assert.ok(
+      surfaces.skill.includes(reference),
+      `${surfacePaths.skill} must point at ${reference}`
+    );
+  }
+}
+
+// Onboarding decisions ratified on prototype/onboarding-93.
+{
+  const onboarding = surfaces.onboarding;
+  assert.ok(
+    onboarding.includes(
+      "Then walk me through PatchPage's onboarding: set up how my pages should look and publish"
+    ),
+    `${surfacePaths.onboarding} must quote the setup prompt's onboarding sentence verbatim`
+  );
+  assert.match(
+    onboarding,
+    /status --json/,
+    `${surfacePaths.onboarding} must probe with status --json`
+  );
+  assert.match(
+    onboarding,
+    /no per-session first-run check/i,
+    `${surfacePaths.onboarding} must rule out a per-session first-run check`
+  );
+  assert.match(
+    onboarding,
+    /exactly two options/i,
+    `${surfacePaths.onboarding} must offer exactly two style options`
+  );
+  assert.match(
+    onboarding,
+    /assumed, never asked/i,
+    `${surfacePaths.onboarding} must leave hosting unasked`
+  );
+  assert.match(
+    onboarding,
+    /no separate key step/i,
+    `${surfacePaths.onboarding} must let the welcome publish perform the mint`
+  );
+  assert.ok(
+    onboarding.includes("welcome-draft.html"),
+    `${surfacePaths.onboarding} must point at the welcome draft`
+  );
+}
+
+// Welcome draft, approved as prototyped.
+{
+  const draft = surfaces.welcomeDraft;
+  for (const fact of ["Shareable", "Updatable", "Long-lived", "Deletable"]) {
+    assert.ok(draft.includes(fact), `${surfacePaths.welcomeDraft} must keep the ${fact} fact card`);
+  }
+  assert.match(
+    draft,
+    /make this a patch page/i,
+    `${surfacePaths.welcomeDraft} must carry the habit chip`
+  );
+  assert.match(
+    draft,
+    /quietly retired/i,
+    `${surfacePaths.welcomeDraft} must soften long-lived to match draft expiry`
+  );
+  assert.match(
+    draft,
+    /patchyhq\.com/i,
+    `${surfacePaths.welcomeDraft} must credit patchyhq.com in the footer`
+  );
+  assert.doesNotMatch(
+    draft,
+    /<(?:script|form|input|iframe|embed|object|applet|link|base)\b/i,
+    `${surfacePaths.welcomeDraft} must remain a safe static HTML artifact`
+  );
+}
+
+for (const name of [
+  "rootReadme",
+  "cliReadme",
+  "selfHosting",
+  "skill",
+  "onboarding",
+  "operatorSkill"
+]) {
   for (const block of markdownShellBlocks(surfaces[name])) {
     assert.doesNotMatch(
       block.body,
@@ -580,6 +716,20 @@ async function pathExists(candidate) {
 
 function visibleText(source) {
   return source.replace(/<[^>]*>/g, " ").replace(/\s+/g, " ");
+}
+
+function assertTermsNear(text, anchor, required, { label, radius }) {
+  const matches = text.matchAll(
+    new RegExp(anchor.source, [...new Set(`${anchor.flags}g`)].join(""))
+  );
+  for (const match of matches) {
+    const window = text.slice(
+      Math.max(0, match.index - radius),
+      match.index + match[0].length + radius
+    );
+    if (required.every((pattern) => pattern.test(window))) return;
+  }
+  assert.fail(`${label} must place ${required.join(", ")} near ${anchor}`);
 }
 
 function decodeHtmlCode(source) {
