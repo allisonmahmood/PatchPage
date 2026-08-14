@@ -10,9 +10,11 @@ import type {
   DbDriverOptions,
   DraftRecord,
   DraftModerationOptions,
+  DraftReportRecord,
   DraftVersionLookup,
   DraftVersionRecord,
   PatchPageDb,
+  RecordDraftReportInput,
   RecordUploadInput,
   RecordUploadResult,
   UploadTargetInput
@@ -505,6 +507,28 @@ export class PostgresPatchPageDb implements PatchPageDb {
     return Boolean(result.rowCount);
   }
 
+  async recordDraftReport(input: RecordDraftReportInput): Promise<DraftReportRecord> {
+    // One INSERT and nothing else: no trigger, no cascade, no UPDATE of the
+    // draft. That is what makes report volume unable to move any state.
+    const result = await this.pool.query(
+      `
+        INSERT INTO draft_reports (id, draft_id, source_ip, reason)
+        VALUES ($1, $2, $3, $4)
+        RETURNING *
+      `,
+      [newInternalId("rpt"), input.draftId, input.sourceIp, cleanText(input.reason)]
+    );
+    return mapDraftReport(result.rows[0]);
+  }
+
+  async listDraftReports(draftId: string): Promise<DraftReportRecord[]> {
+    const result = await this.pool.query(
+      "SELECT * FROM draft_reports WHERE draft_id = $1 ORDER BY created_at, id",
+      [draftId]
+    );
+    return result.rows.map(mapDraftReport);
+  }
+
   async close(): Promise<void> {
     await this.pool.end();
   }
@@ -611,6 +635,16 @@ function mapDraftVersion(row: any): DraftVersionRecord {
     gitBranch: row.git_branch,
     gitCommitSha: row.git_commit_sha,
     originalFilename: row.original_filename,
+    createdAt: toIso(row.created_at)
+  };
+}
+
+function mapDraftReport(row: any): DraftReportRecord {
+  return {
+    id: row.id,
+    draftId: row.draft_id,
+    sourceIp: row.source_ip,
+    reason: row.reason,
     createdAt: toIso(row.created_at)
   };
 }

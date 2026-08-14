@@ -52,6 +52,32 @@ export interface DraftVersionRecord {
   createdAt: string;
 }
 
+/**
+ * A reader's flag on a served draft, filed without an account and stored for an
+ * operator to read. Nothing in the system acts on one: disabling, deleting, and
+ * revoking are all operator decisions, so no volume of these rows can take a
+ * page down.
+ *
+ * A report outlives its draft on purpose — `draftId` is a plain string, not a
+ * reference — because expiry hard-deletes drafts and the record of what was
+ * reported has to survive that.
+ */
+export interface DraftReportRecord {
+  id: string;
+  draftId: string;
+  /** The reporting reader's address, as the server resolved it. */
+  sourceIp: string | null;
+  /** The reader's optional short note. Absent when they filed without one. */
+  reason: string | null;
+  createdAt: string;
+}
+
+export interface RecordDraftReportInput {
+  draftId: string;
+  sourceIp: string | null;
+  reason: string | null;
+}
+
 export interface CreateApiTokenInput {
   accountId: string;
   name: string;
@@ -207,6 +233,18 @@ export interface PatchPageDb {
     accountId: string,
     options?: DraftModerationOptions
   ): Promise<boolean>;
+  /**
+   * Files a reader's report against a draft. Storing one is the whole effect:
+   * this writes a row and changes nothing about the draft, its retention clock,
+   * or its owning token.
+   */
+  recordDraftReport(input: RecordDraftReportInput): Promise<DraftReportRecord>;
+  /**
+   * Every report filed against one draft, oldest first. This is the operator's
+   * review path at launch — a database read, deliberately with no endpoint in
+   * front of it — and the seam the report path is observable through.
+   */
+  listDraftReports(draftId: string): Promise<DraftReportRecord[]>;
   close(): Promise<void>;
 }
 

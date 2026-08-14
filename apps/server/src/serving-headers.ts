@@ -27,6 +27,24 @@ export const DRAFT_CONTENT_SECURITY_POLICY = [
   "form-action 'none'"
 ].join("; ");
 
+/**
+ * The report page's own policy. A served draft's CSP is a fixed promise and does
+ * not move for this: `form-action 'none'` there means a form inside the draft
+ * wrapper could never submit, so the footer's report link is a plain navigation
+ * to a *separate* page, and that page carries the form under its own headers.
+ *
+ * Same shape as the draft policy in every other respect — still no script source
+ * of any kind, so the flow works with JavaScript disabled — except that it may
+ * post back to itself, and it has no reason to frame anything.
+ */
+export const REPORT_PAGE_CONTENT_SECURITY_POLICY = [
+  "default-src 'none'",
+  "style-src 'unsafe-inline'",
+  "img-src https: data:",
+  "base-uri 'none'",
+  "form-action 'self'"
+].join("; ");
+
 /** Everything that is not a served draft — API routes included — stays uncached. */
 export const NO_STORE_CACHE_CONTROL = "no-store";
 
