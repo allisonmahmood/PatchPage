@@ -108,10 +108,11 @@ Two objects are easy to confuse, so they are named here. **`0002_drafts_account_
 the shipped additive migrations** — each ships permanently and none supersedes
 another; `0002` exists because ownership lookups scan `drafts` by account, `0004`
 adds the pin plus the partial index the sweep scans, and `0006` adds a whole table
-rather than a column (see "Reports" below). **`0005` is deliberately absent** — it
+rather than a column (see "Reports" above). **`0005` is deliberately absent** — it
 is claimed by work in flight, and an ID is immutable once merged, so the list keeps
 a gap rather than renumbering. Apply order is ID order and the ledger records what
 actually ran, so a gap is not a missing step. The **probe migrations in
+`src/migration-fixtures.fixture.ts` are test-only** and never ship: they exercise
 a column-level additive step on both drivers without putting a placeholder column
 in the shipped schema. A later agent should not treat a probe as the pattern to
 copy for a real column — copy `0003` and the steps below.
