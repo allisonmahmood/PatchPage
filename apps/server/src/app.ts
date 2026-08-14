@@ -215,6 +215,15 @@ export function createApp(options: CreateAppOptions): FastifyInstance {
       scopes
     });
 
+    // A token minted is a token minted, whichever door it came through. The
+    // flag is what tells the operator's own issuing apart from the self-service
+    // flow, so the event list stays one narrative rather than two.
+    analytics.capture({
+      name: "token.minted",
+      principalId: auth.accountId,
+      properties: { apiTokenId: apiToken.id, selfService: false }
+    });
+
     return reply.status(201).send({
       ok: true,
       apiToken,

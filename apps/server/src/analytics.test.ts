@@ -190,6 +190,29 @@ describe("server-side analytics", () => {
     await watched.close();
   });
 
+  it("reports an operator-issued token as a mint that was not self-service", async () => {
+    const watched = await createWatchedApp("admin-mint");
+
+    const created = await watched.app.inject({
+      method: "POST",
+      url: "/api/tokens",
+      headers: { authorization: "Bearer dev-token" },
+      payload: { name: "Teammate", scopes: ["upload"] }
+    });
+    expect(created.statusCode).toBe(201);
+    const apiToken = (created.json() as { apiToken: { id: string } }).apiToken;
+
+    const event = watched.analytics.only();
+    expect(event.name).toBe("token.minted");
+    expect(event.properties).toEqual({ apiTokenId: apiToken.id, selfService: false });
+    // The plaintext exists in that response and must never leave through here.
+    expect(JSON.stringify(event)).not.toContain("pp_");
+    // Nor the name an operator chose for it.
+    expect(JSON.stringify(event)).not.toContain("Teammate");
+
+    await watched.close();
+  });
+
   it("reports nothing when a mint is refused", async () => {
     const watched = await createWatchedApp("mint-refused");
 
@@ -321,6 +344,47 @@ describe("server-side analytics", () => {
     await watched.close();
   });
 
+  it("marks a draft its own owner disabled or deleted as not an operator's act", async () => {
+    const watched = await createWatchedApp("moderation-owner", {
+      config: { allowSelfServiceTokens: true }
+    });
+
+    const mint = await watched.app.inject({
+      method: "POST",
+      url: MINT_PATH,
+      headers: { "content-type": "application/json" },
+      payload: "{}",
+      remoteAddress: "203.0.113.14"
+    });
+    expect(mint.statusCode).toBe(201);
+    const owner = (mint.json() as { token: string }).token;
+
+    const disabledId = await watched.createDraft("Mine to disable", owner);
+    const deletedId = await watched.createDraft("Mine to delete", owner);
+    watched.analytics.events.length = 0;
+
+    const disable = await watched.app.inject({
+      method: "POST",
+      url: `/api/drafts/${disabledId}/disable`,
+      headers: { authorization: `Bearer ${owner}` }
+    });
+    expect(disable.statusCode).toBe(200);
+
+    const remove = await watched.app.inject({
+      method: "DELETE",
+      url: `/api/drafts/${deletedId}`,
+      headers: { authorization: `Bearer ${owner}` }
+    });
+    expect(remove.statusCode).toBe(200);
+
+    expect(watched.analytics.names()).toEqual(["draft.disabled", "draft.deleted"]);
+    const [disabled, deleted] = watched.analytics.events as [AnalyticsEvent, AnalyticsEvent];
+    expect(disabled.properties).toEqual({ draftId: disabledId, admin: false });
+    expect(deleted.properties).toEqual({ draftId: deletedId, admin: false });
+
+    await watched.close();
+  });
+
   it("reports nothing when a moderation request finds no draft", async () => {
     const watched = await createWatchedApp("moderation-missing");
 
@@ -387,8 +451,45 @@ describe("server-side analytics", () => {
     // Readers are unwatched: a visit moves a retention clock and is reported
     // nowhere, and nothing analytics-shaped reaches the page either.
     expect(watched.analytics.events).toEqual([]);
-    expect(latest.body).not.toContain("posthog");
-    expect(latest.body).not.toContain("<script");
+    for (const response of [latest, version, reportForm]) {
+      expect(response.body).not.toContain("posthog");
+      expect(response.body).not.toContain("<script");
+      // No cookie, and a policy that admits no script source at all: scripts
+      // fall to `default-src 'none'` and no directive re-opens them. There is
+      // nowhere for analytics JavaScript to arrive from even if something one
+      // day tried to put it on the page.
+      expect(response.headers["set-cookie"]).toBeUndefined();
+      expect(response.headers["content-security-policy"]).toContain("default-src 'none'");
+      expect(response.headers["content-security-policy"]).not.toContain("script-src");
+    }
+
+    await watched.close();
+  });
+
+  it("reports nothing for the routes that are not on the list", async () => {
+    const watched = await createWatchedApp("closed-list");
+    const draftId = await watched.createDraft("Pinned");
+    watched.analytics.events.length = 0;
+
+    for (const suffix of ["pin", "unpin"]) {
+      const response = await watched.app.inject({
+        method: "POST",
+        url: `/api/drafts/${draftId}/${suffix}`,
+        headers: { authorization: "Bearer dev-token" }
+      });
+      expect(response.statusCode).toBe(200);
+    }
+
+    const me = await watched.app.inject({
+      method: "GET",
+      url: "/api/me",
+      headers: { authorization: "Bearer dev-token" }
+    });
+    expect(me.statusCode).toBe(200);
+
+    // The seven are the whole list. Pinning, unpinning, and reading are things
+    // that happen; they are not moments the instance reports.
+    expect(watched.analytics.events).toEqual([]);
 
     await watched.close();
   });

@@ -329,7 +329,7 @@ Setting a key turns on capture for seven business events, and only those seven:
 
 | Event | When | Properties |
 | --- | --- | --- |
-| `token.minted` | A self-service mint succeeds | `apiTokenId`, `selfService` |
+| `token.minted` | A token is issued, self-service or by an operator | `apiTokenId`, `selfService` |
 | `draft.created` | An upload creates a draft | `draftId`, `apiTokenId`, `versionNumber`, `htmlBytes` |
 | `draft.updated` | An upload adds a version | `draftId`, `apiTokenId`, `versionNumber`, `htmlBytes` |
 | `draft.reported` | A reader files a report | `draftId`, `reasonGiven` |
