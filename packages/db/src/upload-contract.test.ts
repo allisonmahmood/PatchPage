@@ -1029,6 +1029,194 @@ function describeUploadContract(
         await harness.close();
       }
     });
+
+    it("stores a reader's report against the draft it names, with or without a reason", async () => {
+      const harness = await createHarness();
+      const draftId = newDraftId();
+      const otherDraftId = newDraftId();
+
+      try {
+        for (const id of [draftId, otherDraftId]) {
+          await harness.db.recordUpload(uploadInput("create", id, harness.auth));
+        }
+
+        const filed = await harness.db.recordDraftReport({
+          draftId,
+          sourceIp: "203.0.113.7",
+          reason: "  Impersonates my company.  "
+        });
+        expect(filed.draftId).toBe(draftId);
+        expect(filed.sourceIp).toBe("203.0.113.7");
+        // The drivers agree on trimming and on the stored ceiling.
+        expect(filed.reason).toBe("Impersonates my company.");
+        expect(filed.id).toMatch(/^rpt_/);
+        expect(Number.isNaN(Date.parse(filed.createdAt))).toBe(false);
+
+        await harness.db.recordDraftReport({
+          draftId,
+          sourceIp: null,
+          reason: null
+        });
+        await harness.db.recordDraftReport({
+          draftId: otherDraftId,
+          sourceIp: "198.51.100.4",
+          reason: "Unrelated."
+        });
+
+        const reports = await harness.db.listDraftReports(draftId);
+        expect(reports).toHaveLength(2);
+        expect(reports.map((report) => report.reason).sort()).toEqual([
+          "Impersonates my company.",
+          null
+        ]);
+        expect(reports.every((report) => report.draftId === draftId)).toBe(true);
+        // A reader who files without a reason is still a stored report.
+        expect(reports.some((report) => report.reason === null && report.sourceIp === null)).toBe(
+          true
+        );
+
+        // Reports are per draft: the neighbouring draft's report is its own.
+        expect(await harness.db.listDraftReports(otherDraftId)).toHaveLength(1);
+        expect(await harness.db.listDraftReports(newDraftId())).toEqual([]);
+      } finally {
+        await harness.close();
+      }
+    });
+
+    it("truncates an overlong report reason rather than storing it whole", async () => {
+      const harness = await createHarness();
+      const draftId = newDraftId();
+
+      try {
+        await harness.db.recordUpload(uploadInput("create", draftId, harness.auth));
+
+        const filed = await harness.db.recordDraftReport({
+          draftId,
+          sourceIp: "203.0.113.9",
+          reason: "x".repeat(4_000)
+        });
+        expect(filed.reason).toBe("x".repeat(255));
+      } finally {
+        await harness.close();
+      }
+    });
+
+    it("leaves a reported draft exactly as servable as an unreported one", async () => {
+      const harness = await createHarness();
+      const reportedId = newDraftId();
+      const quietId = newDraftId();
+
+      try {
+        for (const id of [reportedId, quietId]) {
+          await harness.db.recordUpload(uploadInput("create", id, harness.auth));
+        }
+
+        const before = await harness.db.findDraftVersion(reportedId);
+
+        // Report-bombing is the case that matters: no count of reports is a
+        // takedown, because nothing reads this table but an operator.
+        for (let index = 0; index < 50; index += 1) {
+          await harness.db.recordDraftReport({
+            draftId: reportedId,
+            sourceIp: `203.0.113.${index % 256}`,
+            reason: `Bomb ${index}.`
+          });
+        }
+        expect(await harness.db.listDraftReports(reportedId)).toHaveLength(50);
+
+        const after = await harness.db.findDraftVersion(reportedId);
+        expect(after.draft?.id).toBe(reportedId);
+        expect(after.draft?.disabledAt).toBeNull();
+        expect(after.draft?.deletedAt).toBeNull();
+        // Not one field of the draft moved, the retention clock included.
+        expect(after.draft).toEqual(before.draft);
+        expect(after.version?.id).toBe(before.version?.id);
+
+        // And the draft nobody reported is untouched either way.
+        expect((await harness.db.findDraftVersion(quietId)).draft?.id).toBe(quietId);
+        expect(await harness.db.listDraftReports(quietId)).toEqual([]);
+      } finally {
+        await harness.close();
+      }
+    });
+
+    it("keeps a report after the draft it flags is gone", async () => {
+      const harness = await createHarness();
+      const draftId = newDraftId();
+
+      try {
+        await harness.db.recordUpload(uploadInput("create", draftId, harness.auth));
+        await harness.db.recordDraftReport({
+          draftId,
+          sourceIp: "203.0.113.11",
+          reason: "Reported, then removed."
+        });
+
+        // An operator reviewing a report after acting on it still has to be
+        // able to see what was filed — which is why the report does not
+        // reference the draft row.
+        await harness.db.deleteDraft(draftId, harness.auth.accountId);
+        expect((await harness.db.findDraftVersion(draftId)).draft).toBeNull();
+
+        const reports = await harness.db.listDraftReports(draftId);
+        expect(reports).toHaveLength(1);
+        expect(reports[0]?.reason).toBe("Reported, then removed.");
+      } finally {
+        await harness.close();
+      }
+    });
+
+    it("keeps a report after the expiry sweep hard-deletes the draft it flags", async () => {
+      const harness = await createHarness();
+      const draftId = newDraftId();
+      let now = RETENTION_EPOCH;
+      const clocked = harness.openDb({ clock: () => now });
+
+      try {
+        await clocked.recordUpload(uploadInput("create", draftId, harness.auth));
+        await clocked.recordDraftReport({
+          draftId,
+          sourceIp: "203.0.113.13",
+          reason: "Reported, then expired."
+        });
+
+        // The sweep is a hard delete of the draft, its versions, and its stored
+        // bytes. Reports are none of those: they are the operator's record that
+        // something was flagged, and that record has to survive the page it was
+        // filed against. The sweep must never grow a step that removes them —
+        // and no foreign key exists that would force it to.
+        now = RETENTION_EPOCH + 91 * DAY_MS;
+        expect(await clocked.listExpiredDraftIds(1_000)).toContain(draftId);
+        expect(await clocked.deleteExpiredDraft(draftId)).not.toBeNull();
+        expect((await clocked.findDraftVersion(draftId)).draft).toBeNull();
+
+        const reports = await clocked.listDraftReports(draftId);
+        expect(reports).toHaveLength(1);
+        expect(reports[0]?.reason).toBe("Reported, then expired.");
+        expect(reports[0]?.sourceIp).toBe("203.0.113.13");
+      } finally {
+        await harness.close();
+      }
+    });
+
+    it("attributes a stored report to the address the server resolved", async () => {
+      const harness = await createHarness();
+      const draftId = newDraftId();
+
+      try {
+        await harness.db.recordUpload(uploadInput("create", draftId, harness.auth));
+        await harness.db.recordDraftReport({
+          draftId,
+          sourceIp: "198.51.100.23",
+          reason: "From a specific address."
+        });
+
+        const [stored] = await harness.db.listDraftReports(draftId);
+        expect(stored?.sourceIp).toBe("198.51.100.23");
+      } finally {
+        await harness.close();
+      }
+    });
   });
 }
 

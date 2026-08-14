@@ -188,6 +188,37 @@ export const SCHEMA_MIGRATIONS: readonly SchemaMigration[] = [
         }
       }
     }
+  },
+  {
+    // 0005 is claimed by the self-service mint records in flight; IDs are
+    // immutable once merged, so this keeps its number and leaves the gap. Apply
+    // order is ID order, and the ledger records what ran — a gap is not a
+    // missing step, and a fresh database applies 0001-0004 then 0006 cleanly.
+    id: "0006_draft_reports",
+    // Where a reader's flag on a served draft lands. Reports are operator-review
+    // material and nothing else: no trigger reads this table, so no volume of
+    // rows here can disable, delete, or revoke anything.
+    //
+    // `draft_id` deliberately carries no foreign key, and the expiry sweep must
+    // never grow a step that deletes these rows. A report has to outlive the
+    // draft it flags — expiry hard-deletes drafts, and an operator reviewing a
+    // report after the fact still needs to see that it was filed, against what,
+    // and from where. A reference would make the sweep's delete fail instead.
+    postgres: `
+      CREATE TABLE IF NOT EXISTS draft_reports (
+        id TEXT PRIMARY KEY,
+        draft_id TEXT NOT NULL,
+        source_ip TEXT,
+        reason TEXT,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+      );
+
+      CREATE INDEX IF NOT EXISTS draft_reports_draft_id_idx ON draft_reports(draft_id);
+      CREATE INDEX IF NOT EXISTS draft_reports_created_at_idx ON draft_reports(created_at);
+    `,
+    json(state) {
+      if (!Array.isArray(state.draftReports)) state.draftReports = [];
+    }
   }
 ];
 

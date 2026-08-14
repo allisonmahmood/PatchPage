@@ -27,9 +27,11 @@ import type {
   DbDriverOptions,
   DraftRecord,
   DraftModerationOptions,
+  DraftReportRecord,
   DraftVersionLookup,
   DraftVersionRecord,
   PatchPageDb,
+  RecordDraftReportInput,
   RecordUploadInput,
   RecordUploadResult,
   UploadTargetInput
@@ -72,6 +74,7 @@ interface JsonDbState {
   drafts: DraftRecord[];
   draftVersions: DraftVersionRecord[];
   uploadEvents: UploadEventRow[];
+  draftReports: DraftReportRecord[];
 }
 
 interface LoadedJsonDbState {
@@ -426,6 +429,33 @@ export class JsonFilePatchPageDb implements PatchPageDb {
       draft.pinnedAt = null;
       return { value: true, changed: true };
     });
+  }
+
+  async recordDraftReport(input: RecordDraftReportInput): Promise<DraftReportRecord> {
+    return this.mutateState((state) => {
+      // Nothing else in this transform touches the draft. Filing a report is a
+      // write to one collection and nothing more — no disable, no clock change.
+      const report: DraftReportRecord = {
+        id: newInternalId("rpt"),
+        draftId: input.draftId,
+        sourceIp: input.sourceIp,
+        reason: cleanText(input.reason),
+        createdAt: this.nowIso()
+      };
+
+      state.draftReports.push(report);
+      return { value: { ...report }, changed: true };
+    });
+  }
+
+  async listDraftReports(draftId: string): Promise<DraftReportRecord[]> {
+    const state = await this.readState();
+    // Push order is chronological, so it is already the oldest-first order the
+    // port promises — no sort needed, and none that could disagree with a
+    // frozen clock's identical timestamps.
+    return state.draftReports
+      .filter((report) => report.draftId === draftId)
+      .map((report) => ({ ...report }));
   }
 
   async close(): Promise<void> {
@@ -876,7 +906,9 @@ function isJsonDbState(value: unknown): value is JsonDbState {
     Array.isArray(value.draftVersions) &&
     value.draftVersions.every(isDraftVersionRecord) &&
     Array.isArray(value.uploadEvents) &&
-    value.uploadEvents.every(isUploadEventRow)
+    value.uploadEvents.every(isUploadEventRow) &&
+    Array.isArray(value.draftReports) &&
+    value.draftReports.every(isDraftReportRecord)
   );
 }
 
@@ -959,6 +991,17 @@ function isUploadEventRow(value: unknown): value is UploadEventRow {
     isNullableString(value.sourceIp) &&
     isNullableString(value.userAgent) &&
     isRecord(value.metadataJson) &&
+    typeof value.createdAt === "string"
+  );
+}
+
+function isDraftReportRecord(value: unknown): value is DraftReportRecord {
+  return (
+    isRecord(value) &&
+    typeof value.id === "string" &&
+    typeof value.draftId === "string" &&
+    isNullableString(value.sourceIp) &&
+    isNullableString(value.reason) &&
     typeof value.createdAt === "string"
   );
 }

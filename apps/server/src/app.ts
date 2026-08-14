@@ -5,6 +5,7 @@ import type { ServerConfig } from "@patchpage/config";
 import { isUploadTargetError } from "@patchpage/db";
 import type {
   ApiTokenAuth,
+  DraftRecord,
   PatchPageDb,
   RecordUploadInput,
   RecordUploadResult
@@ -26,11 +27,19 @@ import {
   type FixedWindowRateLimiter,
   type RateLimitDecision
 } from "./rate-limit.js";
-import { renderDraftWrapper, renderHome, renderNotFound } from "./render.js";
+import {
+  renderDraftReportAcknowledgement,
+  renderDraftReportForm,
+  renderDraftWrapper,
+  renderHome,
+  renderNotFound
+} from "./render.js";
 import {
   DRAFT_CONTENT_SECURITY_POLICY,
   DRAFT_ROBOTS_TAG,
+  NO_REFERRER_POLICY,
   NO_STORE_CACHE_CONTROL,
+  REPORT_PAGE_CONTENT_SECURITY_POLICY,
   servedDraftCacheControl
 } from "./serving-headers.js";
 
@@ -94,6 +103,13 @@ type ApiRequestTargetPolicy =
       requiredScope?: ApiPolicyScope;
       uploadLimit?: boolean;
     };
+
+/**
+ * A report is one optional sentence, and the driver caps what it stores at 255
+ * characters anyway. Refusing an oversized body outright keeps the only
+ * unauthenticated write on the service from being a place to push bytes.
+ */
+const REPORT_FORM_BODY_LIMIT_BYTES = 8 * 1024;
 
 const FASTIFY_DEFAULT_MAX_PARAM_LENGTH = 100;
 /**
@@ -359,6 +375,56 @@ export function createApp(options: CreateAppOptions): FastifyInstance {
     return renderDraft(options, params.draftId, Number(params.versionNumber), reply);
   });
 
+  // The report path, in its own encapsulated scope so its form-body parser
+  // belongs to it alone: adding a urlencoded parser to the root instance would
+  // quietly change how every `/api` route answers a form-encoded body.
+  app.register(async (reportScope) => {
+    reportScope.addContentTypeParser(
+      "application/x-www-form-urlencoded",
+      { parseAs: "string", bodyLimit: REPORT_FORM_BODY_LIMIT_BYTES },
+      (_request, body, done) => {
+        done(null, Object.fromEntries(new URLSearchParams(body as string)));
+      }
+    );
+
+    reportScope.get("/report/:draftId", async (request, reply) => {
+      const draftId = (request.params as { draftId: string }).draftId;
+      const draft = await findReportableDraft(options, draftId);
+      if (!draft) return sendDraftNotFound(reply);
+
+      applyReportPageHeaders(reply);
+      return reply
+        .type("text/html")
+        .send(renderDraftReportForm({ draft, publicBaseUrl: options.config.publicBaseUrl }));
+    });
+
+    reportScope.post("/report/:draftId", async (request, reply) => {
+      const draftId = (request.params as { draftId: string }).draftId;
+      const draft = await findReportableDraft(options, draftId);
+      if (!draft) return sendDraftNotFound(reply);
+
+      // Storing the report is the entire effect. Nothing here disables the
+      // draft, shortens its clock, or touches its token: a page comes down
+      // only when an operator decides it should, so filing the same report a
+      // thousand times changes exactly as much as filing it once.
+      await options.db.recordDraftReport({
+        draftId: draft.id,
+        sourceIp: request.ip || null,
+        reason: cleanText((request.body as { reason?: unknown } | null)?.reason)
+      });
+
+      applyReportPageHeaders(reply);
+      return reply
+        .type("text/html")
+        .send(
+          renderDraftReportAcknowledgement({
+            draft,
+            publicBaseUrl: options.config.publicBaseUrl
+          })
+        );
+    });
+  });
+
   app.setNotFoundHandler((_request, reply) => {
     return reply.status(404).type("text/html").send(renderNotFound());
   });
@@ -383,6 +449,7 @@ async function renderDraft(
   reply: FastifyReply
 ): Promise<void> {
   reply.header("X-Robots-Tag", DRAFT_ROBOTS_TAG);
+  reply.header("Referrer-Policy", NO_REFERRER_POLICY);
 
   const { draft, version } = await options.db.findDraftVersion(draftId, versionNumber);
   if (!draft || !version) {
@@ -419,6 +486,43 @@ async function renderDraft(
       homeUrl: options.config.publicBaseUrl
     })
   );
+}
+
+/**
+ * The draft a report is about, or nothing. You can only report a page you could
+ * have read: the same lookup that serves a draft decides this, so a deleted,
+ * disabled, or expired draft answers 404 here exactly as its URL does — and an
+ * unknown ID is never a way to write a row.
+ *
+ * Deliberately not a visit: opening the report page is not a reading of the
+ * draft, so it must not top the retention clock up.
+ */
+async function findReportableDraft(
+  options: CreateAppOptions,
+  draftId: string
+): Promise<DraftRecord | null> {
+  if (!isDraftId(draftId)) return null;
+  const { draft } = await options.db.findDraftVersion(draftId);
+  return draft;
+}
+
+/**
+ * Report pages are first-party pages on the serving host, and they keep the
+ * serving guarantees: noindexed, never cached, no cookie, and no script source
+ * in their policy. Only the form-action differs from a served draft's, and only
+ * on this page — see `REPORT_PAGE_CONTENT_SECURITY_POLICY`.
+ */
+function applyReportPageHeaders(reply: FastifyReply): void {
+  reply.header("X-Robots-Tag", DRAFT_ROBOTS_TAG);
+  reply.header("Referrer-Policy", NO_REFERRER_POLICY);
+  reply.header("Content-Security-Policy", REPORT_PAGE_CONTENT_SECURITY_POLICY);
+  // `Cache-Control` is left to the global hook, which makes it `no-store`.
+}
+
+function sendDraftNotFound(reply: FastifyReply): FastifyReply {
+  reply.header("X-Robots-Tag", DRAFT_ROBOTS_TAG);
+  reply.header("Referrer-Policy", NO_REFERRER_POLICY);
+  return reply.status(404).type("text/html").send(renderNotFound());
 }
 
 function protectedApiPrefixGuard(
