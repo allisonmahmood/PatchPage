@@ -206,6 +206,10 @@ export function createApp(options: CreateAppOptions): FastifyInstance {
       // Only creates are quota-bearing. An update rewrites a draft the token
       // already holds, so it costs nothing against either ceiling.
       if (requestedDraftId === null) {
+        // The per-minute bucket is consumed before the quota is counted, so a
+        // client parked at the quota is throttled instead of being free to
+        // re-count the database at the higher upload-limit rate. The cost is
+        // that such a client sees 403 flip to 429 once its bucket empties.
         const createAttempt = rateLimiters.draftCreate.consume(principal.apiTokenId);
         if (!createAttempt.allowed) {
           sendRateLimited(reply, createAttempt);
@@ -640,12 +644,14 @@ function sendRateLimited(reply: FastifyReply, decision: RateLimitDecision): void
   });
 }
 
-function sendLiveDraftQuotaExceeded(reply: FastifyReply, limit: number): FastifyReply {
+// "Draft quota", not "draft limit": the glossary reserves limit-shaped wording
+// for the per-minute create limit, which is a different rejection.
+function sendLiveDraftQuotaExceeded(reply: FastifyReply, quota: number): FastifyReply {
   return reply.status(403).send({
     ok: false,
-    error: `Live draft limit reached: ${limit} live drafts per token. Delete or let a draft expire before creating another.`,
+    error: `Draft quota reached: ${quota} live drafts per token. Delete or let a draft expire before creating another.`,
     code: "live_draft_quota_exceeded",
-    limit
+    quota
   });
 }
 

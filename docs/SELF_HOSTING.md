@@ -239,6 +239,8 @@ When a bucket is exceeded, PatchPage returns HTTP `429` with JSON `{ "ok": false
 
 Expired buckets are pruned deterministically when the process observes a request at or after their reset boundary. A request exactly at the reset time starts a new fixed window for that key. Public `GET /healthz` and draft viewer routes under `/d/...` do not consume protected API or upload buckets.
 
+These counters are process-local and memory-only. They reset on restart and are not shared across Node processes, containers, or replicas. For multi-instance deployments, treat them as a local safety net and add an ingress, load balancer, CDN, or shared external rate limiter if you need a global limit.
+
 ### Per-token draft quotas
 
 Only per-minute limits live in memory. A long-window quota is derived from the database on every attempt, so restarting the process never hands anyone a fresh allowance.
@@ -247,9 +249,9 @@ Only per-minute limits live in memory. A long-window quota is derived from the d
 
 The cap is per token, not per account: two tokens on one account each get the full allowance. It applies uniformly, with no exemption for `admin`-scoped tokens.
 
-A create that would exceed the cap is rejected with HTTP `403` and JSON `{ "ok": false, "code": "live_draft_quota_exceeded", "limit": <cap>, "error": "..." }`, where the error text names the cap. Updates are never rejected by this quota.
+A create that would exceed the quota is rejected with HTTP `403` and JSON `{ "ok": false, "code": "live_draft_quota_exceeded", "quota": <cap>, "error": "..." }`, where the error text names the cap. Updates are never rejected by this quota.
 
-These counters are process-local and memory-only. They reset on restart and are not shared across Node processes, containers, or replicas. For multi-instance deployments, treat them as a local safety net and add an ingress, load balancer, CDN, or shared external rate limiter if you need a global limit.
+Unlike the buckets above, this ceiling is not process-local: it is recounted from the metadata store on every create, so restarting or scaling the server does not reset it.
 
 ### JSON metadata durability
 

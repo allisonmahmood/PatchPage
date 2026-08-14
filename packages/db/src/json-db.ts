@@ -89,7 +89,7 @@ interface StateMutationResult<T> {
   changed: boolean;
 }
 
-/** A draft's creating token is the one that wrote this version. */
+/** A draft's creating token is the one recorded on its first version. */
 const FIRST_VERSION_NUMBER = 1;
 
 // This serializer is intentionally process-local; interprocess locking is unsupported.

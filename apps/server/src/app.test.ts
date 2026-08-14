@@ -1265,9 +1265,17 @@ describe("PatchPage server", () => {
 
     try {
       const first = await createDraft(app, "dev-token", "First");
-      const second = await createDraft(app, "dev-token", "Second");
-      expect([first.statusCode, second.statusCode]).toEqual([201, 201]);
+      expect(first.statusCode).toBe(201);
       const { draftId } = first.json() as { draftId: string };
+
+      // Updates in the same window must not spend any of the create budget.
+      for (let revision = 0; revision < 3; revision += 1) {
+        const update = await updateDraft(app, "dev-token", draftId, `First v${revision}`);
+        expect(update.statusCode).toBe(200);
+      }
+
+      // Still room for the window's second create, so the updates cost nothing.
+      expect((await createDraft(app, "dev-token", "Second")).statusCode).toBe(201);
 
       const limited = await createDraft(app, "dev-token", "Third");
       expect(limited.statusCode).toBe(429);
@@ -1279,13 +1287,10 @@ describe("PatchPage server", () => {
         retryAfterSeconds: 60
       });
 
-      const update = await app.inject({
-        method: "POST",
-        url: "/api/uploads",
-        headers: { authorization: "Bearer dev-token" },
-        payload: { draftId, html: draftHtml("First revised") }
-      });
-      expect(update.statusCode).toBe(200);
+      // An update still succeeds once the create bucket is empty.
+      expect(
+        (await updateDraft(app, "dev-token", draftId, "First again")).statusCode
+      ).toBe(200);
 
       now = 61_000;
       const afterWindow = await createDraft(app, "dev-token", "Fourth");
@@ -1306,7 +1311,9 @@ describe("PatchPage server", () => {
     const app = createApp({ config, db, storage });
 
     try {
-      expect((await createDraft(app, "dev-token", "One")).statusCode).toBe(201);
+      const one = await createDraft(app, "dev-token", "One");
+      expect(one.statusCode).toBe(201);
+      const { draftId } = one.json() as { draftId: string };
       expect((await createDraft(app, "dev-token", "Two")).statusCode).toBe(201);
 
       const overQuota = await createDraft(app, "dev-token", "Three");
@@ -1314,10 +1321,16 @@ describe("PatchPage server", () => {
       expect(overQuota.json()).toEqual({
         ok: false,
         error:
-          "Live draft limit reached: 2 live drafts per token. Delete or let a draft expire before creating another.",
+          "Draft quota reached: 2 live drafts per token. Delete or let a draft expire before creating another.",
         code: "live_draft_quota_exceeded",
-        limit: 2
+        quota: 2
       });
+
+      // The quota bounds creates only: at the ceiling, rewriting a draft the
+      // token already holds still succeeds.
+      expect(
+        (await updateDraft(app, "dev-token", draftId, "One revised")).statusCode
+      ).toBe(200);
     } finally {
       await app.close();
       await db.close();
@@ -1334,7 +1347,7 @@ describe("PatchPage server", () => {
       expect(stillOverQuota.statusCode).toBe(403);
       expect(stillOverQuota.json()).toMatchObject({
         code: "live_draft_quota_exceeded",
-        limit: 2
+        quota: 2
       });
     } finally {
       await restarted.close();
@@ -2036,6 +2049,20 @@ async function createDraft(
     url: "/api/uploads",
     headers: { authorization: `Bearer ${token}` },
     payload: { html: draftHtml(title) }
+  });
+}
+
+async function updateDraft(
+  app: ReturnType<typeof createApp>,
+  token: string,
+  draftId: string,
+  title: string
+) {
+  return app.inject({
+    method: "POST",
+    url: "/api/uploads",
+    headers: { authorization: `Bearer ${token}` },
+    payload: { draftId, html: draftHtml(title) }
   });
 }
 

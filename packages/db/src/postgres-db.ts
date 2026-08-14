@@ -29,7 +29,7 @@ const { Pool } = pg;
 // racing on `CREATE TABLE IF NOT EXISTS`, which is not race-free in Postgres.
 const MIGRATION_ADVISORY_LOCK_KEY = 5150324118422001n;
 
-/** A draft's creating token is the one that wrote this version. */
+/** A draft's creating token is the one recorded on its first version. */
 const FIRST_VERSION_NUMBER = 1;
 
 export class PostgresPatchPageDb implements PatchPageDb {
