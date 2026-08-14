@@ -23,6 +23,10 @@ const DEFAULT_API_URL = "https://post.patchyhq.com";
 const MINT_PATH = "/api/tokens/self-service";
 const MINTED_TOKEN = "pp_minted_publishing_key";
 const AUP_URL = "https://patchyhq.com/acceptable-use";
+// Not spec-pinned copy: the mint response carries the URL and acceptance is
+// implied by publishing, so the CLI surfaces it. Asserted separately from the
+// pinned announcement paragraph so the two can never be edited as one string.
+const AUP_NOTICE = `Publishing here accepts the acceptable use policy: ${AUP_URL}\n`;
 const DEPRECATED_ANONYMOUS_NOTICE =
   "Warning: --anonymous is deprecated and ignored. Uploads always use a publishing token; " +
   "one is minted automatically when none is stored for the instance.\n";
@@ -603,7 +607,7 @@ describe("patchpage upload", () => {
       expect(result.status).toBe(0);
       expect(result.stderr).toBe(DEPRECATED_ANONYMOUS_NOTICE);
       expect(result.stdout).toBe(
-        `${mintAnnouncement(server.apiUrl, stateDir)}Uploaded draft\n` +
+        `${mintAnnouncement(server.apiUrl, stateDir)}${AUP_NOTICE}Uploaded draft\n` +
           "URL: http://example.test/d/mnopqrstuvwx\n" +
           "Draft ID: mnopqrstuvwx\n" +
           "Version: 1\n"
@@ -1135,7 +1139,7 @@ describe("auto-mint on first upload", () => {
       expect(result.stderr).toBe("");
       // The announcement is pinned byte-for-byte and precedes the upload result.
       expect(result.stdout).toBe(
-        `${mintAnnouncement(server.apiUrl, stateDir)}Uploaded draft\n` +
+        `${mintAnnouncement(server.apiUrl, stateDir)}${AUP_NOTICE}Uploaded draft\n` +
           "URL: http://example.test/d/mnopqrstuvwx\n" +
           "Draft ID: mnopqrstuvwx\n" +
           "Version: 1\n"
@@ -1176,6 +1180,89 @@ describe("auto-mint on first upload", () => {
       expect(server.mints[0]?.raw).toBe("{}");
     } finally {
       await server.close();
+    }
+  });
+
+  it("mints from upload alone, never from whoami or validate", async () => {
+    const stateDir = makeStateDir();
+    const htmlPath = path.join(stateDir, "read-only.html");
+    writeFileSync(htmlPath, "<!doctype html><title>Read only</title>");
+    const server = await startUploadServer(createOnly("mnopqrstuvwx"));
+
+    try {
+      const whoami = await runCliAsync(
+        ["whoami", "--api-url", server.apiUrl],
+        {},
+        stateDir
+      );
+      const validate = await runCliAsync(["validate", htmlPath], {}, stateDir);
+
+      // Both are read-only diagnostics: they report the absence of a token
+      // rather than quietly creating an identity the user never asked for.
+      expect(whoami.status).toBe(1);
+      expect(whoami.stderr).toBe(
+        `No publishing token is stored for ${server.apiUrl}.\n` +
+          "One is minted automatically on your first upload, or save an existing one with: " +
+          `patchpage auth set --api-url ${server.apiUrl}\n`
+      );
+      expect(validate.status).toBe(0);
+      expect(server.mints).toEqual([]);
+      expect(server.requests).toEqual([]);
+      expect(existsSync(path.join(stateDir, "credentials.json"))).toBe(false);
+
+      // The same instance mints readily once an upload asks it to.
+      const upload = await runCliAsync(
+        ["upload", htmlPath, "--api-url", server.apiUrl],
+        {},
+        stateDir
+      );
+      expect(upload.status).toBe(0);
+      expect(server.mints).toHaveLength(1);
+    } finally {
+      await server.close();
+    }
+  });
+
+  it("relays the acceptable use policy only when the instance names one", async () => {
+    const withPolicy = await startUploadServer(createOnly("mnopqrstuvwx"));
+    const withoutPolicy = await startUploadServer(createOnly("yzabcdefghij"), () => ({
+      status: 201,
+      body: { ok: true, token: MINTED_TOKEN }
+    }));
+
+    try {
+      const policyState = makeStateDir();
+      const policyHtml = path.join(policyState, "aup.html");
+      writeFileSync(policyHtml, "<!doctype html><title>Policy</title>");
+      const announced = await runCliAsync(
+        ["upload", policyHtml, "--api-url", withPolicy.apiUrl],
+        {},
+        policyState
+      );
+
+      const silentState = makeStateDir();
+      const silentHtml = path.join(silentState, "no-aup.html");
+      writeFileSync(silentHtml, "<!doctype html><title>No policy</title>");
+      const silent = await runCliAsync(
+        ["upload", silentHtml, "--api-url", withoutPolicy.apiUrl],
+        {},
+        silentState
+      );
+
+      expect([announced.status, silent.status]).toEqual([0, 0]);
+      // Acceptance is implied by publishing, so the link is shown when offered.
+      expect(announced.stdout).toContain(AUP_NOTICE);
+      // An instance that names no policy gets no invented one, and minting
+      // still succeeds: the URL is relayed, never required.
+      expect(silent.stdout).not.toContain("acceptable use policy");
+      expect(silent.stdout).toContain(mintAnnouncement(withoutPolicy.apiUrl, silentState));
+      expect(readHostCredential(silentState, withoutPolicy.apiUrl)).toMatchObject({
+        token: MINTED_TOKEN,
+        source: "mint"
+      });
+    } finally {
+      await withPolicy.close();
+      await withoutPolicy.close();
     }
   });
 
@@ -1281,7 +1368,7 @@ describe("auto-mint on first upload", () => {
     writeFileSync(htmlPath, "<!doctype html><title>Mint rate limited</title>");
     const server = await startUploadServer(
       createOnly("mnopqrstuvwx"),
-      refusesMint("rate_limited", { retryAfterSeconds: 42 })
+      refusesMint("rate_limited", 42)
     );
 
     try {
@@ -1692,7 +1779,7 @@ describe("host-keyed local state", () => {
     }
   });
 
-  it("gives the default instance flip-agnostic self-service guidance", () => {
+  it("names auto-mint and auth set for the default instance without claiming its posture", () => {
     const result = runCli(["whoami"]);
 
     expect(result.status).toBe(1);
@@ -1702,9 +1789,9 @@ describe("host-keyed local state", () => {
         "One is minted automatically on your first upload, or save an existing one with: " +
         `patchpage auth set --api-url ${DEFAULT_API_URL}\n`
     );
-    // True whether or not the instance hands out tokens yet: if it does not,
-    // the refused-mint error on the first upload says so with its own next
-    // action, so this copy never has to guess at the instance's posture.
+    // True whether or not the instance allows self-service minting yet: if it
+    // does not, the refused-mint error on the first upload says so with its
+    // own next action, so this copy never has to guess.
     expect(result.stderr).not.toContain("does not issue public tokens");
   });
 
@@ -2230,7 +2317,13 @@ interface MintRequest {
   raw: string;
 }
 
-type MintResponder = () => UploadResponse;
+/** A mint reply is its own contract, not an upload reply that happens to fit. */
+interface MintResponse {
+  status: number;
+  body: Record<string, unknown>;
+}
+
+type MintResponder = () => MintResponse;
 
 /**
  * A hand-written loopback instance implementing the pinned self-service mint
@@ -2286,24 +2379,32 @@ function mintsToken(token: string): MintResponder {
 /** The pinned refusals, verbatim from the mint wire contract. */
 function refusesMint(
   code: "self_service_disabled" | "mint_quota_exceeded" | "rate_limited",
-  extra: Record<string, unknown> = {}
+  retryAfterSeconds?: number
 ): MintResponder {
   const status = code === "self_service_disabled" ? 403 : 429;
   return () => ({
     status,
-    body: { ok: false, error: `Mint refused: ${code}.`, code, ...extra }
+    body: {
+      ok: false,
+      error: `Mint refused: ${code}.`,
+      code,
+      ...(retryAfterSeconds === undefined ? {} : { retryAfterSeconds })
+    }
   });
 }
 
-/** The announcement copy, pinned byte-for-byte by the spec. */
+/**
+ * The announcement paragraph, pinned byte-for-byte by the spec. Nothing that
+ * is not spec text belongs in this string: folding extra copy in here would
+ * let an ordinary edit masquerade as an edit of the pinned wording.
+ */
 function mintAnnouncement(apiUrl: string, stateDir: string): string {
   return (
     `Minted a new publishing token for ${apiUrl}; saved to ` +
     `${path.join(stateDir, "credentials.json")}. That file is the only key to these pages — ` +
     "copy it to another machine to publish from there with the same editing rights. If you've " +
     "published from another machine before, those pages belong to that machine's token — ask " +
-    "your agent to help copy it over instead of using this new one.\n" +
-    `Publishing here accepts the acceptable use policy: ${AUP_URL}\n`
+    "your agent to help copy it over instead of using this new one.\n"
   );
 }
 

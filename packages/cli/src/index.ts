@@ -149,12 +149,7 @@ program
     }
 
     const apiUrl = resolveApiUrl(options.apiUrl);
-    credentials.hosts[apiUrl] = {
-      token: apiToken,
-      updatedAt: new Date().toISOString(),
-      source: "auth-set"
-    } satisfies HostCredential;
-    writeJson(CREDENTIALS_PATH, credentials, 0o600);
+    saveHostCredential(credentials, apiUrl, apiToken, "auth-set");
 
     console.log(`PatchPage credentials saved for ${apiUrl}.`);
   });
@@ -240,8 +235,8 @@ program
 
     // Local validation gates the network, so an unpublishable file never costs
     // a mint against the instance's per-network quota.
-    const { apiUrl, apiToken: storedToken } = readUploadAuth(options.apiUrl);
-    const apiToken = storedToken ?? (await mintPublishingToken(apiUrl));
+    const { apiUrl, apiToken: configuredToken } = readUploadAuth(options.apiUrl);
+    const apiToken = configuredToken ?? (await mintPublishingToken(apiUrl));
 
     const drafts = readDraftFile();
     const cachedDrafts = readCachedDrafts(drafts.hosts, apiUrl);
@@ -485,13 +480,7 @@ async function mintPublishingToken(apiUrl: string): Promise<string> {
     );
   }
 
-  const credentials = readCredentialFileForWrite();
-  credentials.hosts[apiUrl] = {
-    token,
-    updatedAt: new Date().toISOString(),
-    source: "mint"
-  } satisfies HostCredential;
-  writeJson(CREDENTIALS_PATH, credentials, 0o600);
+  saveHostCredential(readCredentialFileForWrite(), apiUrl, token, "mint");
 
   // Saved before it is announced: a token that reached the instance but not
   // the disk would silently orphan every page it just created.
@@ -599,6 +588,25 @@ function readStoredCredential(
     updatedAt: typeof entry.updatedAt === "string" ? entry.updatedAt : undefined,
     source: entry.source === "mint" || entry.source === "auth-set" ? entry.source : undefined
   };
+}
+
+/**
+ * The single writer for a token. Both ways one arrives — the operator pasting
+ * it and the instance minting it — record the same shape, so the two sources
+ * cannot drift apart in what they persist or how tightly the file is locked.
+ */
+function saveHostCredential(
+  credentials: { hosts: Record<string, unknown> },
+  apiUrl: string,
+  token: string,
+  source: CredentialSource
+): void {
+  credentials.hosts[apiUrl] = {
+    token,
+    updatedAt: new Date().toISOString(),
+    source
+  } satisfies HostCredential;
+  writeJson(CREDENTIALS_PATH, credentials, 0o600);
 }
 
 /**
