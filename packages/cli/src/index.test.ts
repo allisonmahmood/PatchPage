@@ -20,6 +20,16 @@ import { afterEach, beforeAll, describe, expect, it } from "vitest";
 const packageDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const cliPath = path.join(packageDir, "dist/index.js");
 const DEFAULT_API_URL = "https://post.patchyhq.com";
+const MINT_PATH = "/api/tokens/self-service";
+const MINTED_TOKEN = "pp_minted_publishing_key";
+const AUP_URL = "https://patchyhq.com/acceptable-use";
+// Not spec-pinned copy: the mint response carries the URL and acceptance is
+// implied by publishing, so the CLI surfaces it. Asserted separately from the
+// pinned announcement paragraph so the two can never be edited as one string.
+const AUP_NOTICE = `Publishing here accepts the acceptable use policy: ${AUP_URL}\n`;
+const DEPRECATED_ANONYMOUS_NOTICE =
+  "Warning: --anonymous is deprecated and ignored. Uploads always use a publishing token; " +
+  "one is minted automatically when none is stored for the instance.\n";
 const argvPreloadUrl = pathToFileURL(
   path.join(packageDir, "test/record-argv.mjs")
 ).href;
@@ -464,13 +474,16 @@ describe("patchpage auth set terminal boundary", () => {
 });
 
 describe("CLI auth guidance", () => {
-  it("directs missing credentials to the hidden prompt without a token placeholder", () => {
+  it("explains both ways a token arrives without a token placeholder", () => {
     const result = runCli(["whoami", "--api-url", "http://127.0.0.1:1"]);
 
     expect(result.status).toBe(1);
     expect(result.stdout).toBe("");
+    // `whoami` reports; it never mints. Both routes to a token are named.
     expect(result.stderr).toBe(
-      "Missing API token for http://127.0.0.1:1. Run: patchpage auth set --api-url http://127.0.0.1:1\n"
+      "No publishing token is stored for http://127.0.0.1:1.\n" +
+        "One is minted automatically on your first upload, or save an existing one with: " +
+        "patchpage auth set --api-url http://127.0.0.1:1\n"
     );
     expect(result.stderr).not.toContain("<api-token>");
   });
@@ -504,7 +517,7 @@ describe("patchpage upload", () => {
       "--draft <draft-id>  Update an existing draft only; never creates a draft"
     );
     expect(result.stdout).toContain(
-      "--anonymous         Create without credentials; never updates a draft"
+      "--anonymous         Deprecated and ignored; uploads always use a token"
     );
   });
 
@@ -523,13 +536,6 @@ describe("patchpage upload", () => {
       "",
       "--new"
     ]);
-    const anonymousResult = runCli([
-      "upload",
-      "does-not-exist.html",
-      "--draft",
-      "abcdefghijkl",
-      "--anonymous"
-    ]);
 
     expect(result.status).toBe(1);
     expect(result.stdout).toBe("");
@@ -537,171 +543,119 @@ describe("patchpage upload", () => {
     expect(emptyTargetResult.status).toBe(1);
     expect(emptyTargetResult.stdout).toBe("");
     expect(emptyTargetResult.stderr).toBe("--draft and --new cannot be used together.\n");
-    expect(anonymousResult.status).toBe(1);
-    expect(anonymousResult.stdout).toBe("");
-    expect(anonymousResult.stderr).toBe(
-      "Anonymous uploads are create-only; --draft requires credentials.\n"
-    );
   });
 
-  it("lets --anonymous bypass credentials and cached update state", async () => {
+  it("accepts --anonymous as a deprecated no-op that publishes normally", async () => {
     const stateDir = makeStateDir();
-    const htmlPath = path.join(stateDir, "anonymous-override.html");
+    const htmlPath = path.join(stateDir, "deprecated-anonymous.html");
     const cachedDraftId = "abcdefghijkl";
-    const draftCachePath = path.join(stateDir, "drafts.json");
-    const draftCacheReadMarker = path.join(stateDir, "draft-cache-read");
-    const cacheReadProbe = {
-      PATCHPAGE_TEST_FS_READ_TARGET: draftCachePath,
-      PATCHPAGE_TEST_FS_READ_MARKER: draftCacheReadMarker
-    };
     writeFileSync(
       htmlPath,
-      "<!doctype html><html><head><title>Anonymous override</title></head><body></body></html>"
+      "<!doctype html><html><head><title>Deprecated anonymous</title></head><body></body></html>"
     );
-    writeFileSync(
-      path.join(stateDir, "credentials.json"),
-      "malformed stored credentials that anonymous mode must not read\n"
-    );
-    let cachedState: string;
-    let authorization: string | undefined;
-    let requestBody: Record<string, unknown> | undefined;
-    const server = createServer(async (request, response) => {
-      authorization = request.headers.authorization;
-      let body = "";
-      for await (const chunk of request) body += chunk;
-      requestBody = JSON.parse(body) as Record<string, unknown>;
-      response.statusCode = 201;
-      response.setHeader("Content-Type", "application/json");
-      response.end(
-        JSON.stringify({
-          ok: true,
-          draftId: "mnopqrstuvwx",
-          publicUrl: "http://example.test/d/mnopqrstuvwx",
-          versionNumber: 1,
-          warnings: []
-        })
-      );
-    });
-    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const server = await startUploadServer(createOrUpdate("mnopqrstuvwx"));
 
     try {
-      const address = server.address();
-      if (!address || typeof address === "string") throw new Error("Expected a TCP test server");
-      const apiUrl = `http://127.0.0.1:${address.port}`;
-      cachedState = hostKeyedDraftCache({
-        [apiUrl]: { [htmlPath]: { draftId: cachedDraftId, latestVersionNumber: 3 } }
-      });
-      writeFileSync(draftCachePath, cachedState);
-
-      const result = await runCliAsync(
-        ["upload", htmlPath, "--anonymous", "--api-url", apiUrl],
-        { PATCHPAGE_API_TOKEN: "environment-token", ...cacheReadProbe },
-        stateDir
+      writeFileSync(
+        path.join(stateDir, "credentials.json"),
+        hostKeyedCredentials({ [server.apiUrl]: "stored-token" })
       );
-      const explicitNewResult = await runCliAsync(
-        ["upload", htmlPath, "--anonymous", "--new", "--api-url", apiUrl],
-        { PATCHPAGE_API_TOKEN: "environment-token", ...cacheReadProbe },
-        stateDir
-      );
-
-      expect([result.status, explicitNewResult.status]).toEqual([0, 0]);
-      expect(authorization).toBeUndefined();
-      expect(requestBody).not.toHaveProperty("draftId");
-      expect(readFileSync(draftCachePath, "utf8")).toBe(cachedState);
-      expect(existsSync(draftCacheReadMarker)).toBe(false);
-    } finally {
-      await new Promise<void>((resolve, reject) =>
-        server.close((error) => (error ? reject(error) : resolve()))
-      );
-    }
-  });
-
-  it("rejects an explicit update when automatic anonymous mode has no credentials", async () => {
-    const stateDir = makeStateDir();
-    const htmlPath = path.join(stateDir, "anonymous-update.html");
-    writeFileSync(
-      htmlPath,
-      "<!doctype html><html><head><title>Anonymous update</title></head><body></body></html>"
-    );
-    let requestCount = 0;
-    const server = createServer((_request, response) => {
-      requestCount += 1;
-      response.statusCode = 201;
-      response.setHeader("Content-Type", "application/json");
-      response.end(
-        JSON.stringify({
-          ok: true,
-          draftId: "mnopqrstuvwx",
-          publicUrl: "http://example.test/d/mnopqrstuvwx",
-          versionNumber: 1,
-          warnings: []
+      writeFileSync(
+        path.join(stateDir, "drafts.json"),
+        hostKeyedDraftCache({
+          [server.apiUrl]: { [htmlPath]: { draftId: cachedDraftId, latestVersionNumber: 3 } }
         })
       );
-    });
-    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
 
-    try {
-      const address = server.address();
-      if (!address || typeof address === "string") throw new Error("Expected a TCP test server");
       const result = await runCliAsync(
-        [
-          "upload",
-          htmlPath,
-          "--draft",
-          "abcdefghijkl",
-          "--api-url",
-          `http://127.0.0.1:${address.port}`
-        ],
+        ["upload", htmlPath, "--anonymous", "--api-url", server.apiUrl],
         {},
         stateDir
       );
 
-      expect(result.status).toBe(1);
-      expect(result.stderr).toBe(
-        "Anonymous uploads are create-only; --draft requires credentials.\n"
-      );
-      expect(requestCount).toBe(0);
+      expect(result.status).toBe(0);
+      // Announced on stderr, then ignored: credentials and the cached draft are
+      // both honoured exactly as they would be without the flag.
+      expect(result.stderr).toBe(DEPRECATED_ANONYMOUS_NOTICE);
+      expect(result.stdout).toContain("Updated draft");
+      expect(server.requests).toHaveLength(1);
+      expect(server.requests[0]?.authorization).toBe("Bearer stored-token");
+      expect(server.requests[0]?.body).toHaveProperty("draftId", cachedDraftId);
+      expect(server.mints).toEqual([]);
+      expect(readDraftCache(stateDir).hosts[server.apiUrl]?.files[htmlPath]).toMatchObject({
+        draftId: cachedDraftId,
+        latestVersionNumber: 2
+      });
     } finally {
-      await new Promise<void>((resolve, reject) =>
-        server.close((error) => (error ? reject(error) : resolve()))
-      );
+      await server.close();
     }
   });
 
-  it("selects environment, stored, then automatic anonymous upload credentials", async () => {
-    const authorizations: Array<string | undefined> = [];
-    const requestBodies: Array<Record<string, unknown>> = [];
-    const server = createServer(async (request, response) => {
-      authorizations.push(request.headers.authorization);
-      let body = "";
-      for await (const chunk of request) body += chunk;
-      requestBodies.push(JSON.parse(body) as Record<string, unknown>);
-      response.statusCode = 201;
-      response.setHeader("Content-Type", "application/json");
-      response.end(
-        JSON.stringify({
-          ok: true,
-          draftId: "mnopqrstuvwx",
-          publicUrl: "http://example.test/d/mnopqrstuvwx",
-          versionNumber: 1,
-          warnings: []
-        })
-      );
-    });
-    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  it("still auto-mints under the deprecated --anonymous flag", async () => {
+    const stateDir = makeStateDir();
+    const htmlPath = path.join(stateDir, "deprecated-anonymous-mint.html");
+    writeFileSync(htmlPath, "<!doctype html><title>Deprecated anonymous mint</title>");
+    const server = await startUploadServer(createOnly("mnopqrstuvwx"));
 
     try {
-      const address = server.address();
-      if (!address || typeof address === "string") throw new Error("Expected a TCP test server");
-      const apiUrl = `http://127.0.0.1:${address.port}`;
-      const apiArgs = ["--api-url", apiUrl];
+      const result = await runCliAsync(
+        ["upload", htmlPath, "--anonymous", "--api-url", server.apiUrl],
+        {},
+        stateDir
+      );
+
+      expect(result.status).toBe(0);
+      expect(result.stderr).toBe(DEPRECATED_ANONYMOUS_NOTICE);
+      expect(result.stdout).toBe(
+        `${mintAnnouncement(server.apiUrl, stateDir)}${AUP_NOTICE}Uploaded draft\n` +
+          "URL: http://example.test/d/mnopqrstuvwx\n" +
+          "Draft ID: mnopqrstuvwx\n" +
+          "Version: 1\n"
+      );
+      expect(server.mints).toHaveLength(1);
+      expect(server.requests[0]?.authorization).toBe(`Bearer ${MINTED_TOKEN}`);
+    } finally {
+      await server.close();
+    }
+  });
+
+  it("mints before an explicit --draft update when no token is stored", async () => {
+    const stateDir = makeStateDir();
+    const htmlPath = path.join(stateDir, "mint-then-update.html");
+    writeFileSync(htmlPath, "<!doctype html><title>Mint then update</title>");
+    const server = await startUploadServer(createOrUpdate("mnopqrstuvwx"));
+
+    try {
+      const result = await runCliAsync(
+        ["upload", htmlPath, "--draft", "abcdefghijkl", "--api-url", server.apiUrl],
+        {},
+        stateDir
+      );
+
+      expect(result.status).toBe(0);
+      // The flag combination that used to be rejected is now ordinary: every
+      // upload has a token, so an explicit target is always answerable.
+      expect(result.stdout).toContain("Updated draft");
+      expect(server.mints).toHaveLength(1);
+      expect(server.requests[0]?.authorization).toBe(`Bearer ${MINTED_TOKEN}`);
+      expect(server.requests[0]?.body).toHaveProperty("draftId", "abcdefghijkl");
+    } finally {
+      await server.close();
+    }
+  });
+
+  it("selects environment, then stored, then a freshly minted upload credential", async () => {
+    const server = await startUploadServer(createOnly("mnopqrstuvwx"));
+
+    try {
+      const apiArgs = ["--api-url", server.apiUrl];
 
       const environmentState = makeStateDir();
       const environmentHtml = path.join(environmentState, "environment.html");
       writeFileSync(environmentHtml, "<!doctype html><title>Environment</title>");
       writeFileSync(
         path.join(environmentState, "credentials.json"),
-        hostKeyedCredentials({ [apiUrl]: "stored-token" })
+        hostKeyedCredentials({ [server.apiUrl]: "stored-token" })
       );
       const environmentResult = await runCliAsync(
         ["upload", environmentHtml, "--new", ...apiArgs],
@@ -714,7 +668,7 @@ describe("patchpage upload", () => {
       writeFileSync(storedHtml, "<!doctype html><title>Stored</title>");
       writeFileSync(
         path.join(storedState, "credentials.json"),
-        hostKeyedCredentials({ [apiUrl]: "stored-token" })
+        hostKeyedCredentials({ [server.apiUrl]: "stored-token" })
       );
       const storedResult = await runCliAsync(
         ["upload", storedHtml, "--new", ...apiArgs],
@@ -722,35 +676,25 @@ describe("patchpage upload", () => {
         storedState
       );
 
-      const anonymousState = makeStateDir();
-      const anonymousHtml = path.join(anonymousState, "anonymous.html");
-      writeFileSync(anonymousHtml, "<!doctype html><title>Automatic anonymous</title>");
-      const cachedState = hostKeyedDraftCache({
-        [apiUrl]: { [anonymousHtml]: { draftId: "abcdefghijkl", latestVersionNumber: 2 } }
-      });
-      writeFileSync(path.join(anonymousState, "drafts.json"), cachedState);
-      const anonymousResult = await runCliAsync(
-        ["upload", anonymousHtml, ...apiArgs],
-        {},
-        anonymousState
-      );
+      const mintState = makeStateDir();
+      const mintHtml = path.join(mintState, "minted.html");
+      writeFileSync(mintHtml, "<!doctype html><title>Minted</title>");
+      const mintResult = await runCliAsync(["upload", mintHtml, ...apiArgs], {}, mintState);
 
       expect([
         environmentResult.status,
         storedResult.status,
-        anonymousResult.status
+        mintResult.status
       ]).toEqual([0, 0, 0]);
-      expect(authorizations).toEqual([
+      expect(server.requests.map((request) => request.authorization)).toEqual([
         "Bearer environment-token",
         "Bearer stored-token",
-        undefined
+        `Bearer ${MINTED_TOKEN}`
       ]);
-      expect(requestBodies[2]).not.toHaveProperty("draftId");
-      expect(readFileSync(path.join(anonymousState, "drafts.json"), "utf8")).toBe(cachedState);
+      // Minting is the last resort, so neither configured source triggers one.
+      expect(server.mints).toHaveLength(1);
     } finally {
-      await new Promise<void>((resolve, reject) =>
-        server.close((error) => (error ? reject(error) : resolve()))
-      );
+      await server.close();
     }
   });
 
@@ -855,61 +799,33 @@ describe("patchpage upload", () => {
     }
   });
 
-  it("keeps repeated no-credential uploads create-only without persisting update intent", async () => {
+  it("mints once and republishes with the saved token on later uploads", async () => {
     const stateDir = makeStateDir();
-    const htmlPath = path.join(stateDir, "repeat-anonymous.html");
-    const draftCachePath = path.join(stateDir, "drafts.json");
-    const draftCacheReadMarker = path.join(stateDir, "draft-cache-read");
-    const cacheReadProbe = {
-      PATCHPAGE_TEST_FS_READ_TARGET: draftCachePath,
-      PATCHPAGE_TEST_FS_READ_MARKER: draftCacheReadMarker
-    };
-    writeFileSync(htmlPath, "<!doctype html><title>Repeat anonymous</title>");
-    const authorizations: Array<string | undefined> = [];
-    const requestBodies: Array<Record<string, unknown>> = [];
-    const responseDraftIds = ["mnopqrstuvwx", "yzabcdefghij"];
-    const server = createServer(async (request, response) => {
-      authorizations.push(request.headers.authorization);
-      let body = "";
-      for await (const chunk of request) body += chunk;
-      requestBodies.push(JSON.parse(body) as Record<string, unknown>);
-      const draftId = responseDraftIds[requestBodies.length - 1];
-      response.statusCode = 201;
-      response.setHeader("Content-Type", "application/json");
-      response.end(
-        JSON.stringify({
-          ok: true,
-          draftId,
-          publicUrl: `http://example.test/d/${draftId}`,
-          versionNumber: 1,
-          warnings: []
-        })
-      );
-    });
-    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const htmlPath = path.join(stateDir, "repeat-upload.html");
+    writeFileSync(htmlPath, "<!doctype html><title>Repeat upload</title>");
+    const server = await startUploadServer(createOrUpdate("mnopqrstuvwx"));
 
     try {
-      const address = server.address();
-      if (!address || typeof address === "string") throw new Error("Expected a TCP test server");
-      const args = ["upload", htmlPath, "--api-url", `http://127.0.0.1:${address.port}`];
-
-      const first = await runCliAsync(args, cacheReadProbe, stateDir);
-      const second = await runCliAsync(args, cacheReadProbe, stateDir);
+      const args = ["upload", htmlPath, "--api-url", server.apiUrl];
+      const first = await runCliAsync(args, {}, stateDir);
+      const second = await runCliAsync(args, {}, stateDir);
 
       expect([first.status, second.status]).toEqual([0, 0]);
-      expect(authorizations).toEqual([undefined, undefined]);
-      expect(requestBodies).toHaveLength(2);
-      for (const requestBody of requestBodies) {
-        expect(requestBody).not.toHaveProperty("draftId");
-      }
-      expect(first.stdout).toContain("Draft ID: mnopqrstuvwx");
-      expect(second.stdout).toContain("Draft ID: yzabcdefghij");
-      expect(existsSync(path.join(stateDir, "drafts.json"))).toBe(false);
-      expect(existsSync(draftCacheReadMarker)).toBe(false);
+      // One key per instance, for the life of that instance's pages.
+      expect(server.mints).toHaveLength(1);
+      expect(server.requests.map((request) => request.authorization)).toEqual([
+        `Bearer ${MINTED_TOKEN}`,
+        `Bearer ${MINTED_TOKEN}`
+      ]);
+      expect(first.stdout).toContain(mintAnnouncement(server.apiUrl, stateDir));
+      expect(first.stdout).toContain("Uploaded draft");
+      // The announcement is a first-run event, not a per-upload banner.
+      expect(second.stdout).not.toContain("Minted a new publishing token");
+      expect(second.stdout).toContain("Updated draft");
+      expect(server.requests[0]?.body).not.toHaveProperty("draftId");
+      expect(server.requests[1]?.body).toHaveProperty("draftId", "mnopqrstuvwx");
     } finally {
-      await new Promise<void>((resolve, reject) =>
-        server.close((error) => (error ? reject(error) : resolve()))
-      );
+      await server.close();
     }
   });
 
@@ -917,42 +833,23 @@ describe("patchpage upload", () => {
     const stateDir = makeStateDir();
     const htmlPath = path.join(stateDir, "empty-environment-token.html");
     writeFileSync(htmlPath, "<!doctype html><title>Empty environment token</title>");
-    let requestCount = 0;
-    let authorization: string | undefined | null = null;
-    const server = createServer((request, response) => {
-      requestCount += 1;
-      authorization = request.headers.authorization;
-      response.statusCode = 201;
-      response.setHeader("Content-Type", "application/json");
-      response.end(
-        JSON.stringify({
-          ok: true,
-          draftId: "mnopqrstuvwx",
-          publicUrl: "http://example.test/d/mnopqrstuvwx",
-          versionNumber: 1,
-          warnings: []
-        })
-      );
-    });
-    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const server = await startUploadServer(createOnly("mnopqrstuvwx"));
 
     try {
-      const address = server.address();
-      if (!address || typeof address === "string") throw new Error("Expected a TCP test server");
       const result = await runCliAsync(
-        ["upload", htmlPath, "--api-url", `http://127.0.0.1:${address.port}`],
+        ["upload", htmlPath, "--api-url", server.apiUrl],
         { PATCHPAGE_API_TOKEN: "" },
         stateDir
       );
 
       expect(result.status).toBe(0);
-      expect(requestCount).toBe(1);
-      expect(authorization).toBeUndefined();
-      expect(existsSync(path.join(stateDir, "drafts.json"))).toBe(false);
+      // Unset means unset: the empty value mints rather than sending an empty
+      // Bearer header the instance would reject.
+      expect(server.mints).toHaveLength(1);
+      expect(server.requests).toHaveLength(1);
+      expect(server.requests[0]?.authorization).toBe(`Bearer ${MINTED_TOKEN}`);
     } finally {
-      await new Promise<void>((resolve, reject) =>
-        server.close((error) => (error ? reject(error) : resolve()))
-      );
+      await server.close();
     }
   });
 
@@ -1006,39 +903,63 @@ describe("patchpage upload", () => {
     }
   });
 
-  it("does not retry an authenticated upload failure anonymously", async () => {
-    const token = "pp_rejected_environment_token";
-    const stateDir = makeStateDir();
-    const htmlPath = path.join(stateDir, "rejected-auth.html");
-    writeFileSync(htmlPath, "<!doctype html><title>Rejected auth</title>");
-    let requestCount = 0;
-    let authorization: string | undefined;
-    const server = createServer((request, response) => {
-      requestCount += 1;
-      authorization = request.headers.authorization;
-      response.statusCode = 401;
-      response.setHeader("Content-Type", "application/json");
-      response.end(JSON.stringify({ ok: false, error: "Missing or invalid API token." }));
+  it("never re-mints after a configured token is rejected", async () => {
+    const environmentToken = "pp_rejected_environment_token";
+    const storedToken = "pp_rejected_stored_token";
+    const reject = (): UploadResponse => ({
+      status: 401,
+      body: { ok: false, error: "Missing or invalid API token." }
     });
-    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const server = await startUploadServer(reject);
 
     try {
-      const address = server.address();
-      if (!address || typeof address === "string") throw new Error("Expected a TCP test server");
-      const result = await runCliAsync(
-        ["upload", htmlPath, "--api-url", `http://127.0.0.1:${address.port}`],
-        { PATCHPAGE_API_TOKEN: token },
-        stateDir
+      const environmentState = makeStateDir();
+      const environmentHtml = path.join(environmentState, "rejected-environment.html");
+      writeFileSync(environmentHtml, "<!doctype html><title>Rejected environment</title>");
+      const environmentResult = await runCliAsync(
+        ["upload", environmentHtml, "--api-url", server.apiUrl],
+        { PATCHPAGE_API_TOKEN: environmentToken },
+        environmentState
       );
 
-      expect(result.status).toBe(1);
-      expect(requestCount).toBe(1);
-      expect(authorization).toBe(`Bearer ${token}`);
-      expect(existsSync(path.join(stateDir, "drafts.json"))).toBe(false);
-    } finally {
-      await new Promise<void>((resolve, reject) =>
-        server.close((error) => (error ? reject(error) : resolve()))
+      const storedState = makeStateDir();
+      const storedHtml = path.join(storedState, "rejected-stored.html");
+      writeFileSync(storedHtml, "<!doctype html><title>Rejected stored</title>");
+      writeFileSync(
+        path.join(storedState, "credentials.json"),
+        hostKeyedCredentials({ [server.apiUrl]: storedToken })
       );
+      const storedResult = await runCliAsync(
+        ["upload", storedHtml, "--api-url", server.apiUrl],
+        {},
+        storedState
+      );
+
+      // A rejected token is a misconfiguration to surface, not a reason to mint
+      // a second identity that would not control the first one's pages.
+      expect([environmentResult.status, storedResult.status]).toEqual([1, 1]);
+      expect(server.mints).toEqual([]);
+      expect(server.requests.map((request) => request.authorization)).toEqual([
+        `Bearer ${environmentToken}`,
+        `Bearer ${storedToken}`
+      ]);
+      for (const result of [environmentResult, storedResult]) {
+        expect(result.stdout).toBe("");
+        expect(result.stderr).toContain("Missing or invalid API token.");
+        expect(result.stderr).not.toContain("Minted a new publishing token");
+        expect(existsSync(path.join(result.stateDir, "drafts.json"))).toBe(false);
+      }
+      expect(`${environmentResult.stdout}${environmentResult.stderr}`).not.toContain(
+        environmentToken
+      );
+      expect(`${storedResult.stdout}${storedResult.stderr}`).not.toContain(storedToken);
+      // The rejected stored token is left exactly as configured.
+      expect(readHostCredential(storedState, server.apiUrl)).toMatchObject({
+        token: storedToken,
+        source: "auth-set"
+      });
+    } finally {
+      await server.close();
     }
   });
 
@@ -1200,6 +1121,410 @@ describe("patchpage upload", () => {
   });
 });
 
+describe("auto-mint on first upload", () => {
+  it("mints, announces, saves host-keyed, and completes the upload", async () => {
+    const stateDir = makeStateDir();
+    const htmlPath = path.join(stateDir, "first-upload.html");
+    writeFileSync(htmlPath, "<!doctype html><title>First upload</title>");
+    const server = await startUploadServer(createOnly("mnopqrstuvwx"));
+
+    try {
+      const result = await runCliAsync(
+        ["upload", htmlPath, "--api-url", server.apiUrl],
+        {},
+        stateDir
+      );
+
+      expect(result.status).toBe(0);
+      expect(result.stderr).toBe("");
+      // The announcement is pinned byte-for-byte and precedes the upload result.
+      expect(result.stdout).toBe(
+        `${mintAnnouncement(server.apiUrl, stateDir)}${AUP_NOTICE}Uploaded draft\n` +
+          "URL: http://example.test/d/mnopqrstuvwx\n" +
+          "Draft ID: mnopqrstuvwx\n" +
+          "Version: 1\n"
+      );
+
+      // The plaintext is never echoed and never reaches argv.
+      expect(`${result.stdout}${result.stderr}`).not.toContain(MINTED_TOKEN);
+      expect(result.argv.join("\0")).not.toContain(MINTED_TOKEN);
+
+      expect(readHostCredential(stateDir, server.apiUrl)).toMatchObject({
+        token: MINTED_TOKEN,
+        source: "mint"
+      });
+      expect(typeof readHostCredential(stateDir, server.apiUrl)?.updatedAt).toBe("string");
+      expect(server.requests[0]?.authorization).toBe(`Bearer ${MINTED_TOKEN}`);
+    } finally {
+      await server.close();
+    }
+  });
+
+  it("asks the resolved instance for a token with no credentials of its own", async () => {
+    const stateDir = makeStateDir();
+    const htmlPath = path.join(stateDir, "mint-request.html");
+    writeFileSync(htmlPath, "<!doctype html><title>Mint request</title>");
+    const server = await startUploadServer(createOnly("mnopqrstuvwx"));
+
+    try {
+      const result = await runCliAsync(
+        ["upload", htmlPath, "--api-url", server.apiUrl],
+        {},
+        stateDir
+      );
+
+      expect(result.status).toBe(0);
+      expect(server.mints).toHaveLength(1);
+      // Self-service minting is zero-input and unauthenticated by contract.
+      expect(server.mints[0]?.authorization).toBeUndefined();
+      expect(server.mints[0]?.raw).toBe("{}");
+    } finally {
+      await server.close();
+    }
+  });
+
+  it("reports a minted token to the status probe without the probe minting one", async () => {
+    const stateDir = makeStateDir();
+    const htmlPath = path.join(stateDir, "probe-after-mint.html");
+    writeFileSync(htmlPath, "<!doctype html><title>Probe after mint</title>");
+    const server = await startUploadServer(createOnly("mnopqrstuvwx"));
+
+    try {
+      const apiArgs = ["--api-url", server.apiUrl];
+      const before = JSON.parse(
+        (await runCliAsync(["status", "--json", ...apiArgs], {}, stateDir)).stdout
+      ) as Record<string, unknown>;
+
+      const upload = await runCliAsync(["upload", htmlPath, ...apiArgs], {}, stateDir);
+
+      const after = JSON.parse(
+        (await runCliAsync(["status", "--json", ...apiArgs], {}, stateDir)).stdout
+      ) as Record<string, unknown>;
+
+      expect(upload.status).toBe(0);
+      // The probe reads state and nothing else: it reported the absence
+      // without creating a token, and the only mint came from the upload.
+      expect(before).toMatchObject({ hasToken: false, tokenSource: null });
+      expect(after).toMatchObject({ hasToken: true, tokenSource: "mint" });
+      expect(server.mints).toHaveLength(1);
+      // Two probes either side of the upload, and neither touched the network.
+      expect(server.requests).toHaveLength(1);
+    } finally {
+      await server.close();
+    }
+  });
+
+  it("mints from upload alone, never from whoami or validate", async () => {
+    const stateDir = makeStateDir();
+    const htmlPath = path.join(stateDir, "read-only.html");
+    writeFileSync(htmlPath, "<!doctype html><title>Read only</title>");
+    const server = await startUploadServer(createOnly("mnopqrstuvwx"));
+
+    try {
+      const whoami = await runCliAsync(
+        ["whoami", "--api-url", server.apiUrl],
+        {},
+        stateDir
+      );
+      const validate = await runCliAsync(["validate", htmlPath], {}, stateDir);
+
+      // Both are read-only diagnostics: they report the absence of a token
+      // rather than quietly creating an identity the user never asked for.
+      expect(whoami.status).toBe(1);
+      expect(whoami.stderr).toBe(
+        `No publishing token is stored for ${server.apiUrl}.\n` +
+          "One is minted automatically on your first upload, or save an existing one with: " +
+          `patchpage auth set --api-url ${server.apiUrl}\n`
+      );
+      expect(validate.status).toBe(0);
+      expect(server.mints).toEqual([]);
+      expect(server.requests).toEqual([]);
+      expect(existsSync(path.join(stateDir, "credentials.json"))).toBe(false);
+
+      // The same instance mints readily once an upload asks it to.
+      const upload = await runCliAsync(
+        ["upload", htmlPath, "--api-url", server.apiUrl],
+        {},
+        stateDir
+      );
+      expect(upload.status).toBe(0);
+      expect(server.mints).toHaveLength(1);
+    } finally {
+      await server.close();
+    }
+  });
+
+  it("relays the acceptable use policy only when the instance names one", async () => {
+    const withPolicy = await startUploadServer(createOnly("mnopqrstuvwx"));
+    const withoutPolicy = await startUploadServer(createOnly("yzabcdefghij"), () => ({
+      status: 201,
+      body: { ok: true, token: MINTED_TOKEN }
+    }));
+
+    try {
+      const policyState = makeStateDir();
+      const policyHtml = path.join(policyState, "aup.html");
+      writeFileSync(policyHtml, "<!doctype html><title>Policy</title>");
+      const announced = await runCliAsync(
+        ["upload", policyHtml, "--api-url", withPolicy.apiUrl],
+        {},
+        policyState
+      );
+
+      const silentState = makeStateDir();
+      const silentHtml = path.join(silentState, "no-aup.html");
+      writeFileSync(silentHtml, "<!doctype html><title>No policy</title>");
+      const silent = await runCliAsync(
+        ["upload", silentHtml, "--api-url", withoutPolicy.apiUrl],
+        {},
+        silentState
+      );
+
+      expect([announced.status, silent.status]).toEqual([0, 0]);
+      // Acceptance is implied by publishing, so the link is shown when offered.
+      expect(announced.stdout).toContain(AUP_NOTICE);
+      // An instance that names no policy gets no invented one, and minting
+      // still succeeds: the URL is relayed, never required.
+      expect(silent.stdout).not.toContain("acceptable use policy");
+      expect(silent.stdout).toContain(mintAnnouncement(withoutPolicy.apiUrl, silentState));
+      expect(readHostCredential(silentState, withoutPolicy.apiUrl)).toMatchObject({
+        token: MINTED_TOKEN,
+        source: "mint"
+      });
+    } finally {
+      await withPolicy.close();
+      await withoutPolicy.close();
+    }
+  });
+
+  it("merges a minted token beside every other instance's saved token", async () => {
+    const stateDir = makeStateDir();
+    const htmlPath = path.join(stateDir, "merged-mint.html");
+    writeFileSync(htmlPath, "<!doctype html><title>Merged mint</title>");
+    const neighbourToken = "pp_neighbour_live_key";
+    const server = await startUploadServer(createOnly("mnopqrstuvwx"));
+
+    try {
+      writeFileSync(
+        path.join(stateDir, "credentials.json"),
+        hostKeyedCredentials({ "https://neighbour.test": neighbourToken })
+      );
+
+      const result = await runCliAsync(
+        ["upload", htmlPath, "--api-url", server.apiUrl],
+        {},
+        stateDir
+      );
+
+      expect(result.status).toBe(0);
+      const { hosts } = readCredentials(stateDir);
+      expect(Object.keys(hosts).sort()).toEqual(["https://neighbour.test", server.apiUrl].sort());
+      expect(hosts["https://neighbour.test"]).toMatchObject({
+        token: neighbourToken,
+        source: "auth-set"
+      });
+      expect(hosts[server.apiUrl]).toMatchObject({ token: MINTED_TOKEN, source: "mint" });
+      expect(`${result.stdout}${result.stderr}`).not.toContain(neighbourToken);
+    } finally {
+      await server.close();
+    }
+  });
+
+  it("fails hard when the instance does not hand out tokens", async () => {
+    const stateDir = makeStateDir();
+    const htmlPath = path.join(stateDir, "mint-disabled.html");
+    writeFileSync(htmlPath, "<!doctype html><title>Mint disabled</title>");
+    const server = await startUploadServer(
+      createOnly("mnopqrstuvwx"),
+      refusesMint("self_service_disabled")
+    );
+
+    try {
+      const result = await runCliAsync(
+        ["upload", htmlPath, "--api-url", server.apiUrl],
+        {},
+        stateDir
+      );
+
+      expect(result.status).toBe(1);
+      expect(result.stdout).toBe("");
+      expect(result.stderr).toBe(
+        `Could not get a publishing token: ${server.apiUrl} does not hand them out on request.\n` +
+          "Ask that instance's operator for a token and save it with: " +
+          `patchpage auth set --api-url ${server.apiUrl}\n`
+      );
+      // One attempt, no fallback instance, and nothing written.
+      expect(server.mints).toHaveLength(1);
+      expect(server.requests).toEqual([]);
+      expect(existsSync(path.join(stateDir, "credentials.json"))).toBe(false);
+      expect(existsSync(path.join(stateDir, "drafts.json"))).toBe(false);
+    } finally {
+      await server.close();
+    }
+  });
+
+  it("fails hard when the network has exhausted its daily mints", async () => {
+    const stateDir = makeStateDir();
+    const htmlPath = path.join(stateDir, "mint-quota.html");
+    writeFileSync(htmlPath, "<!doctype html><title>Mint quota</title>");
+    const server = await startUploadServer(
+      createOnly("mnopqrstuvwx"),
+      refusesMint("mint_quota_exceeded")
+    );
+
+    try {
+      const result = await runCliAsync(
+        ["upload", htmlPath, "--api-url", server.apiUrl],
+        {},
+        stateDir
+      );
+
+      expect(result.status).toBe(1);
+      expect(result.stdout).toBe("");
+      expect(result.stderr).toBe(
+        `Could not get a publishing token: ${server.apiUrl} has reached its limit of new tokens ` +
+          "for your network today.\nCopy an existing token from another machine and save it " +
+          `with: patchpage auth set --api-url ${server.apiUrl}, or try again tomorrow.\n`
+      );
+      expect(server.mints).toHaveLength(1);
+      expect(server.requests).toEqual([]);
+    } finally {
+      await server.close();
+    }
+  });
+
+  it("fails hard and names the wait when minting is rate limited", async () => {
+    const stateDir = makeStateDir();
+    const htmlPath = path.join(stateDir, "mint-rate-limited.html");
+    writeFileSync(htmlPath, "<!doctype html><title>Mint rate limited</title>");
+    const server = await startUploadServer(
+      createOnly("mnopqrstuvwx"),
+      refusesMint("rate_limited", 42)
+    );
+
+    try {
+      const result = await runCliAsync(
+        ["upload", htmlPath, "--api-url", server.apiUrl],
+        {},
+        stateDir
+      );
+
+      expect(result.status).toBe(1);
+      expect(result.stdout).toBe("");
+      expect(result.stderr).toBe(
+        `Could not get a publishing token: ${server.apiUrl} is handing out tokens faster than ` +
+          "it allows right now.\nWait 42 seconds and run the same command again.\n"
+      );
+      // Named as the next action rather than slept through: no retries.
+      expect(server.mints).toHaveLength(1);
+      expect(server.requests).toEqual([]);
+    } finally {
+      await server.close();
+    }
+  });
+
+  it("fails hard when the resolved instance cannot be reached", async () => {
+    const stateDir = makeStateDir();
+    const htmlPath = path.join(stateDir, "mint-unreachable.html");
+    writeFileSync(htmlPath, "<!doctype html><title>Mint unreachable</title>");
+    const apiUrl = "http://127.0.0.1:1";
+
+    const result = await runCliAsync(["upload", htmlPath, "--api-url", apiUrl], {}, stateDir);
+
+    expect(result.status).toBe(1);
+    expect(result.stdout).toBe("");
+    expect(result.stderr).toBe(
+      `Could not get a publishing token: ${apiUrl} could not be reached.\n` +
+        "Check the address and your network connection, then run the same command again.\n"
+    );
+    // Never the official instance as a consolation prize.
+    expect(result.stderr).not.toContain(DEFAULT_API_URL);
+    expect(existsSync(path.join(stateDir, "credentials.json"))).toBe(false);
+  });
+
+  it("fails hard on an instance with no self-service mint route", async () => {
+    const stateDir = makeStateDir();
+    const htmlPath = path.join(stateDir, "mint-absent.html");
+    writeFileSync(htmlPath, "<!doctype html><title>Mint absent</title>");
+    const server = await startUploadServer(createOnly("mnopqrstuvwx"), () => ({
+      status: 404,
+      body: { ok: false, error: "Not found." }
+    }));
+
+    try {
+      const result = await runCliAsync(
+        ["upload", htmlPath, "--api-url", server.apiUrl],
+        {},
+        stateDir
+      );
+
+      expect(result.status).toBe(1);
+      expect(result.stdout).toBe("");
+      expect(result.stderr).toBe(
+        `Could not get a publishing token from ${server.apiUrl}: Not found.\n` +
+          "If that instance does not hand out tokens, ask its operator for one and save it " +
+          `with: patchpage auth set --api-url ${server.apiUrl}\n`
+      );
+      expect(server.requests).toEqual([]);
+    } finally {
+      await server.close();
+    }
+  });
+
+  it("does not mint for an unpublishable file", async () => {
+    const stateDir = makeStateDir();
+    const htmlPath = path.join(stateDir, "invalid.html");
+    writeFileSync(htmlPath, "<!doctype html><title>Invalid</title><script>alert(1)</script>");
+    const server = await startUploadServer(createOnly("mnopqrstuvwx"));
+
+    try {
+      const result = await runCliAsync(
+        ["upload", htmlPath, "--api-url", server.apiUrl],
+        {},
+        stateDir
+      );
+
+      expect(result.status).toBe(1);
+      // Local validation gates the network, so a bad file costs no mint quota.
+      expect(server.mints).toEqual([]);
+      expect(server.requests).toEqual([]);
+      expect(existsSync(path.join(stateDir, "credentials.json"))).toBe(false);
+    } finally {
+      await server.close();
+    }
+  });
+
+  it("keeps a minted token when the upload it was minted for fails", async () => {
+    const stateDir = makeStateDir();
+    const htmlPath = path.join(stateDir, "mint-then-fail.html");
+    writeFileSync(htmlPath, "<!doctype html><title>Mint then fail</title>");
+    const server = await startUploadServer(() => ({
+      status: 500,
+      body: { ok: false, error: "Storage unavailable." }
+    }));
+
+    try {
+      const result = await runCliAsync(
+        ["upload", htmlPath, "--api-url", server.apiUrl],
+        {},
+        stateDir
+      );
+
+      expect(result.status).toBe(1);
+      expect(result.stderr).toContain("Storage unavailable.");
+      // The instance already issued it, so discarding it locally would orphan
+      // anything it goes on to control.
+      expect(readHostCredential(stateDir, server.apiUrl)).toMatchObject({
+        token: MINTED_TOKEN,
+        source: "mint"
+      });
+      expect(existsSync(path.join(stateDir, "drafts.json"))).toBe(false);
+    } finally {
+      await server.close();
+    }
+  });
+});
+
 describe("host-keyed local state", () => {
   it("saves auth set credentials under the resolved instance and merges other instances", () => {
     const stateDir = makeStateDir();
@@ -1269,13 +1594,21 @@ describe("host-keyed local state", () => {
       );
 
       expect(result.status).toBe(0);
+      // The other instance mints its own key rather than borrowing this one.
       expect(configured.requests).toEqual([]);
+      expect(configured.mints).toEqual([]);
+      expect(other.mints).toHaveLength(1);
       expect(other.requests).toHaveLength(1);
-      expect(other.requests[0]?.authorization).toBeUndefined();
+      expect(other.requests[0]?.authorization).toBe(`Bearer ${MINTED_TOKEN}`);
       expect(result.argv.join("\0")).not.toContain(token);
       expect(`${result.stdout}${result.stderr}`).not.toContain(token);
-      // A credential-free upload stays create-only and writes no cache.
-      expect(existsSync(path.join(stateDir, "drafts.json"))).toBe(false);
+      // Each instance keeps its own key; the first instance's is untouched.
+      expect(readHostCredential(stateDir, configured.apiUrl)).toMatchObject({ token });
+      expect(readHostCredential(stateDir, other.apiUrl)).toMatchObject({
+        token: MINTED_TOKEN,
+        source: "mint"
+      });
+      expect(Object.keys(readDraftCache(stateDir).hosts)).toEqual([other.apiUrl]);
     } finally {
       await configured.close();
       await other.close();
@@ -1477,16 +1810,20 @@ describe("host-keyed local state", () => {
     }
   });
 
-  it("names the default instance's own next action instead of a competing auth set", () => {
+  it("names auto-mint and auth set for the default instance without claiming its posture", () => {
     const result = runCli(["whoami"]);
 
     expect(result.status).toBe(1);
     expect(result.stdout).toBe("");
-    expect(result.stderr).toContain(`Missing API token for ${DEFAULT_API_URL}.`);
-    expect(result.stderr).toContain("does not issue public tokens");
-    expect(result.stderr).toContain("--api-url or PATCHPAGE_API_URL");
-    // The instance that issues no tokens is never offered as an auth set target.
-    expect(result.stderr).not.toContain(`patchpage auth set --api-url ${DEFAULT_API_URL}`);
+    expect(result.stderr).toBe(
+      `No publishing token is stored for ${DEFAULT_API_URL}.\n` +
+        "One is minted automatically on your first upload, or save an existing one with: " +
+        `patchpage auth set --api-url ${DEFAULT_API_URL}\n`
+    );
+    // True whether or not the instance allows self-service minting yet: if it
+    // does not, the refused-mint error on the first upload says so with its
+    // own next action, so this copy never has to guess.
+    expect(result.stderr).not.toContain("does not issue public tokens");
   });
 
   it("fails closed on a credentials file in the retired single-instance format", async () => {
@@ -2005,21 +2342,47 @@ interface UploadResponse {
   body: Record<string, unknown>;
 }
 
+/** What a mint attempt saw, so a test can assert the pinned request shape. */
+interface MintRequest {
+  authorization: string | undefined;
+  raw: string;
+}
+
+/** A mint reply is its own contract, not an upload reply that happens to fit. */
+interface MintResponse {
+  status: number;
+  body: Record<string, unknown>;
+}
+
+type MintResponder = () => MintResponse;
+
 /**
- * A hand-written loopback instance. Each returned server is a distinct host key
- * because it listens on its own port.
+ * A hand-written loopback instance implementing the pinned self-service mint
+ * route alongside uploads. Each returned server is a distinct host key because
+ * it listens on its own port.
  */
-async function startUploadServer(respond: (request: UploadRequest) => UploadResponse) {
+async function startUploadServer(
+  respond: (request: UploadRequest) => UploadResponse,
+  mint: MintResponder = mintsToken(MINTED_TOKEN)
+) {
   const requests: UploadRequest[] = [];
+  const mints: MintRequest[] = [];
   const server = createServer(async (incoming, response) => {
     let raw = "";
     for await (const chunk of incoming) raw += chunk;
-    const request: UploadRequest = {
-      authorization: incoming.headers.authorization,
-      body: JSON.parse(raw) as Record<string, unknown>
-    };
-    requests.push(request);
-    const { status, body } = respond(request);
+
+    const isMint = incoming.url === MINT_PATH;
+    const { status, body } = isMint
+      ? (mints.push({ authorization: incoming.headers.authorization, raw }), mint())
+      : (() => {
+          const request: UploadRequest = {
+            authorization: incoming.headers.authorization,
+            body: JSON.parse(raw) as Record<string, unknown>
+          };
+          requests.push(request);
+          return respond(request);
+        })();
+
     response.statusCode = status;
     response.setHeader("Content-Type", "application/json");
     response.end(JSON.stringify(body));
@@ -2031,11 +2394,49 @@ async function startUploadServer(respond: (request: UploadRequest) => UploadResp
   return {
     apiUrl: `http://127.0.0.1:${address.port}`,
     requests,
+    mints,
     close: () =>
       new Promise<void>((resolve, reject) =>
         server.close((error) => (error ? reject(error) : resolve()))
       )
   };
+}
+
+/** The pinned 201: plaintext exactly once, alongside the AUP URL constant. */
+function mintsToken(token: string): MintResponder {
+  return () => ({ status: 201, body: { ok: true, token, aupUrl: AUP_URL } });
+}
+
+/** The pinned refusals, verbatim from the mint wire contract. */
+function refusesMint(
+  code: "self_service_disabled" | "mint_quota_exceeded" | "rate_limited",
+  retryAfterSeconds?: number
+): MintResponder {
+  const status = code === "self_service_disabled" ? 403 : 429;
+  return () => ({
+    status,
+    body: {
+      ok: false,
+      error: `Mint refused: ${code}.`,
+      code,
+      ...(retryAfterSeconds === undefined ? {} : { retryAfterSeconds })
+    }
+  });
+}
+
+/**
+ * The announcement paragraph, pinned byte-for-byte by the spec. Nothing that
+ * is not spec text belongs in this string: folding extra copy in here would
+ * let an ordinary edit masquerade as an edit of the pinned wording.
+ */
+function mintAnnouncement(apiUrl: string, stateDir: string): string {
+  return (
+    `Minted a new publishing token for ${apiUrl}; saved to ` +
+    `${path.join(stateDir, "credentials.json")}. That file is the only key to these pages — ` +
+    "copy it to another machine to publish from there with the same editing rights. If you've " +
+    "published from another machine before, those pages belong to that machine's token — ask " +
+    "your agent to help copy it over instead of using this new one.\n"
+  );
 }
 
 function createOnly(draftId: string) {

@@ -454,62 +454,72 @@ try {
     stderr: /Missing or invalid API token\./
   });
 
-  console.log("[packed-cli-e2e] exercising automatic and explicit anonymous creation");
-  const anonymousStateDir = path.join(tempRoot, "cli state anonymous");
-  await checkedCall(() => mkdir(anonymousStateDir));
-  const anonymousEnv = environment({ PATCHPAGE_STATE_DIR: anonymousStateDir }, [
+  // Auto-mint is the only credential-free path now. This server predates the
+  // self-service mint route, so the CLI's refused-mint hard error is what a
+  // tokenless upload must produce: one plain error, no fallback instance, and
+  // nothing written on either side. The happy path is covered at the
+  // publishing seam against a loopback instance that implements the route.
+  console.log("[packed-cli-e2e] proving a tokenless upload fails closed without self-service mint");
+  const mintStateDir = path.join(tempRoot, "cli state mint refused");
+  await checkedCall(() => mkdir(mintStateDir));
+  const mintEnv = environment({ PATCHPAGE_STATE_DIR: mintStateDir }, [
     "PATCHPAGE_API_TOKEN",
     "PATCHPAGE_API_URL"
   ]);
-  const anonymousHtml = validHtml("Anonymous same path", "anonymous-same-path");
-  await checkedCall(() => writeFile(fixturePath, anonymousHtml, "utf8"));
-  const automaticAnonymousOne = parseUpload(
-    await runCli(cliPath, ["upload", fixtureArgument, "--api-url", publicBaseUrl], {
-      cwd: consumerDir,
-      env: anonymousEnv
-    })
+  await checkedCall(() =>
+    writeFile(fixturePath, validHtml("Mint refused", "mint-refused-no-fallback"), "utf8")
   );
-  const automaticAnonymousTwo = parseUpload(
-    await runCli(cliPath, ["upload", fixtureArgument, "--api-url", publicBaseUrl], {
-      cwd: consumerDir,
-      env: anonymousEnv
-    })
-  );
-  assert.notEqual(automaticAnonymousOne.draftId, automaticAnonymousTwo.draftId);
-  assert.equal(automaticAnonymousOne.versionNumber, 1);
-  assert.equal(automaticAnonymousTwo.versionNumber, 1);
-  assert.deepEqual(await snapshotTree(anonymousStateDir), []);
+  await assertCliFailureNoMutation({
+    cliPath,
+    args: ["upload", fixtureArgument, "--api-url", publicBaseUrl],
+    cwd: consumerDir,
+    env: mintEnv,
+    cliStateDir: mintStateDir,
+    metadataPath,
+    objectDir,
+    expectAuthoritativeNonEmpty: true,
+    expectEmptyCliState: true,
+    stderr: /Could not get a publishing token/
+  });
 
-  const authenticatedCacheBeforeAnonymous = await checkedCall(() =>
-    readFile(path.join(cliStateDir, "drafts.json"), "utf8")
+  console.log("[packed-cli-e2e] proving --anonymous is a deprecated no-op");
+  const deprecatedFlagHtml = validHtml(
+    "Deprecated anonymous",
+    "deprecated-anonymous-published-with-credential"
   );
-  const explicitAnonymousHtml = validHtml(
-    "Explicit anonymous",
-    "explicit-anonymous-bypassed-valid-credential"
+  await checkedCall(() => writeFile(fixturePath, deprecatedFlagHtml, "utf8"));
+  const deprecatedFlagResult = await runCli(
+    cliPath,
+    ["upload", fixtureArgument, "--anonymous", "--new"],
+    { cwd: consumerDir, env: { ...cliEnv, PATCHPAGE_API_TOKEN: bootstrapToken } }
   );
-  await checkedCall(() => writeFile(fixturePath, explicitAnonymousHtml, "utf8"));
-  const explicitAnonymous = parseUpload(
-    await runCli(cliPath, ["upload", fixtureArgument, "--anonymous"], {
-      cwd: consumerDir,
-      env: { ...cliEnv, PATCHPAGE_API_TOKEN: bootstrapToken }
-    })
+  assert.match(
+    deprecatedFlagResult.stderr,
+    /--anonymous is deprecated and ignored/,
+    "expected the deprecation notice on stderr"
   );
-  assert.equal(explicitAnonymous.label, "Uploaded draft");
-  assert.equal(explicitAnonymous.versionNumber, 1);
-  assert.notEqual(explicitAnonymous.draftId, first.draftId);
-  assert.notEqual(explicitAnonymous.draftId, fresh.draftId);
-  assert.notEqual(explicitAnonymous.draftId, automaticAnonymousOne.draftId);
-  assert.notEqual(explicitAnonymous.draftId, automaticAnonymousTwo.draftId);
+  const deprecatedFlag = parseUpload(deprecatedFlagResult);
+  assert.equal(deprecatedFlag.label, "Uploaded draft");
+  assert.equal(deprecatedFlag.versionNumber, 1);
+  assert.notEqual(deprecatedFlag.draftId, first.draftId);
+  assert.notEqual(deprecatedFlag.draftId, fresh.draftId);
+  // The upload is ordinary in every respect, including keeping the draft cache:
+  // the flag no longer excuses it from the per-instance update state.
+  const deprecatedFlagCache = JSON.parse(
+    await checkedCall(() => readFile(path.join(cliStateDir, "drafts.json"), "utf8"))
+  );
   assert.equal(
-    await checkedCall(() => readFile(path.join(cliStateDir, "drafts.json"), "utf8")),
-    authenticatedCacheBeforeAnonymous
+    deprecatedFlagCache.hosts[publicBaseUrl].files[fixtureCachePath].draftId,
+    deprecatedFlag.draftId,
+    "the deprecated flag must still update the per-instance draft cache"
   );
-  const metadataAfterExplicitAnonymous = await readMetadata(metadataPath);
-  await assertStoredDraft(metadataAfterExplicitAnonymous, objectDir, {
-    draftId: explicitAnonymous.draftId,
-    expectedHtmlByVersion: [explicitAnonymousHtml],
-    accountId: "acct_anonymous",
-    apiTokenId: "tok_anonymous"
+  const metadataAfterDeprecatedFlag = await readMetadata(metadataPath);
+  // The credential the flag used to bypass is the one that published it.
+  await assertStoredDraft(metadataAfterDeprecatedFlag, objectDir, {
+    draftId: deprecatedFlag.draftId,
+    expectedHtmlByVersion: [deprecatedFlagHtml],
+    accountId: "acct_bootstrap",
+    apiTokenId: "tok_bootstrap"
   });
 
   console.log("[packed-cli-e2e] proving environment credentials override stored credentials");
@@ -526,30 +536,22 @@ try {
   );
 
   const finalMetadata = await readMetadata(metadataPath);
-  assert.equal(finalMetadata.drafts.length, 6);
-  assert.equal(finalMetadata.draftVersions.length, 7);
-  assert.equal(finalMetadata.uploadEvents.length, 7);
-  for (const anonymousUpload of [automaticAnonymousOne, automaticAnonymousTwo]) {
-    await assertStoredDraft(finalMetadata, objectDir, {
-      draftId: anonymousUpload.draftId,
-      expectedHtmlByVersion: [anonymousHtml],
-      accountId: "acct_anonymous",
-      apiTokenId: "tok_anonymous"
-    });
-  }
-  await assertStoredDraft(finalMetadata, objectDir, {
-    draftId: explicitAnonymous.draftId,
-    expectedHtmlByVersion: [explicitAnonymousHtml],
-    accountId: "acct_anonymous",
-    apiTokenId: "tok_anonymous"
-  });
+  // Every draft on the instance has a controlling token from birth: the
+  // tokenless upload path is gone, so nothing here is ownerless.
+  assert.equal(finalMetadata.drafts.length, 4);
+  assert.equal(finalMetadata.draftVersions.length, 5);
+  assert.equal(finalMetadata.uploadEvents.length, 5);
+  assert.ok(
+    finalMetadata.drafts.every((draft) => draft.accountId === "acct_bootstrap"),
+    "every draft must carry the controlling account that published it"
+  );
   await assertStoredDraft(finalMetadata, objectDir, {
     draftId: envPrecedence.draftId,
     expectedHtmlByVersion: [envPrecedenceHtml],
     accountId: "acct_bootstrap",
     apiTokenId: "tok_bootstrap"
   });
-  assert.equal((await snapshotTree(objectDir)).length, 7);
+  assert.equal((await snapshotTree(objectDir)).length, 5);
 
   console.log(
     "[packed-cli-e2e] PASS: spaced consumer/artifact/state paths and quoted POSIX sh commands"
