@@ -6,6 +6,7 @@ import type { AddressInfo } from "node:net";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { ACCEPTABLE_USE_URL, getServerConfig } from "@patchpage/config";
 import type { ServerConfig } from "@patchpage/config";
+import { sha256 } from "@patchpage/core";
 import { JsonFilePatchPageDb } from "@patchpage/db";
 import type { RecordUploadInput, RecordUploadResult } from "@patchpage/db";
 import { FileSystemHtmlStorage } from "@patchpage/storage";
@@ -2596,6 +2597,339 @@ describe("PatchPage server", () => {
   });
 });
 
+describe("self-service minting", () => {
+  it("mints a token whose plaintext appears once and is kept only as a hash", async () => {
+    const minting = await createMintApp("mint-happy");
+
+    try {
+      const mint = await minting.mint("198.51.100.20");
+
+      expect(mint.statusCode).toBe(201);
+      const body = mint.json() as { ok: boolean; token: string; aupUrl: string };
+      expect(body.ok).toBe(true);
+      expect(body.token).toMatch(/^pp_[A-Za-z0-9_-]{43}$/);
+      expect(body.aupUrl).toBe(ACCEPTABLE_USE_URL);
+      // No credential was offered and none was asked for: this is how a caller
+      // with nothing gets its first token.
+      expect(mint.headers["cache-control"]).toBe("no-store");
+
+      // The token works, and the mint date is what named it.
+      const me = await minting.app.inject({
+        method: "GET",
+        url: "/api/me",
+        headers: { authorization: `Bearer ${body.token}` }
+      });
+      expect(me.statusCode).toBe(200);
+      expect(me.json()).toMatchObject({
+        apiTokenName: "Self-service token 2026-01-01",
+        scopes: ["upload"]
+      });
+
+      // "Exactly once" is a claim about storage as much as about the wire, and
+      // the wire alone cannot make it. This is the one assertion in the suite
+      // that reads what the instance kept: the plaintext is not in it.
+      const stored = await readFile(minting.dbFile, "utf8");
+      expect(stored).not.toContain(body.token);
+      expect(stored).toContain(sha256(body.token));
+    } finally {
+      await minting.close();
+    }
+  });
+
+  it("refuses to mint on an instance that keeps its admin-only token posture", async () => {
+    const minting = await createMintApp("mint-disabled", { allowSelfServiceTokens: false });
+
+    try {
+      const refused = await minting.mint("198.51.100.21");
+
+      expect(refused.statusCode).toBe(403);
+      expect(refused.json()).toMatchObject({
+        ok: false,
+        code: "self_service_disabled"
+      });
+      expect((refused.json() as { error: string }).error).toMatch(/operator/i);
+
+      // The admin token endpoint is a different operation and is untouched by
+      // the flag: still admin-scoped, still named the same, still takes a body.
+      const unauthenticated = await minting.app.inject({
+        method: "POST",
+        url: "/api/tokens",
+        payload: { name: "Sneaky" }
+      });
+      expect(unauthenticated.statusCode).toBe(401);
+
+      const administered = await minting.app.inject({
+        method: "POST",
+        url: "/api/tokens",
+        headers: { authorization: "Bearer dev-token" },
+        payload: { name: "Operator issued" }
+      });
+      expect(administered.statusCode).toBe(201);
+      expect(administered.json()).toMatchObject({
+        ok: true,
+        apiToken: { name: "Operator issued" }
+      });
+    } finally {
+      await minting.close();
+    }
+  });
+
+  it("accepts an absent body and an empty JSON object alike", async () => {
+    const minting = await createMintApp("mint-bodies");
+
+    try {
+      const shapes: Array<{ label: string; headers?: Record<string, string>; payload?: string }> =
+        [
+          { label: "no body and no content type" },
+          {
+            label: "empty JSON object",
+            headers: { "content-type": "application/json" },
+            payload: "{}"
+          },
+          {
+            label: "JSON content type with nothing in the body",
+            headers: { "content-type": "application/json" },
+            payload: ""
+          }
+        ];
+
+      const minted = new Set<string>();
+      for (const shape of shapes) {
+        const mint = await minting.app.inject({
+          method: "POST",
+          url: MINT_PATH,
+          remoteAddress: "198.51.100.22",
+          ...(shape.headers ? { headers: shape.headers } : {}),
+          ...(shape.payload === undefined ? {} : { payload: shape.payload })
+        });
+
+        expect(mint.statusCode, shape.label).toBe(201);
+        minted.add((mint.json() as { token: string }).token);
+      }
+
+      // Three requests, three distinct tokens — no shape was a silent no-op.
+      expect(minted.size).toBe(3);
+
+      // A body that is neither absent nor JSON is still a bad request: the
+      // route is lenient about emptiness, not about malformed input.
+      const malformed = await minting.app.inject({
+        method: "POST",
+        url: MINT_PATH,
+        headers: { "content-type": "application/json" },
+        payload: "{oops",
+        remoteAddress: "198.51.100.23"
+      });
+      expect(malformed.statusCode).toBe(400);
+      expect(malformed.json()).toMatchObject({ ok: false, error: "Malformed JSON body." });
+
+      // And the leniency belongs to this route alone. An empty upload body is
+      // still refused by Fastify's own parser before the handler sees it —
+      // which is also what proves the mint route's parser stayed encapsulated
+      // rather than quietly loosening every route in the app.
+      const emptyUpload = await minting.app.inject({
+        method: "POST",
+        url: "/api/uploads",
+        headers: {
+          authorization: "Bearer dev-token",
+          "content-type": "application/json"
+        },
+        payload: ""
+      });
+      expect(emptyUpload.statusCode).toBe(400);
+      expect((emptyUpload.json() as { error: string }).error).toMatch(
+        /Body cannot be empty/i
+      );
+    } finally {
+      await minting.close();
+    }
+  });
+
+  it("counts the daily mint quota in the database, where a restart cannot clear it", async () => {
+    const minting = await createMintApp("mint-quota", { selfServiceMintsPerIpPerDay: 2 });
+
+    try {
+      expect((await minting.mint("203.0.113.30")).statusCode).toBe(201);
+      expect((await minting.mint("203.0.113.30")).statusCode).toBe(201);
+
+      const exceeded = await minting.mint("203.0.113.30");
+      expect(exceeded.statusCode).toBe(429);
+      expect(exceeded.json()).toMatchObject({
+        ok: false,
+        code: "mint_quota_exceeded",
+        quota: 2
+      });
+
+      // Another address carries its own tally.
+      expect((await minting.mint("203.0.113.31")).statusCode).toBe(201);
+
+      // A restart empties every bucket held in memory. The quota is not one of
+      // them: it is recounted from the stored mint records.
+      await minting.restart();
+      const afterRestart = await minting.mint("203.0.113.30");
+      expect(afterRestart.statusCode).toBe(429);
+      expect(afterRestart.json()).toMatchObject({ code: "mint_quota_exceeded" });
+
+      // The window rolls rather than resetting at a fixed hour, so the day has
+      // to pass from the mints themselves before the address mints again.
+      minting.advanceMs(DAY_MS + 1_000);
+      expect((await minting.mint("203.0.113.30")).statusCode).toBe(201);
+    } finally {
+      await minting.close();
+    }
+  });
+
+  it("throttles mints per minute from one address, in memory", async () => {
+    const minting = await createMintApp("mint-rate", {
+      selfServiceMintRateLimitPerMinute: 2,
+      selfServiceMintsPerIpPerDay: 100
+    });
+
+    try {
+      expect((await minting.mint("203.0.113.40")).statusCode).toBe(201);
+      expect((await minting.mint("203.0.113.40")).statusCode).toBe(201);
+
+      const limited = await minting.mint("203.0.113.40");
+      expect(limited.statusCode).toBe(429);
+      expect(limited.json()).toMatchObject({
+        ok: false,
+        code: "rate_limited",
+        retryAfterSeconds: 60
+      });
+      expect(limited.headers["retry-after"]).toBe("60");
+
+      // Another address is unaffected; the bucket is per source address.
+      expect((await minting.mint("203.0.113.41")).statusCode).toBe(201);
+
+      minting.advanceMs(60_000);
+      expect((await minting.mint("203.0.113.40")).statusCode).toBe(201);
+
+      // In memory and nowhere else: a restart hands the address a fresh minute
+      // even though the day's tally in the database keeps counting.
+      expect((await minting.mint("203.0.113.40")).statusCode).toBe(201);
+      expect((await minting.mint("203.0.113.40")).statusCode).toBe(429);
+      await minting.restart();
+      expect((await minting.mint("203.0.113.40")).statusCode).toBe(201);
+    } finally {
+      await minting.close();
+    }
+  });
+
+  it("gives every mint its own principal with own-drafts-only rights", async () => {
+    const minting = await createMintApp("mint-rights");
+
+    try {
+      const first = await minting.mintedToken("203.0.113.50");
+      const second = await minting.mintedToken("203.0.113.51");
+
+      // Fresh principal per mint: the two tokens share nothing to own through.
+      expect(first.accountId).not.toBe(second.accountId);
+
+      const draftId = await minting.uploadAs(first.token, "First principal page");
+
+      // The other minted token cannot reach a draft it does not own — not to
+      // update it, not to moderate it, not to delete it.
+      const foreignUpdate = await minting.app.inject({
+        method: "POST",
+        url: "/api/uploads",
+        headers: { authorization: `Bearer ${second.token}` },
+        payload: {
+          draftId,
+          html: "<!doctype html><html><head><title>Hijack</title></head><body></body></html>"
+        }
+      });
+      expect(foreignUpdate.statusCode).toBe(404);
+
+      const foreignDisable = await minting.app.inject({
+        method: "POST",
+        url: `/api/drafts/${draftId}/disable`,
+        headers: { authorization: `Bearer ${second.token}` },
+        payload: { reason: "not mine" }
+      });
+      expect(foreignDisable.statusCode).toBe(404);
+
+      const foreignDelete = await minting.app.inject({
+        method: "DELETE",
+        url: `/api/drafts/${draftId}`,
+        headers: { authorization: `Bearer ${second.token}` }
+      });
+      expect(foreignDelete.statusCode).toBe(404);
+
+      // A draft the operator owns is just as far out of reach.
+      const operatorDraftId = await publishDraft(minting.app, "Operator page");
+      const reachUp = await minting.app.inject({
+        method: "DELETE",
+        url: `/api/drafts/${operatorDraftId}`,
+        headers: { authorization: `Bearer ${first.token}` }
+      });
+      expect(reachUp.statusCode).toBe(404);
+
+      // Never admin, so it cannot mint further tokens through the admin
+      // endpoint however it asks.
+      const escalation = await minting.app.inject({
+        method: "POST",
+        url: "/api/tokens",
+        headers: { authorization: `Bearer ${first.token}` },
+        payload: { name: "More reach", scopes: ["admin"] }
+      });
+      expect(escalation.statusCode).toBe(403);
+
+      // Its own draft, though, it updates and deletes freely.
+      const ownUpdate = await minting.app.inject({
+        method: "POST",
+        url: "/api/uploads",
+        headers: { authorization: `Bearer ${first.token}` },
+        payload: {
+          draftId,
+          html: "<!doctype html><html><head><title>Second cut</title></head><body></body></html>"
+        }
+      });
+      expect(ownUpdate.statusCode).toBe(200);
+
+      const ownDelete = await minting.app.inject({
+        method: "DELETE",
+        url: `/api/drafts/${draftId}`,
+        headers: { authorization: `Bearer ${first.token}` }
+      });
+      expect(ownDelete.statusCode).toBe(200);
+    } finally {
+      await minting.close();
+    }
+  });
+
+  it("subjects a minted principal's drafts to expiry like any other", async () => {
+    const minting = await createMintApp("mint-expiry");
+
+    try {
+      const { token } = await minting.mintedToken("203.0.113.60");
+      const draftId = await minting.uploadAs(token, "Minted and mortal");
+
+      expect(
+        (await minting.app.inject({ method: "GET", url: `/d/${draftId}` })).statusCode
+      ).toBe(200);
+
+      // Minting buys no exemption: the retention clock runs on this draft
+      // exactly as it does on the operator's, and the sweep takes it.
+      minting.advanceMs(91 * DAY_MS);
+      expect(
+        (await minting.app.inject({ method: "GET", url: `/d/${draftId}` })).statusCode
+      ).toBe(404);
+      expect(await minting.app.sweepExpiredDrafts()).toMatchObject({ deleted: 1 });
+
+      // And pinning stays an operator's act — a self-service token cannot buy
+      // itself the exemption either.
+      const secondDraftId = await minting.uploadAs(token, "Minted and hopeful");
+      const selfPin = await minting.app.inject({
+        method: "POST",
+        url: `/api/drafts/${secondDraftId}/pin`,
+        headers: { authorization: `Bearer ${token}` }
+      });
+      expect(selfPin.statusCode).toBe(403);
+    } finally {
+      await minting.close();
+    }
+  });
+});
+
 interface ServedDraft {
   app: ReturnType<typeof createApp>;
   /** The store behind the app, for reading what a request left behind. */
@@ -2941,6 +3275,111 @@ type ClockedAppOptions = {
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 
+/** The pinned mint route, spelled out here rather than imported from the app. */
+const MINT_PATH = "/api/tokens/self-service";
+
+type MintedToken = { token: string; accountId: string };
+type InjectedResponse = Awaited<ReturnType<ReturnType<typeof createApp>["inject"]>>;
+
+interface MintApp {
+  readonly app: ReturnType<typeof createApp>;
+  readonly dbFile: string;
+  mint(sourceIp: string): Promise<InjectedResponse>;
+  /** Mints, then reads back the principal the token authenticates as. */
+  mintedToken(sourceIp: string): Promise<MintedToken>;
+  uploadAs(token: string, title: string): Promise<string>;
+  advanceMs(ms: number): void;
+  /** Drops the process and opens a new one over the same stored state. */
+  restart(): Promise<void>;
+  close(): Promise<void>;
+}
+
+/**
+ * An app for the mint route, with a clock both it and its database read, and a
+ * restart that keeps the stored state while discarding everything in memory —
+ * which is the only way to tell the durable half of the mint guardrail from the
+ * per-minute half.
+ */
+async function createMintApp(
+  label: string,
+  overrides: Partial<ServerConfig> = {}
+): Promise<MintApp> {
+  let now = Date.UTC(2026, 0, 1);
+  const clock = (): number => now;
+  const dbFile = path.join(tempDir, `${label}-db.json`);
+  const storage = new FileSystemHtmlStorage(path.join(tempDir, `${label}-drafts`));
+  const config: ServerConfig = {
+    ...testConfig(),
+    allowSelfServiceTokens: true,
+    jsonDbFile: dbFile,
+    ...overrides
+  };
+
+  const open = async (): Promise<{
+    app: ReturnType<typeof createApp>;
+    db: JsonFilePatchPageDb;
+  }> => {
+    const db = new JsonFilePatchPageDb(dbFile, { clock });
+    await db.initialize("dev-token");
+    return { app: createApp({ config, db, storage, clock }), db };
+  };
+
+  let running = await open();
+
+  return {
+    get app() {
+      return running.app;
+    },
+    dbFile,
+    async mint(sourceIp) {
+      return running.app.inject({
+        method: "POST",
+        url: MINT_PATH,
+        headers: { "content-type": "application/json" },
+        payload: "{}",
+        remoteAddress: sourceIp
+      });
+    },
+    async mintedToken(sourceIp) {
+      const mint = await this.mint(sourceIp);
+      expect(mint.statusCode).toBe(201);
+      const token = (mint.json() as { token: string }).token;
+
+      const me = await running.app.inject({
+        method: "GET",
+        url: "/api/me",
+        headers: { authorization: `Bearer ${token}` }
+      });
+      expect(me.statusCode).toBe(200);
+      return { token, accountId: (me.json() as { accountId: string }).accountId };
+    },
+    async uploadAs(token, title) {
+      const upload = await running.app.inject({
+        method: "POST",
+        url: "/api/uploads",
+        headers: { authorization: `Bearer ${token}` },
+        payload: {
+          html: `<!doctype html><html><head><title>${title}</title></head><body></body></html>`
+        }
+      });
+      expect(upload.statusCode).toBe(201);
+      return (upload.json() as { draftId: string }).draftId;
+    },
+    advanceMs(ms) {
+      now += ms;
+    },
+    async restart() {
+      await running.app.close();
+      await running.db.close();
+      running = await open();
+    },
+    async close() {
+      await running.app.close();
+      await running.db.close();
+    }
+  };
+}
+
 /**
  * An app whose clock can be wound forward months. The database gets the *same*
  * clock: the retention clock is the database's, so an app-only clock would move
@@ -3009,6 +3448,7 @@ function testConfig(): ServerConfig {
     protectedApiRateLimitPerMinute: 60,
     authenticatedUploadRateLimitPerMinute: 20,
     selfServiceMintRateLimitPerMinute: 5,
+    selfServiceMintsPerIpPerDay: 5,
     draftCreateRateLimitPerMinute: 10,
     liveDraftsPerToken: 1_000,
     dbDriver: "json",

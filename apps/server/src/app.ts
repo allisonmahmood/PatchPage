@@ -1,6 +1,7 @@
 import type { IncomingMessage } from "node:http";
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import Fastify from "fastify";
+import { ACCEPTABLE_USE_URL } from "@patchpage/config";
 import type { ServerConfig } from "@patchpage/config";
 import { isUploadTargetError } from "@patchpage/db";
 import type {
@@ -106,10 +107,20 @@ type ApiRequestTargetPolicy =
 
 /**
  * A report is one optional sentence, and the driver caps what it stores at 255
- * characters anyway. Refusing an oversized body outright keeps the only
- * unauthenticated write on the service from being a place to push bytes.
+ * characters anyway. Refusing an oversized body outright keeps an
+ * unauthenticated write from being a place to push bytes.
  */
 const REPORT_FORM_BODY_LIMIT_BYTES = 8 * 1024;
+
+/**
+ * Self-service minting's route. Deliberately under `/api/tokens/` and just as
+ * deliberately not `/api/tokens`: the admin token-creation endpoint keeps its
+ * name, its body, and its admin-only posture, and this is a different operation
+ * with a different audience — zero input, no credential, its own guardrails.
+ *
+ * It is the service's other unauthenticated write, alongside the report path.
+ */
+const SELF_SERVICE_MINT_PATH = "/api/tokens/self-service";
 
 const FASTIFY_DEFAULT_MAX_PARAM_LENGTH = 100;
 /**
@@ -128,6 +139,7 @@ type MarkedIncomingMessage = IncomingMessage & {
 };
 
 export function createApp(options: CreateAppOptions): FastifyInstance {
+  const clock = options.clock ?? Date.now;
   const rateLimiters = createRateLimiters(options.config, { clock: options.clock });
   const app = Fastify({
     logger: false,
@@ -199,6 +211,38 @@ export function createApp(options: CreateAppOptions): FastifyInstance {
       apiToken,
       token
     });
+  });
+
+  // The mint route parses its own body. The operation takes no input at all, so
+  // both an absent body and `{}` have to be accepted — and Fastify's stock JSON
+  // parser rejects the absent one whenever the client still sends the JSON
+  // content-type, which is the shape the CLI's auto-mint actually puts on the
+  // wire. Encapsulated in its own scope so no other route's body handling
+  // moves: an upload that arrives empty must keep failing exactly as it does.
+  app.register(async (mintScope) => {
+    mintScope.addContentTypeParser(
+      "application/json",
+      { parseAs: "string" },
+      (_request, body: string, done) => {
+        if (body.trim().length === 0) {
+          done(null, {});
+          return;
+        }
+        try {
+          done(null, JSON.parse(body) as unknown);
+        } catch {
+          const malformed = new Error("Malformed JSON body.") as Error & {
+            statusCode?: number;
+          };
+          malformed.statusCode = 400;
+          done(malformed);
+        }
+      }
+    );
+
+    mintScope.post(SELF_SERVICE_MINT_PATH, async (request, reply) =>
+      mintSelfServiceToken(options, rateLimiters.selfServiceMint, clock, request, reply)
+    );
   });
 
   app.post(
@@ -440,6 +484,80 @@ export function createApp(options: CreateAppOptions): FastifyInstance {
   });
 
   return app;
+}
+
+/**
+ * Self-service minting: the zero-input operation that hands a caller a token
+ * and the fresh principal that token controls.
+ *
+ * Three refusals guard it, and the order they run in is the point. The enabled
+ * flag first, because a private instance owes an unauthenticated caller nothing
+ * but "no". The per-minute rate next, before the quota is counted, for the same
+ * reason draft creates do it in that order: a caller parked at the daily
+ * ceiling should be throttled rather than left free to re-count the database as
+ * fast as it can ask. The daily quota last, because it is the expensive one.
+ */
+async function mintSelfServiceToken(
+  options: CreateAppOptions,
+  mintLimiter: FixedWindowRateLimiter,
+  clock: () => number,
+  request: FastifyRequest,
+  reply: FastifyReply
+): Promise<FastifyReply> {
+  if (!options.config.allowSelfServiceTokens) {
+    return reply.status(403).send({
+      ok: false,
+      error:
+        "This instance does not issue self-service tokens. Ask its operator for a token.",
+      code: "self_service_disabled"
+    });
+  }
+
+  const sourceIp = request.ip || null;
+
+  const mintAttempt = mintLimiter.consume(sourceIp ?? "");
+  if (!mintAttempt.allowed) {
+    sendRateLimited(reply, mintAttempt);
+    return reply;
+  }
+
+  // Recounted from the database on every mint, so the ceiling outlives a
+  // restart. Concurrent mints can overshoot it by at most the burst the
+  // per-minute limiter above lets through.
+  const quota = options.config.selfServiceMintsPerIpPerDay;
+  const recentMints = await options.db.countSelfServiceMintsBySourceIp(sourceIp);
+  if (recentMints >= quota) {
+    return reply.status(429).send({
+      ok: false,
+      error: `Mint quota reached: ${quota} self-service tokens per address per day. Reuse the token you already hold, or try again tomorrow.`,
+      code: "mint_quota_exceeded",
+      quota
+    });
+  }
+
+  const token = `pp_${randomToken(32)}`;
+  await options.db.mintSelfServiceToken({
+    token,
+    name: selfServiceTokenName(clock()),
+    sourceIp
+  });
+
+  // The plaintext appears here and nowhere else, exactly once. Only its hash is
+  // stored, so no later response — and no operator — can produce it again.
+  return reply.status(201).send({
+    ok: true,
+    token,
+    aupUrl: ACCEPTABLE_USE_URL
+  });
+}
+
+/**
+ * The internal name a mint assigns its principal and token. The client chooses
+ * nothing here — the operation takes no input — so the mint date is what makes
+ * the row legible to an operator reading the table later.
+ */
+function selfServiceTokenName(now: number): string {
+  return `Self-service token ${new Date(now).toISOString().slice(0, 10)}`;
 }
 
 async function renderDraft(
@@ -711,6 +829,13 @@ function classifyApiRequestTargetPolicy(requestTarget: string): ApiRequestTarget
       requiredScope: "upload",
       uploadLimit: true
     };
+  }
+  // The one API route that admits a request with no credential at all. It is
+  // how a caller gets its first token, so requiring one would be circular; the
+  // mint's own guardrails — the enabled flag, the per-address rate limit, and
+  // the per-address daily quota — are what stand in for authentication here.
+  if (pathname === SELF_SERVICE_MINT_PATH) {
+    return { protected: false };
   }
   if (pathname === "/api/tokens") {
     return { protected: true, requiredScope: "admin" };

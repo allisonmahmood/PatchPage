@@ -32,6 +32,14 @@ _Avoid_: view, hit, page load (a visit is a serving that succeeded, not a reques
 A draft that still counts against its creator's quota: neither deleted nor disabled. A draft leaves the tally the moment it is deleted or disabled, and for good when expiry hard-deletes it — an expired draft still counts until the sweep removes it, because its row and its stored content are both still there. Which token created it is fixed at creation; a later update by another token never moves it.
 _Avoid_: active draft, published draft (every draft is published), open draft
 
+**Mint record**:
+The row a self-service mint leaves behind: which principal and token were created, from what source address, and when. It is what the mint quota counts, and it outlives revocation — a token can be turned off, but where it came from stays reviewable.
+_Avoid_: audit log, signup record
+
+**Mint quota**:
+The ceiling on self-service mints one source address may be handed. Counted from the database at mint time over a rolling day, so it survives a restart — unlike the per-minute mint rate, which is in-memory and may reset. Mints the server could not attribute to an address share one bucket rather than each escaping the count.
+_Avoid_: mint limit (ambiguous with the per-minute mint rate), signup limit
+
 **Draft quota**:
 The ceiling on live drafts one token may hold at once. Counted from the database on every create, so it survives a restart — unlike the per-minute create limit, which is in-memory and may reset. Per token, not per account, and uniform: no exemption for admin tokens.
 _Avoid_: draft limit (ambiguous with the per-minute create limit), storage quota (this counts drafts, not bytes)

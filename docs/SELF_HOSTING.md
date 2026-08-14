@@ -195,6 +195,9 @@ PATCHPAGE_DRAFT_CREATE_RATE_LIMIT_PER_MINUTE=10
 # Per-token quotas
 PATCHPAGE_LIVE_DRAFTS_PER_TOKEN=1000
 
+# Per-address quotas (only used when self-service minting is on)
+PATCHPAGE_SELF_SERVICE_MINTS_PER_IP_PER_DAY=5
+
 # Retired. PATCHPAGE_ALLOW_ANONYMOUS_UPLOADS and
 # PATCHPAGE_ANONYMOUS_CREATE_RATE_LIMIT_PER_MINUTE now fail startup; use
 # PATCHPAGE_ALLOW_SELF_SERVICE_TOKENS and
@@ -230,7 +233,8 @@ Notes on values:
 - `PATCHPAGE_MAX_HTML_BYTES` caps the size of a single HTML document (default 524288 = 512 KiB).
 - `PATCHPAGE_PROTECTED_API_RATE_LIMIT_PER_MINUTE`, `PATCHPAGE_AUTHENTICATED_UPLOAD_RATE_LIMIT_PER_MINUTE`, `PATCHPAGE_SELF_SERVICE_MINT_RATE_LIMIT_PER_MINUTE`, and `PATCHPAGE_DRAFT_CREATE_RATE_LIMIT_PER_MINUTE` are decimal integers from `1` through `10000`. Defaults are `60`, `20`, `5`, and `10`.
 - `PATCHPAGE_LIVE_DRAFTS_PER_TOKEN` is a decimal integer from `1` through `1000000` and defaults to `1000`. See [Per-token draft quotas](#per-token-draft-quotas).
-- `PATCHPAGE_ALLOW_SELF_SERVICE_TOKENS` is a strict `true`/`false` value and defaults to `false`. It is parsed and validated today but gates nothing yet: it will later let a caller mint its own publishing token. It never admits an upload that carries no bearer token. `PATCHPAGE_SELF_SERVICE_MINT_RATE_LIMIT_PER_MINUTE` is likewise validated but not yet applied to any route.
+- `PATCHPAGE_ALLOW_SELF_SERVICE_TOKENS` is a strict `true`/`false` value and defaults to `false`. It gates the self-service mint route (`POST /api/tokens/self-service`) and nothing else; while it is `false` that route refuses every caller and your instance keeps its admin-only token posture. It never admits an upload that carries no bearer token. See [Self-service minting](#self-service-minting).
+- `PATCHPAGE_SELF_SERVICE_MINTS_PER_IP_PER_DAY` is a decimal integer from `1` through `1000000` and defaults to `5`. It applies only while self-service minting is on.
 - `PATCHPAGE_ALLOW_ANONYMOUS_UPLOADS` and `PATCHPAGE_ANONYMOUS_CREATE_RATE_LIMIT_PER_MINUTE` are retired. Setting either one fails server startup with an error naming its replacement; neither is silently ignored, so a deliberate posture is never dropped on upgrade.
 - Uploads are authenticated on every path. A missing bearer token, and any malformed, invalid, revoked, or insufficiently scoped credential, is an authentication or authorization failure with no unauthenticated fallback.
 - When running from source, the `json` metadata driver and `filesystem` storage driver write under `.local/` by default. The supported image overrides those path defaults to `/data` as shown above. Both modes need no external services and suit a quick or single-instance self-host. For a durable multi-instance deployment, use `postgres` and a shared object store (`azure-blob`).
@@ -241,7 +245,7 @@ PatchPage applies deterministic fixed-window in-memory limits inside each server
 
 - Protected `/api` requests are limited to `PATCHPAGE_PROTECTED_API_RATE_LIMIT_PER_MINUTE` attempts per minute per canonical Fastify `request.ip`. That IP follows `PATCHPAGE_TRUST_PROXY`, so configure the proxy boundary before relying on IP-based buckets.
 - Authenticated upload requests are limited to `PATCHPAGE_AUTHENTICATED_UPLOAD_RATE_LIMIT_PER_MINUTE` attempts per minute per API token database identity. Rotating the raw bearer secret for the same token record does not create a fresh upload bucket.
-- `PATCHPAGE_SELF_SERVICE_MINT_RATE_LIMIT_PER_MINUTE` reserves the limit for future self-service token minting. It is validated at startup but no limiter consumes it yet.
+- `PATCHPAGE_SELF_SERVICE_MINT_RATE_LIMIT_PER_MINUTE` limits self-service mints per minute per canonical Fastify `request.ip`, on instances where minting is enabled. It is the only limiter on an unauthenticated route, because a caller asking for its first token has no token to key on.
 - Draft *creates* are additionally limited to `PATCHPAGE_DRAFT_CREATE_RATE_LIMIT_PER_MINUTE` per minute per creating token. An upload carrying a `draftId` is an update and never consumes this bucket. Because the request body decides create versus update, this bucket is consumed after body parsing, unlike the buckets above.
 
 When a bucket is exceeded, PatchPage returns HTTP `429` with JSON `{ "ok": false, "code": "rate_limited", ... }` and an integer `Retry-After` header. Each limiter tracks up to `10000` live keys in memory. If all live key slots are occupied, an unseen key receives the same bounded `429` response until the earliest live bucket resets. Live buckets are never evicted to make room for an unseen key, because eviction would let an attacker bypass limits by cycling key values.
@@ -291,6 +295,25 @@ rm -rf "$PIN_TMP_DIR"
 `POST /api/drafts/:draftId/unpin` reverses it. Both return `404` for a draft that is not there, and `403` for a token without the `admin` scope — including the token that created the draft. A pinned draft is never expired and never swept, however long it sits; in every other respect it is ordinary. Its clock keeps running underneath the pin and visits keep topping it up, so unpinning hands it back to whatever time it had left: a page still being read keeps its 30-day visit window, and one nobody has read in months expires at once.
 
 A pin only ever holds a page that is **in service**. Deleting or disabling a draft ends its pin, and pinning a draft that is already deleted or disabled returns `404` — so a pin can never keep a moderated or withdrawn page's storage alive. Unpinning works on any draft that still has a row, which means a pin can never get stuck out of reach.
+
+### Self-service minting
+
+Off by default. Leave `PATCHPAGE_ALLOW_SELF_SERVICE_TOKENS=false` and your instance behaves exactly as it always has: the only way to get a token is for you to issue one through the admin-scoped `POST /api/tokens`, and `POST /api/tokens/self-service` refuses every caller with HTTP `403` and `{ "ok": false, "code": "self_service_disabled", "error": "..." }`.
+
+Setting it to `true` opens one route, `POST /api/tokens/self-service`. It is the only API route that accepts a request with no `Authorization` header — requiring a credential to obtain your first credential would be circular. It takes no input at all: an absent body and `{}` are both accepted, and nothing in the request influences the result. On success it answers HTTP `201` with `{ "ok": true, "token": "pp_...", "aupUrl": "..." }`. **That response is the only time the plaintext exists on your instance**; only its hash is stored, so a lost token cannot be recovered by you or anyone else, and the remedy is minting a fresh one.
+
+Each mint creates a fresh account holding exactly one `upload`-scoped token. That reuses the ownership checks already described above rather than adding a second authorization model, so a self-service token can create drafts and update or delete only the ones it created. It is never `admin`, so it cannot moderate another principal's drafts and cannot issue further tokens through `POST /api/tokens`. The account is marked as self-service minted, and every mint records its source address and time.
+
+Two guardrails limit minting, and they are deliberately different in kind:
+
+- `PATCHPAGE_SELF_SERVICE_MINT_RATE_LIMIT_PER_MINUTE` is the in-memory bucket, per source address. Exceeding it returns HTTP `429` with `{ "ok": false, "code": "rate_limited", "retryAfterSeconds": <n>, "error": "..." }` and a `Retry-After` header. Like every other limiter here it is process-local and resets on restart.
+- `PATCHPAGE_SELF_SERVICE_MINTS_PER_IP_PER_DAY` is counted from the metadata store on every mint, over a **rolling** 24 hours ending now rather than a calendar day — a calendar day resets at an hour every caller can predict. Exceeding it returns HTTP `429` with `{ "ok": false, "code": "mint_quota_exceeded", "quota": <cap>, "error": "..." }`. Restarting or redeploying does not reset it.
+
+Both key on the canonical Fastify `request.ip`, which follows `PATCHPAGE_TRUST_PROXY`. **Configure your proxy boundary before enabling minting**: behind an unconfigured proxy every request appears to come from one address, which collapses all callers into a single quota, and a wrongly trusted one lets a caller choose its own bucket by forging a header. Mints the server cannot attribute to an address share one bucket rather than escaping the count.
+
+A self-service token's drafts are ordinary drafts in every respect that matters to the guardrails above: they carry the same retention clock, are swept on the same terms, and count against the same [per-token draft quota](#per-token-draft-quotas). Minting creates no exemption from anything.
+
+Turning the flag back off stops new mints; it does not revoke tokens already minted or remove the drafts they own.
 
 ### JSON metadata durability
 
@@ -809,4 +832,4 @@ The [`infra/azure`](../infra/azure) OpenTofu directory is an Azure-specific work
 
 ## Security
 
-No instance publishes without credentials: every upload requires a bearer token, and no configuration accepts one that carries none. `PATCHPAGE_ALLOW_SELF_SERVICE_TOKENS` defaults to `false` and gates no route today; keep it `false` unless you intentionally plan to accept public token-minting traffic and have an appropriate external abuse-control layer. An ordinary `upload` token can disable or delete only the drafts it owns; the `admin` scope additionally moderates any principal's draft, which is the operator's takedown path. Treat `PATCHPAGE_BOOTSTRAP_API_TOKEN` as a secret, and remember that draft viewer URLs are public and unlisted — anyone with a link can view the rendered HTML unless you add your own viewer access controls.
+No instance publishes without credentials: every upload requires a bearer token, and no configuration accepts one that carries none. `PATCHPAGE_ALLOW_SELF_SERVICE_TOKENS` defaults to `false`; keep it `false` unless you intentionally plan to accept public token-minting traffic and have an appropriate external abuse-control layer, and read [Self-service minting](#self-service-minting) — particularly the proxy-boundary warning — before turning it on. An ordinary `upload` token can disable or delete only the drafts it owns; the `admin` scope additionally moderates any principal's draft, which is the operator's takedown path. Treat `PATCHPAGE_BOOTSTRAP_API_TOKEN` as a secret, and remember that draft viewer URLs are public and unlisted — anyone with a link can view the rendered HTML unless you add your own viewer access controls.

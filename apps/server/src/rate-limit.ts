@@ -21,12 +21,21 @@ export interface FixedWindowRateLimiterDiagnostics {
 export interface RateLimitConfig {
   protectedApiRateLimitPerMinute: number;
   authenticatedUploadRateLimitPerMinute: number;
+  selfServiceMintRateLimitPerMinute: number;
   draftCreateRateLimitPerMinute: number;
 }
 
 export interface RateLimiters {
   protectedApi: FixedWindowRateLimiter;
   authenticatedUpload: FixedWindowRateLimiter;
+  /**
+   * Self-service mints per minute, keyed by source address — the only limiter
+   * on an unauthenticated route, since a caller asking for its first token has
+   * no token to key on yet. This is the fast half of the mint guardrail; the
+   * per-day ceiling is a database count, so a restart empties this bucket but
+   * not that one.
+   */
+  selfServiceMint: FixedWindowRateLimiter;
   /**
    * Draft creates per minute, keyed by the creating token. Only per-minute
    * limits live in memory; the long-window live-draft quota is a database
@@ -71,6 +80,10 @@ export function createRateLimiters(
     authenticatedUpload: new FixedWindowRateLimiter({
       ...base,
       limit: config.authenticatedUploadRateLimitPerMinute
+    }),
+    selfServiceMint: new FixedWindowRateLimiter({
+      ...base,
+      limit: config.selfServiceMintRateLimitPerMinute
     }),
     draftCreate: new FixedWindowRateLimiter({
       ...base,

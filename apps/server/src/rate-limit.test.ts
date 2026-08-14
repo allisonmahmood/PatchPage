@@ -127,6 +127,7 @@ describe("FixedWindowRateLimiter", () => {
       {
         protectedApiRateLimitPerMinute: 60,
         authenticatedUploadRateLimitPerMinute: 20,
+        selfServiceMintRateLimitPerMinute: 5,
         draftCreateRateLimitPerMinute: 10
       },
       {
@@ -161,6 +162,7 @@ describe("FixedWindowRateLimiter", () => {
       {
         protectedApiRateLimitPerMinute: 60,
         authenticatedUploadRateLimitPerMinute: 20,
+        selfServiceMintRateLimitPerMinute: 5,
         draftCreateRateLimitPerMinute: 10
       },
       {
@@ -190,6 +192,47 @@ describe("FixedWindowRateLimiter", () => {
 
     now = 61_000;
     expect(limiters.draftCreate.consume("tok_one")).toMatchObject({
+      allowed: true,
+      resetAt: 121_000
+    });
+  });
+
+  it("exposes a real self-service mint limiter keyed by source address", () => {
+    let now = 1_000;
+    const limiters = createRateLimiters(
+      {
+        protectedApiRateLimitPerMinute: 60,
+        authenticatedUploadRateLimitPerMinute: 20,
+        selfServiceMintRateLimitPerMinute: 3,
+        draftCreateRateLimitPerMinute: 10
+      },
+      {
+        clock: () => now,
+        maxKeys: 10
+      }
+    );
+
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      expect(limiters.selfServiceMint.consume("198.51.100.7")).toMatchObject({
+        allowed: true,
+        resetAt: 61_000
+      });
+    }
+
+    expect(limiters.selfServiceMint.consume("198.51.100.7")).toMatchObject({
+      allowed: false,
+      retryAfterSeconds: 60,
+      resetAt: 61_000
+    });
+    // Another address mints freely, and no other bucket moved.
+    expect(limiters.selfServiceMint.consume("198.51.100.8")).toMatchObject({ allowed: true });
+    expect(limiters.protectedApi.consume("198.51.100.7")).toMatchObject({
+      allowed: true,
+      remaining: 59
+    });
+
+    now = 61_000;
+    expect(limiters.selfServiceMint.consume("198.51.100.7")).toMatchObject({
       allowed: true,
       resetAt: 121_000
     });

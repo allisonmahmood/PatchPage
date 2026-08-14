@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -500,6 +501,117 @@ function describeUploadContract(
         expect(updated.versionNumber).toBe(2);
         expect(await harness.db.countLiveDraftsByCreatorApiToken(creator.id)).toBe(1);
         expect(await harness.db.countLiveDraftsByCreatorApiToken(editor.id)).toBe(0);
+      } finally {
+        await harness.close();
+      }
+    });
+
+    it("counts self-service mints per source address across a rolling day", async () => {
+      const harness = await createHarness();
+      const sourceIp = uniqueSourceIp();
+      const otherIp = uniqueSourceIp();
+      // Anchored at the wall clock so the default-clock peer handle below reads
+      // the same window this one writes into.
+      let now = Date.now();
+      const clocked = harness.openDb({ clock: () => now });
+
+      try {
+        await clocked.initialize(null);
+        expect(await clocked.countSelfServiceMintsBySourceIp(sourceIp)).toBe(0);
+
+        await mintToken(clocked, sourceIp);
+        await mintToken(clocked, sourceIp);
+        await mintToken(clocked, otherIp);
+
+        expect(await clocked.countSelfServiceMintsBySourceIp(sourceIp)).toBe(2);
+        expect(await clocked.countSelfServiceMintsBySourceIp(otherIp)).toBe(1);
+
+        // The tally is stored, not remembered: another handle on the same store
+        // counts the same mints without having seen one of them happen.
+        expect(await harness.peerDb.countSelfServiceMintsBySourceIp(sourceIp)).toBe(2);
+
+        // A mint the server could not attribute lands in a bucket of its own
+        // rather than escaping the count altogether.
+        const unattributedBefore = await clocked.countSelfServiceMintsBySourceIp(null);
+        await mintToken(clocked, null);
+        expect(await clocked.countSelfServiceMintsBySourceIp(null)).toBe(
+          unattributedBefore + 1
+        );
+        expect(await clocked.countSelfServiceMintsBySourceIp(sourceIp)).toBe(2);
+
+        // Still inside the day, then past it: the window rolls off the mints
+        // themselves rather than resetting at a fixed hour.
+        now += DAY_MS - 1_000;
+        expect(await clocked.countSelfServiceMintsBySourceIp(sourceIp)).toBe(2);
+        now += 2_000;
+        expect(await clocked.countSelfServiceMintsBySourceIp(sourceIp)).toBe(0);
+      } finally {
+        await harness.close();
+      }
+    });
+
+    it("mints a fresh marked principal holding one upload-only token", async () => {
+      const harness = await createHarness();
+      const token = randomToken();
+      const name = "Self-service token 2026-01-01";
+
+      try {
+        const minted = await harness.db.mintSelfServiceToken({
+          token,
+          name,
+          sourceIp: uniqueSourceIp()
+        });
+
+        const auth = await harness.db.findApiTokenByToken(token);
+        expect(auth).toMatchObject({
+          id: minted.apiTokenId,
+          accountId: minted.accountId,
+          name,
+          scopes: ["upload"],
+          // The provenance mark, read back on the path every request takes.
+          selfService: true
+        });
+        expect(minted.apiTokenName).toBe(name);
+
+        // The operator's own principal was seeded, not minted, so it is unmarked.
+        expect(harness.auth.selfService).toBe(false);
+
+        // One principal per mint, and one token per principal.
+        const second = await harness.db.mintSelfServiceToken({
+          token: randomToken(),
+          name,
+          sourceIp: uniqueSourceIp()
+        });
+        expect(second.accountId).not.toBe(minted.accountId);
+        expect(second.apiTokenId).not.toBe(minted.apiTokenId);
+      } finally {
+        await harness.close();
+      }
+    });
+
+    it("owns exactly the drafts a minted principal creates", async () => {
+      const harness = await createHarness();
+      const draftId = newDraftId();
+
+      try {
+        const minted = await mintedAuth(harness, uniqueSourceIp());
+
+        await harness.db.recordUpload(uploadInput("create", draftId, minted));
+        const own = await harness.db.recordUpload(uploadInput("update", draftId, minted));
+        expect(own.versionNumber).toBe(2);
+
+        // Ownership is the existing account-scoped check, reused unchanged: the
+        // operator's principal is simply a different account, so its update is
+        // refused exactly as any other stranger's would be.
+        const foreign = await captureError(
+          harness.db.recordUpload(uploadInput("update", draftId, harness.auth))
+        );
+        expect(isUploadTargetError(foreign)).toBe(true);
+        expect(foreign).toMatchObject({ code: "draft_unavailable" });
+
+        expect(await harness.db.countLiveDraftsByCreatorApiToken(minted.id)).toBe(1);
+        expect(await harness.db.deleteDraft(draftId, harness.auth.accountId)).toBe(false);
+        expect(await harness.db.deleteDraft(draftId, minted.accountId)).toBe(true);
       } finally {
         await harness.close();
       }
@@ -1340,8 +1452,8 @@ async function createPostgresHarness(connectionString: string): Promise<Contract
       // Drop everything this branch built, then rebuild from the DDL string
       // origin/main shipped: no ledger table, no drafts_account_id_idx.
       await runSql(`
-        DROP TABLE IF EXISTS schema_migrations, upload_events, draft_versions,
-          drafts, api_tokens, accounts CASCADE;
+        DROP TABLE IF EXISTS schema_migrations, token_mints, upload_events,
+          draft_versions, drafts, api_tokens, accounts CASCADE;
       `);
       await runSql(DEPLOYED_POSTGRES_SCHEMA_SQL);
       await runSql(SEED_DEPLOYED_ROWS_SQL);
@@ -1381,6 +1493,40 @@ async function createUploadToken(
   });
   const auth = await harness.db.findApiTokenByToken(token);
   if (!auth) throw new Error(`Expected authentication for ${name}.`);
+  return auth;
+}
+
+/**
+ * A source address nobody else in the suite shares. The Postgres harness reuses
+ * one database across runs, so a per-address tally is only assertable from zero
+ * when the address itself is new. The column is text, so this has to be unique,
+ * not routable — hence the documentation range with a random host part.
+ */
+function uniqueSourceIp(): string {
+  return `2001:db8::${randomUUID().slice(0, 8)}`;
+}
+
+async function mintToken(db: PatchPageDb, sourceIp: string | null): Promise<void> {
+  await db.mintSelfServiceToken({
+    token: randomToken(),
+    name: "Self-service token 2026-01-01",
+    sourceIp
+  });
+}
+
+/** Mints, then reads back the principal the minted token authenticates as. */
+async function mintedAuth(
+  harness: ContractHarness,
+  sourceIp: string | null
+): Promise<ApiTokenAuth> {
+  const token = randomToken();
+  await harness.db.mintSelfServiceToken({
+    token,
+    name: "Self-service token 2026-01-01",
+    sourceIp
+  });
+  const auth = await harness.db.findApiTokenByToken(token);
+  if (!auth) throw new Error("Expected authentication for a minted token.");
   return auth;
 }
 

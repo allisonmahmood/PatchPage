@@ -7,6 +7,13 @@ export interface ApiTokenAuth {
   accountName: string;
   name: string;
   scopes: string[];
+  /**
+   * Whether this token's principal came from a self-service mint — the
+   * provenance mark, read back on the path every API request already takes so
+   * a guardrail can key on it without a second query. Operator-created tokens
+   * are false, including every token that predates self-service minting.
+   */
+  selfService: boolean;
 }
 
 export interface DraftRecord {
@@ -83,6 +90,25 @@ export interface CreateApiTokenInput {
   name: string;
   token: string;
   scopes: string[];
+}
+
+export interface MintSelfServiceTokenInput {
+  /** The plaintext token. Only its hash is stored, exactly as elsewhere. */
+  token: string;
+  /**
+   * The internal name for both the new principal and its token. The server
+   * derives it from the mint date; it exists for admin legibility and is never
+   * chosen by the client, because the mint operation takes no input at all.
+   */
+  name: string;
+  /** The mint's source address, or null when the request has no usable one. */
+  sourceIp: string | null;
+}
+
+export interface MintSelfServiceTokenResult {
+  accountId: string;
+  apiTokenId: string;
+  apiTokenName: string;
 }
 
 export interface UploadTargetInput {
@@ -162,6 +188,28 @@ export interface PatchPageDb {
   listAppliedMigrations(): Promise<string[]>;
   findApiTokenByToken(token: string): Promise<ApiTokenAuth | null>;
   createApiToken(input: CreateApiTokenInput): Promise<{ id: string; name: string }>;
+  /**
+   * How many self-service mints this source address has to its name inside the
+   * quota window ending now. The window is `mint-quota.ts`'s, read from the
+   * driver's own clock — the caller passes no instant, exactly as the live-draft
+   * tally takes no cutoff.
+   *
+   * A null address is a bucket like any other: mints the server could not
+   * attribute count together rather than each escaping the tally.
+   */
+  countSelfServiceMintsBySourceIp(sourceIp: string | null): Promise<number>;
+  /**
+   * Mints a self-service token: a fresh principal, the one token that controls
+   * it, and the mint record carrying source address and date, together. All
+   * three or none — a principal with no token owns drafts nobody can reach, and
+   * a token with no mint record is one the quota cannot see.
+   *
+   * The principal is 1:1 with the token by construction, which is the whole
+   * point: it reuses the account-scoped ownership checks unchanged, so a
+   * self-service token reaches its own drafts and no others without a second
+   * authorization model existing anywhere.
+   */
+  mintSelfServiceToken(input: MintSelfServiceTokenInput): Promise<MintSelfServiceTokenResult>;
   /**
    * How many drafts this token created that are still live — neither deleted
    * nor disabled. The creating token is the one on a draft's first version, so
