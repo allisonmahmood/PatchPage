@@ -127,7 +127,8 @@ describe("FixedWindowRateLimiter", () => {
       {
         protectedApiRateLimitPerMinute: 60,
         authenticatedUploadRateLimitPerMinute: 20,
-        anonymousCreateRateLimitPerMinute: 5
+        anonymousCreateRateLimitPerMinute: 5,
+        draftCreateRateLimitPerMinute: 10
       },
       {
         clock: () => now,
@@ -150,6 +151,47 @@ describe("FixedWindowRateLimiter", () => {
 
     now = 61_000;
     expect(limiters.anonymousCreate.consume("203.0.113.9")).toMatchObject({
+      allowed: true,
+      resetAt: 121_000
+    });
+  });
+
+  it("exposes a real draft-create limiter at ten attempts per token", () => {
+    let now = 1_000;
+    const limiters = createRateLimiters(
+      {
+        protectedApiRateLimitPerMinute: 60,
+        authenticatedUploadRateLimitPerMinute: 20,
+        anonymousCreateRateLimitPerMinute: 5,
+        draftCreateRateLimitPerMinute: 10
+      },
+      {
+        clock: () => now,
+        maxKeys: 10
+      }
+    );
+
+    for (let attempt = 0; attempt < 10; attempt += 1) {
+      expect(limiters.draftCreate.consume("tok_one")).toMatchObject({
+        allowed: true,
+        resetAt: 61_000
+      });
+    }
+
+    expect(limiters.draftCreate.consume("tok_one")).toMatchObject({
+      allowed: false,
+      retryAfterSeconds: 60,
+      resetAt: 61_000
+    });
+    // A second token has its own bucket, and the upload bucket is untouched.
+    expect(limiters.draftCreate.consume("tok_two")).toMatchObject({ allowed: true });
+    expect(limiters.authenticatedUpload.consume("tok_one")).toMatchObject({
+      allowed: true,
+      remaining: 19
+    });
+
+    now = 61_000;
+    expect(limiters.draftCreate.consume("tok_one")).toMatchObject({
       allowed: true,
       resetAt: 121_000
     });

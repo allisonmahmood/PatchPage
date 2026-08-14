@@ -1255,6 +1255,164 @@ describe("PatchPage server", () => {
     }
   });
 
+  it("limits draft creates per minute per token without counting updates", async () => {
+    let now = 1_000;
+    const config = { ...testConfig(), draftCreateRateLimitPerMinute: 2 };
+    const db = new JsonFilePatchPageDb(path.join(tempDir, "create-limit-db.json"));
+    await db.initialize("dev-token");
+    const storage = new FileSystemHtmlStorage(path.join(tempDir, "create-limit-drafts"));
+    const app = createApp({ config, db, storage, clock: () => now });
+
+    try {
+      const first = await createDraft(app, "dev-token", "First");
+      expect(first.statusCode).toBe(201);
+      const { draftId } = first.json() as { draftId: string };
+
+      // Updates in the same window must not spend any of the create budget.
+      for (let revision = 0; revision < 3; revision += 1) {
+        const update = await updateDraft(app, "dev-token", draftId, `First v${revision}`);
+        expect(update.statusCode).toBe(200);
+      }
+
+      // Still room for the window's second create, so the updates cost nothing.
+      expect((await createDraft(app, "dev-token", "Second")).statusCode).toBe(201);
+
+      const limited = await createDraft(app, "dev-token", "Third");
+      expect(limited.statusCode).toBe(429);
+      expect(limited.headers["retry-after"]).toBe("60");
+      expect(limited.json()).toEqual({
+        ok: false,
+        error: "Rate limit exceeded.",
+        code: "rate_limited",
+        retryAfterSeconds: 60
+      });
+
+      // An update still succeeds once the create bucket is empty.
+      expect(
+        (await updateDraft(app, "dev-token", draftId, "First again")).statusCode
+      ).toBe(200);
+
+      now = 61_000;
+      const afterWindow = await createDraft(app, "dev-token", "Fourth");
+      expect(afterWindow.statusCode).toBe(201);
+    } finally {
+      await app.close();
+      await db.close();
+    }
+  });
+
+  it("caps live drafts per token from the database, across a restart", async () => {
+    const config = { ...testConfig(), liveDraftsPerToken: 2 };
+    const dbFile = path.join(tempDir, "live-cap-db.json");
+    const storage = new FileSystemHtmlStorage(path.join(tempDir, "live-cap-drafts"));
+    // `dev-token` is the admin bootstrap token: the cap has no admin exemption.
+    const db = new JsonFilePatchPageDb(dbFile);
+    await db.initialize("dev-token");
+    const app = createApp({ config, db, storage });
+
+    try {
+      const one = await createDraft(app, "dev-token", "One");
+      expect(one.statusCode).toBe(201);
+      const { draftId } = one.json() as { draftId: string };
+      expect((await createDraft(app, "dev-token", "Two")).statusCode).toBe(201);
+
+      const overQuota = await createDraft(app, "dev-token", "Three");
+      expect(overQuota.statusCode).toBe(403);
+      expect(overQuota.json()).toEqual({
+        ok: false,
+        error:
+          "Draft quota reached: 2 live drafts per token. Delete or let a draft expire before creating another.",
+        code: "live_draft_quota_exceeded",
+        quota: 2
+      });
+
+      // The quota bounds creates only: at the ceiling, rewriting a draft the
+      // token already holds still succeeds.
+      expect(
+        (await updateDraft(app, "dev-token", draftId, "One revised")).statusCode
+      ).toBe(200);
+    } finally {
+      await app.close();
+      await db.close();
+    }
+
+    // A restart drops every in-memory bucket. The cap is recounted from the
+    // database, so it is still there.
+    const restartedDb = new JsonFilePatchPageDb(dbFile);
+    await restartedDb.initialize("dev-token");
+    const restarted = createApp({ config, db: restartedDb, storage });
+
+    try {
+      const stillOverQuota = await createDraft(restarted, "dev-token", "Three again");
+      expect(stillOverQuota.statusCode).toBe(403);
+      expect(stillOverQuota.json()).toMatchObject({
+        code: "live_draft_quota_exceeded",
+        quota: 2
+      });
+    } finally {
+      await restarted.close();
+      await restartedDb.close();
+    }
+  });
+
+  it("returns live-draft cap room when a draft is disabled or deleted", async () => {
+    const config = { ...testConfig(), liveDraftsPerToken: 1 };
+    const db = new JsonFilePatchPageDb(path.join(tempDir, "live-cap-release-db.json"));
+    await db.initialize("dev-token");
+    const auth = await db.findApiTokenByToken("dev-token");
+    expect(auth).not.toBeNull();
+    await db.createApiToken({
+      accountId: auth!.accountId,
+      name: "Sibling upload token",
+      token: "sibling-token",
+      scopes: ["upload"]
+    });
+    const storage = new FileSystemHtmlStorage(
+      path.join(tempDir, "live-cap-release-drafts")
+    );
+    const app = createApp({ config, db, storage });
+
+    try {
+      const created = await createDraft(app, "dev-token", "Only one");
+      expect(created.statusCode).toBe(201);
+      const { draftId } = created.json() as { draftId: string };
+      expect((await createDraft(app, "dev-token", "Blocked")).statusCode).toBe(403);
+
+      // The cap is per token, not per account: a sibling token on the same
+      // account still has its own room.
+      expect((await createDraft(app, "sibling-token", "Sibling")).statusCode).toBe(201);
+
+      const disable = await app.inject({
+        method: "POST",
+        url: `/api/drafts/${draftId}/disable`,
+        headers: { authorization: "Bearer dev-token" },
+        payload: { reason: "quota test" }
+      });
+      expect(disable.statusCode).toBe(200);
+
+      const afterDisable = await createDraft(app, "dev-token", "After disable");
+      expect(afterDisable.statusCode).toBe(201);
+      const replacementDraftId = (afterDisable.json() as { draftId: string }).draftId;
+      expect((await createDraft(app, "dev-token", "Blocked again")).statusCode).toBe(403);
+
+      const removed = await app.inject({
+        method: "DELETE",
+        url: `/api/drafts/${replacementDraftId}`,
+        headers: { authorization: "Bearer dev-token" }
+      });
+      expect(removed.statusCode).toBe(200);
+
+      expect((await createDraft(app, "dev-token", "After delete")).statusCode).toBe(201);
+      // Nothing the first token did moved the sibling's own tally.
+      expect((await createDraft(app, "sibling-token", "Sibling blocked")).statusCode).toBe(
+        403
+      );
+    } finally {
+      await app.close();
+      await db.close();
+    }
+  });
+
   it("persists the direct socket address when proxy trust is not configured", async () => {
     const sourceIp = await uploadSourceIp({
       remoteAddress: "192.0.2.10"
@@ -1783,7 +1941,265 @@ describe("PatchPage server", () => {
     await app.close();
     await db.close();
   });
+
+  it("serves drafts noindexed, unwatched, and open to machines", async () => {
+    const served = await createServedDraft("serving-guarantees");
+
+    for (const url of [served.latestUrl, served.versionUrl]) {
+      const anonymous = await served.app.inject({ method: "GET", url });
+      expect(anonymous.statusCode).toBe(200);
+      expect(anonymous.headers["x-robots-tag"]).toBe("noindex");
+      expect(anonymous.headers["set-cookie"]).toBeUndefined();
+      expect(anonymous.headers["www-authenticate"]).toBeUndefined();
+      expect(anonymous.body).toContain("Serving Guarantees");
+    }
+
+    // No auth or session on the serving host: reader credentials are neither
+    // required nor consulted, and a bad one never turns into a challenge.
+    const credentialed = await served.app.inject({
+      method: "GET",
+      url: served.latestUrl,
+      headers: { authorization: "Bearer not-a-real-token", cookie: "session=whatever" }
+    });
+    expect(credentialed.statusCode).toBe(200);
+    expect(credentialed.headers["set-cookie"]).toBeUndefined();
+    expect(credentialed.headers["www-authenticate"]).toBeUndefined();
+    expect(credentialed.body).toContain("Serving Guarantees");
+
+    const missing = await served.app.inject({ method: "GET", url: "/d/doesnotexist1" });
+    expect(missing.statusCode).toBe(404);
+    expect(missing.headers["x-robots-tag"]).toBe("noindex");
+    expect(missing.headers["set-cookie"]).toBeUndefined();
+
+    await served.close();
+  });
+
+  it("caches version URLs immutably, latest-draft URLs briefly, and everything else never", async () => {
+    const served = await createServedDraft("serving-cache-headers");
+
+    const latest = await served.app.inject({ method: "GET", url: served.latestUrl });
+    expect(latest.statusCode).toBe(200);
+    expect(latest.headers["cache-control"]).toBe("public, max-age=60");
+
+    const version = await served.app.inject({ method: "GET", url: served.versionUrl });
+    expect(version.statusCode).toBe(200);
+    expect(version.headers["cache-control"]).toBe("public, max-age=31536000, immutable");
+
+    const missingVersion = await served.app.inject({
+      method: "GET",
+      url: `/d/${served.draftId}/v/9`
+    });
+    expect(missingVersion.statusCode).toBe(404);
+    expect(missingVersion.headers["cache-control"]).toBe("no-store");
+
+    const missingDraft = await served.app.inject({ method: "GET", url: "/d/doesnotexist1" });
+    expect(missingDraft.statusCode).toBe(404);
+    expect(missingDraft.headers["cache-control"]).toBe("no-store");
+
+    // Everything that is not a served draft — API routes included — stays uncached.
+    const uncachedResponses = [
+      await served.app.inject({
+        method: "GET",
+        url: "/api/me",
+        headers: { authorization: "Bearer dev-token" }
+      }),
+      await served.app.inject({ method: "GET", url: "/api/me" }),
+      await served.app.inject({
+        method: "POST",
+        url: "/api/uploads",
+        headers: { authorization: "Bearer dev-token" },
+        payload: { html: "<!doctype html><html><head><title>Second</title></head><body></body></html>" }
+      }),
+      await served.app.inject({ method: "GET", url: "/healthz" }),
+      await served.app.inject({ method: "GET", url: "/" })
+    ];
+    for (const response of uncachedResponses) {
+      expect(response.headers["cache-control"]).toBe("no-store");
+    }
+
+    await served.close();
+  });
+
+  it("locks the draft content security policy with no script sources", async () => {
+    const served = await createServedDraft("serving-csp");
+
+    for (const url of [served.latestUrl, served.versionUrl]) {
+      const response = await served.app.inject({ method: "GET", url });
+      expect(response.statusCode).toBe(200);
+      expect(response.headers["content-security-policy"]).toBe(
+        "default-src 'none'; style-src 'unsafe-inline'; img-src https: data:; " +
+          "frame-src 'self' about:; base-uri 'none'; form-action 'none'"
+      );
+      expect(response.headers["content-security-policy"]).not.toContain("script");
+      expect(response.body).not.toContain("<script");
+    }
+
+    await served.close();
+  });
+
+  it("stops serving and stops updating a draft once its retention clock runs out", async () => {
+    const clocked = await createClockedApp("expiry");
+
+    try {
+      const draftId = await publishDraft(clocked.app, "Ninety day page");
+
+      // A visit this early tops up nothing, so the clock still ends at day 90.
+      clocked.advanceDays(1);
+      const early = await clocked.app.inject({ method: "GET", url: `/d/${draftId}` });
+      expect(early.statusCode).toBe(200);
+      expect(early.body).toContain("Ninety day page");
+
+      clocked.advanceDays(90);
+      for (const url of [`/d/${draftId}`, `/d/${draftId}/v/1`]) {
+        const gone = await clocked.app.inject({ method: "GET", url });
+        expect(gone.statusCode).toBe(404);
+        expect(gone.headers["content-type"]).toContain("text/html");
+        expect(gone.body).not.toContain("Ninety day page");
+
+        // An expired draft's 404 is an ordinary draft-URL 404 and carries the
+        // same serving guarantees: still noindexed, and never cached — the page
+        // it replaced was cacheable, and this must not inherit that.
+        expect(gone.headers["x-robots-tag"]).toBe("noindex");
+        expect(gone.headers["cache-control"]).toBe("no-store");
+        expect(gone.headers["set-cookie"]).toBeUndefined();
+      }
+
+      const update = await clocked.app.inject({
+        method: "POST",
+        url: "/api/uploads",
+        headers: { authorization: "Bearer dev-token" },
+        payload: {
+          draftId,
+          html: "<!doctype html><html><head><title>Too late</title></head><body></body></html>"
+        }
+      });
+      expect(update.statusCode).toBe(404);
+      expect(update.json()).toEqual({ ok: false, error: "Draft not found." });
+    } finally {
+      await clocked.close();
+    }
+  });
+
+  it("keeps a visited draft alive, and lets it go once the visits stop", async () => {
+    const clocked = await createClockedApp("visit-topup");
+
+    try {
+      const draftId = await publishDraft(clocked.app, "Still visited");
+
+      // Ten days left on the upload's window: this visit tops it up to thirty.
+      clocked.advanceDays(80);
+      const inWindow = await clocked.app.inject({ method: "GET", url: `/d/${draftId}` });
+      expect(inWindow.statusCode).toBe(200);
+
+      // Day 95 — past where the upload alone would have ended it. The page is
+      // still here because it was visited, and this visit extends it again.
+      clocked.advanceDays(15);
+      const extended = await clocked.app.inject({ method: "GET", url: `/d/${draftId}` });
+      expect(extended.statusCode).toBe(200);
+      expect(extended.body).toContain("Still visited");
+
+      // Thirty-one days without a visit, and it is gone.
+      clocked.advanceDays(31);
+      const abandoned = await clocked.app.inject({ method: "GET", url: `/d/${draftId}` });
+      expect(abandoned.statusCode).toBe(404);
+    } finally {
+      await clocked.close();
+    }
+  });
+
+  it("serves a draft whose visit top-up write fails, without moving its clock", async () => {
+    const clocked = await createClockedApp(
+      "visit-write-failure",
+      (file, clock) => new VisitFailingJsonDb(file, { clock })
+    );
+
+    try {
+      const draftId = await publishDraft(clocked.app, "Survives a failed top-up");
+
+      // Ten days left, so this visit is one the clock would move — and the
+      // write throws. The reader still gets the page.
+      clocked.advanceDays(80);
+      const served = await clocked.app.inject({ method: "GET", url: `/d/${draftId}` });
+      expect(served.statusCode).toBe(200);
+      expect(served.body).toContain("Survives a failed top-up");
+
+      // Best-effort means exactly that: the page was served and the clock
+      // genuinely did not move, so the original window still ends it.
+      clocked.advanceDays(11);
+      const expired = await clocked.app.inject({ method: "GET", url: `/d/${draftId}` });
+      expect(expired.statusCode).toBe(404);
+    } finally {
+      await clocked.close();
+    }
+  });
+
+  it("restarts the whole window when a new version is published", async () => {
+    const clocked = await createClockedApp("upload-reset");
+
+    try {
+      const draftId = await publishDraft(clocked.app, "First cut");
+
+      clocked.advanceDays(80);
+      const republish = await clocked.app.inject({
+        method: "POST",
+        url: "/api/uploads",
+        headers: { authorization: "Bearer dev-token" },
+        payload: {
+          draftId,
+          html: "<!doctype html><html><head><title>Second cut</title></head><body></body></html>"
+        }
+      });
+      expect(republish.statusCode).toBe(200);
+
+      // Day 100: past the first window, well inside the one the update opened.
+      clocked.advanceDays(20);
+      const served = await clocked.app.inject({ method: "GET", url: `/d/${draftId}` });
+      expect(served.statusCode).toBe(200);
+      expect(served.body).toContain("Second cut");
+    } finally {
+      await clocked.close();
+    }
+  });
 });
+
+interface ServedDraft {
+  app: ReturnType<typeof createApp>;
+  draftId: string;
+  latestUrl: string;
+  versionUrl: string;
+  close: () => Promise<void>;
+}
+
+async function createServedDraft(label: string): Promise<ServedDraft> {
+  const safeLabel = label.replaceAll(/[^a-z0-9]/gi, "-");
+  const config = testConfig();
+  const db = new JsonFilePatchPageDb(path.join(tempDir, `${safeLabel}-db.json`));
+  await db.initialize("dev-token");
+  const storage = new FileSystemHtmlStorage(path.join(tempDir, `${safeLabel}-drafts`));
+  const app = createApp({ config, db, storage });
+
+  const upload = await app.inject({
+    method: "POST",
+    url: "/api/uploads",
+    headers: { authorization: "Bearer dev-token" },
+    payload: {
+      html: "<!doctype html><html><head><title>Serving Guarantees</title></head><body><p>Served.</p></body></html>"
+    }
+  });
+  expect(upload.statusCode).toBe(201);
+  const body = upload.json() as { draftId: string; versionNumber: number };
+
+  return {
+    app,
+    draftId: body.draftId,
+    latestUrl: `/d/${body.draftId}`,
+    versionUrl: `/d/${body.draftId}/v/${body.versionNumber}`,
+    close: async () => {
+      await app.close();
+      await db.close();
+    }
+  };
+}
 
 interface SourceIpAttribution {
   versionSourceIp: string | null | undefined;
@@ -1875,6 +2291,37 @@ async function createScopedTokenApp(label: string, clock?: () => number): Promis
   const storage = new FileSystemHtmlStorage(path.join(tempDir, `${safeLabel}-drafts`));
   const app = createApp({ config, db, storage, clock });
   return { app, db };
+}
+
+function draftHtml(title: string): string {
+  return `<!doctype html><html><head><title>${title}</title></head><body><h1>${title}</h1></body></html>`;
+}
+
+async function createDraft(
+  app: ReturnType<typeof createApp>,
+  token: string,
+  title: string
+) {
+  return app.inject({
+    method: "POST",
+    url: "/api/uploads",
+    headers: { authorization: `Bearer ${token}` },
+    payload: { html: draftHtml(title) }
+  });
+}
+
+async function updateDraft(
+  app: ReturnType<typeof createApp>,
+  token: string,
+  draftId: string,
+  title: string
+) {
+  return app.inject({
+    method: "POST",
+    url: "/api/uploads",
+    headers: { authorization: `Bearer ${token}` },
+    payload: { draftId, html: draftHtml(title) }
+  });
 }
 
 async function oversizedJsonApiRequest(
@@ -2041,6 +2488,66 @@ type ScopedTokenApp = {
   db: JsonFilePatchPageDb;
 };
 
+type ClockedApp = {
+  app: ReturnType<typeof createApp>;
+  advanceDays(days: number): void;
+  close(): Promise<void>;
+};
+
+const DAY_MS = 24 * 60 * 60 * 1000;
+
+/**
+ * An app whose clock can be wound forward months. The database gets the *same*
+ * clock: the retention clock is the database's, so an app-only clock would move
+ * the rate limiters and nothing else.
+ */
+async function createClockedApp(
+  label: string,
+  openDb: (file: string, clock: () => number) => JsonFilePatchPageDb = (file, clock) =>
+    new JsonFilePatchPageDb(file, { clock })
+): Promise<ClockedApp> {
+  let now = Date.UTC(2026, 0, 1);
+  const clock = (): number => now;
+  const db = openDb(path.join(tempDir, `${label}-db.json`), clock);
+  await db.initialize("dev-token");
+  const storage = new FileSystemHtmlStorage(path.join(tempDir, `${label}-drafts`));
+  const app = createApp({ config: testConfig(), db, storage, clock });
+
+  return {
+    app,
+    advanceDays(days) {
+      now += days * DAY_MS;
+    },
+    async close() {
+      await app.close();
+      await db.close();
+    }
+  };
+}
+
+async function publishDraft(
+  app: ReturnType<typeof createApp>,
+  title: string
+): Promise<string> {
+  const upload = await app.inject({
+    method: "POST",
+    url: "/api/uploads",
+    headers: { authorization: "Bearer dev-token" },
+    payload: {
+      html: `<!doctype html><html><head><title>${title}</title></head><body></body></html>`
+    }
+  });
+  expect(upload.statusCode).toBe(201);
+  return (upload.json() as { draftId: string }).draftId;
+}
+
+/** A store that can serve a draft but cannot record the visit that follows. */
+class VisitFailingJsonDb extends JsonFilePatchPageDb {
+  override async recordDraftVisit(): Promise<void> {
+    throw new Error("Forced visit top-up failure.");
+  }
+}
+
 function testConfig(): ServerConfig {
   return {
     port: 3000,
@@ -2052,6 +2559,8 @@ function testConfig(): ServerConfig {
     protectedApiRateLimitPerMinute: 60,
     authenticatedUploadRateLimitPerMinute: 20,
     anonymousCreateRateLimitPerMinute: 5,
+    draftCreateRateLimitPerMinute: 10,
+    liveDraftsPerToken: 1_000,
     dbDriver: "json",
     databaseUrl: null,
     jsonDbFile: path.join(tempDir, "db.json"),

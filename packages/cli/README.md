@@ -43,7 +43,7 @@ npm install -g patchpage
 
 ### `patchpage auth set [--token-stdin] [--api-url <url>]`
 
-Save an API token to local state. By default, `auth set` requires a terminal and reads the token from a non-echoing prompt. Pass `--api-url` to also store the base URL of a self-hosted instance, so later commands don't need the flag.
+Save an API token to local state, under the instance it resolves for: `--api-url`, else `PATCHPAGE_API_URL`, else the stored config, else the default instance. Saving a token for one instance leaves tokens saved for other instances untouched. By default, `auth set` requires a terminal and reads the token from a non-echoing prompt. Pass `--api-url` to also store the base URL of a self-hosted instance, so later commands don't need the flag.
 
 ```sh
 patchpage auth set --api-url https://post.example.com
@@ -61,6 +61,29 @@ patchpage whoami
 # API token: laptop (tok_1a2b3c...)
 # Scopes: upload
 ```
+
+### `patchpage status --json [--api-url <url>]`
+
+Report what the publishing state looks like on this machine for the resolved instance. It is strictly local — it never contacts the instance it names — and it exits `0` whether or not anything is configured, so it answers rather than checks. JSON is its only output format.
+
+```sh
+patchpage status --json
+# {
+#   "instanceUrl": "https://post.example.com",
+#   "instanceSource": "config",
+#   "hasToken": true,
+#   "tokenSource": "auth-set",
+#   "stateDir": "/home/you/.patchpage",
+#   "hasDefaultStyle": false,
+#   "cliVersion": "0.1.1"
+# }
+```
+
+`instanceSource` names the link of the precedence chain that chose `instanceUrl`: `flag` (`--api-url`), `env` (`PATCHPAGE_API_URL`), `config` (the saved `config.json`), or `default`. `hasToken` walks the same credential chain an upload would, so `true` means an upload would have that token to send. Read `false` as *no token this command can vouch for* — usually nothing is stored, but it also covers local state the probe declined to interpret. `tokenSource` is the stored credential's own `source` (`mint` or `auth-set`); it is `null` when there is no token, when the token came from `PATCHPAGE_API_TOKEN`, or when the stored entry predates that field. The token itself is never printed.
+
+Local state the probe cannot read — a file in the retired single-instance format, malformed JSON, an unreadable file, or an invalid entry for this instance — is reported as `hasToken: false` rather than raised as an error, because a probe that cannot answer is worse than one that answers narrowly. The commands that would actually spend a token keep failing closed on exactly those files: `upload` and `whoami` stop with an error naming the file and its next action, and never treat it as a reason to publish without credentials.
+
+So this report is a picture of local state, not a prediction of what `upload` will do. `hasToken: false` does not promise the next upload proceeds without a token, and it never means this machine has no token — a token may be sitting in a file the probe refused to guess about.
 
 ### `patchpage validate <file>`
 
@@ -88,7 +111,8 @@ With credentials, uploading a file the CLI has seen before updates that same dra
 
 ## Flags
 
-- `--api-url <url>` — override the API base URL for this command (available on `auth set`, `whoami`, and `upload`).
+- `--api-url <url>` — override the API base URL for this command (available on `auth set`, `whoami`, `status`, and `upload`).
+- `--json` — on `status`, print the report as JSON. It is required, because JSON is the only format `status` offers.
 - `--token-stdin` — on `auth set`, read exactly one non-empty token from redirected stdin. This is the explicit automation path and is rejected when stdin is a terminal.
 - `--new` — on `upload`, always create a new draft with a server-generated ID instead of updating the one previously uploaded from this path. It cannot be combined with `--draft`.
 - `--draft <draft-id>` — on `upload`, update a specific existing draft. This is update-only and never creates a new draft. It cannot be combined with `--new`.
@@ -97,16 +121,30 @@ With credentials, uploading a file the CLI has seen before updates that same dra
 ## Environment variables
 
 - `PATCHPAGE_API_URL` — API base URL. Overrides the stored config; overridden by `--api-url`. Default: `https://post.patchyhq.com`.
-- `PATCHPAGE_API_TOKEN` — API token for ordinary authenticated commands such as `whoami` and `upload`. It overrides stored credentials and is useful in CI; `auth set` does not read it. When neither it nor a stored token exists, `upload` attempts anonymous creation.
+- `PATCHPAGE_API_TOKEN` — API token for ordinary authenticated commands such as `whoami` and `upload`. It overrides the token stored for the resolved instance and is useful in CI; `auth set` does not read it. When neither it nor a stored token exists, `upload` attempts anonymous creation.
 - `PATCHPAGE_STATE_DIR` — directory for the CLI's config, credentials, and draft cache. Default: `~/.patchpage`.
+
+Setting any of these to the empty string means the same thing as leaving it unset.
 
 ## State
 
 The CLI stores state under `~/.patchpage` (or `PATCHPAGE_STATE_DIR`):
 
 - `config.json` — the saved API base URL.
-- `credentials.json` — the saved API token. On Unix, every save creates or repairs this file to owner-only (`0600`) permissions.
-- `drafts.json` — a per-path cache mapping authenticated uploads to their draft IDs, so later authenticated uploads update the same draft. Anonymous uploads neither consume nor update this cache.
+- `credentials.json` — saved API tokens, keyed by instance. On Unix, every save creates or repairs this file to owner-only (`0600`) permissions.
+- `drafts.json` — the draft cache, keyed by instance and then by absolute file path, so later authenticated uploads update the same draft. Anonymous uploads neither consume nor update this cache.
+- `style.md` — the default style, owned and written by the agent skill. The CLI never reads its contents; `status` reports only whether it exists.
+
+Both files are keyed by the resolved API base URL under exact string equality, so instances that differ only by scheme, host, or port are separate entries by design:
+
+```jsonc
+// credentials.json
+{ "hosts": { "https://post.example.com": { "token": "…", "updatedAt": "…", "source": "auth-set" } } }
+// drafts.json
+{ "hosts": { "https://post.example.com": { "files": { "/abs/plan.html": { "draftId": "…", "publicUrl": "…", "latestVersionNumber": 3, "updatedAt": "…" } } } } }
+```
+
+A token saved for one instance is never sent to another, and a draft ID cached for one instance is never replayed against another. Files written by an older CLI in the previous single-instance format are not migrated: the CLI stops with an error naming the file, so a token that still controls live drafts is never discarded silently. Copy anything you need out of the old file, then delete it.
 
 ## Agent skill
 

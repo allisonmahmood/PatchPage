@@ -54,6 +54,8 @@ max_html_bytes                                  = 524288
 protected_api_rate_limit_per_minute            = 60
 authenticated_upload_rate_limit_per_minute     = 20
 anonymous_create_rate_limit_per_minute         = 5
+draft_create_rate_limit_per_minute             = 10
+live_drafts_per_token                          = 1000
 
 # Fill after the first ACR build:
 # server_image = "acrpatchpageabc123.azurecr.io/patchpage-server@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"

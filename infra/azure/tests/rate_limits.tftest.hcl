@@ -108,6 +108,14 @@ run "wires_default_rate_limits" {
         {
           name  = "PATCHPAGE_ANONYMOUS_CREATE_RATE_LIMIT_PER_MINUTE"
           value = "5"
+        },
+        {
+          name  = "PATCHPAGE_DRAFT_CREATE_RATE_LIMIT_PER_MINUTE"
+          value = "10"
+        },
+        {
+          name  = "PATCHPAGE_LIVE_DRAFTS_PER_TOKEN"
+          value = "1000"
         }
         ] : anytrue([
           for setting in azurerm_container_app.server.template[0].container[0].env :
@@ -127,6 +135,8 @@ run "wires_custom_rate_limits" {
     protected_api_rate_limit_per_minute        = 120
     authenticated_upload_rate_limit_per_minute = 40
     anonymous_create_rate_limit_per_minute     = 10
+    draft_create_rate_limit_per_minute         = 25
+    live_drafts_per_token                      = 50
   }
 
   assert {
@@ -143,6 +153,14 @@ run "wires_custom_rate_limits" {
         {
           name  = "PATCHPAGE_ANONYMOUS_CREATE_RATE_LIMIT_PER_MINUTE"
           value = "10"
+        },
+        {
+          name  = "PATCHPAGE_DRAFT_CREATE_RATE_LIMIT_PER_MINUTE"
+          value = "25"
+        },
+        {
+          name  = "PATCHPAGE_LIVE_DRAFTS_PER_TOKEN"
+          value = "50"
         }
         ] : anytrue([
           for setting in azurerm_container_app.server.template[0].container[0].env :
@@ -259,4 +277,76 @@ run "rejects_too_large_anonymous_create_rate_limit" {
   }
 
   expect_failures = [var.anonymous_create_rate_limit_per_minute]
+}
+
+run "rejects_zero_draft_create_rate_limit" {
+  command = plan
+
+  variables {
+    subscription_id                    = "00000000-0000-0000-0000-000000000000"
+    public_base_url                    = "https://drafts.self-hoster.dev"
+    draft_create_rate_limit_per_minute = 0
+  }
+
+  expect_failures = [var.draft_create_rate_limit_per_minute]
+}
+
+run "rejects_fractional_draft_create_rate_limit" {
+  command = plan
+
+  variables {
+    subscription_id                    = "00000000-0000-0000-0000-000000000000"
+    public_base_url                    = "https://drafts.self-hoster.dev"
+    draft_create_rate_limit_per_minute = 1.5
+  }
+
+  expect_failures = [var.draft_create_rate_limit_per_minute]
+}
+
+run "rejects_too_large_draft_create_rate_limit" {
+  command = plan
+
+  variables {
+    subscription_id                    = "00000000-0000-0000-0000-000000000000"
+    public_base_url                    = "https://drafts.self-hoster.dev"
+    draft_create_rate_limit_per_minute = 10001
+  }
+
+  expect_failures = [var.draft_create_rate_limit_per_minute]
+}
+
+run "rejects_zero_live_drafts_per_token" {
+  command = plan
+
+  variables {
+    subscription_id       = "00000000-0000-0000-0000-000000000000"
+    public_base_url       = "https://drafts.self-hoster.dev"
+    live_drafts_per_token = 0
+  }
+
+  expect_failures = [var.live_drafts_per_token]
+}
+
+run "rejects_fractional_live_drafts_per_token" {
+  command = plan
+
+  variables {
+    subscription_id       = "00000000-0000-0000-0000-000000000000"
+    public_base_url       = "https://drafts.self-hoster.dev"
+    live_drafts_per_token = 1.5
+  }
+
+  expect_failures = [var.live_drafts_per_token]
+}
+
+run "rejects_too_large_live_drafts_per_token" {
+  command = plan
+
+  variables {
+    subscription_id       = "00000000-0000-0000-0000-000000000000"
+    public_base_url       = "https://drafts.self-hoster.dev"
+    live_drafts_per_token = 1000001
+  }
+
+  expect_failures = [var.live_drafts_per_token]
 }

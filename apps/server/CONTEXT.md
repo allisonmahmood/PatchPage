@@ -20,6 +20,18 @@ _Avoid_: account (in product language)
 The guardrail that removes a draft for good when its retention clock runs out. An upload resets the clock to the full window; a visit tops the remaining time up to the visit-extension window. Expiry is a hard delete — content and record both gone, no recovery — and applies to every draft regardless of who owns it, unless the draft is pinned.
 _Avoid_: soft delete, archival, retention (for the act of deleting — retention is the clock, expiry is the consequence)
 
+**Visit**:
+One successful serving of a draft page, at either its latest or a version URL. A visit is the only thing besides an upload that moves a retention clock, and it only ever moves it forward: with less than the visit-extension window left it tops the draft up to exactly that window, and otherwise changes nothing at all. A visit never brings back a draft that has already expired.
+_Avoid_: view, hit, page load (a visit is a serving that succeeded, not a request that arrived)
+
+**Live draft**:
+A draft that still counts against its creator's quota: neither deleted nor disabled. A draft leaves the tally the moment it is deleted or disabled, and for good when expiry hard-deletes it — an expired draft still counts until the sweep removes it, because its row and its stored content are both still there. Which token created it is fixed at creation; a later update by another token never moves it.
+_Avoid_: active draft, published draft (every draft is published), open draft
+
+**Draft quota**:
+The ceiling on live drafts one token may hold at once. Counted from the database on every create, so it survives a restart — unlike the per-minute create limit, which is in-memory and may reset. Per token, not per account, and uniform: no exemption for admin tokens.
+_Avoid_: draft limit (ambiguous with the per-minute create limit), storage quota (this counts drafts, not bytes)
+
 **Pinned draft**:
 A draft exempted from expiry by an operator, for pages the instance itself maintains (welcome page, docs). Pinning is an admin-only act; a pinned draft is otherwise an ordinary draft.
 _Avoid_: permanent draft, system page
@@ -31,6 +43,10 @@ _Avoid_: ban, token deletion
 **Report**:
 A reader's flag on a served draft asking the operator to review it. Filing one is acknowledged immediately and has no automatic consequence; disabling, deleting, or revoking is always an operator decision.
 _Avoid_: takedown request (a report may lead to a takedown; it is not one)
+
+**Serving guarantee**:
+A fixed promise about how a published draft reaches its reader, binding on every served response. There are four, and they hold together: pages are **share-a-link-never-be-found** (`X-Robots-Tag: noindex` keeps them out of search results, and that is the only measure taken against discovery); readers are **unwatched** (no cookies, no auth or session on the serving host, a fully locked CSP with no script sources and so no analytics JavaScript); draft URLs are **open to machines** — never bot-blocked, challenged, or put behind a WAF human-check, because an agent handed a pasted link must be able to fetch it; and caching is **keyed to URL shape** — a version URL names content that can never change, so it is cached for a year and marked immutable, while the latest-draft URL follows the draft and gets a short window that lets an update land on its own. Everything else, API routes included, stays `no-store`. A cache lifetime is never coupled to a CDN purge API: the window expiring is the only invalidation there is.
+_Avoid_: hardening, bot protection (the serving surface is deliberately open to machines), private (unlisted is not private)
 
 **Circuit breaker**:
 The spend threshold beyond which the instance is no longer willing to operate. Crossing it fires the kill switch automatically; no human confirms first.

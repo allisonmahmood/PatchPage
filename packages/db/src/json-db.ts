@@ -18,11 +18,19 @@ import {
   ANONYMOUS_INTERNAL_TOKEN_HASH,
   ANONYMOUS_UPLOAD_PRINCIPAL
 } from "./internal-principals.js";
+import {
+  applyJsonMigrations,
+  JSON_MIGRATION_LEDGER_KEY,
+  SCHEMA_MIGRATIONS
+} from "./migrations.js";
+import { expiryAfterUpload, expiryAfterVisit, hasExpired } from "./retention.js";
 import { UploadTargetError } from "./types.js";
+import type { JsonMigrationState, SchemaMigration } from "./migrations.js";
 import type {
   AnonymousUploadPrincipal,
   ApiTokenAuth,
   CreateApiTokenInput,
+  DbDriverOptions,
   DraftRecord,
   DraftModerationOptions,
   DraftVersionLookup,
@@ -64,6 +72,7 @@ interface UploadEventRow {
 }
 
 interface JsonDbState {
+  schemaMigrations: string[];
   accounts: AccountRow[];
   apiTokens: ApiTokenRow[];
   drafts: DraftRecord[];
@@ -71,10 +80,18 @@ interface JsonDbState {
   uploadEvents: UploadEventRow[];
 }
 
+interface LoadedJsonDbState {
+  state: JsonDbState;
+  migrated: boolean;
+}
+
 interface StateMutationResult<T> {
   value: T;
   changed: boolean;
 }
+
+/** A draft's creating token is the one recorded on its first version. */
+const FIRST_VERSION_NUMBER = 1;
 
 // This serializer is intentionally process-local; interprocess locking is unsupported.
 const mutationQueues = new Map<string, Promise<void>>();
@@ -83,17 +100,47 @@ const utf8Decoder = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
 
 export class JsonFilePatchPageDb implements PatchPageDb {
   private readonly filePath: string;
+  private readonly migrations: readonly SchemaMigration[];
+  private readonly clock: () => number;
 
-  constructor(filePath: string) {
+  constructor(filePath: string, options: DbDriverOptions = {}) {
     this.filePath = path.resolve(filePath);
+    this.migrations = options.migrations ?? SCHEMA_MIGRATIONS;
+    this.clock = options.clock ?? Date.now;
   }
 
   async initialize(bootstrapApiToken: string | null): Promise<void> {
     await this.mutateState((state) => {
-      ensureAnonymousUploadPrincipal(state);
-      ensureBootstrapState(state, bootstrapApiToken);
+      const now = this.nowIso();
+      ensureAnonymousUploadPrincipal(state, now);
+      ensureBootstrapState(state, bootstrapApiToken, now);
       return { value: undefined, changed: true };
     });
+  }
+
+  /**
+   * This driver's stamps all come from the injected clock, including the ones
+   * retention does not care about (`lastUsedAt`, `createdAt`, `disabledAt`,
+   * `deletedAt`), because they are computed in TypeScript right here.
+   *
+   * The Postgres driver stamps those same fields with SQL `now()` and only
+   * `expires_at` from the clock, because there they are column defaults and
+   * `SET x = now()` clauses. So the two drivers agree exactly where it counts —
+   * the retention anchor — and drift on the rest under a wound-forward clock.
+   * Production is wall-clock on both, so this shows up only in tests.
+   *
+   * Deliberate, and deliberately left alone: converging them means either
+   * spelling out every defaulted column in the Postgres INSERTs or giving up
+   * clock control here. Whoever changes one driver's non-retention stamps must
+   * change the other's in the same breath, or the drift becomes a real bug.
+   */
+  private nowIso(): string {
+    return new Date(this.clock()).toISOString();
+  }
+
+  async listAppliedMigrations(): Promise<string[]> {
+    const state = await this.readState();
+    return [...state.schemaMigrations];
   }
 
   async getAnonymousUploadPrincipal(): Promise<AnonymousUploadPrincipal> {
@@ -123,7 +170,7 @@ export class JsonFilePatchPageDb implements PatchPageDb {
       const account = state.accounts.find((row) => row.id === apiToken.accountId);
       if (!account) return { value: null, changed: false };
 
-      apiToken.lastUsedAt = new Date().toISOString();
+      apiToken.lastUsedAt = this.nowIso();
 
       return {
         value: {
@@ -151,7 +198,7 @@ export class JsonFilePatchPageDb implements PatchPageDb {
         name: cleanText(input.name) || "API Token",
         tokenHash: sha256(input.token),
         scopes: input.scopes,
-        createdAt: new Date().toISOString(),
+        createdAt: this.nowIso(),
         lastUsedAt: null,
         revokedAt: null
       };
@@ -162,9 +209,29 @@ export class JsonFilePatchPageDb implements PatchPageDb {
     });
   }
 
+  async countLiveDraftsByCreatorApiToken(apiTokenId: string): Promise<number> {
+    const state = await this.readState();
+    const createdDraftIds = new Set(
+      state.draftVersions
+        .filter(
+          (version) =>
+            version.versionNumber === FIRST_VERSION_NUMBER &&
+            version.createdByApiTokenId === apiTokenId
+        )
+        .map((version) => version.draftId)
+    );
+
+    let live = 0;
+    for (const draft of state.drafts) {
+      if (draft.deletedAt || draft.disabledAt) continue;
+      if (createdDraftIds.has(draft.id)) live += 1;
+    }
+    return live;
+  }
+
   async assertUploadTarget(input: UploadTargetInput): Promise<void> {
     return this.mutateState((state) => {
-      assertUploadTarget(state, input);
+      assertUploadTarget(state, input, this.clock());
       return { value: undefined, changed: false };
     });
   }
@@ -172,8 +239,11 @@ export class JsonFilePatchPageDb implements PatchPageDb {
   async recordUpload(input: RecordUploadInput): Promise<RecordUploadResult> {
     return this.mutateState((state) => {
       assertLosslessJsonPersistenceValue(input.metadata);
-      const existingDraft = assertUploadTarget(state, input);
-      const now = new Date().toISOString();
+      const uploadedAt = this.clock();
+      const existingDraft = assertUploadTarget(state, input, uploadedAt);
+      const now = new Date(uploadedAt).toISOString();
+      // An upload — first version or fifth — restarts the whole window.
+      const expiresAt = expiryAfterUpload(uploadedAt);
 
       const versionNumber =
         Math.max(
@@ -198,6 +268,7 @@ export class JsonFilePatchPageDb implements PatchPageDb {
           repoName,
           createdAt: now,
           updatedAt: now,
+          expiresAt,
           deletedAt: null,
           disabledAt: null,
           disabledReason: null
@@ -208,6 +279,7 @@ export class JsonFilePatchPageDb implements PatchPageDb {
         existingDraft.repoOrg = repoOrg || existingDraft.repoOrg;
         existingDraft.repoName = repoName || existingDraft.repoName;
         existingDraft.updatedAt = now;
+        existingDraft.expiresAt = expiresAt;
       }
 
       state.draftVersions.push({
@@ -248,8 +320,15 @@ export class JsonFilePatchPageDb implements PatchPageDb {
 
   async findDraftVersion(draftId: string, versionNumber?: number): Promise<DraftVersionLookup> {
     const state = await this.readState();
+    const now = this.clock();
     const draft =
-      state.drafts.find((row) => row.id === draftId && !row.deletedAt && !row.disabledAt) || null;
+      state.drafts.find(
+        (row) =>
+          row.id === draftId &&
+          !row.deletedAt &&
+          !row.disabledAt &&
+          !hasExpired(row.expiresAt, now)
+      ) || null;
     if (!draft) return { draft: null, version: null };
 
     const version = versionNumber
@@ -259,6 +338,22 @@ export class JsonFilePatchPageDb implements PatchPageDb {
       : state.draftVersions.find((row) => row.id === draft.currentVersionId) || null;
 
     return { draft, version };
+  }
+
+  async recordDraftVisit(draftId: string): Promise<void> {
+    await this.mutateState((state) => {
+      const now = this.clock();
+      const draft =
+        state.drafts.find((row) => row.id === draftId && !row.deletedAt && !row.disabledAt) ||
+        null;
+      // A visit that changes nothing must not write: outside the top-up window,
+      // serving a draft stays a pure read of the state file.
+      const toppedUp = draft ? expiryAfterVisit(draft.expiresAt, now) : null;
+      if (!draft || !toppedUp) return { value: undefined, changed: false };
+
+      draft.expiresAt = toppedUp;
+      return { value: undefined, changed: true };
+    });
   }
 
   async disableDraft(
@@ -279,7 +374,7 @@ export class JsonFilePatchPageDb implements PatchPageDb {
         ) || null;
       if (!draft) return { value: false, changed: false };
 
-      draft.disabledAt = new Date().toISOString();
+      draft.disabledAt = this.nowIso();
       draft.disabledReason = reason;
       draft.updatedAt = draft.disabledAt;
       return { value: true, changed: true };
@@ -303,7 +398,7 @@ export class JsonFilePatchPageDb implements PatchPageDb {
         ) || null;
       if (!draft) return { value: false, changed: false };
 
-      draft.deletedAt = new Date().toISOString();
+      draft.deletedAt = this.nowIso();
       draft.updatedAt = draft.deletedAt;
       return { value: true, changed: true };
     });
@@ -318,14 +413,19 @@ export class JsonFilePatchPageDb implements PatchPageDb {
   ): Promise<T> {
     const mutationIdentities = await canonicalMutationIdentities(this.filePath);
     return serializeJsonMutation(mutationIdentities, async () => {
-      const state = await this.readState();
+      const { state, migrated } = await this.loadState();
       const result = mutate(state);
-      if (result.changed) await this.writeState(state);
+      // A migration applied on read is only durable once something writes.
+      if (result.changed || migrated) await this.writeState(state);
       return result.value;
     });
   }
 
   private async readState(): Promise<JsonDbState> {
+    return (await this.loadState()).state;
+  }
+
+  private async loadState(): Promise<LoadedJsonDbState> {
     await assertNoSymlinkAncestors(this.filePath);
     await inspectDatabaseFilePath(this.filePath);
 
@@ -333,7 +433,9 @@ export class JsonFilePatchPageDb implements PatchPageDb {
     try {
       bytes = await readFile(this.filePath);
     } catch (error) {
-      if (hasErrorCode(error, "ENOENT")) return emptyState();
+      if (hasErrorCode(error, "ENOENT")) {
+        return { state: this.migrateState(emptyState()).state, migrated: true };
+      }
       throw error;
     }
 
@@ -344,18 +446,37 @@ export class JsonFilePatchPageDb implements PatchPageDb {
       throw new Error("JSON metadata file is not valid UTF-8.");
     }
 
-    let state: unknown;
+    let parsed: unknown;
     try {
-      state = JSON.parse(serialized);
+      parsed = JSON.parse(serialized);
     } catch {
       throw new Error("JSON metadata file contains malformed JSON.");
     }
+
+    if (!isRecord(parsed)) {
+      throw new Error("JSON metadata file has an invalid state shape.");
+    }
+
+    const { state, changed } = this.migrateState(parsed);
+    return { state, migrated: changed };
+  }
+
+  /**
+   * Brings a persisted state up to the current schema, then guards it. Guards
+   * describe the current schema only — migrations are what make a state written
+   * by an earlier version readable, by default-filling the fields it lacks.
+   */
+  private migrateState(parsed: JsonMigrationState): {
+    state: JsonDbState;
+    changed: boolean;
+  } {
+    const { state, changed } = applyJsonMigrations(parsed, this.migrations);
 
     if (!isJsonDbState(state)) {
       throw new Error("JSON metadata file has an invalid state shape.");
     }
 
-    return state;
+    return { state, changed };
   }
 
   private async writeState(state: JsonDbState): Promise<void> {
@@ -721,6 +842,7 @@ function isJsonDbState(value: unknown): value is JsonDbState {
   if (!isRecord(value)) return false;
 
   return (
+    isStringArray(value[JSON_MIGRATION_LEDGER_KEY]) &&
     Array.isArray(value.accounts) &&
     value.accounts.every(isAccountRow) &&
     Array.isArray(value.apiTokens) &&
@@ -772,6 +894,7 @@ function isDraftRecord(value: unknown): value is DraftRecord {
     isNullableString(value.repoName) &&
     typeof value.createdAt === "string" &&
     typeof value.updatedAt === "string" &&
+    typeof value.expiresAt === "string" &&
     isNullableString(value.deletedAt) &&
     isNullableString(value.disabledAt) &&
     isNullableString(value.disabledReason)
@@ -827,20 +950,19 @@ function isNullableString(value: unknown): value is string | null {
   return value === null || typeof value === "string";
 }
 
-function emptyState(): JsonDbState {
-  return {
-    accounts: [],
-    apiTokens: [],
-    drafts: [],
-    draftVersions: [],
-    uploadEvents: []
-  };
+// A database that does not exist yet is an empty state at schema version zero:
+// the migrations build its collections, exactly as they do for a stored one.
+function emptyState(): JsonMigrationState {
+  return {};
 }
 
-function ensureBootstrapState(state: JsonDbState, bootstrapApiToken: string | null): void {
+function ensureBootstrapState(
+  state: JsonDbState,
+  bootstrapApiToken: string | null,
+  now: string
+): void {
   if (!bootstrapApiToken) return;
 
-  const now = new Date().toISOString();
   const account = state.accounts.find((row) => row.id === "acct_bootstrap");
   if (account) {
     account.updatedAt = now;
@@ -872,8 +994,7 @@ function ensureBootstrapState(state: JsonDbState, bootstrapApiToken: string | nu
   }
 }
 
-function ensureAnonymousUploadPrincipal(state: JsonDbState): void {
-  const now = new Date().toISOString();
+function ensureAnonymousUploadPrincipal(state: JsonDbState, now: string): void {
   const account = state.accounts.find(
     (row) => row.id === ANONYMOUS_UPLOAD_PRINCIPAL.accountId
   );
@@ -914,20 +1035,26 @@ function ensureAnonymousUploadPrincipal(state: JsonDbState): void {
 
 function assertUploadTarget(
   state: JsonDbState,
-  input: UploadTargetInput
+  input: UploadTargetInput,
+  now: number
 ): DraftRecord | null {
   const existingDraft = state.drafts.find((draft) => draft.id === input.draftId) || null;
 
   if (input.intent === "create") {
+    // An expired row still occupies its ID until the sweep removes it, so a
+    // create against one is a conflict, not a fresh draft.
     if (existingDraft) throw new UploadTargetError("draft_conflict");
     return null;
   }
 
+  // An expired draft is unavailable to its owner too: republishing is the way
+  // back, and it comes through the create path with a new ID.
   if (
     !existingDraft ||
     existingDraft.accountId !== input.accountId ||
     existingDraft.deletedAt ||
-    existingDraft.disabledAt
+    existingDraft.disabledAt ||
+    hasExpired(existingDraft.expiresAt, now)
   ) {
     throw new UploadTargetError("draft_unavailable");
   }

@@ -27,6 +27,12 @@ import {
   type RateLimitDecision
 } from "./rate-limit.js";
 import { renderDraftWrapper, renderHome, renderNotFound } from "./render.js";
+import {
+  DRAFT_CONTENT_SECURITY_POLICY,
+  DRAFT_ROBOTS_TAG,
+  NO_STORE_CACHE_CONTROL,
+  servedDraftCacheControl
+} from "./serving-headers.js";
 
 export interface CreateAppOptions {
   config: ServerConfig;
@@ -104,7 +110,10 @@ export function createApp(options: CreateAppOptions): FastifyInstance {
 
   app.addHook("onSend", async (_request, reply) => {
     reply.header("X-Content-Type-Options", "nosniff");
-    reply.header("Cache-Control", "no-store");
+    // Served drafts set their own cache policy; everything else stays uncached.
+    if (!reply.hasHeader("Cache-Control")) {
+      reply.header("Cache-Control", NO_STORE_CACHE_CONTROL);
+    }
   });
 
   app.addHook(
@@ -201,6 +210,30 @@ export function createApp(options: CreateAppOptions): FastifyInstance {
         (typeof requestedDraftId !== "string" || !isDraftId(requestedDraftId))
       ) {
         return reply.status(400).send({ ok: false, error: "Invalid draft ID." });
+      }
+
+      // Only creates are quota-bearing. An update rewrites a draft the token
+      // already holds, so it costs nothing against either ceiling.
+      if (requestedDraftId === null) {
+        // The per-minute bucket is consumed before the quota is counted, so a
+        // client parked at the quota is throttled instead of being free to
+        // re-count the database at the higher upload-limit rate. The cost is
+        // that such a client sees 403 flip to 429 once its bucket empties.
+        const createAttempt = rateLimiters.draftCreate.consume(principal.apiTokenId);
+        if (!createAttempt.allowed) {
+          sendRateLimited(reply, createAttempt);
+          return reply;
+        }
+
+        // Recounted from the database every time, so the ceiling outlives a
+        // restart. Concurrent creates can overshoot it by at most the burst the
+        // per-minute limiter above allows through.
+        const liveDrafts = await options.db.countLiveDraftsByCreatorApiToken(
+          principal.apiTokenId
+        );
+        if (liveDrafts >= options.config.liveDraftsPerToken) {
+          return sendLiveDraftQuotaExceeded(reply, options.config.liveDraftsPerToken);
+        }
       }
 
       const draftId = requestedDraftId || newDraftId();
@@ -322,23 +355,35 @@ async function renderDraft(
   versionNumber: number | undefined,
   reply: FastifyReply
 ): Promise<void> {
+  reply.header("X-Robots-Tag", DRAFT_ROBOTS_TAG);
+
   const { draft, version } = await options.db.findDraftVersion(draftId, versionNumber);
   if (!draft || !version) {
     return reply.status(404).type("text/html").send(renderNotFound());
   }
 
   const html = await options.storage.getHtmlObject(version.objectKey);
-  reply.header(
-    "Content-Security-Policy",
-    [
-      "default-src 'none'",
-      "style-src 'unsafe-inline'",
-      "img-src https: data:",
-      "frame-src 'self' about:",
-      "base-uri 'none'",
-      "form-action 'none'"
-    ].join("; ")
-  );
+  // The page is real and already fetched, so this is a visit — the thing that
+  // keeps a draft people still visit from ageing out. The database decides
+  // whether the clock actually moves and writes nothing when it does not.
+  //
+  // Best-effort on purpose: this is a read path, and a reader who is one header
+  // away from their page should get it even if the top-up write fails. Losing a
+  // clock extension costs at most some retention; turning a fetched page into a
+  // 500 costs the reader the page itself.
+  //
+  // Only requests that reach the server are visits, and the cache headers below
+  // mean repeat reads inside the latest URL's window may not. That undercount is
+  // harmless: topping up needs one visit somewhere in the final stretch of a
+  // 30-day window, not a true read count — this is a retention clock, not
+  // analytics.
+  try {
+    await options.db.recordDraftVisit(draft.id);
+  } catch (error) {
+    reply.log.warn({ err: error, draftId: draft.id }, "Draft visit top-up failed.");
+  }
+  reply.header("Content-Security-Policy", DRAFT_CONTENT_SECURITY_POLICY);
+  reply.header("Cache-Control", servedDraftCacheControl(versionNumber));
   return reply.type("text/html").send(
     renderDraftWrapper({
       draft,
@@ -617,6 +662,17 @@ function sendRateLimited(reply: FastifyReply, decision: RateLimitDecision): void
     error: "Rate limit exceeded.",
     code: "rate_limited",
     retryAfterSeconds
+  });
+}
+
+// "Draft quota", not "draft limit": the glossary reserves limit-shaped wording
+// for the per-minute create limit, which is a different rejection.
+function sendLiveDraftQuotaExceeded(reply: FastifyReply, quota: number): FastifyReply {
+  return reply.status(403).send({
+    ok: false,
+    error: `Draft quota reached: ${quota} live drafts per token. Delete or let a draft expire before creating another.`,
+    code: "live_draft_quota_exceeded",
+    quota
   });
 }
 

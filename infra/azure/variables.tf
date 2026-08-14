@@ -428,6 +428,38 @@ variable "anonymous_create_rate_limit_per_minute" {
   }
 }
 
+variable "draft_create_rate_limit_per_minute" {
+  description = "Draft creates allowed per creating API token per minute. Updates are exempt."
+  type        = number
+  default     = 10
+  nullable    = false
+
+  validation {
+    condition = (
+      var.draft_create_rate_limit_per_minute >= 1 &&
+      var.draft_create_rate_limit_per_minute <= 10000 &&
+      floor(var.draft_create_rate_limit_per_minute) == var.draft_create_rate_limit_per_minute
+    )
+    error_message = "draft_create_rate_limit_per_minute must be an integer from 1 through 10000."
+  }
+}
+
+variable "live_drafts_per_token" {
+  description = "Live drafts one API token may hold at once. Counted from the database, so it survives restarts."
+  type        = number
+  default     = 1000
+  nullable    = false
+
+  validation {
+    condition = (
+      var.live_drafts_per_token >= 1 &&
+      var.live_drafts_per_token <= 1000000 &&
+      floor(var.live_drafts_per_token) == var.live_drafts_per_token
+    )
+    error_message = "live_drafts_per_token must be an integer from 1 through 1000000."
+  }
+}
+
 # --- cost posture: circuit breaker, kill switch, and alarms ------------------
 #
 # Every number the cost posture turns on is a variable so a self-hoster can size

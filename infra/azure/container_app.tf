@@ -66,6 +66,8 @@ locals {
     PATCHPAGE_PROTECTED_API_RATE_LIMIT_PER_MINUTE        = tostring(var.protected_api_rate_limit_per_minute)
     PATCHPAGE_AUTHENTICATED_UPLOAD_RATE_LIMIT_PER_MINUTE = tostring(var.authenticated_upload_rate_limit_per_minute)
     PATCHPAGE_ANONYMOUS_CREATE_RATE_LIMIT_PER_MINUTE     = tostring(var.anonymous_create_rate_limit_per_minute)
+    PATCHPAGE_DRAFT_CREATE_RATE_LIMIT_PER_MINUTE         = tostring(var.draft_create_rate_limit_per_minute)
+    PATCHPAGE_LIVE_DRAFTS_PER_TOKEN                      = tostring(var.live_drafts_per_token)
     PATCHPAGE_DB_DRIVER                                  = "postgres"
     PATCHPAGE_STORAGE_DRIVER                             = "azure-blob"
     AZURE_STORAGE_ACCOUNT                                = azurerm_storage_account.drafts.name
@@ -229,11 +231,15 @@ resource "azurerm_container_app" "server" {
     #
     # This is not a capacity setting and it is not a cost setting -- it is a
     # correctness precondition for the rate limiter. The limiter counts
-    # attempts in the server's own memory (see the PATCHPAGE_*_RATE_LIMIT_*
-    # variables above), so every limit it enforces is per replica. At one
-    # replica "10 creates per minute per token" means what it says. At two it
-    # silently means twenty, and at N it means 10N, with no error anywhere and
-    # nothing in a test to notice.
+    # attempts in the server's own memory, so every per-minute limit above is
+    # really per replica. Take PATCHPAGE_DRAFT_CREATE_RATE_LIMIT_PER_MINUTE,
+    # which is 10: at one replica it means ten creates a minute per token, at
+    # two it silently means twenty, and at N it means 10N -- with no error
+    # anywhere and nothing in a test to notice.
+    #
+    # PATCHPAGE_LIVE_DRAFTS_PER_TOKEN is not affected, and the difference is
+    # the point: it is counted from the database, so it holds at any replica
+    # count. Only the in-memory per-minute limits depend on this invariant.
     #
     # So the rule is: any change that raises max_replicas above 1 must, in the
     # same change, replace the in-memory limiter with a shared-store one.

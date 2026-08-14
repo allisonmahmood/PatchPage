@@ -1,15 +1,19 @@
 import pg from "pg";
 import { newInternalId, sha256 } from "@patchpage/core";
 import {
+  ANONYMOUS_INTERNAL_REVOKED_AT,
   ANONYMOUS_INTERNAL_TOKEN_HASH,
   ANONYMOUS_UPLOAD_PRINCIPAL
 } from "./internal-principals.js";
-import { POSTGRES_SCHEMA_SQL } from "./migrations.js";
+import { SCHEMA_MIGRATIONS } from "./migrations.js";
+import { DRAFT_VISIT_EXTENSION_WINDOW_MS, expiryAfterUpload } from "./retention.js";
 import { UploadTargetError } from "./types.js";
+import type { SchemaMigration } from "./migrations.js";
 import type {
   AnonymousUploadPrincipal,
   ApiTokenAuth,
   CreateApiTokenInput,
+  DbDriverOptions,
   DraftRecord,
   DraftModerationOptions,
   DraftVersionLookup,
@@ -22,18 +26,57 @@ import type {
 
 const { Pool } = pg;
 
+// A fixed key so concurrent instances serialize their migration runs instead of
+// racing on `CREATE TABLE IF NOT EXISTS`, which is not race-free in Postgres.
+const MIGRATION_ADVISORY_LOCK_KEY = 5150324118422001n;
+
+/** A draft's creating token is the one recorded on its first version. */
+const FIRST_VERSION_NUMBER = 1;
+
 export class PostgresPatchPageDb implements PatchPageDb {
   private readonly pool: pg.Pool;
+  private readonly migrations: readonly SchemaMigration[];
+  private readonly clock: () => number;
 
-  constructor(connectionString: string) {
+  constructor(connectionString: string, options: DbDriverOptions = {}) {
     this.pool = new Pool({ connectionString });
+    this.migrations = options.migrations ?? SCHEMA_MIGRATIONS;
+    this.clock = options.clock ?? Date.now;
+  }
+
+  /**
+   * The retention clock's reading, as a value Postgres compares against
+   * `expires_at`. Deliberately not SQL `now()`: the clock is injectable, and
+   * `now()` would make the window untestable and drift from the JSON driver.
+   *
+   * Only `expires_at` is on this clock here. Every other stamp in this driver
+   * (`last_used_at`, `created_at`, `disabled_at`, `deleted_at`) stays on SQL
+   * `now()`, where it is a column default or a `SET x = now()` clause, while
+   * the JSON driver puts all of its stamps on the injected clock. See the note
+   * on `JsonFilePatchPageDb.nowIso` — the drivers agree on the retention anchor
+   * and drift on the rest under a wound-forward clock, which is deliberate.
+   * Do not "fix" one driver's non-retention stamps without the other's.
+   */
+  private nowIso(): string {
+    return new Date(this.clock()).toISOString();
   }
 
   async initialize(bootstrapApiToken: string | null): Promise<void> {
-    await this.pool.query(POSTGRES_SCHEMA_SQL);
+    await this.migrate();
+    await this.ensureAnonymousUploadPrincipal();
     if (bootstrapApiToken) {
       await this.ensureBootstrapToken(bootstrapApiToken);
     }
+  }
+
+  async listAppliedMigrations(): Promise<string[]> {
+    const ledgerExists = await this.pool.query(
+      "SELECT to_regclass('schema_migrations') IS NOT NULL AS present"
+    );
+    if (!ledgerExists.rows[0]?.present) return [];
+
+    const result = await this.pool.query("SELECT id FROM schema_migrations ORDER BY id");
+    return result.rows.map((row) => String(row.id));
   }
 
   async getAnonymousUploadPrincipal(): Promise<AnonymousUploadPrincipal> {
@@ -103,6 +146,22 @@ export class PostgresPatchPageDb implements PatchPageDb {
     return { id, name };
   }
 
+  async countLiveDraftsByCreatorApiToken(apiTokenId: string): Promise<number> {
+    const result = await this.pool.query(
+      `
+        SELECT count(*) AS live
+        FROM drafts
+        JOIN draft_versions ON draft_versions.draft_id = drafts.id
+          AND draft_versions.version_number = $2
+        WHERE draft_versions.created_by_api_token_id = $1
+          AND drafts.deleted_at IS NULL
+          AND drafts.disabled_at IS NULL
+      `,
+      [apiTokenId, FIRST_VERSION_NUMBER]
+    );
+    return Number(result.rows[0]?.live ?? 0);
+  }
+
   async assertUploadTarget(input: UploadTargetInput): Promise<void> {
     const result =
       input.intent === "update"
@@ -114,8 +173,9 @@ export class PostgresPatchPageDb implements PatchPageDb {
                 AND account_id = $2
                 AND deleted_at IS NULL
                 AND disabled_at IS NULL
+                AND expires_at >= $3::timestamptz
             `,
-            [input.draftId, input.accountId]
+            [input.draftId, input.accountId, this.nowIso()]
           )
         : await this.pool.query("SELECT 1 FROM drafts WHERE id = $1", [input.draftId]);
 
@@ -134,6 +194,8 @@ export class PostgresPatchPageDb implements PatchPageDb {
 
       const repoOrg = cleanText(input.metadata.repoOrg);
       const repoName = cleanText(input.metadata.repoName);
+      // An upload — first version or fifth — restarts the whole window.
+      const expiresAt = expiryAfterUpload(this.clock());
       let title: string;
       let versionNumber: number;
 
@@ -146,9 +208,10 @@ export class PostgresPatchPageDb implements PatchPageDb {
               AND account_id = $2
               AND deleted_at IS NULL
               AND disabled_at IS NULL
+              AND expires_at >= $3::timestamptz
             FOR UPDATE
           `,
-          [input.draftId, input.accountId]
+          [input.draftId, input.accountId, this.nowIso()]
         );
         const existingDraft = existingResult.rows[0] || null;
         if (!existingDraft) {
@@ -173,13 +236,22 @@ export class PostgresPatchPageDb implements PatchPageDb {
         const createdDraft = await client.query(
           `
             INSERT INTO drafts (
-              id, account_id, title, visibility, current_version_id, repo_org, repo_name
+              id, account_id, title, visibility, current_version_id, repo_org, repo_name,
+              expires_at
             )
-            VALUES ($1, $2, $3, 'unlisted', $4, $5, $6)
+            VALUES ($1, $2, $3, 'unlisted', $4, $5, $6, $7::timestamptz)
             ON CONFLICT (id) DO NOTHING
             RETURNING id
           `,
-          [input.draftId, input.accountId, title, input.versionId, repoOrg, repoName]
+          [
+            input.draftId,
+            input.accountId,
+            title,
+            input.versionId,
+            repoOrg,
+            repoName,
+            expiresAt
+          ]
         );
         if (!createdDraft.rowCount) {
           throw new UploadTargetError("draft_conflict");
@@ -219,10 +291,11 @@ export class PostgresPatchPageDb implements PatchPageDb {
               title = $2,
               repo_org = COALESCE($3, repo_org),
               repo_name = COALESCE($4, repo_name),
-              updated_at = now()
+              updated_at = now(),
+              expires_at = $6::timestamptz
           WHERE id = $5
         `,
-        [input.versionId, title, repoOrg, repoName, input.draftId]
+        [input.versionId, title, repoOrg, repoName, input.draftId, expiresAt]
       );
 
       await client.query(
@@ -273,9 +346,10 @@ export class PostgresPatchPageDb implements PatchPageDb {
         WHERE id = $1
           AND deleted_at IS NULL
           AND disabled_at IS NULL
+          AND expires_at >= $2::timestamptz
         LIMIT 1
       `,
-      [draftId]
+      [draftId, this.nowIso()]
     );
     const draft = draftResult.rows[0] ? mapDraft(draftResult.rows[0]) : null;
     if (!draft) return { draft: null, version: null };
@@ -298,6 +372,30 @@ export class PostgresPatchPageDb implements PatchPageDb {
       draft,
       version: versionResult.rows[0] ? mapDraftVersion(versionResult.rows[0]) : null
     };
+  }
+
+  async recordDraftVisit(draftId: string): Promise<void> {
+    const now = this.clock();
+    // One predicate says both halves of the visit rule: `expires_at` below the
+    // topped-up anchor is exactly "less than the visit-extension window
+    // remains", and it is also exactly "this move does not shorten the clock".
+    // The lower bound keeps a visit from reviving an already-expired draft.
+    await this.pool.query(
+      `
+        UPDATE drafts
+        SET expires_at = $2::timestamptz
+        WHERE id = $1
+          AND deleted_at IS NULL
+          AND disabled_at IS NULL
+          AND expires_at >= $3::timestamptz
+          AND expires_at < $2::timestamptz
+      `,
+      [
+        draftId,
+        new Date(now + DRAFT_VISIT_EXTENSION_WINDOW_MS).toISOString(),
+        new Date(now).toISOString()
+      ]
+    );
   }
 
   async disableDraft(
@@ -354,6 +452,83 @@ export class PostgresPatchPageDb implements PatchPageDb {
     await this.pool.end();
   }
 
+  private async migrate(): Promise<void> {
+    const client = await this.pool.connect();
+    try {
+      await client.query("SELECT pg_advisory_lock($1)", [
+        MIGRATION_ADVISORY_LOCK_KEY.toString()
+      ]);
+      await client.query(`
+        CREATE TABLE IF NOT EXISTS schema_migrations (
+          id TEXT PRIMARY KEY,
+          applied_at TIMESTAMPTZ NOT NULL DEFAULT now()
+        );
+      `);
+
+      const applied = new Set(
+        (await client.query("SELECT id FROM schema_migrations")).rows.map((row) =>
+          String(row.id)
+        )
+      );
+
+      for (const migration of this.migrations) {
+        if (applied.has(migration.id)) continue;
+
+        // One transaction per step: Postgres DDL is transactional, so a failed
+        // step leaves neither half-applied schema nor a ledger row claiming it.
+        await client.query("BEGIN");
+        try {
+          if (migration.postgres) await client.query(migration.postgres);
+          await client.query(
+            "INSERT INTO schema_migrations (id) VALUES ($1) ON CONFLICT (id) DO NOTHING",
+            [migration.id]
+          );
+          await client.query("COMMIT");
+        } catch (error) {
+          await client.query("ROLLBACK").catch(() => undefined);
+          throw new Error(`Schema migration ${migration.id} failed.`, { cause: error });
+        }
+      }
+    } finally {
+      await client
+        .query("SELECT pg_advisory_unlock($1)", [MIGRATION_ADVISORY_LOCK_KEY.toString()])
+        .catch(() => undefined);
+      client.release();
+    }
+  }
+
+  private async ensureAnonymousUploadPrincipal(): Promise<void> {
+    await this.pool.query(
+      `
+        INSERT INTO accounts (id, name)
+        VALUES ($1, 'Anonymous Uploads')
+        ON CONFLICT (id) DO UPDATE
+        SET name = EXCLUDED.name,
+            updated_at = now()
+      `,
+      [ANONYMOUS_UPLOAD_PRINCIPAL.accountId]
+    );
+
+    await this.pool.query(
+      `
+        INSERT INTO api_tokens (id, account_id, name, token_hash, scopes, revoked_at)
+        VALUES ($1, $2, 'Anonymous Upload Audit Actor', $3, '[]'::jsonb, $4::timestamptz)
+        ON CONFLICT (id) DO UPDATE
+        SET account_id = EXCLUDED.account_id,
+            name = EXCLUDED.name,
+            token_hash = EXCLUDED.token_hash,
+            scopes = EXCLUDED.scopes,
+            revoked_at = EXCLUDED.revoked_at
+      `,
+      [
+        ANONYMOUS_UPLOAD_PRINCIPAL.apiTokenId,
+        ANONYMOUS_UPLOAD_PRINCIPAL.accountId,
+        ANONYMOUS_INTERNAL_TOKEN_HASH,
+        ANONYMOUS_INTERNAL_REVOKED_AT
+      ]
+    );
+  }
+
   private async ensureBootstrapToken(token: string): Promise<void> {
     await this.pool.query(
       `
@@ -388,6 +563,7 @@ function mapDraft(row: any): DraftRecord {
     repoName: row.repo_name,
     createdAt: toIso(row.created_at),
     updatedAt: toIso(row.updated_at),
+    expiresAt: toIso(row.expires_at),
     deletedAt: row.deleted_at ? toIso(row.deleted_at) : null,
     disabledAt: row.disabled_at ? toIso(row.disabled_at) : null,
     disabledReason: row.disabled_reason
