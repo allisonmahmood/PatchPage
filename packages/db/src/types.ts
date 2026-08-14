@@ -24,8 +24,17 @@ export interface DraftRecord {
   repoName: string | null;
   createdAt: string;
   updatedAt: string;
-  /** The retention clock's anchor: the draft is expired once this is past. */
+  /**
+   * The retention clock's anchor: the draft is expired once this is past,
+   * unless `pinnedAt` holds it.
+   */
   expiresAt: string;
+  /**
+   * When an operator pinned this draft, or `null` for an ordinary one. A pinned
+   * draft is exempt from expiry — it keeps serving and the sweep never takes
+   * it — and is ordinary in every other respect.
+   */
+  pinnedAt: string | null;
   deletedAt: string | null;
   disabledAt: string | null;
   disabledReason: string | null;
@@ -146,6 +155,35 @@ export interface PatchPageDb {
    * and never brings a draft back.
    */
   recordDraftVisit(draftId: string): Promise<void>;
+  /**
+   * Pins or unpins a draft, exempting it from expiry or handing it back to the
+   * clock. An operator's act and admin-only above this port, so no ownership
+   * narrows it: the instance's own pages may sit on any account. Answers
+   * whether a draft was there to move; a deleted draft is not.
+   *
+   * Pinning is idempotent in effect but not in stamp — re-pinning restamps
+   * `pinnedAt` — and unpinning restores the ordinary clock, which for a draft
+   * pinned long past its anchor means it expires immediately.
+   */
+  setDraftPinned(draftId: string, pinned: boolean): Promise<boolean>;
+  /**
+   * IDs the expiry sweep may take right now — expired and unpinned, the
+   * longest-expired first — capped at `limit`. Deleted and disabled drafts are
+   * included: they are out of sight already, and the sweep is what finally
+   * frees their storage.
+   */
+  listExpiredDraftIds(limit: number): Promise<string[]>;
+  /**
+   * Hard-deletes one expired draft — its upload events, its versions, and the
+   * draft row — and answers with the storage keys those versions held, so the
+   * caller can delete the content behind them. Answers `null` when the draft is
+   * no longer the sweep's to take: already gone, or pinned since it was listed.
+   *
+   * The record goes first on purpose. Once the row is gone its objects are
+   * unreachable, so a crash before the caller deletes them leaks storage — the
+   * other order risks a live draft whose content vanished, which is worse.
+   */
+  deleteExpiredDraft(draftId: string): Promise<string[] | null>;
   disableDraft(
     draftId: string,
     accountId: string,

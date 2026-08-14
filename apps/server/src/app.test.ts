@@ -566,6 +566,51 @@ describe("PatchPage server", () => {
     }
   });
 
+  it("pins a draft only for an admin token, and only one that is there", async () => {
+    const { app, db } = await createScopedTokenApp("pin-admin-only");
+
+    try {
+      const created = await createDraft(app, "upload-token", "Pinnable");
+      expect(created.statusCode).toBe(201);
+      const { draftId } = created.json() as { draftId: string };
+
+      // Pinning is the operator's act, so the token that made the draft cannot
+      // exempt it from expiry — only an admin can.
+      for (const suffix of ["pin", "unpin"]) {
+        const refused = await app.inject({
+          method: "POST",
+          url: `/api/drafts/${draftId}/${suffix}`,
+          headers: { authorization: "Bearer upload-token" }
+        });
+        expect(refused.statusCode).toBe(403);
+        expect(refused.json()).toEqual({
+          ok: false,
+          error: "API token does not have the required scope."
+        });
+      }
+
+      // An admin pins any draft, whoever holds it.
+      const pinned = await app.inject({
+        method: "POST",
+        url: `/api/drafts/${draftId}/pin`,
+        headers: { authorization: "Bearer admin-only-token" }
+      });
+      expect(pinned.statusCode).toBe(200);
+      expect(pinned.json()).toEqual({ ok: true, pinned: true });
+
+      const missing = await app.inject({
+        method: "POST",
+        url: "/api/drafts/doesnotexist1/pin",
+        headers: { authorization: "Bearer admin-only-token" }
+      });
+      expect(missing.statusCode).toBe(404);
+      expect(missing.json()).toEqual({ ok: false, error: "Draft not found." });
+    } finally {
+      await app.close();
+      await db.close();
+    }
+  });
+
   it("returns API 404 before parsing arbitrary authenticated unmatched API targets", async () => {
     const { app, db } = await createScopedTokenApp("authorized-arbitrary-unmatched-api");
 
@@ -933,6 +978,18 @@ describe("PatchPage server", () => {
       label: "DELETE overlong route parameter",
       protectedTarget: `/api/drafts/${"x".repeat(101)}`,
       method: "DELETE",
+      authenticatedStatus: 414,
+      authenticatedError: "Request target is too long."
+    },
+    {
+      label: "pin overlong route parameter",
+      protectedTarget: `/api/drafts/${"x".repeat(101)}/pin`,
+      authenticatedStatus: 414,
+      authenticatedError: "Request target is too long."
+    },
+    {
+      label: "unpin overlong route parameter",
+      protectedTarget: `/api/drafts/${"x".repeat(101)}/unpin`,
       authenticatedStatus: 414,
       authenticatedError: "Request target is too long."
     }
@@ -2108,10 +2165,9 @@ describe("PatchPage server", () => {
   });
 
   it("serves a draft whose visit top-up write fails, without moving its clock", async () => {
-    const clocked = await createClockedApp(
-      "visit-write-failure",
-      (file, clock) => new VisitFailingJsonDb(file, { clock })
-    );
+    const clocked = await createClockedApp("visit-write-failure", {
+      openDb: (file, clock) => new VisitFailingJsonDb(file, { clock })
+    });
 
     try {
       const draftId = await publishDraft(clocked.app, "Survives a failed top-up");
@@ -2156,6 +2212,163 @@ describe("PatchPage server", () => {
       const served = await clocked.app.inject({ method: "GET", url: `/d/${draftId}` });
       expect(served.statusCode).toBe(200);
       expect(served.body).toContain("Second cut");
+    } finally {
+      await clocked.close();
+    }
+  });
+
+  it("takes an expired draft's content and record together, with no way back", async () => {
+    const clocked = await createClockedApp("expiry-sweep");
+
+    try {
+      const draftId = await publishDraft(clocked.app, "Ages out");
+      const updated = await clocked.app.inject({
+        method: "POST",
+        url: "/api/uploads",
+        headers: { authorization: "Bearer dev-token" },
+        payload: { draftId, html: draftHtml("Ages out, twice") }
+      });
+      expect(updated.statusCode).toBe(200);
+      expect(await listFiles(clocked.storageDir)).toHaveLength(2);
+
+      // Expired, and so already unserved — but every stored byte is still here,
+      // which is what the sweep exists to change.
+      clocked.advanceDays(91);
+      expect(await listFiles(clocked.storageDir)).toHaveLength(2);
+
+      expect(await clocked.app.sweepExpiredDrafts()).toEqual({
+        deleted: 1,
+        skipped: 0,
+        failed: 0,
+        orphanedObjects: 0
+      });
+
+      expect(await listFiles(clocked.storageDir)).toEqual([]);
+      for (const url of [`/d/${draftId}`, `/d/${draftId}/v/1`, `/d/${draftId}/v/2`]) {
+        const gone = await clocked.app.inject({ method: "GET", url });
+        expect(gone.statusCode).toBe(404);
+        expect(gone.body).not.toContain("Ages out");
+      }
+
+      // Republishing is the recovery path, and it is a new page.
+      const republished = await clocked.app.inject({
+        method: "POST",
+        url: "/api/uploads",
+        headers: { authorization: "Bearer dev-token" },
+        payload: { draftId, html: draftHtml("Too late") }
+      });
+      expect(republished.statusCode).toBe(404);
+    } finally {
+      await clocked.close();
+    }
+  });
+
+  it("keeps a pinned draft serving forever, and lets it go once it is unpinned", async () => {
+    const clocked = await createClockedApp("expiry-sweep-pinned");
+
+    try {
+      const draftId = await publishDraft(clocked.app, "Welcome page");
+      const pinned = await clocked.app.inject({
+        method: "POST",
+        url: `/api/drafts/${draftId}/pin`,
+        headers: { authorization: "Bearer dev-token" }
+      });
+      expect(pinned.statusCode).toBe(200);
+      expect(pinned.json()).toEqual({ ok: true, pinned: true });
+
+      // A year with nobody reading it, and the instance's own page is still up.
+      clocked.advanceDays(365);
+      const served = await clocked.app.inject({ method: "GET", url: `/d/${draftId}` });
+      expect(served.statusCode).toBe(200);
+      expect(served.body).toContain("Welcome page");
+
+      expect(await clocked.app.sweepExpiredDrafts()).toMatchObject({ deleted: 0 });
+      const survived = await clocked.app.inject({ method: "GET", url: `/d/${draftId}` });
+      expect(survived.statusCode).toBe(200);
+      expect(await listFiles(clocked.storageDir)).toHaveLength(1);
+
+      const unpinned = await clocked.app.inject({
+        method: "POST",
+        url: `/api/drafts/${draftId}/unpin`,
+        headers: { authorization: "Bearer dev-token" }
+      });
+      expect(unpinned.statusCode).toBe(200);
+      expect(unpinned.json()).toEqual({ ok: true, pinned: false });
+
+      // The visit above topped the clock up to thirty days, so the page keeps
+      // its window — and then goes, content and all.
+      clocked.advanceDays(31);
+      expect(await clocked.app.sweepExpiredDrafts()).toMatchObject({ deleted: 1 });
+      const gone = await clocked.app.inject({ method: "GET", url: `/d/${draftId}` });
+      expect(gone.statusCode).toBe(404);
+      expect(await listFiles(clocked.storageDir)).toEqual([]);
+    } finally {
+      await clocked.close();
+    }
+  });
+
+  it("sweeps repeatedly and concurrently while the server keeps serving", async () => {
+    const clocked = await createClockedApp("expiry-sweep-idempotent");
+
+    try {
+      const expiring = await publishDraft(clocked.app, "Abandoned");
+      clocked.advanceDays(91);
+      const fresh = await publishDraft(clocked.app, "Still here");
+
+      // Two runs at once are one run: the second finds nothing half-swept.
+      const [first, second] = await Promise.all([
+        clocked.app.sweepExpiredDrafts(),
+        clocked.app.sweepExpiredDrafts()
+      ]);
+      expect(first).toEqual({ deleted: 1, skipped: 0, failed: 0, orphanedObjects: 0 });
+      expect(second).toEqual(first);
+
+      // Running again changes nothing, and the live draft was never in reach.
+      expect(await clocked.app.sweepExpiredDrafts()).toEqual({
+        deleted: 0,
+        skipped: 0,
+        failed: 0,
+        orphanedObjects: 0
+      });
+
+      const gone = await clocked.app.inject({ method: "GET", url: `/d/${expiring}` });
+      expect(gone.statusCode).toBe(404);
+      const served = await clocked.app.inject({ method: "GET", url: `/d/${fresh}` });
+      expect(served.statusCode).toBe(200);
+      expect(served.body).toContain("Still here");
+      expect(await listFiles(clocked.storageDir)).toHaveLength(1);
+    } finally {
+      await clocked.close();
+    }
+  });
+
+  it("counts an object it could not delete once the record is already gone", async () => {
+    const clocked = await createClockedApp("expiry-sweep-storage-failure", {
+      openStorage: (dir) => new ControlledHtmlStorage(dir)
+    });
+    const storage = clocked.storage as ControlledHtmlStorage;
+
+    try {
+      const draftId = await publishDraft(clocked.app, "Object outlives its record");
+      clocked.advanceDays(91);
+      storage.deleteError = new Error("Storage delete failed.");
+
+      expect(await clocked.app.sweepExpiredDrafts()).toEqual({
+        deleted: 1,
+        skipped: 0,
+        failed: 0,
+        orphanedObjects: 1
+      });
+
+      // The record went and the object stayed. Nothing serves it and no later
+      // run can find it — storage to reclaim by hand, not a draft that survived.
+      expect(await listFiles(clocked.storageDir)).toHaveLength(1);
+      const gone = await clocked.app.inject({ method: "GET", url: `/d/${draftId}` });
+      expect(gone.statusCode).toBe(404);
+      expect(await clocked.app.sweepExpiredDrafts()).toMatchObject({
+        deleted: 0,
+        orphanedObjects: 0
+      });
     } finally {
       await clocked.close();
     }
@@ -2490,8 +2703,16 @@ type ScopedTokenApp = {
 
 type ClockedApp = {
   app: ReturnType<typeof createApp>;
+  storage: FileSystemHtmlStorage;
+  /** Where this app's HTML objects land, so a test can watch them go. */
+  storageDir: string;
   advanceDays(days: number): void;
   close(): Promise<void>;
+};
+
+type ClockedAppOptions = {
+  openDb?: (file: string, clock: () => number) => JsonFilePatchPageDb;
+  openStorage?: (storageDir: string) => FileSystemHtmlStorage;
 };
 
 const DAY_MS = 24 * 60 * 60 * 1000;
@@ -2503,18 +2724,23 @@ const DAY_MS = 24 * 60 * 60 * 1000;
  */
 async function createClockedApp(
   label: string,
-  openDb: (file: string, clock: () => number) => JsonFilePatchPageDb = (file, clock) =>
-    new JsonFilePatchPageDb(file, { clock })
+  options: ClockedAppOptions = {}
 ): Promise<ClockedApp> {
+  const openDb =
+    options.openDb ?? ((file, clock) => new JsonFilePatchPageDb(file, { clock }));
+  const openStorage = options.openStorage ?? ((dir) => new FileSystemHtmlStorage(dir));
   let now = Date.UTC(2026, 0, 1);
   const clock = (): number => now;
   const db = openDb(path.join(tempDir, `${label}-db.json`), clock);
   await db.initialize("dev-token");
-  const storage = new FileSystemHtmlStorage(path.join(tempDir, `${label}-drafts`));
+  const storageDir = path.join(tempDir, `${label}-drafts`);
+  const storage = openStorage(storageDir);
   const app = createApp({ config: testConfig(), db, storage, clock });
 
   return {
     app,
+    storage,
+    storageDir,
     advanceDays(days) {
       now += days * DAY_MS;
     },

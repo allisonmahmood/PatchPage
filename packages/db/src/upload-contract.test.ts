@@ -779,6 +779,227 @@ function describeUploadContract(
         await harness.close();
       }
     });
+
+    it("hard-deletes an expired draft with every version it held, freeing its ID", async () => {
+      const harness = await createHarness();
+      const draftId = newDraftId();
+      let now = RETENTION_EPOCH;
+      const clocked = harness.openDb({ clock: () => now });
+
+      try {
+        const created = uploadInput("create", draftId, harness.auth);
+        const updated = uploadInput("update", draftId, harness.auth);
+        await clocked.recordUpload(created);
+        await clocked.recordUpload(updated);
+
+        now = RETENTION_EPOCH + 91 * DAY_MS;
+        expect(await clocked.listExpiredDraftIds(1_000)).toContain(draftId);
+
+        // Every version's object comes back, because every version's row goes.
+        const objectKeys = await clocked.deleteExpiredDraft(draftId);
+        expect([...(objectKeys ?? [])].sort()).toEqual(
+          [created.objectKey, updated.objectKey].sort()
+        );
+
+        expect(await clocked.findDraftVersion(draftId)).toEqual({
+          draft: null,
+          version: null
+        });
+        expect(await clocked.listExpiredDraftIds(1_000)).not.toContain(draftId);
+        // Sweeping twice is one sweep: there is nothing left to take.
+        expect(await clocked.deleteExpiredDraft(draftId)).toBeNull();
+
+        // The ID is free again. Version one is available only because the old
+        // versions went with the draft — republishing is the way back.
+        const republished = await clocked.recordUpload(
+          uploadInput("create", draftId, harness.auth)
+        );
+        expect(republished.versionNumber).toBe(1);
+      } finally {
+        await harness.close();
+      }
+    });
+
+    it("offers nothing to sweep while a draft's clock still runs", async () => {
+      const harness = await createHarness();
+      const draftId = newDraftId();
+      let now = RETENTION_EPOCH;
+      const clocked = harness.openDb({ clock: () => now });
+
+      try {
+        await clocked.recordUpload(uploadInput("create", draftId, harness.auth));
+
+        now = RETENTION_EPOCH + 90 * DAY_MS;
+        expect(await clocked.listExpiredDraftIds(1_000)).not.toContain(draftId);
+        expect(await clocked.deleteExpiredDraft(draftId)).toBeNull();
+        expect((await clocked.findDraftVersion(draftId)).draft?.id).toBe(draftId);
+
+        now += 1;
+        expect(await clocked.listExpiredDraftIds(1_000)).toContain(draftId);
+        // A caller asking for no drafts is asked for no drafts.
+        expect(await clocked.listExpiredDraftIds(0)).toEqual([]);
+        expect(await clocked.deleteExpiredDraft(draftId)).not.toBeNull();
+      } finally {
+        await harness.close();
+      }
+    });
+
+    it("offers the longest-expired drafts first", async () => {
+      const harness = await createHarness();
+      const older = newDraftId();
+      const newer = newDraftId();
+      let now = RETENTION_EPOCH;
+      const clocked = harness.openDb({ clock: () => now });
+
+      try {
+        await clocked.recordUpload(uploadInput("create", older, harness.auth));
+        now = RETENTION_EPOCH + 10 * DAY_MS;
+        await clocked.recordUpload(uploadInput("create", newer, harness.auth));
+
+        now = RETENTION_EPOCH + 101 * DAY_MS;
+        const listed = await clocked.listExpiredDraftIds(1_000);
+        // Other drafts may be waiting too; only the relative order is the rule.
+        expect(listed.filter((id) => id === older || id === newer)).toEqual([older, newer]);
+
+        for (const draftId of [older, newer]) {
+          expect(await clocked.deleteExpiredDraft(draftId)).not.toBeNull();
+        }
+      } finally {
+        await harness.close();
+      }
+    });
+
+    it("sweeps deleted and disabled drafts once their clock runs out", async () => {
+      const harness = await createHarness();
+      const deletedDraftId = newDraftId();
+      const disabledDraftId = newDraftId();
+      let now = RETENTION_EPOCH;
+      const clocked = harness.openDb({ clock: () => now });
+
+      try {
+        for (const draftId of [deletedDraftId, disabledDraftId]) {
+          await clocked.recordUpload(uploadInput("create", draftId, harness.auth));
+        }
+        await clocked.deleteDraft(deletedDraftId, harness.auth.accountId);
+        await clocked.disableDraft(disabledDraftId, harness.auth.accountId, "policy");
+
+        // Out of sight is not out of storage: their clocks run out like any
+        // other draft's, and the sweep is what finally frees what they hold.
+        now = RETENTION_EPOCH + 91 * DAY_MS;
+        const listed = await clocked.listExpiredDraftIds(1_000);
+        for (const draftId of [deletedDraftId, disabledDraftId]) {
+          expect(listed).toContain(draftId);
+          expect(await clocked.deleteExpiredDraft(draftId)).not.toBeNull();
+        }
+      } finally {
+        await harness.close();
+      }
+    });
+
+    it("returns a swept draft's slot to its creator's live tally", async () => {
+      const harness = await createHarness();
+      const draftIds = [newDraftId(), newDraftId()];
+      let now = RETENTION_EPOCH;
+      const clocked = harness.openDb({ clock: () => now });
+
+      try {
+        const creator = await createUploadToken(harness, "Expiry sweep quota token");
+        for (const draftId of draftIds) {
+          await clocked.recordUpload(uploadInput("create", draftId, creator));
+        }
+        expect(await clocked.countLiveDraftsByCreatorApiToken(creator.id)).toBe(2);
+
+        // An expired draft still counts: its row and its content are both there.
+        now = RETENTION_EPOCH + 91 * DAY_MS;
+        expect(await clocked.countLiveDraftsByCreatorApiToken(creator.id)).toBe(2);
+
+        for (const draftId of draftIds) {
+          expect(await clocked.deleteExpiredDraft(draftId)).not.toBeNull();
+        }
+        expect(await clocked.countLiveDraftsByCreatorApiToken(creator.id)).toBe(0);
+      } finally {
+        await harness.close();
+      }
+    });
+
+    it("holds a pinned draft out of expiry, and hands it back on unpin", async () => {
+      const harness = await createHarness();
+      const draftId = newDraftId();
+      let now = RETENTION_EPOCH;
+      const clocked = harness.openDb({ clock: () => now });
+
+      try {
+        await clocked.recordUpload(uploadInput("create", draftId, harness.auth));
+        expect(await clocked.setDraftPinned(draftId, true)).toBe(true);
+
+        // Long past the window an upload opens, and none of it applies.
+        now = RETENTION_EPOCH + 200 * DAY_MS;
+        expect((await clocked.findDraftVersion(draftId)).draft?.pinnedAt).toEqual(
+          expect.any(String)
+        );
+        expect(await clocked.listExpiredDraftIds(1_000)).not.toContain(draftId);
+        expect(await clocked.deleteExpiredDraft(draftId)).toBeNull();
+
+        // Ordinary in every other respect: its owner still updates it.
+        const updated = await clocked.recordUpload(
+          uploadInput("update", draftId, harness.auth)
+        );
+        expect(updated.versionNumber).toBe(2);
+
+        now = RETENTION_EPOCH + 400 * DAY_MS;
+        expect((await clocked.findDraftVersion(draftId)).draft?.id).toBe(draftId);
+
+        // Unpinning hands the draft back to the clock it was always carrying.
+        expect(await clocked.setDraftPinned(draftId, false)).toBe(true);
+        expect((await clocked.findDraftVersion(draftId)).draft).toBeNull();
+        expect(await clocked.listExpiredDraftIds(1_000)).toContain(draftId);
+        expect(await clocked.deleteExpiredDraft(draftId)).not.toBeNull();
+      } finally {
+        await harness.close();
+      }
+    });
+
+    it("keeps a pinned draft's clock moving, so unpinning a read page leaves it a window", async () => {
+      const harness = await createHarness();
+      const draftId = newDraftId();
+      let now = RETENTION_EPOCH;
+      const clocked = harness.openDb({ clock: () => now });
+
+      try {
+        await clocked.recordUpload(uploadInput("create", draftId, harness.auth));
+        expect(await clocked.setDraftPinned(draftId, true)).toBe(true);
+
+        // A visit long past the anchor still tops up, because a pinned draft is
+        // not expired and topping it up therefore revives nothing.
+        now = RETENTION_EPOCH + 200 * DAY_MS;
+        await clocked.recordDraftVisit(draftId);
+        expect(await clocked.setDraftPinned(draftId, false)).toBe(true);
+
+        now = RETENTION_EPOCH + 229 * DAY_MS;
+        expect((await clocked.findDraftVersion(draftId)).draft?.id).toBe(draftId);
+
+        now = RETENTION_EPOCH + 231 * DAY_MS;
+        expect((await clocked.findDraftVersion(draftId)).draft).toBeNull();
+        expect(await clocked.deleteExpiredDraft(draftId)).not.toBeNull();
+      } finally {
+        await harness.close();
+      }
+    });
+
+    it("pins only a draft that is there to pin", async () => {
+      const harness = await createHarness();
+      const deletedDraftId = newDraftId();
+
+      try {
+        expect(await harness.db.setDraftPinned(newDraftId(), true)).toBe(false);
+
+        await harness.db.recordUpload(uploadInput("create", deletedDraftId, harness.auth));
+        await harness.db.deleteDraft(deletedDraftId, harness.auth.accountId);
+        expect(await harness.db.setDraftPinned(deletedDraftId, true)).toBe(false);
+      } finally {
+        await harness.close();
+      }
+    });
   });
 }
 
