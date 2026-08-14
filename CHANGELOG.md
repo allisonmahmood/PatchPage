@@ -14,8 +14,8 @@ All notable changes to PatchPage are documented in this file. The format is base
   instance with no stored token and no `PATCHPAGE_API_TOKEN` in the environment, it
   requests one from that instance's self-service endpoint, saves it before announcing it,
   and prints the mint announcement: which instance, where the token was saved
-  (`~/.patchpage/credentials.json`), and how to reuse an existing identity from another
-  machine instead. Auto-mint is never silent and never fires while any token is
+  (`credentials.json` in the state dir, `~/.patchpage` unless `PATCHPAGE_STATE_DIR` says
+  otherwise), and how to reuse an existing identity from another machine instead. Auto-mint is never silent and never fires while any token is
   configured — a rejected token is an error, not a reason to mint again — and only the
   resolved instance is ever asked. Each refusal (self-service disabled, per-network mint
   quota exhausted, rate-limited) produces a plain-language error naming the cause and the
@@ -36,15 +36,6 @@ All notable changes to PatchPage are documented in this file. The format is base
   database, `pnpm db:migrate` does not reach it, and the server never calls it. The
   operator entry point is `pnpm --filter @patchpage/db db:go-public-flip`, which inspects
   and writes nothing by default and performs the surgery only with `--apply`.
-
-### Removed
-
-- Tokenless ("anonymous") upload is removed everywhere. No instance accepts an upload
-  without a bearer token, on any configuration: a tokenless request to the upload endpoint
-  is `401`, and a present-but-invalid bearer stays `401` rather than being downgraded. The
-  anonymous branch of the API guard, its per-IP anonymous-create limiter, and the internal
-  `acct_anonymous`/`tok_anonymous` sentinel principals and their seed code are all gone.
-  The rationale is recorded in `docs/adr/ADR-0001-trust-model-no-tokenless-upload.md`.
 
 ### Changed
 
@@ -103,6 +94,15 @@ All notable changes to PatchPage are documented in this file. The format is base
   anywhere (see Removed), so the flag prints a warning and the upload proceeds with a
   publishing token as always — minted automatically if none is stored. The flag will be
   removed in a later release.
+
+### Removed
+
+- Tokenless ("anonymous") upload is removed everywhere. No instance accepts an upload
+  without a bearer token, on any configuration: a tokenless request to the upload endpoint
+  is `401`, and a present-but-invalid bearer stays `401` rather than being downgraded. The
+  anonymous branch of the API guard, its per-IP anonymous-create limiter, and the internal
+  `acct_anonymous`/`tok_anonymous` sentinel principals and their seed code are all gone.
+  The rationale is recorded in `docs/adr/ADR-0001-trust-model-no-tokenless-upload.md`.
 
 ## [0.1.1] - 2026-07-14
 
