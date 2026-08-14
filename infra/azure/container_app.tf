@@ -66,6 +66,8 @@ locals {
     PATCHPAGE_PROTECTED_API_RATE_LIMIT_PER_MINUTE        = tostring(var.protected_api_rate_limit_per_minute)
     PATCHPAGE_AUTHENTICATED_UPLOAD_RATE_LIMIT_PER_MINUTE = tostring(var.authenticated_upload_rate_limit_per_minute)
     PATCHPAGE_ANONYMOUS_CREATE_RATE_LIMIT_PER_MINUTE     = tostring(var.anonymous_create_rate_limit_per_minute)
+    PATCHPAGE_DRAFT_CREATE_RATE_LIMIT_PER_MINUTE         = tostring(var.draft_create_rate_limit_per_minute)
+    PATCHPAGE_LIVE_DRAFTS_PER_TOKEN                      = tostring(var.live_drafts_per_token)
     PATCHPAGE_DB_DRIVER                                  = "postgres"
     PATCHPAGE_STORAGE_DRIVER                             = "azure-blob"
     AZURE_STORAGE_ACCOUNT                                = azurerm_storage_account.drafts.name

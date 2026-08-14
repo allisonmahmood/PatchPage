@@ -459,6 +459,61 @@ function describeUploadContract(
       }
     });
 
+    it("counts a token's live drafts, excluding deleted and disabled ones", async () => {
+      const harness = await createHarness();
+      const kept = newDraftId();
+      const deleted = newDraftId();
+      const disabled = newDraftId();
+      const foreign = newDraftId();
+
+      try {
+        const creator = await createUploadToken(harness, "Quota creator token");
+        const other = await createUploadToken(harness, "Quota other token");
+
+        expect(await harness.db.countLiveDraftsByCreatorApiToken(creator.id)).toBe(0);
+
+        for (const draftId of [kept, deleted, disabled]) {
+          await harness.db.recordUpload(uploadInput("create", draftId, creator));
+        }
+        await harness.db.recordUpload(uploadInput("create", foreign, other));
+
+        expect(await harness.db.countLiveDraftsByCreatorApiToken(creator.id)).toBe(3);
+        expect(await harness.db.countLiveDraftsByCreatorApiToken(other.id)).toBe(1);
+
+        await harness.db.deleteDraft(deleted, creator.accountId);
+        await harness.db.disableDraft(disabled, creator.accountId, "policy");
+
+        expect(await harness.db.countLiveDraftsByCreatorApiToken(creator.id)).toBe(1);
+        expect(await harness.db.countLiveDraftsByCreatorApiToken(other.id)).toBe(1);
+        expect(
+          await harness.db.countLiveDraftsByCreatorApiToken("tok_never_used")
+        ).toBe(0);
+      } finally {
+        await harness.close();
+      }
+    });
+
+    it("keeps a draft in its creator's tally when another token updates it", async () => {
+      const harness = await createHarness();
+      const draftId = newDraftId();
+
+      try {
+        const creator = await createUploadToken(harness, "Quota update creator token");
+        const editor = await createUploadToken(harness, "Quota update editor token");
+
+        await harness.db.recordUpload(uploadInput("create", draftId, creator));
+        const updated = await harness.db.recordUpload(
+          uploadInput("update", draftId, editor)
+        );
+
+        expect(updated.versionNumber).toBe(2);
+        expect(await harness.db.countLiveDraftsByCreatorApiToken(creator.id)).toBe(1);
+        expect(await harness.db.countLiveDraftsByCreatorApiToken(editor.id)).toBe(0);
+      } finally {
+        await harness.close();
+      }
+    });
+
     it("serializes concurrent owned updates into distinct sequential versions", async () => {
       const harness = await createHarness();
       const draftId = newDraftId();
@@ -628,6 +683,27 @@ async function createPostgresHarness(connectionString: string): Promise<Contract
       await Promise.all(opened.map((opening) => opening.close()));
     }
   };
+}
+
+/**
+ * A token nobody else in the suite shares. The Postgres harness reuses one
+ * database across runs, so a per-token tally is only assertable from zero when
+ * the token itself is new.
+ */
+async function createUploadToken(
+  harness: ContractHarness,
+  name: string
+): Promise<ApiTokenAuth> {
+  const token = randomToken();
+  await harness.db.createApiToken({
+    accountId: harness.auth.accountId,
+    name,
+    token,
+    scopes: ["upload"]
+  });
+  const auth = await harness.db.findApiTokenByToken(token);
+  if (!auth) throw new Error(`Expected authentication for ${name}.`);
+  return auth;
 }
 
 function uploadInput(

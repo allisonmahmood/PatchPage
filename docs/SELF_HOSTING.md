@@ -188,6 +188,10 @@ PATCHPAGE_MAX_HTML_BYTES=524288
 PATCHPAGE_PROTECTED_API_RATE_LIMIT_PER_MINUTE=60
 PATCHPAGE_AUTHENTICATED_UPLOAD_RATE_LIMIT_PER_MINUTE=20
 PATCHPAGE_ANONYMOUS_CREATE_RATE_LIMIT_PER_MINUTE=5
+PATCHPAGE_DRAFT_CREATE_RATE_LIMIT_PER_MINUTE=10
+
+# Per-token quotas
+PATCHPAGE_LIVE_DRAFTS_PER_TOKEN=1000
 
 # Metadata store: "postgres" or "json"
 # Defaults to "postgres" if DATABASE_URL is set, otherwise "json".
@@ -217,7 +221,8 @@ Notes on values:
 - `PATCHPAGE_PUBLIC_BASE_URL` is used to build the public draft URLs returned by uploads and rendered in the viewer. Set it to the externally reachable origin (scheme + host, no trailing slash). The Azure OpenTofu example requires a deployer-owned HTTPS origin; the application itself retains its `http://localhost:3000` default for local development.
 - `PATCHPAGE_TRUST_PROXY` controls whether Fastify derives `request.ip` from `X-Forwarded-For`. Leave it undefined unless every route to the server has a verified trust boundary. See [Client IP attribution behind proxies](#client-ip-attribution-behind-proxies).
 - `PATCHPAGE_MAX_HTML_BYTES` caps the size of a single HTML document (default 524288 = 512 KiB).
-- `PATCHPAGE_PROTECTED_API_RATE_LIMIT_PER_MINUTE`, `PATCHPAGE_AUTHENTICATED_UPLOAD_RATE_LIMIT_PER_MINUTE`, and `PATCHPAGE_ANONYMOUS_CREATE_RATE_LIMIT_PER_MINUTE` are decimal integers from `1` through `10000`. Defaults are `60`, `20`, and `5`.
+- `PATCHPAGE_PROTECTED_API_RATE_LIMIT_PER_MINUTE`, `PATCHPAGE_AUTHENTICATED_UPLOAD_RATE_LIMIT_PER_MINUTE`, `PATCHPAGE_ANONYMOUS_CREATE_RATE_LIMIT_PER_MINUTE`, and `PATCHPAGE_DRAFT_CREATE_RATE_LIMIT_PER_MINUTE` are decimal integers from `1` through `10000`. Defaults are `60`, `20`, `5`, and `10`.
+- `PATCHPAGE_LIVE_DRAFTS_PER_TOKEN` is a decimal integer from `1` through `1000000` and defaults to `1000`. See [Per-token draft quotas](#per-token-draft-quotas).
 - `PATCHPAGE_ALLOW_ANONYMOUS_UPLOADS` is a strict `true`/`false` opt-in and defaults to `false`. When `true`, a request with no `Authorization` header may create a new unlisted draft only. Anonymous requests must omit `draftId`; they cannot update, list, disable, or delete drafts. Any present malformed, invalid, revoked, or insufficient credential remains an authentication or authorization failure and never falls back to anonymous access.
 - When running from source, the `json` metadata driver and `filesystem` storage driver write under `.local/` by default. The supported image overrides those path defaults to `/data` as shown above. Both modes need no external services and suit a quick or single-instance self-host. For a durable multi-instance deployment, use `postgres` and a shared object store (`azure-blob`).
 
@@ -228,12 +233,25 @@ PatchPage applies deterministic fixed-window in-memory limits inside each server
 - Protected `/api` requests are limited to `PATCHPAGE_PROTECTED_API_RATE_LIMIT_PER_MINUTE` attempts per minute per canonical Fastify `request.ip`. That IP follows `PATCHPAGE_TRUST_PROXY`, so configure the proxy boundary before relying on IP-based buckets.
 - Authenticated upload requests are limited to `PATCHPAGE_AUTHENTICATED_UPLOAD_RATE_LIMIT_PER_MINUTE` attempts per minute per API token database identity. Rotating the raw bearer secret for the same token record does not create a fresh upload bucket.
 - When anonymous uploads are enabled, anonymous create attempts are additionally limited to `PATCHPAGE_ANONYMOUS_CREATE_RATE_LIMIT_PER_MINUTE` attempts per minute per canonical `request.ip`. They consume the protected-IP bucket and this anonymous-create bucket, but never an authenticated token bucket.
+- Draft *creates* are additionally limited to `PATCHPAGE_DRAFT_CREATE_RATE_LIMIT_PER_MINUTE` per minute per creating token. An upload carrying a `draftId` is an update and never consumes this bucket. Because the request body decides create versus update, this bucket is consumed after body parsing, unlike the buckets above.
 
 When a bucket is exceeded, PatchPage returns HTTP `429` with JSON `{ "ok": false, "code": "rate_limited", ... }` and an integer `Retry-After` header. Each limiter tracks up to `10000` live keys in memory. If all live key slots are occupied, an unseen key receives the same bounded `429` response until the earliest live bucket resets. Live buckets are never evicted to make room for an unseen key, because eviction would let an attacker bypass limits by cycling key values.
 
 Expired buckets are pruned deterministically when the process observes a request at or after their reset boundary. A request exactly at the reset time starts a new fixed window for that key. Public `GET /healthz` and draft viewer routes under `/d/...` do not consume protected API or upload buckets.
 
 These counters are process-local and memory-only. They reset on restart and are not shared across Node processes, containers, or replicas. For multi-instance deployments, treat them as a local safety net and add an ingress, load balancer, CDN, or shared external rate limiter if you need a global limit.
+
+### Per-token draft quotas
+
+Only per-minute limits live in memory. A long-window quota is derived from the database on every attempt, so restarting the process never hands anyone a fresh allowance.
+
+`PATCHPAGE_LIVE_DRAFTS_PER_TOKEN` caps how many *live* drafts one token may hold at once. A draft is live while it is neither deleted nor disabled, and it belongs to the token that created it — a later update by a different token never moves it between tallies. Deleting or disabling a draft returns its slot immediately.
+
+The cap is per token, not per account: two tokens on one account each get the full allowance. It applies uniformly, with no exemption for `admin`-scoped tokens.
+
+A create that would exceed the quota is rejected with HTTP `403` and JSON `{ "ok": false, "code": "live_draft_quota_exceeded", "quota": <cap>, "error": "..." }`, where the error text names the cap. Updates are never rejected by this quota.
+
+Unlike the buckets above, this ceiling is not process-local: it is recounted from the metadata store on every create, so restarting or scaling the server does not reset it.
 
 ### JSON metadata durability
 

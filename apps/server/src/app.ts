@@ -212,6 +212,30 @@ export function createApp(options: CreateAppOptions): FastifyInstance {
         return reply.status(400).send({ ok: false, error: "Invalid draft ID." });
       }
 
+      // Only creates are quota-bearing. An update rewrites a draft the token
+      // already holds, so it costs nothing against either ceiling.
+      if (requestedDraftId === null) {
+        // The per-minute bucket is consumed before the quota is counted, so a
+        // client parked at the quota is throttled instead of being free to
+        // re-count the database at the higher upload-limit rate. The cost is
+        // that such a client sees 403 flip to 429 once its bucket empties.
+        const createAttempt = rateLimiters.draftCreate.consume(principal.apiTokenId);
+        if (!createAttempt.allowed) {
+          sendRateLimited(reply, createAttempt);
+          return reply;
+        }
+
+        // Recounted from the database every time, so the ceiling outlives a
+        // restart. Concurrent creates can overshoot it by at most the burst the
+        // per-minute limiter above allows through.
+        const liveDrafts = await options.db.countLiveDraftsByCreatorApiToken(
+          principal.apiTokenId
+        );
+        if (liveDrafts >= options.config.liveDraftsPerToken) {
+          return sendLiveDraftQuotaExceeded(reply, options.config.liveDraftsPerToken);
+        }
+      }
+
       const draftId = requestedDraftId || newDraftId();
       const versionId = newInternalId("ver");
       const objectKey = `drafts/${draftId}/versions/${versionId}.html`;
@@ -619,6 +643,17 @@ function sendRateLimited(reply: FastifyReply, decision: RateLimitDecision): void
     error: "Rate limit exceeded.",
     code: "rate_limited",
     retryAfterSeconds
+  });
+}
+
+// "Draft quota", not "draft limit": the glossary reserves limit-shaped wording
+// for the per-minute create limit, which is a different rejection.
+function sendLiveDraftQuotaExceeded(reply: FastifyReply, quota: number): FastifyReply {
+  return reply.status(403).send({
+    ok: false,
+    error: `Draft quota reached: ${quota} live drafts per token. Delete or let a draft expire before creating another.`,
+    code: "live_draft_quota_exceeded",
+    quota
   });
 }
 

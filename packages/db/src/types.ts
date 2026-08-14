@@ -118,6 +118,14 @@ export interface PatchPageDb {
   getAnonymousUploadPrincipal(): Promise<AnonymousUploadPrincipal>;
   findApiTokenByToken(token: string): Promise<ApiTokenAuth | null>;
   createApiToken(input: CreateApiTokenInput): Promise<{ id: string; name: string }>;
+  /**
+   * How many drafts this token created that are still live — neither deleted
+   * nor disabled. The creating token is the one on a draft's first version, so
+   * a later update by another token never moves a draft between tallies. This
+   * is the durable half of the per-token quota: it is recounted from the
+   * database on every create, so a restart cannot reset it.
+   */
+  countLiveDraftsByCreatorApiToken(apiTokenId: string): Promise<number>;
   assertUploadTarget(input: UploadTargetInput): Promise<void>;
   recordUpload(input: RecordUploadInput): Promise<RecordUploadResult>;
   findDraftVersion(draftId: string, versionNumber?: number): Promise<DraftVersionLookup>;

@@ -20,6 +20,14 @@ _Avoid_: account (in product language)
 The guardrail that removes a draft for good when its retention clock runs out. An upload resets the clock to the full window; a visit tops the remaining time up to the visit-extension window. Expiry is a hard delete — content and record both gone, no recovery — and applies to every draft regardless of who owns it, unless the draft is pinned.
 _Avoid_: soft delete, archival, retention (for the act of deleting — retention is the clock, expiry is the consequence)
 
+**Live draft**:
+A draft that still counts against its creator's quota: neither deleted nor disabled. A draft leaves the tally the moment it is deleted or disabled, and for good when expiry hard-deletes it. Which token created it is fixed at creation; a later update by another token never moves it.
+_Avoid_: active draft, published draft (every draft is published), open draft
+
+**Draft quota**:
+The ceiling on live drafts one token may hold at once. Counted from the database on every create, so it survives a restart — unlike the per-minute create limit, which is in-memory and may reset. Per token, not per account, and uniform: no exemption for admin tokens.
+_Avoid_: draft limit (ambiguous with the per-minute create limit), storage quota (this counts drafts, not bytes)
+
 **Pinned draft**:
 A draft exempted from expiry by an operator, for pages the instance itself maintains (welcome page, docs). Pinning is an admin-only act; a pinned draft is otherwise an ordinary draft.
 _Avoid_: permanent draft, system page
