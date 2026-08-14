@@ -2055,6 +2055,13 @@ describe("PatchPage server", () => {
         expect(gone.statusCode).toBe(404);
         expect(gone.headers["content-type"]).toContain("text/html");
         expect(gone.body).not.toContain("Ninety day page");
+
+        // An expired draft's 404 is an ordinary draft-URL 404 and carries the
+        // same serving guarantees: still noindexed, and never cached — the page
+        // it replaced was cacheable, and this must not inherit that.
+        expect(gone.headers["x-robots-tag"]).toBe("noindex");
+        expect(gone.headers["cache-control"]).toBe("no-store");
+        expect(gone.headers["set-cookie"]).toBeUndefined();
       }
 
       const update = await clocked.app.inject({
