@@ -158,8 +158,14 @@ export interface PatchPageDb {
   /**
    * Pins or unpins a draft, exempting it from expiry or handing it back to the
    * clock. An operator's act and admin-only above this port, so no ownership
-   * narrows it: the instance's own pages may sit on any account. Answers
-   * whether a draft was there to move; a deleted draft is not.
+   * narrows it: the instance's own pages may sit on any account.
+   *
+   * A pin is a statement about a page that is *live*, and the two directions
+   * are deliberately not symmetric. Pinning answers `false` unless the draft is
+   * in service — neither deleted nor disabled — because a pin on a taken-down
+   * draft would exempt storage nobody can reach from the sweep. Unpinning
+   * answers `true` for any row that is still there, so a pin can never become
+   * stuck on a draft the operator has since taken down.
    *
    * Pinning is idempotent in effect but not in stamp — re-pinning restamps
    * `pinnedAt` — and unpinning restores the ordinary clock, which for a draft
@@ -184,6 +190,12 @@ export interface PatchPageDb {
    * other order risks a live draft whose content vanished, which is worse.
    */
   deleteExpiredDraft(draftId: string): Promise<string[] | null>;
+  /**
+   * Taking a draft out of service ends any pin on it, here and in
+   * `deleteDraft`. A pinned draft is otherwise ordinary, and that includes
+   * this: moderation and deletion outrank a pin, so neither can leave content
+   * the sweep may never take.
+   */
   disableDraft(
     draftId: string,
     accountId: string,

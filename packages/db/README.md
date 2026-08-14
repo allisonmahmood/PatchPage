@@ -12,7 +12,13 @@ the rules that act on it: an upload restarts the full window, a visit tops the
 remaining time up to the visit window when less than that remains, a draft is
 expired the moment `expiresAt` is past — and a **pinned** draft (`pinnedAt` set)
 is never expired, however far past its anchor now is. `isExpired` is the one
-answer everything keys on. Expired drafts are absent from `findDraftVersion` and
+answer everything keys on, and it needs no term for deleted or disabled drafts
+because a pin only ever sits on a draft in service: `deleteDraft` and
+`disableDraft` clear the pin, and `setDraftPinned` refuses to pin a draft that is
+already deleted or disabled — while unpinning takes any row still there, so a pin
+can never be stuck on a draft the operator has since taken down. Without that
+invariant, a pinned-then-deleted draft would be exempt from the sweep forever.
+Expired drafts are absent from `findDraftVersion` and
 refused as update targets, exactly as deleted and disabled ones are; the row
 itself stays until the sweep removes it.
 

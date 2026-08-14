@@ -411,16 +411,25 @@ export class PostgresPatchPageDb implements PatchPageDb {
   }
 
   async setDraftPinned(draftId: string, pinned: boolean): Promise<boolean> {
-    const result = await this.pool.query(
-      `
-        UPDATE drafts
-        SET pinned_at = $2::timestamptz
-        WHERE id = $1
-          AND deleted_at IS NULL
-        RETURNING id
-      `,
-      [draftId, pinned ? this.nowIso() : null]
-    );
+    // Two statements rather than one predicate carrying a boolean: pinning
+    // needs a draft in service, and unpinning takes whatever row is left, so a
+    // pin can never be stuck on a draft that has since been taken down.
+    const result = pinned
+      ? await this.pool.query(
+          `
+            UPDATE drafts
+            SET pinned_at = $2::timestamptz
+            WHERE id = $1
+              AND deleted_at IS NULL
+              AND disabled_at IS NULL
+            RETURNING id
+          `,
+          [draftId, this.nowIso()]
+        )
+      : await this.pool.query(
+          "UPDATE drafts SET pinned_at = NULL WHERE id = $1 RETURNING id",
+          [draftId]
+        );
     return Boolean(result.rowCount);
   }
 
@@ -493,7 +502,9 @@ export class PostgresPatchPageDb implements PatchPageDb {
     const result = await this.pool.query(
       `
         UPDATE drafts
-        SET disabled_at = now(), disabled_reason = $3, updated_at = now()
+        SET disabled_at = now(), disabled_reason = $3, updated_at = now(),
+            -- Out of service, so out of pin: moderation outranks an exemption.
+            pinned_at = NULL
         WHERE id = $1
           AND (account_id = $2 OR ($4 AND account_id = $5))
           AND deleted_at IS NULL
@@ -518,7 +529,9 @@ export class PostgresPatchPageDb implements PatchPageDb {
     const result = await this.pool.query(
       `
         UPDATE drafts
-        SET deleted_at = now(), updated_at = now()
+        SET deleted_at = now(), updated_at = now(),
+            -- A deleted draft keeps no pin, so its storage still ages out.
+            pinned_at = NULL
         WHERE id = $1
           AND (account_id = $2 OR ($3 AND account_id = $4))
           AND deleted_at IS NULL

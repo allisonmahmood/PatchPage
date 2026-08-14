@@ -334,6 +334,9 @@ export function createApp(options: CreateAppOptions): FastifyInstance {
   // Pinning is an operator's act on the instance's own pages, so it is
   // admin-scoped and unowned: an admin pins any draft, whoever holds it. The
   // pin exempts the draft from expiry and changes nothing else about it.
+  //
+  // A pin only holds a draft that is in service, so pinning a deleted or
+  // disabled one is a 404 — while unpinning works on anything still there.
   for (const route of [
     { suffix: "pin", pinned: true },
     { suffix: "unpin", pinned: false }
@@ -343,8 +346,8 @@ export function createApp(options: CreateAppOptions): FastifyInstance {
       { onRequest: protectedApi("admin") },
       async (request, reply) => {
         const draftId = (request.params as { draftId: string }).draftId;
-        const moved = await options.db.setDraftPinned(draftId, route.pinned);
-        if (!moved) return reply.status(404).send({ ok: false, error: "Draft not found." });
+        const applied = await options.db.setDraftPinned(draftId, route.pinned);
+        if (!applied) return reply.status(404).send({ ok: false, error: "Draft not found." });
         return { ok: true, pinned: route.pinned };
       }
     );

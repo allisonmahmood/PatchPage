@@ -37,7 +37,7 @@ The ceiling on live drafts one token may hold at once. Counted from the database
 _Avoid_: draft limit (ambiguous with the per-minute create limit), storage quota (this counts drafts, not bytes)
 
 **Pinned draft**:
-A draft exempted from expiry by an operator, for pages the instance itself maintains (welcome page, docs). Pinning is an admin-only act; a pinned draft is otherwise an ordinary draft — served, updatable by its owner, counted against its creator's quota. The clock keeps running underneath the pin and visits keep topping it up, so unpinning hands the draft back to whatever time it had left: a page still being read keeps its visit window, and one nobody has read in months expires at once.
+A draft exempted from expiry by an operator, for pages the instance itself maintains (welcome page, docs). Pinning is an admin-only act; a pinned draft is otherwise an ordinary draft — served, updatable by its owner, counted against its creator's quota. The clock keeps running underneath the pin and visits keep topping it up, so unpinning hands the draft back to whatever time it had left: a page still being read keeps its visit window, and one nobody has read in months expires at once. A pin only ever holds a draft that is in service: deleting or disabling one ends its pin, and a draft already deleted or disabled cannot be pinned — moderation and deletion outrank a pin, so neither can leave content the sweep may never take.
 _Avoid_: permanent draft, system page
 
 **Revocation**:

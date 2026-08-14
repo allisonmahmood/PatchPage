@@ -356,7 +356,13 @@ export class JsonFilePatchPageDb implements PatchPageDb {
 
   async setDraftPinned(draftId: string, pinned: boolean): Promise<boolean> {
     return this.mutateState((state) => {
-      const draft = state.drafts.find((row) => row.id === draftId && !row.deletedAt) || null;
+      // Pinning needs a draft in service; unpinning takes whatever row is left,
+      // so a pin can never be stuck on a draft that has since been taken down.
+      const draft =
+        state.drafts.find(
+          (row) =>
+            row.id === draftId && (!pinned || (!row.deletedAt && !row.disabledAt))
+        ) || null;
       if (!draft) return { value: false, changed: false };
 
       draft.pinnedAt = pinned ? this.nowIso() : null;
@@ -421,6 +427,8 @@ export class JsonFilePatchPageDb implements PatchPageDb {
       draft.disabledAt = this.nowIso();
       draft.disabledReason = reason;
       draft.updatedAt = draft.disabledAt;
+      // Out of service, so out of pin: moderation outranks an expiry exemption.
+      draft.pinnedAt = null;
       return { value: true, changed: true };
     });
   }
@@ -444,6 +452,8 @@ export class JsonFilePatchPageDb implements PatchPageDb {
 
       draft.deletedAt = this.nowIso();
       draft.updatedAt = draft.deletedAt;
+      // A deleted draft keeps no pin, so its storage still ages out.
+      draft.pinnedAt = null;
       return { value: true, changed: true };
     });
   }

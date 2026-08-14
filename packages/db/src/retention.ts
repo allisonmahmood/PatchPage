@@ -62,6 +62,12 @@ export function expiryAfterVisit(draft: RetainedDraft, now: number): string | nu
  * past, unless a pin holds it. Everything expiry means keys on this one
  * answer — an expired draft stops serving, refuses updates, and is what the
  * sweep hard-deletes.
+ *
+ * There is deliberately no term here for deleted or disabled drafts, because a
+ * pin only ever sits on a draft that is in service: the store clears the pin
+ * when a draft is deleted or disabled, and refuses to pin one that already is.
+ * That invariant is what keeps this a single rule — without it, a pin on a
+ * taken-down draft would exempt storage nobody can ever reach from the sweep.
  */
 export function isExpired(draft: RetainedDraft, now: number): boolean {
   if (draft.pinnedAt !== null) return false;
@@ -69,6 +75,6 @@ export function isExpired(draft: RetainedDraft, now: number): boolean {
 }
 
 /** The clock alone, with no pin in the question: `expiresAt < now`. */
-export function hasClockRunOut(expiresAt: string, now: number): boolean {
+function hasClockRunOut(expiresAt: string, now: number): boolean {
   return Date.parse(expiresAt) < now;
 }

@@ -2307,6 +2307,44 @@ describe("PatchPage server", () => {
     }
   });
 
+  it("frees a pinned draft the operator deleted, pin and all", async () => {
+    const clocked = await createClockedApp("expiry-sweep-pinned-then-deleted");
+
+    try {
+      const draftId = await publishDraft(clocked.app, "Pinned then withdrawn");
+      const pinned = await clocked.app.inject({
+        method: "POST",
+        url: `/api/drafts/${draftId}/pin`,
+        headers: { authorization: "Bearer dev-token" }
+      });
+      expect(pinned.statusCode).toBe(200);
+
+      const deleted = await clocked.app.inject({
+        method: "DELETE",
+        url: `/api/drafts/${draftId}`,
+        headers: { authorization: "Bearer dev-token" }
+      });
+      expect(deleted.statusCode).toBe(200);
+
+      // Taking the page down ended the pin, so the ordinary clock applies and
+      // the sweep frees the storage. A pin that survived here would exempt
+      // bytes nobody can reach, with no way to unpin them back into reach.
+      clocked.advanceDays(91);
+      expect(await clocked.app.sweepExpiredDrafts()).toMatchObject({ deleted: 1 });
+      expect(await listFiles(clocked.storageDir)).toEqual([]);
+
+      // And pinning it again was never on the table.
+      const repinned = await clocked.app.inject({
+        method: "POST",
+        url: `/api/drafts/${draftId}/pin`,
+        headers: { authorization: "Bearer dev-token" }
+      });
+      expect(repinned.statusCode).toBe(404);
+    } finally {
+      await clocked.close();
+    }
+  });
+
   it("sweeps repeatedly and concurrently while the server keeps serving", async () => {
     const clocked = await createClockedApp("expiry-sweep-idempotent");
 

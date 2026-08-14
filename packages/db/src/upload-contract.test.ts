@@ -986,16 +986,58 @@ function describeUploadContract(
       }
     });
 
-    it("pins only a draft that is there to pin", async () => {
+    it("pins only a draft in service, and unpins whatever row is left", async () => {
       const harness = await createHarness();
       const deletedDraftId = newDraftId();
+      const disabledDraftId = newDraftId();
 
       try {
         expect(await harness.db.setDraftPinned(newDraftId(), true)).toBe(false);
 
         await harness.db.recordUpload(uploadInput("create", deletedDraftId, harness.auth));
+        await harness.db.recordUpload(uploadInput("create", disabledDraftId, harness.auth));
         await harness.db.deleteDraft(deletedDraftId, harness.auth.accountId);
+        await harness.db.disableDraft(disabledDraftId, harness.auth.accountId, "policy");
+
+        // A pin is a statement about a live page, so there is nothing here to
+        // exempt — pinning one of these would exempt unreachable storage.
         expect(await harness.db.setDraftPinned(deletedDraftId, true)).toBe(false);
+        expect(await harness.db.setDraftPinned(disabledDraftId, true)).toBe(false);
+
+        // Unpinning is the other way round: it takes any row still there, so a
+        // pin can never be stuck on a draft the operator has since taken down.
+        expect(await harness.db.setDraftPinned(deletedDraftId, false)).toBe(true);
+        expect(await harness.db.setDraftPinned(disabledDraftId, false)).toBe(true);
+        expect(await harness.db.setDraftPinned(newDraftId(), false)).toBe(false);
+      } finally {
+        await harness.close();
+      }
+    });
+
+    it("ends a pin when a draft is taken out of service, so its storage still frees", async () => {
+      const harness = await createHarness();
+      const deletedDraftId = newDraftId();
+      const disabledDraftId = newDraftId();
+      let now = RETENTION_EPOCH;
+      const clocked = harness.openDb({ clock: () => now });
+
+      try {
+        for (const draftId of [deletedDraftId, disabledDraftId]) {
+          await clocked.recordUpload(uploadInput("create", draftId, harness.auth));
+          expect(await clocked.setDraftPinned(draftId, true)).toBe(true);
+        }
+
+        // Taking a draft down outranks its pin. Without that, the row would be
+        // exempt from the sweep with no way to unpin it back into reach.
+        await clocked.deleteDraft(deletedDraftId, harness.auth.accountId);
+        await clocked.disableDraft(disabledDraftId, harness.auth.accountId, "policy");
+
+        now = RETENTION_EPOCH + 91 * DAY_MS;
+        const listed = await clocked.listExpiredDraftIds(1_000);
+        for (const draftId of [deletedDraftId, disabledDraftId]) {
+          expect(listed).toContain(draftId);
+          expect(await clocked.deleteExpiredDraft(draftId)).not.toBeNull();
+        }
       } finally {
         await harness.close();
       }
