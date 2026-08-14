@@ -1329,6 +1329,203 @@ function describeUploadContract(
         await harness.close();
       }
     });
+
+    it("answers a reported draft with the principal and token behind it", async () => {
+      const harness = await createHarness();
+      const draftId = newDraftId();
+      let now = RETENTION_EPOCH;
+      const clocked = harness.openDb({ clock: () => now });
+
+      try {
+        const creator = await createUploadToken(harness, "Moderation read creator token");
+        const editor = await createUploadToken(harness, "Moderation read editor token");
+        await clocked.recordUpload(uploadInput("create", draftId, creator));
+
+        expect(await clocked.findDraftForModeration(draftId)).toMatchObject({
+          id: draftId,
+          accountId: harness.auth.accountId,
+          createdByApiTokenId: creator.id,
+          deletedAt: null,
+          disabledAt: null
+        });
+
+        // The culprit is fixed at creation: a later editor never becomes it.
+        await clocked.recordUpload(uploadInput("update", draftId, editor));
+        expect((await clocked.findDraftForModeration(draftId))?.createdByApiTokenId).toBe(
+          creator.id
+        );
+
+        // Unlike the serving read, moderation answers for a draft that is
+        // already off — the operator is asked about those most of all.
+        await clocked.disableDraft(draftId, harness.auth.accountId, "operator policy");
+        const disabled = await clocked.findDraftForModeration(draftId);
+        expect(disabled?.createdByApiTokenId).toBe(creator.id);
+        expect(disabled?.disabledAt).toEqual(expect.any(String));
+
+        await clocked.deleteDraft(draftId, harness.auth.accountId);
+        expect((await clocked.findDraftForModeration(draftId))?.deletedAt).toEqual(
+          expect.any(String)
+        );
+
+        // And for one whose clock ran out, which serving has stopped answering.
+        now = RETENTION_EPOCH + 200 * DAY_MS;
+        expect((await clocked.findDraftVersion(draftId)).draft).toBeNull();
+        expect((await clocked.findDraftForModeration(draftId))?.id).toBe(draftId);
+
+        expect(await clocked.findDraftForModeration(newDraftId())).toBeNull();
+      } finally {
+        await harness.close();
+      }
+    });
+
+    it("lists a principal's drafts newest first, without the ones it deleted", async () => {
+      const harness = await createHarness();
+      const [oldest, middle, newest] = [newDraftId(), newDraftId(), newDraftId()];
+      const deleted = newDraftId();
+      let now = RETENTION_EPOCH;
+      const clocked = harness.openDb({ clock: () => now });
+
+      try {
+        const creator = await createUploadToken(harness, "Principal listing creator token");
+        for (const draftId of [deleted, oldest, middle, newest]) {
+          await clocked.recordUpload(uploadInput("create", draftId, creator));
+          now += DAY_MS;
+        }
+        await clocked.deleteDraft(deleted, harness.auth.accountId);
+
+        // Small enough to truncate on purpose: the answer says so rather than
+        // pretending to be whole.
+        const page = await clocked.listDraftsByPrincipal(harness.auth.accountId, 2);
+        expect(page.drafts.map((draft) => draft.id)).toEqual([newest, middle]);
+        expect(page.truncated).toBe(true);
+        expect(page.drafts[0]?.createdByApiTokenId).toBe(creator.id);
+
+        const roomy = await clocked.listDraftsByPrincipal(harness.auth.accountId, 4);
+        expect(roomy.drafts.map((draft) => draft.id).slice(0, 3)).toEqual([
+          newest,
+          middle,
+          oldest
+        ]);
+        expect(roomy.drafts.map((draft) => draft.id)).not.toContain(deleted);
+
+        // A principal holding nothing is an empty answer, not a truncated one.
+        expect(await clocked.listDraftsByPrincipal("acct_holds_nothing", 10)).toEqual({
+          drafts: [],
+          truncated: false
+        });
+      } finally {
+        await harness.close();
+      }
+    });
+
+    it("revokes a token as a state its row keeps, exactly once", async () => {
+      const harness = await createHarness();
+
+      try {
+        const token = randomToken();
+        const created = await harness.db.createApiToken({
+          accountId: harness.auth.accountId,
+          name: "Revocable token",
+          token,
+          scopes: ["upload"]
+        });
+        expect(await harness.db.findApiTokenByToken(token)).not.toBeNull();
+
+        const revocation = await harness.db.revokeApiToken(created.id);
+        expect(revocation).toMatchObject({
+          id: created.id,
+          accountId: harness.auth.accountId,
+          name: "Revocable token",
+          alreadyRevoked: false
+        });
+        expect(revocation?.revokedAt).toEqual(expect.any(String));
+
+        // Revoked is a state, never a deletion: the token authenticates nothing
+        // any more, and the row it left behind is still there to be read.
+        expect(await harness.db.findApiTokenByToken(token)).toBeNull();
+
+        const again = await harness.db.revokeApiToken(created.id);
+        expect(again).toMatchObject({ id: created.id, alreadyRevoked: true });
+        // The first moment stands — it is when the drafts' top-ups froze.
+        expect(again?.revokedAt).toBe(revocation?.revokedAt);
+
+        expect(await harness.db.revokeApiToken("tok_never_existed")).toBeNull();
+      } finally {
+        await harness.close();
+      }
+    });
+
+    it("lets only one of two concurrent revocations claim the first stamp", async () => {
+      const harness = await createHarness();
+
+      try {
+        const token = randomToken();
+        const created = await harness.db.createApiToken({
+          accountId: harness.auth.accountId,
+          name: "Doubly revoked token",
+          token,
+          scopes: ["upload"]
+        });
+
+        // Two handles on the same store, racing. The freeze moment is the thing
+        // being protected: if both calls could stamp, the later one would move
+        // it forward and hand the token's drafts back the clock they had lost.
+        const [first, second] = await Promise.all([
+          harness.db.revokeApiToken(created.id),
+          harness.peerDb.revokeApiToken(created.id)
+        ]);
+
+        expect([first?.alreadyRevoked, second?.alreadyRevoked].sort()).toEqual([
+          false,
+          true
+        ]);
+        // Both report the same instant, and it is the one that actually stuck.
+        expect(first?.revokedAt).toBe(second?.revokedAt);
+        expect(await harness.db.findApiTokenByToken(token)).toBeNull();
+
+        const settled = await harness.db.revokeApiToken(created.id);
+        expect(settled).toMatchObject({ alreadyRevoked: true });
+        expect(settled?.revokedAt).toBe(first?.revokedAt);
+      } finally {
+        await harness.close();
+      }
+    });
+
+    it("freezes visit top-ups from the moment a draft's creating token is revoked", async () => {
+      const harness = await createHarness();
+      const draftId = newDraftId();
+      let now = RETENTION_EPOCH;
+      const clocked = harness.openDb({ clock: () => now });
+
+      try {
+        const creator = await createUploadToken(harness, "Revocation freeze creator token");
+        await clocked.recordUpload(uploadInput("create", draftId, creator));
+
+        // Day 70, twenty days left: this visit lands before the revocation and
+        // tops the clock up to day 100, and that extension survives.
+        now = RETENTION_EPOCH + 70 * DAY_MS;
+        await clocked.recordDraftVisit(draftId);
+
+        now = RETENTION_EPOCH + 71 * DAY_MS;
+        expect((await clocked.revokeApiToken(creator.id))?.alreadyRevoked).toBe(false);
+
+        // Revocation is not a takedown: the page is still served.
+        expect((await clocked.findDraftVersion(draftId)).draft?.id).toBe(draftId);
+
+        // Day 95, five days left — before the freeze this visit would have
+        // bought another thirty. Now it buys nothing.
+        now = RETENTION_EPOCH + 95 * DAY_MS;
+        await clocked.recordDraftVisit(draftId);
+
+        now = RETENTION_EPOCH + 99 * DAY_MS;
+        expect((await clocked.findDraftVersion(draftId)).draft?.id).toBe(draftId);
+
+        now = RETENTION_EPOCH + 101 * DAY_MS;
+        expect((await clocked.findDraftVersion(draftId)).draft).toBeNull();
+      } finally {
+        await harness.close();
+      }
+    });
   });
 }
 

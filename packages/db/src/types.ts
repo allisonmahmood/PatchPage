@@ -111,6 +111,47 @@ export interface MintSelfServiceTokenResult {
   apiTokenName: string;
 }
 
+/**
+ * A draft as the moderation loop sees it: the ordinary record plus the token
+ * that created it, which is the thing revocation acts on. The creating token is
+ * fixed at the draft's first version, so a later update by another token never
+ * changes who a report resolves to.
+ *
+ * `createdByApiTokenId` is nullable because a draft row can outlive knowledge of
+ * its first version only in a corrupt store; the loop reports what it found
+ * rather than inventing a culprit.
+ */
+export interface ModeratedDraftRecord extends DraftRecord {
+  createdByApiTokenId: string | null;
+}
+
+/** One principal's drafts, as the operator's list read returns them. */
+export interface PrincipalDraftListing {
+  /** Newest first, deleted drafts excluded. */
+  drafts: ModeratedDraftRecord[];
+  /** True when the principal holds more than the requested limit. */
+  truncated: boolean;
+}
+
+/**
+ * The outcome of revoking a token. Revoked is a state, never a deletion: the
+ * row survives with its mint provenance, and `revokedAt` is the moment the
+ * freeze began.
+ */
+export interface ApiTokenRevocation {
+  id: string;
+  /** The owning principal — the same row `/api/me` calls the account. */
+  accountId: string;
+  name: string;
+  revokedAt: string;
+  /**
+   * True when the token was already revoked and this call changed nothing. The
+   * first revocation's timestamp stands: it is when top-ups froze, and moving
+   * it would rewrite that history.
+   */
+  alreadyRevoked: boolean;
+}
+
 export interface UploadTargetInput {
   intent: "create" | "update";
   draftId: string;
@@ -211,6 +252,16 @@ export interface PatchPageDb {
    */
   mintSelfServiceToken(input: MintSelfServiceTokenInput): Promise<MintSelfServiceTokenResult>;
   /**
+   * Puts a token into the revoked state and reports what it found. `null` for a
+   * token that does not exist; otherwise the row, which survives — the
+   * version-history foreign key makes deleting a token that ever uploaded
+   * mechanically impossible, and the mint provenance is worth keeping anyway.
+   *
+   * Idempotent: revoking an already-revoked token is a no-op that returns the
+   * original `revokedAt`.
+   */
+  revokeApiToken(apiTokenId: string): Promise<ApiTokenRevocation | null>;
+  /**
    * How many drafts this token created that are still live — neither deleted
    * nor disabled. The creating token is the one on a draft's first version, so
    * a later update by another token never moves a draft between tallies. This
@@ -223,10 +274,30 @@ export interface PatchPageDb {
   /** Expired drafts are absent here, exactly as deleted and disabled ones are. */
   findDraftVersion(draftId: string, versionNumber?: number): Promise<DraftVersionLookup>;
   /**
+   * A reported draft's owning principal and creating token — the first step of
+   * the moderation loop, the one that turns a URL into a culprit.
+   *
+   * Deliberately unlike `findDraftVersion`: a disabled, deleted, or expired
+   * draft is still answered here. The operator is asked about pages that are
+   * already off, and hiding the row would hide the principal behind them.
+   */
+  findDraftForModeration(draftId: string): Promise<ModeratedDraftRecord | null>;
+  /**
+   * The second step: everything else that principal is holding. Newest first,
+   * at most `limit` rows, deleted drafts excluded — a deleted draft is a
+   * resolved one, and excluding it is what lets the list drain as the operator
+   * works it rather than filling up with history it can never act on again.
+   */
+  listDraftsByPrincipal(principalId: string, limit: number): Promise<PrincipalDraftListing>;
+  /**
    * Tops a served draft's retention clock up to the visit-extension window when
    * less than that remains. A no-op otherwise, including for a draft that is
    * already expired, deleted, or disabled — a visit never shortens the clock
    * and never brings a draft back.
+   *
+   * Also a no-op once the draft's creating token is revoked: from that moment
+   * the clock only runs down, so abuse ages out on whatever window it had left
+   * instead of being kept alive by the traffic it attracts.
    */
   recordDraftVisit(draftId: string): Promise<void>;
   /**

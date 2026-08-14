@@ -24,6 +24,7 @@ import { UploadTargetError } from "./types.js";
 import type { JsonMigrationState, SchemaMigration } from "./migrations.js";
 import type {
   ApiTokenAuth,
+  ApiTokenRevocation,
   CreateApiTokenInput,
   DbDriverOptions,
   DraftRecord,
@@ -33,7 +34,9 @@ import type {
   DraftVersionRecord,
   MintSelfServiceTokenInput,
   MintSelfServiceTokenResult,
+  ModeratedDraftRecord,
   PatchPageDb,
+  PrincipalDraftListing,
   RecordDraftReportInput,
   RecordUploadInput,
   RecordUploadResult,
@@ -260,6 +263,29 @@ export class JsonFilePatchPageDb implements PatchPageDb {
     });
   }
 
+  async revokeApiToken(apiTokenId: string): Promise<ApiTokenRevocation | null> {
+    return this.mutateState<ApiTokenRevocation | null>((state) => {
+      const apiToken = state.apiTokens.find((row) => row.id === apiTokenId);
+      if (!apiToken) return { value: null, changed: false };
+
+      // The first revocation's stamp stands. It is the instant top-ups froze,
+      // so re-stamping it would hand the token's drafts clock back.
+      const alreadyRevoked = apiToken.revokedAt !== null;
+      if (!alreadyRevoked) apiToken.revokedAt = this.nowIso();
+
+      return {
+        value: {
+          id: apiToken.id,
+          accountId: apiToken.accountId,
+          name: apiToken.name,
+          revokedAt: apiToken.revokedAt as string,
+          alreadyRevoked
+        },
+        changed: !alreadyRevoked
+      };
+    });
+  }
+
   async countLiveDraftsByCreatorApiToken(apiTokenId: string): Promise<number> {
     const state = await this.readState();
     const createdDraftIds = new Set(
@@ -389,12 +415,38 @@ export class JsonFilePatchPageDb implements PatchPageDb {
     return { draft, version };
   }
 
+  async findDraftForModeration(draftId: string): Promise<ModeratedDraftRecord | null> {
+    const state = await this.readState();
+    const draft = state.drafts.find((row) => row.id === draftId) || null;
+    return draft ? moderatedDraft(state, draft) : null;
+  }
+
+  async listDraftsByPrincipal(
+    principalId: string,
+    limit: number
+  ): Promise<PrincipalDraftListing> {
+    const state = await this.readState();
+    const owned = state.drafts
+      .filter((row) => row.accountId === principalId && !row.deletedAt)
+      .sort(byNewestFirst);
+
+    return {
+      drafts: owned.slice(0, Math.max(0, limit)).map((draft) => moderatedDraft(state, draft)),
+      truncated: owned.length > Math.max(0, limit)
+    };
+  }
+
   async recordDraftVisit(draftId: string): Promise<void> {
     await this.mutateState((state) => {
       const now = this.clock();
       const draft =
-        state.drafts.find((row) => row.id === draftId && !row.deletedAt && !row.disabledAt) ||
-        null;
+        state.drafts.find(
+          (row) =>
+            row.id === draftId &&
+            !row.deletedAt &&
+            !row.disabledAt &&
+            !hasRevokedCreator(state, row.id)
+        ) || null;
       // A visit that changes nothing must not write: outside the top-up window,
       // serving a draft stays a pure read of the state file.
       const toppedUp = draft ? expiryAfterVisit(draft, now) : null;
@@ -1150,6 +1202,32 @@ function ensureBootstrapState(
       revokedAt: null
     });
   }
+}
+
+/** The token on a draft's first version: who to revoke when a report lands. */
+function creatingApiTokenId(state: JsonDbState, draftId: string): string | null {
+  const firstVersion = state.draftVersions.find(
+    (version) => version.draftId === draftId && version.versionNumber === FIRST_VERSION_NUMBER
+  );
+  return firstVersion ? firstVersion.createdByApiTokenId : null;
+}
+
+function moderatedDraft(state: JsonDbState, draft: DraftRecord): ModeratedDraftRecord {
+  return { ...draft, createdByApiTokenId: creatingApiTokenId(state, draft.id) };
+}
+
+/** Whether the draft's clock is frozen because its creating token was revoked. */
+function hasRevokedCreator(state: JsonDbState, draftId: string): boolean {
+  const apiTokenId = creatingApiTokenId(state, draftId);
+  if (!apiTokenId) return false;
+  const apiToken = state.apiTokens.find((row) => row.id === apiTokenId);
+  return Boolean(apiToken?.revokedAt);
+}
+
+/** Newest first, with the ID as a tiebreak so a page of drafts is stable. */
+function byNewestFirst(left: DraftRecord, right: DraftRecord): number {
+  if (left.createdAt !== right.createdAt) return left.createdAt < right.createdAt ? 1 : -1;
+  return left.id < right.id ? 1 : -1;
 }
 
 function assertUploadTarget(
