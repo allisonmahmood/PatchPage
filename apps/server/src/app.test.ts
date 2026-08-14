@@ -1255,6 +1255,151 @@ describe("PatchPage server", () => {
     }
   });
 
+  it("limits draft creates per minute per token without counting updates", async () => {
+    let now = 1_000;
+    const config = { ...testConfig(), draftCreateRateLimitPerMinute: 2 };
+    const db = new JsonFilePatchPageDb(path.join(tempDir, "create-limit-db.json"));
+    await db.initialize("dev-token");
+    const storage = new FileSystemHtmlStorage(path.join(tempDir, "create-limit-drafts"));
+    const app = createApp({ config, db, storage, clock: () => now });
+
+    try {
+      const first = await createDraft(app, "dev-token", "First");
+      const second = await createDraft(app, "dev-token", "Second");
+      expect([first.statusCode, second.statusCode]).toEqual([201, 201]);
+      const { draftId } = first.json() as { draftId: string };
+
+      const limited = await createDraft(app, "dev-token", "Third");
+      expect(limited.statusCode).toBe(429);
+      expect(limited.headers["retry-after"]).toBe("60");
+      expect(limited.json()).toEqual({
+        ok: false,
+        error: "Rate limit exceeded.",
+        code: "rate_limited",
+        retryAfterSeconds: 60
+      });
+
+      const update = await app.inject({
+        method: "POST",
+        url: "/api/uploads",
+        headers: { authorization: "Bearer dev-token" },
+        payload: { draftId, html: draftHtml("First revised") }
+      });
+      expect(update.statusCode).toBe(200);
+
+      now = 61_000;
+      const afterWindow = await createDraft(app, "dev-token", "Fourth");
+      expect(afterWindow.statusCode).toBe(201);
+    } finally {
+      await app.close();
+      await db.close();
+    }
+  });
+
+  it("caps live drafts per token from the database, across a restart", async () => {
+    const config = { ...testConfig(), liveDraftsPerToken: 2 };
+    const dbFile = path.join(tempDir, "live-cap-db.json");
+    const storage = new FileSystemHtmlStorage(path.join(tempDir, "live-cap-drafts"));
+    // `dev-token` is the admin bootstrap token: the cap has no admin exemption.
+    const db = new JsonFilePatchPageDb(dbFile);
+    await db.initialize("dev-token");
+    const app = createApp({ config, db, storage });
+
+    try {
+      expect((await createDraft(app, "dev-token", "One")).statusCode).toBe(201);
+      expect((await createDraft(app, "dev-token", "Two")).statusCode).toBe(201);
+
+      const overQuota = await createDraft(app, "dev-token", "Three");
+      expect(overQuota.statusCode).toBe(403);
+      expect(overQuota.json()).toEqual({
+        ok: false,
+        error:
+          "Live draft limit reached: 2 live drafts per token. Delete or let a draft expire before creating another.",
+        code: "live_draft_quota_exceeded",
+        limit: 2
+      });
+    } finally {
+      await app.close();
+      await db.close();
+    }
+
+    // A restart drops every in-memory bucket. The cap is recounted from the
+    // database, so it is still there.
+    const restartedDb = new JsonFilePatchPageDb(dbFile);
+    await restartedDb.initialize("dev-token");
+    const restarted = createApp({ config, db: restartedDb, storage });
+
+    try {
+      const stillOverQuota = await createDraft(restarted, "dev-token", "Three again");
+      expect(stillOverQuota.statusCode).toBe(403);
+      expect(stillOverQuota.json()).toMatchObject({
+        code: "live_draft_quota_exceeded",
+        limit: 2
+      });
+    } finally {
+      await restarted.close();
+      await restartedDb.close();
+    }
+  });
+
+  it("returns live-draft cap room when a draft is disabled or deleted", async () => {
+    const config = { ...testConfig(), liveDraftsPerToken: 1 };
+    const db = new JsonFilePatchPageDb(path.join(tempDir, "live-cap-release-db.json"));
+    await db.initialize("dev-token");
+    const auth = await db.findApiTokenByToken("dev-token");
+    expect(auth).not.toBeNull();
+    await db.createApiToken({
+      accountId: auth!.accountId,
+      name: "Sibling upload token",
+      token: "sibling-token",
+      scopes: ["upload"]
+    });
+    const storage = new FileSystemHtmlStorage(
+      path.join(tempDir, "live-cap-release-drafts")
+    );
+    const app = createApp({ config, db, storage });
+
+    try {
+      const created = await createDraft(app, "dev-token", "Only one");
+      expect(created.statusCode).toBe(201);
+      const { draftId } = created.json() as { draftId: string };
+      expect((await createDraft(app, "dev-token", "Blocked")).statusCode).toBe(403);
+
+      // The cap is per token, not per account: a sibling token on the same
+      // account still has its own room.
+      expect((await createDraft(app, "sibling-token", "Sibling")).statusCode).toBe(201);
+
+      const disable = await app.inject({
+        method: "POST",
+        url: `/api/drafts/${draftId}/disable`,
+        headers: { authorization: "Bearer dev-token" },
+        payload: { reason: "quota test" }
+      });
+      expect(disable.statusCode).toBe(200);
+
+      const afterDisable = await createDraft(app, "dev-token", "After disable");
+      expect(afterDisable.statusCode).toBe(201);
+      const replacementDraftId = (afterDisable.json() as { draftId: string }).draftId;
+      expect((await createDraft(app, "dev-token", "Blocked again")).statusCode).toBe(403);
+
+      const removed = await app.inject({
+        method: "DELETE",
+        url: `/api/drafts/${replacementDraftId}`,
+        headers: { authorization: "Bearer dev-token" }
+      });
+      expect(removed.statusCode).toBe(200);
+
+      expect((await createDraft(app, "dev-token", "After delete")).statusCode).toBe(201);
+      // Nothing the first token did moved the sibling's own tally.
+      expect((await createDraft(app, "sibling-token", "Sibling blocked")).statusCode).toBe(
+        403
+      );
+    } finally {
+      await app.close();
+      await db.close();
+    }
+  });
+
   it("persists the direct socket address when proxy trust is not configured", async () => {
     const sourceIp = await uploadSourceIp({
       remoteAddress: "192.0.2.10"
@@ -1877,6 +2022,23 @@ async function createScopedTokenApp(label: string, clock?: () => number): Promis
   return { app, db };
 }
 
+function draftHtml(title: string): string {
+  return `<!doctype html><html><head><title>${title}</title></head><body><h1>${title}</h1></body></html>`;
+}
+
+async function createDraft(
+  app: ReturnType<typeof createApp>,
+  token: string,
+  title: string
+) {
+  return app.inject({
+    method: "POST",
+    url: "/api/uploads",
+    headers: { authorization: `Bearer ${token}` },
+    payload: { html: draftHtml(title) }
+  });
+}
+
 async function oversizedJsonApiRequest(
   app: ReturnType<typeof createApp>,
   options: { target: ApiTargetCase; token: string }
@@ -2052,6 +2214,8 @@ function testConfig(): ServerConfig {
     protectedApiRateLimitPerMinute: 60,
     authenticatedUploadRateLimitPerMinute: 20,
     anonymousCreateRateLimitPerMinute: 5,
+    draftCreateRateLimitPerMinute: 10,
+    liveDraftsPerToken: 1_000,
     dbDriver: "json",
     databaseUrl: null,
     jsonDbFile: path.join(tempDir, "db.json"),

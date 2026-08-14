@@ -203,6 +203,26 @@ export function createApp(options: CreateAppOptions): FastifyInstance {
         return reply.status(400).send({ ok: false, error: "Invalid draft ID." });
       }
 
+      // Only creates are quota-bearing. An update rewrites a draft the token
+      // already holds, so it costs nothing against either ceiling.
+      if (requestedDraftId === null) {
+        const createAttempt = rateLimiters.draftCreate.consume(principal.apiTokenId);
+        if (!createAttempt.allowed) {
+          sendRateLimited(reply, createAttempt);
+          return reply;
+        }
+
+        // Recounted from the database every time, so the ceiling outlives a
+        // restart. Concurrent creates can overshoot it by at most the burst the
+        // per-minute limiter above allows through.
+        const liveDrafts = await options.db.countLiveDraftsByCreatorApiToken(
+          principal.apiTokenId
+        );
+        if (liveDrafts >= options.config.liveDraftsPerToken) {
+          return sendLiveDraftQuotaExceeded(reply, options.config.liveDraftsPerToken);
+        }
+      }
+
       const draftId = requestedDraftId || newDraftId();
       const versionId = newInternalId("ver");
       const objectKey = `drafts/${draftId}/versions/${versionId}.html`;
@@ -617,6 +637,15 @@ function sendRateLimited(reply: FastifyReply, decision: RateLimitDecision): void
     error: "Rate limit exceeded.",
     code: "rate_limited",
     retryAfterSeconds
+  });
+}
+
+function sendLiveDraftQuotaExceeded(reply: FastifyReply, limit: number): FastifyReply {
+  return reply.status(403).send({
+    ok: false,
+    error: `Live draft limit reached: ${limit} live drafts per token. Delete or let a draft expire before creating another.`,
+    code: "live_draft_quota_exceeded",
+    limit
   });
 }
 

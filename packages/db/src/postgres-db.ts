@@ -29,6 +29,9 @@ const { Pool } = pg;
 // racing on `CREATE TABLE IF NOT EXISTS`, which is not race-free in Postgres.
 const MIGRATION_ADVISORY_LOCK_KEY = 5150324118422001n;
 
+/** A draft's creating token is the one that wrote this version. */
+const FIRST_VERSION_NUMBER = 1;
+
 export class PostgresPatchPageDb implements PatchPageDb {
   private readonly pool: pg.Pool;
   private readonly migrations: readonly SchemaMigration[];
@@ -121,6 +124,22 @@ export class PostgresPatchPageDb implements PatchPageDb {
     );
 
     return { id, name };
+  }
+
+  async countLiveDraftsByCreatorApiToken(apiTokenId: string): Promise<number> {
+    const result = await this.pool.query(
+      `
+        SELECT count(*) AS live
+        FROM drafts
+        JOIN draft_versions ON draft_versions.draft_id = drafts.id
+          AND draft_versions.version_number = $2
+        WHERE draft_versions.created_by_api_token_id = $1
+          AND drafts.deleted_at IS NULL
+          AND drafts.disabled_at IS NULL
+      `,
+      [apiTokenId, FIRST_VERSION_NUMBER]
+    );
+    return Number(result.rows[0]?.live ?? 0);
   }
 
   async assertUploadTarget(input: UploadTargetInput): Promise<void> {

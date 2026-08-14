@@ -17,6 +17,23 @@ describe("getServerConfig", () => {
     expect(config.protectedApiRateLimitPerMinute).toBe(60);
     expect(config.authenticatedUploadRateLimitPerMinute).toBe(20);
     expect(config.anonymousCreateRateLimitPerMinute).toBe(5);
+    expect(config.draftCreateRateLimitPerMinute).toBe(10);
+  });
+
+  it("defaults the live-draft quota to a thousand per token", () => {
+    expect(getServerConfig({}).liveDraftsPerToken).toBe(1_000);
+    expect(
+      getServerConfig({ PATCHPAGE_LIVE_DRAFTS_PER_TOKEN: "25" }).liveDraftsPerToken
+    ).toBe(25);
+    expect(
+      getServerConfig({ PATCHPAGE_LIVE_DRAFTS_PER_TOKEN: "1000000" }).liveDraftsPerToken
+    ).toBe(1_000_000);
+
+    for (const value of ["0", "-1", "+1", "01", "1.5", "1e2", "1000001"]) {
+      expect(() =>
+        getServerConfig({ PATCHPAGE_LIVE_DRAFTS_PER_TOKEN: value })
+      ).toThrow(/PATCHPAGE_LIVE_DRAFTS_PER_TOKEN/);
+    }
   });
 
   it("requires an explicit true boolean to enable anonymous uploads", () => {
@@ -41,12 +58,14 @@ describe("getServerConfig", () => {
     const config = getServerConfig({
       PATCHPAGE_PROTECTED_API_RATE_LIMIT_PER_MINUTE: "120",
       PATCHPAGE_AUTHENTICATED_UPLOAD_RATE_LIMIT_PER_MINUTE: "40",
-      PATCHPAGE_ANONYMOUS_CREATE_RATE_LIMIT_PER_MINUTE: "10"
+      PATCHPAGE_ANONYMOUS_CREATE_RATE_LIMIT_PER_MINUTE: "10",
+      PATCHPAGE_DRAFT_CREATE_RATE_LIMIT_PER_MINUTE: "30"
     });
 
     expect(config.protectedApiRateLimitPerMinute).toBe(120);
     expect(config.authenticatedUploadRateLimitPerMinute).toBe(40);
     expect(config.anonymousCreateRateLimitPerMinute).toBe(10);
+    expect(config.draftCreateRateLimitPerMinute).toBe(30);
   });
 
   it("requires abuse-protection limits to be decimal integers from 1 through 10000", () => {
@@ -62,6 +81,10 @@ describe("getServerConfig", () => {
       [
         "PATCHPAGE_ANONYMOUS_CREATE_RATE_LIMIT_PER_MINUTE",
         "anonymousCreateRateLimitPerMinute"
+      ],
+      [
+        "PATCHPAGE_DRAFT_CREATE_RATE_LIMIT_PER_MINUTE",
+        "draftCreateRateLimitPerMinute"
       ]
     ] as const;
 

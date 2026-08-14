@@ -89,6 +89,9 @@ interface StateMutationResult<T> {
   changed: boolean;
 }
 
+/** A draft's creating token is the one that wrote this version. */
+const FIRST_VERSION_NUMBER = 1;
+
 // This serializer is intentionally process-local; interprocess locking is unsupported.
 const mutationQueues = new Map<string, Promise<void>>();
 const durabilityVerifiedDirectories = new Set<string>();
@@ -180,6 +183,26 @@ export class JsonFilePatchPageDb implements PatchPageDb {
 
       return { value: { id: apiToken.id, name: apiToken.name }, changed: true };
     });
+  }
+
+  async countLiveDraftsByCreatorApiToken(apiTokenId: string): Promise<number> {
+    const state = await this.readState();
+    const createdDraftIds = new Set(
+      state.draftVersions
+        .filter(
+          (version) =>
+            version.versionNumber === FIRST_VERSION_NUMBER &&
+            version.createdByApiTokenId === apiTokenId
+        )
+        .map((version) => version.draftId)
+    );
+
+    let live = 0;
+    for (const draft of state.drafts) {
+      if (draft.deletedAt || draft.disabledAt) continue;
+      if (createdDraftIds.has(draft.id)) live += 1;
+    }
+    return live;
   }
 
   async assertUploadTarget(input: UploadTargetInput): Promise<void> {

@@ -2,6 +2,7 @@ import { isIP } from "node:net";
 
 const MAX_TRUST_PROXY_HOPS = 32;
 const MAX_RATE_LIMIT_PER_MINUTE = 10_000;
+const MAX_LIVE_DRAFTS_PER_TOKEN = 1_000_000;
 const IPV4_BITS = 32;
 const IPV6_BITS = 128;
 const IPV4_MAX = (1n << 32n) - 1n;
@@ -26,6 +27,12 @@ export interface ServerConfig {
   protectedApiRateLimitPerMinute: number;
   authenticatedUploadRateLimitPerMinute: number;
   anonymousCreateRateLimitPerMinute: number;
+  draftCreateRateLimitPerMinute: number;
+  /**
+   * The live-draft ceiling one token may hold. Counted from the database on
+   * every create, so it survives a restart — unlike the per-minute limiters.
+   */
+  liveDraftsPerToken: number;
   dbDriver: "postgres" | "json";
   databaseUrl: string | null;
   jsonDbFile: string;
@@ -66,6 +73,17 @@ export function getServerConfig(env: NodeJS.ProcessEnv = process.env): ServerCon
       "PATCHPAGE_ANONYMOUS_CREATE_RATE_LIMIT_PER_MINUTE",
       env.PATCHPAGE_ANONYMOUS_CREATE_RATE_LIMIT_PER_MINUTE,
       5
+    ),
+    draftCreateRateLimitPerMinute: rateLimitPerMinuteValue(
+      "PATCHPAGE_DRAFT_CREATE_RATE_LIMIT_PER_MINUTE",
+      env.PATCHPAGE_DRAFT_CREATE_RATE_LIMIT_PER_MINUTE,
+      10
+    ),
+    liveDraftsPerToken: boundedIntegerValue(
+      "PATCHPAGE_LIVE_DRAFTS_PER_TOKEN",
+      env.PATCHPAGE_LIVE_DRAFTS_PER_TOKEN,
+      1_000,
+      MAX_LIVE_DRAFTS_PER_TOKEN
     ),
     dbDriver,
     databaseUrl,
@@ -257,21 +275,23 @@ function rateLimitPerMinuteValue(
   value: string | undefined,
   fallback: number
 ): number {
+  return boundedIntegerValue(name, value, fallback, MAX_RATE_LIMIT_PER_MINUTE);
+}
+
+function boundedIntegerValue(
+  name: string,
+  value: string | undefined,
+  fallback: number,
+  max: number
+): number {
   const trimmed = stringValue(value);
   if (!trimmed) return fallback;
-  if (!/^[1-9]\d*$/.test(trimmed)) {
+  if (!/^[1-9]\d*$/.test(trimmed) || Number(trimmed) > max) {
     throw new Error(
-      `${name} must be a decimal integer from 1 through ${MAX_RATE_LIMIT_PER_MINUTE}, received: ${value}`
+      `${name} must be a decimal integer from 1 through ${max}, received: ${value}`
     );
   }
-
-  const parsed = Number(trimmed);
-  if (parsed > MAX_RATE_LIMIT_PER_MINUTE) {
-    throw new Error(
-      `${name} must be a decimal integer from 1 through ${MAX_RATE_LIMIT_PER_MINUTE}, received: ${value}`
-    );
-  }
-  return parsed;
+  return Number(trimmed);
 }
 
 function strictBoolValue(
