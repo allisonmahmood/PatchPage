@@ -287,7 +287,7 @@ async function fixtureRepo(t, options = {}) {
   };
   Object.assign(pack, options.packExtras);
   if (options.packFilePath) pack.files.push({ path: options.packFilePath, size: 1 });
-  await writeJson(packJsonPath, [pack]);
+  await writeJson(packJsonPath, options.npm12PackJson ? { patchpage: pack } : [pack]);
 
   const packedPackage = {
     name: "patchpage",
@@ -377,6 +377,23 @@ test("accepts approved personal identity as author and committer", async (t) => 
   const failures = await verifyFixture(fixture);
 
   assert.deepEqual(failures, []);
+});
+
+test("accepts the npm 12 name-keyed pack JSON shape", async (t) => {
+  const fixture = await fixtureRepo(t, { npm12PackJson: true });
+
+  const failures = await verifyFixture(fixture);
+
+  assert.deepEqual(failures, []);
+});
+
+test("rejects pack JSON that does not describe exactly one package", async (t) => {
+  const fixture = await fixtureRepo(t);
+  await writeJson(fixture.packJsonPath, {});
+
+  const failures = await verifyFixture(fixture);
+
+  assert.deepEqual(categories(failures), ["pack-json-shape"]);
 });
 
 test("rejects malformed tar end markers with opaque errors", async (t) => {
@@ -695,6 +712,38 @@ test("rejects tracked path names and tracked textual disclosures", async (t) => 
     privateCategory("tracked-text", "export"),
     "tracked-text-temp-build-path"
   ]);
+});
+
+test("accepts private-artifact words used as ordinary prose", async (t) => {
+  const fixture = await fixtureRepo(t);
+  await addTrackedFile(
+    fixture.root,
+    "docs/notes.md",
+    [
+      `every change ${PRIVATE_KIND} is recorded before the apply step`,
+      `the ${privateKind(1)} resumes once the ${privateKind(2)} completes`
+    ].join("\n")
+  );
+
+  const failures = await verifyFixture(fixture);
+
+  assert.deepEqual(failures, []);
+});
+
+test("still rejects file-shaped private-artifact references in tracked text", async (t) => {
+  const fixture = await fixtureRepo(t);
+  await addTrackedFile(
+    fixture.root,
+    "docs/notes.md",
+    [
+      `export saved as ${privateStructuredArtifactName()}`,
+      `see logs/${PRIVATE_KIND}-2026 for the raw capture`
+    ].join("\n")
+  );
+
+  const failures = await verifyFixture(fixture);
+
+  assert.deepEqual(categories(failures), [privateCategory("tracked-text", "export")]);
 });
 
 test("scans tracked symlink target text", async (t) => {

@@ -469,7 +469,7 @@ run "supports_a_self_hosters_own_thresholds" {
     egress_tripwire_bytes_per_day  = 10737418240
     blob_capacity_alarm_bytes      = 5368709120
     storage_replication_type       = "ZRS"
-    operator_alert_email           = "ops@self-hoster.dev"
+    operator_alert_email           = "ops@example.com"
   }
 
   assert {
@@ -507,7 +507,7 @@ run "supports_a_self_hosters_own_thresholds" {
   assert {
     condition = (
       length(azurerm_monitor_action_group.kill_switch.email_receiver) == 1 &&
-      azurerm_monitor_action_group.kill_switch.email_receiver[0].email_address == "ops@self-hoster.dev"
+      azurerm_monitor_action_group.kill_switch.email_receiver[0].email_address == "ops@example.com"
     )
     error_message = "Expected the configured operator address on the kill action group."
   }
@@ -515,7 +515,7 @@ run "supports_a_self_hosters_own_thresholds" {
   assert {
     condition = (
       length(azurerm_monitor_action_group.operator_notice.email_receiver) == 1 &&
-      azurerm_monitor_action_group.operator_notice.email_receiver[0].email_address == "ops@self-hoster.dev"
+      azurerm_monitor_action_group.operator_notice.email_receiver[0].email_address == "ops@example.com"
     )
     error_message = "Expected the configured operator address on the notice action group."
   }

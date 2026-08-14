@@ -1121,7 +1121,7 @@ run_app_release_block() {
     PUBLIC_BASE_URL="https://drafts.example.invalid"
     CANARY_URL="$PUBLIC_BASE_URL/d/abc123def456"
     case "$scenario" in
-      public_base_credentials) PUBLIC_BASE_URL="https://user@drafts.example.invalid" ;;
+      public_base_credentials) PUBLIC_BASE_URL="https://user@example.com" ;;
       public_base_port) PUBLIC_BASE_URL="https://drafts.example.invalid:443" ;;
       public_base_path) PUBLIC_BASE_URL="https://drafts.example.invalid/path" ;;
       public_base_query) PUBLIC_BASE_URL="https://drafts.example.invalid?mode=canary" ;;
@@ -1612,7 +1612,7 @@ run_app_rollback_block() {
     CANARY_URL="$PUBLIC_BASE_URL/d/abc123def456"
     CANARY_MARKER="PATCHPAGE_CANARY"
     case "$scenario" in
-      public_base_credentials) PUBLIC_BASE_URL="https://user@drafts.example.invalid" ;;
+      public_base_credentials) PUBLIC_BASE_URL="https://user@example.com" ;;
       public_base_port) PUBLIC_BASE_URL="https://drafts.example.invalid:443" ;;
       public_base_path) PUBLIC_BASE_URL="https://drafts.example.invalid/path" ;;
       public_base_query) PUBLIC_BASE_URL="https://drafts.example.invalid?mode=canary" ;;

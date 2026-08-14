@@ -22,8 +22,12 @@ const HOME_PATH_RE =
   /(?:^|[\s"'`=:(])((?:file:\/\/)?(?:~(?:\/[^/\\\s"'`),;]*)+|\/Users\/[^/\\\s"'`),;]+(?:\/[^/\\\s"'`),;]*)+|\/home\/[^/\\\s"'`),;]+(?:\/[^/\\\s"'`),;]*)+|[A-Za-z]:[\\/](?:Users|Documents and Settings)[\\/][^\\/\s"'`),;]+(?:[\\/][^\\/\s"'`),;]*)*))/gi;
 const TEMP_BUILD_PATH_RE =
   /(?:^|[\s"'`=:(])((?:file:\/\/)?(?:\/private\/(?:var\/)?folders\/[^/\\\s"'`),;]+|\/private\/tmp(?:\/[^/\\\s"'`),;]+)+|\/var\/folders\/[^/\\\s"'`),;]+(?:\/[^/\\\s"'`),;]*)*|\/var\/tmp(?:\/[^/\\\s"'`),;]+)+|\/tmp\/[^/\\\s"'`),;]+(?:\/[^/\\\s"'`),;]*)*|[A-Za-z]:[\\/](?:Windows[\\/]Temp|Temp|Users[\\/][^\\/\s"'`),;]+[\\/]AppData[\\/]Local[\\/]Temp)(?:[\\/][^\\/\s"'`),;]*)*|%(?:TEMP|TMP)%[\\/][^\\/\s"'`),;]+(?:[\\/][^\\/\s"'`),;]*)*))/gi;
+// The word family only counts as a private-artifact reference when it is
+// file-shaped: either it carries an artifact extension, or it sits inside a
+// path. A bare word in ordinary prose is not a leak and must not block a
+// release.
 const PRIVATE_ARTIFACT_TEXT_RE =
-  /(?:^|[\s"'`=:(])(?:\.?\/)?(?:[\w.-]+\/){0,8}(?:trans(?:)cript|trans(?:)ript|sess(?:)ions?|conver(?:)sation|roll(?:)out)(?:[-_. ][\w.-]+)?(?:\.(?:txt|jsonl|json|md|log|html?|zip|tgz|gz|tar(?:\.gz)?))?(?=$|[\s"'`),;])/gi;
+  /(?:^|[\s"'`=:(])(?:\.?\/)?(?:(?:[\w.-]+\/){1,8}(?:trans(?:)cript|trans(?:)ript|sess(?:)ions?|conver(?:)sation|roll(?:)out)(?:[-_.][\w.-]+)?(?:\.(?:txt|jsonl|json|md|log|html?|zip|tgz|gz|tar(?:\.gz)?))?|(?:trans(?:)cript|trans(?:)ript|sess(?:)ions?|conver(?:)sation|roll(?:)out)(?:[-_.][\w.-]+)?\.(?:txt|jsonl|json|md|log|html?|zip|tgz|gz|tar(?:\.gz)?))(?=$|[\s"'`),;])/gi;
 const PRIVATE_ARTIFACT_COMPONENT_RE =
   /^(?:[^/]*?(?:trans(?:)cript|trans(?:)ript)(?:[-_.][^/]*)?|(?:sess(?:)ion|sess(?:)ions|conver(?:)sation|roll(?:)out)(?:[-_.][^/]*)?)(?:\.(?:txt|jsonl|json|md|log|html?|zip|tgz|gz|tar(?:\.gz)?))?$/i;
 const PRIVATE_IDENTIFIER_FIELD_RE =
@@ -39,17 +43,23 @@ const PAX_DUPLICATE_KEY = Symbol("pax-duplicate-key");
 const REVIEWED_TAR_ENTRY_TYPES = new Set(["0", "1", "2", "5", "x", "g", "L", "K"]);
 const RESERVED_EXAMPLE_EMAIL_DOMAINS = new Set(["example.com", "example.net", "example.org"]);
 const TRACKED_TEMP_EXEMPTIONS = new Set([
+  "infra/azure/tests/canonicalize_guide_logs.sh\u0000/tmp/logs-base",
+  "infra/azure/tests/canonicalize_guide_logs.sh\u0000/tmp/logs-head",
   "scripts/packed-cli-e2e.mjs\u0000/tmp/consumer/node_modules/.bin/patchpage",
   "scripts/verify-release-workflow.mjs\u0000/tmp/attacker.cjs",
   "scripts/verify-release-workflow.mjs\u0000/tmp/attacker.tgz"
 ]);
 const TRACKED_HOME_EXEMPTIONS = new Set([
   ".agents/skills/patchpage-mint-token/SKILL.md\u0000~/.patchpage/credentials.json",
+  "CHANGELOG.md\u0000~/.patchpage",
   "docs/PLAN.md\u0000~/.patchpage",
+  "docs/SKILL_DISTRIBUTION.md\u0000~/.claude/skills/",
+  "packages/cli/README.md\u0000/home/you/.patchpage",
   "packages/cli/README.md\u0000~/.patchpage",
   "skills/patchpage/SKILL.md\u0000~/.patchpage"
 ]);
 const TAR_HOME_EXEMPTIONS = new Set([
+  "package/README.md\u0000/home/you/.patchpage",
   "package/README.md\u0000~/.patchpage",
   "package/skills/patchpage/SKILL.md\u0000~/.patchpage"
 ]);
@@ -799,14 +809,20 @@ async function scanPackJson(packJsonPath, allowlist, failures) {
     decodeRequiredUtf8(await readFile(packJsonPath), "npm pack JSON"),
     "npm pack JSON"
   );
-  if (!Array.isArray(packJson) || packJson.length !== 1 || !isMapping(packJson[0])) {
+  // npm 11 printed an array; npm 12 prints an object keyed by package name.
+  const packs = Array.isArray(packJson)
+    ? packJson
+    : isMapping(packJson)
+      ? Object.values(packJson)
+      : null;
+  if (packs === null || packs.length !== 1 || !isMapping(packs[0])) {
     add(failures, "pack-json-shape", "pack-json");
     return null;
   }
 
   scanJson(packJson, "pack-json", allowlist, failures, "pack-json");
 
-  const [pack] = packJson;
+  const [pack] = packs;
   if (!Array.isArray(pack.files)) {
     add(failures, "pack-json-files-shape", "pack-json/files");
     return pack;
