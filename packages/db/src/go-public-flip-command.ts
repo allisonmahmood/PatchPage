@@ -21,7 +21,7 @@ import { createPatchPageDb } from "./factory.js";
 import { isGoPublicFlipPreconditionError } from "./go-public-flip.js";
 import type { GoPublicFlipInspection, GoPublicFlipOutcome } from "./types.js";
 
-const USAGE = `usage: pnpm db:go-public-flip [--re-home <id>[,<id>...]] [--apply]
+const USAGE = `usage: pnpm db:go-public-flip [--re-home <id>[,<id>...]] [--no-re-home] [--apply]
 
 Inspects the database the server config points at and reports what the
 go-public flip would find. With --apply, performs the flip's data surgery once
@@ -30,10 +30,25 @@ and reports what it left.
   --re-home <ids>  Comma-separated api-token IDs to re-home onto fresh 1:1
                    principals. Repeatable. The teammate tokens, named from the
                    private token record — never guessed.
+  --no-re-home     Say out loud that this flip re-homes nobody. Required with
+                   --apply when no --re-home target is named.
   --apply          Perform the surgery. Without it nothing is written.
 
 Reads PATCHPAGE_DB_DRIVER, DATABASE_URL and PATCHPAGE_JSON_DB_FILE from the
 environment exactly as the server does.`;
+
+/**
+ * A refusal to read the arguments as anything, as opposed to a refusal by the
+ * flip itself. Its own type so the entry point can answer every one of them
+ * with the usage text: an operator who mistyped a flag mid-flip should see
+ * what the command takes, not a stack trace.
+ */
+export class GoPublicFlipUsageError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "GoPublicFlipUsageError";
+  }
+}
 
 interface ParsedArguments {
   reHomeApiTokenIds: string[];
@@ -43,6 +58,7 @@ interface ParsedArguments {
 export function parseArguments(argv: readonly string[]): ParsedArguments {
   const reHomeApiTokenIds: string[] = [];
   let apply = false;
+  let noReHome = false;
 
   for (let index = 0; index < argv.length; index += 1) {
     const argument = argv[index];
@@ -53,10 +69,16 @@ export function parseArguments(argv: readonly string[]): ParsedArguments {
       apply = true;
       continue;
     }
+    if (argument === "--no-re-home") {
+      noReHome = true;
+      continue;
+    }
     if (argument === "--re-home") {
       const value = argv[index + 1];
       if (value === undefined || value.startsWith("--")) {
-        throw new Error("--re-home needs a comma-separated list of api-token IDs.");
+        throw new GoPublicFlipUsageError(
+          "--re-home needs a comma-separated list of api-token IDs."
+        );
       }
       index += 1;
       for (const id of value.split(",")) {
@@ -65,14 +87,32 @@ export function parseArguments(argv: readonly string[]): ParsedArguments {
       }
       continue;
     }
-    throw new Error(`Unknown argument: ${argument}`);
+    throw new GoPublicFlipUsageError(`Unknown argument: ${argument}`);
   }
 
   const duplicates = reHomeApiTokenIds.filter(
     (id, index) => reHomeApiTokenIds.indexOf(id) !== index
   );
   if (duplicates.length > 0) {
-    throw new Error(`Repeated re-home target: ${duplicates.join(", ")}`);
+    throw new GoPublicFlipUsageError(`Repeated re-home target: ${duplicates.join(", ")}`);
+  }
+
+  if (noReHome && reHomeApiTokenIds.length > 0) {
+    throw new GoPublicFlipUsageError(
+      "--no-re-home and --re-home say opposite things. Drop one."
+    );
+  }
+
+  // The footgun this closes: `--apply` pasted without the token IDs is a
+  // perfectly legal flip that re-arms every clock, drops the sentinel, and
+  // silently re-homes nobody — and re-arming is the step that cannot be run
+  // again for free, so the retry costs another 90 days on every draft. A
+  // no-re-home flip is a real thing to want (a second instance, a rehearsal),
+  // so this asks the operator to say so rather than forbidding it.
+  if (apply && reHomeApiTokenIds.length === 0 && !noReHome) {
+    throw new GoPublicFlipUsageError(
+      "--apply with no --re-home target would flip without re-homing anyone. Name the teammate tokens with --re-home, or pass --no-re-home if that is really what you mean."
+    );
   }
 
   return { reHomeApiTokenIds, apply };
@@ -147,7 +187,12 @@ export async function runGoPublicFlipCommand(
   try {
     if (!parsed.apply) {
       log("PatchPage go-public flip — INSPECTION ONLY, nothing written.");
-      log(`Would re-home: ${parsed.reHomeApiTokenIds.join(", ") || "no tokens named"}`);
+      log(
+        `Would re-home: ${
+          parsed.reHomeApiTokenIds.join(", ") ||
+          "no tokens named (--apply would need --no-re-home)"
+        }`
+      );
       log("");
       for (const line of renderInspection(await db.inspectGoPublicFlip())) log(line);
       log("");
@@ -183,7 +228,7 @@ if (invokedDirectly) {
       console.error(`Flip refused. ${error.message}`);
       console.error("Nothing was written. Resolve the condition above and rerun.");
       process.exitCode = 1;
-    } else if (error instanceof Error && error.message.startsWith("Unknown argument")) {
+    } else if (error instanceof GoPublicFlipUsageError) {
       console.error(error.message);
       console.error(USAGE);
       process.exitCode = 1;

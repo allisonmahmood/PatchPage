@@ -209,7 +209,14 @@ export interface GoPublicFlipInspection {
    * service was re-armed together, so this must be a full window out.
    */
   earliestInServiceExpiry: string | null;
-  /** Every token that created a draft still live, largest tally first. */
+  /**
+   * Every token holding a live draft, largest tally first — plus every
+   * admin-scoped token whether or not it holds one. The runbook has the
+   * operator read the admin line as the quota-uniformity check, so that line
+   * has to be there even at zero; a check that silently disappears when the
+   * count is zero is not a check. Ordinary tokens at zero stay out, so the
+   * list does not grow with every self-service mint.
+   */
   liveDraftTallies: LiveDraftTally[];
 }
 
@@ -468,11 +475,6 @@ export interface PatchPageDb {
     options?: DraftModerationOptions
   ): Promise<boolean>;
   /**
-   * Files a reader's report against a draft. Storing one is the whole effect:
-   * this writes a row and changes nothing about the draft, its retention clock,
-   * or its owning token.
-   */
-  /**
    * Reads the database as the go-public flip finds it, writing nothing. Run
    * before the flip as its dry run and after it as its verification — the same
    * read answers both questions, which is what keeps the two from drifting.
@@ -494,6 +496,11 @@ export interface PatchPageDb {
    * `go-public-flip.ts` for what each refusal means.
    */
   applyGoPublicFlip(input: GoPublicFlipInput): Promise<GoPublicFlipOutcome>;
+  /**
+   * Files a reader's report against a draft. Storing one is the whole effect:
+   * this writes a row and changes nothing about the draft, its retention clock,
+   * or its owning token.
+   */
   recordDraftReport(input: RecordDraftReportInput): Promise<DraftReportRecord>;
   /**
    * Every report filed against one draft, oldest first. This is the operator's

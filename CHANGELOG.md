@@ -6,6 +6,19 @@ All notable changes to PatchPage are documented in this file. The format is base
 
 ## [Unreleased]
 
+### Added
+
+- Added the go-public flip: the one-shot data surgery that turns the maintainer's private
+  instance into the free public service, plus the operator runbook that choreographs it
+  (`docs/GO_PUBLIC_FLIP.md`). The surgery re-homes named teammate tokens onto fresh 1:1
+  principals — they keep their tokens and, deliberately, lose edit rights over their
+  pre-flip drafts — re-arms every draft in service to a full 90-day window from the flip
+  moment, and assert-and-drops the retired `acct_anonymous`/`tok_anonymous` sentinel rows.
+  It is deliberately **not** a schema migration: nothing here runs on a self-hosted
+  database, `pnpm db:migrate` does not reach it, and the server never calls it. The
+  operator entry point is `pnpm --filter @patchpage/db db:go-public-flip`, which inspects
+  and writes nothing by default and performs the surgery only with `--apply`.
+
 ### Removed
 
 - Tokenless ("anonymous") upload is removed everywhere. No instance accepts an upload
@@ -62,16 +75,6 @@ All notable changes to PatchPage are documented in this file. The format is base
 
 ### Added
 
-- Added the go-public flip: the one-shot data surgery that turns the maintainer's private
-  instance into the free public service, plus the operator runbook that choreographs it
-  (`docs/GO_PUBLIC_FLIP.md`). The surgery re-homes named teammate tokens onto fresh 1:1
-  principals — they keep their tokens and, deliberately, lose edit rights over their
-  pre-flip drafts — re-arms every draft in service to a full 90-day window from the flip
-  moment, and assert-and-drops the retired `acct_anonymous`/`tok_anonymous` sentinel rows.
-  It is deliberately **not** a schema migration: nothing here runs on a self-hosted
-  database, `pnpm db:migrate` does not reach it, and the server never calls it. The
-  operator entry point is `pnpm --filter @patchpage/db db:go-public-flip`, which inspects
-  and writes nothing by default and performs the surgery only with `--apply`.
 - Bundled the `patchpage-mint-token` operator skill for minting API tokens and safely
   bootstrapping CLI credentials.
 - Added bounded trusted-proxy configuration for canonical client IP attribution, with safe

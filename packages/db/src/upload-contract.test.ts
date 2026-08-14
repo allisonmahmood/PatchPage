@@ -1657,11 +1657,18 @@ function describeUploadContract(
       try {
         const flip = await flipFixture(harness, () => now);
 
-        // A draft taken out of service before the flip, to prove the flip does
-        // not re-arm storage nobody can reach.
-        const retiredDraftId = flip.teammateDraftIds[2];
-        expect(await flip.db.deleteDraft(retiredDraftId, BOOTSTRAP_PRINCIPAL_ID)).toBe(true);
-        const anchorBefore = (await flip.db.findDraftForModeration(retiredDraftId))?.expiresAt;
+        // Two drafts taken out of service before the flip, one each way. The
+        // disabled one is the sharper case: it is a page an operator took down,
+        // and its clock running out is how the takedown finishes — re-arming it
+        // would hand abuse another 90 days of paid storage.
+        const outOfServiceIds = [flip.teammateDraftIds[2], flip.teammateDraftIds[1]];
+        expect(await flip.db.deleteDraft(outOfServiceIds[0], BOOTSTRAP_PRINCIPAL_ID)).toBe(
+          true
+        );
+        expect(
+          await flip.db.disableDraft(outOfServiceIds[1], BOOTSTRAP_PRINCIPAL_ID, "abuse")
+        ).toBe(true);
+        const anchorsBefore = await readAnchors(flip.db, outOfServiceIds);
 
         const flipInstant = RETENTION_EPOCH + 40 * DAY_MS;
         now = flipInstant;
@@ -1675,12 +1682,12 @@ function describeUploadContract(
         // strongest statement the flip can make about the clock.
         expect(outcome.after.earliestInServiceExpiry).toBe(fullWindow);
         // The legacy draft, the three teammate drafts and the operator's, minus
-        // the one taken out of service.
-        expect(outcome.reArmedDraftCount).toBe(flip.draftsInServiceCount - 1);
-        expect(outcome.leftOnTheirClockCount).toBe(1);
+        // the two taken out of service.
+        expect(outcome.reArmedDraftCount).toBe(flip.draftsInServiceCount - 2);
+        expect(outcome.leftOnTheirClockCount).toBe(2);
 
-        const anchorAfter = (await flip.db.findDraftForModeration(retiredDraftId))?.expiresAt;
-        expect(anchorAfter).toBe(anchorBefore);
+        // Neither the deleted nor the disabled draft moved.
+        expect(await readAnchors(flip.db, outOfServiceIds)).toEqual(anchorsBefore);
 
         // Nothing pre-existing is pinned: the welcome draft is the first pin,
         // and the flip is not what sets it.
@@ -1828,6 +1835,23 @@ function describeUploadContract(
             outcome.after.liveDraftTallies.find((tally) => tally.apiTokenId === teammate.id)
           ).toMatchObject({ admin: false, liveDraftCount: 1 });
         }
+
+        // An admin token holding nothing still earns a line. The runbook has the
+        // operator read the admin lines as the uniformity check, so a check that
+        // vanishes when the count happens to be zero proves nothing.
+        expect(
+          outcome.after.liveDraftTallies.find(
+            (tally) => tally.apiTokenId === flip.secondAdminToken.id
+          )
+        ).toMatchObject({ admin: true, liveDraftCount: 0 });
+
+        // Ordinary tokens at zero stay out, so the list does not grow with every
+        // self-service mint the public instance hands out.
+        expect(
+          outcome.after.liveDraftTallies.some(
+            (tally) => tally.apiTokenId === flip.operatorUploadTokens[0].id
+          )
+        ).toBe(false);
       } finally {
         await harness.close();
       }
@@ -1946,6 +1970,18 @@ function describeUploadContract(
       }
     });
   });
+
+  /** The retention anchors of drafts the port only answers for through moderation. */
+  async function readAnchors(
+    db: PatchPageDb,
+    draftIds: readonly string[]
+  ): Promise<(string | undefined)[]> {
+    const anchors: (string | undefined)[] = [];
+    for (const draftId of draftIds) {
+      anchors.push((await db.findDraftForModeration(draftId))?.expiresAt);
+    }
+    return anchors;
+  }
 
   /**
    * The instance as it stands the moment before the flip: the operator's

@@ -66,6 +66,14 @@ evidence.
 - [ ] **The kill switch is armed and drilled.** See step 3.
 - [ ] **Replicas are min 1 / max 1.** The in-memory rate limiter is correct only
       on a single replica. This is a standing invariant, not a setting.
+- [ ] **The skill onboarding is merged to the default branch (#122, #123).**
+      This is #106's rollout step 1 and it gates step 2, which is what this
+      runbook choreographs. The order is load-bearing rather than tidy: the
+      skills CLI installs straight from the default branch, live and
+      unversioned, so a user who follows the setup prompt the moment the
+      instance opens gets whatever is on `main` at that second. Opening the
+      instance first means the first arrivals onboard against a skill that
+      does not exist yet.
 
 ### Two known gaps that are not this repository's server code
 
@@ -80,21 +88,21 @@ by the change that added this runbook. Decide on each before flipping.
       agreed, that it should not stay that way through the flip.
 
       What already bounds it: the draft must be servable, so an unknown,
-          deleted, disabled, or expired ID is a 404 that writes nothing; the form
-          body is capped at 8 KiB; the stored reason is capped at 255 characters by
-          both drivers. What is **not** bounded is volume from one address against a
-          real draft. There is no correctness risk — reports have no automatic
-          consequence, so this can never take a page down — but on a free service
-          behind a $200 circuit breaker it is unbounded row growth and write load
-          for the cost of a loop.
+      deleted, disabled, or expired ID is a 404 that writes nothing; the form
+      body is capped at 8 KiB; the stored reason is capped at 255 characters by
+      both drivers. What is **not** bounded is volume from one address against a
+      real draft. There is no correctness risk — reports have no automatic
+      consequence, so this can never take a page down — but on a free service
+      behind a $200 circuit breaker it is unbounded row growth and write load
+      for the cost of a loop.
 
-          The fix is small and fits the existing rule that only per-minute limits
-          live in memory: a fourth `FixedWindowRateLimiter` in
-          `apps/server/src/rate-limit.ts` keyed by source address, with its own
-          config knob to match house style. **Treat it as launch-blocking**, and
-          land it in the same change that turns `PATCHPAGE_ALLOW_SELF_SERVICE_TOKENS`
-          on — that is when the instance becomes worth abusing. It is out of scope
-          for the ticket that wrote this runbook (#124), so it needs its own.
+      The fix is small and fits the existing rule that only per-minute limits
+      live in memory: a fourth `FixedWindowRateLimiter` in
+      `apps/server/src/rate-limit.ts` keyed by source address, with its own
+      config knob to match house style. **Treat it as launch-blocking**, and
+      land it in the same change that turns `PATCHPAGE_ALLOW_SELF_SERVICE_TOKENS`
+      on — that is when the instance becomes worth abusing. It is out of scope
+      for the ticket that wrote this runbook (#124), so it needs its own.
 
 - [ ] **The CLI's default-host hint still says the instance issues no public
       tokens.** `defaultHostHint` in `packages/cli/src/index.ts` prints
@@ -103,15 +111,22 @@ by the change that added this runbook. Decide on each before flipping.
       was already made posture-neutral, but this string was not, and it is
       wrong the moment the flip lands.
 
-      It matters less than it reads: after the flip a 401/403 on the default
-          host means a bad token, not a closed instance, and the auto-mint path
-          does not go through it. But it is a published string in a published npm
-          package, so correcting it needs a CLI release, not a server change.
-          Confirm whether the CLI release (#121) carried the corrected copy; if it
-          did not, the correction rides the next release and the window is
-          cosmetic. The same stale framing lives in `README.md`,
-          `packages/cli/README.md`, `docs/SELF_HOSTING.md` and the skill — those
-          are #126's, which runs after the flip by design.
+      #106 puts this flip in **step 2's change**, so leaving the string live
+      across the environment flip publishes a claim about the service that is
+      no longer true — a user who hits a 401 is told the instance issues no
+      public tokens at the moment it does. Correcting it needs a CLI release,
+      not a server change, which is exactly why it cannot be fixed during the
+      flip and has to be settled before it.
+
+      **Treat this as a hard gate, not a cosmetic follow-up:** either confirm
+      the CLI release (#121) shipped the corrected copy, or ship that
+      correction first. The blast radius is genuinely small — auto-mint does
+      not go through this path, and after the flip a 401/403 on the default
+      host means a bad token — but "small and published" is still published.
+
+      The same stale framing lives in `README.md`, `packages/cli/README.md`,
+      `docs/SELF_HOSTING.md` and the skill. Those are #126's, which runs after
+      the flip by design.
 
 ### Records to have open
 
@@ -209,6 +224,12 @@ that is not idempotent: a second `--apply` moves every retention anchor forward
 again. That is survivable — it grants another 90 days, it does not delete
 anything — but it is not what you meant, so do not rerun it casually.
 
+For the same reason `--apply` **refuses when no `--re-home` target is named**.
+A command pasted without the token IDs is otherwise a perfectly legal flip that
+re-arms every clock, drops the sentinel, and silently re-homes nobody — and the
+correcting rerun is the expensive one. If a flip really should re-home nobody,
+say `--no-re-home` and it proceeds.
+
 What it does, in one transaction:
 
 1. **Re-homes** each named token onto a fresh principal of its own, exactly the
@@ -216,6 +237,16 @@ What it does, in one transaction:
    secret, same name, same scopes — and its holder keeps publishing with it.
    The new principal carries the self-service provenance mark and a mint record
    names it, so anything keyed on that provenance reaches a re-homed token too.
+
+   **Know the one cost of that mint record.** It carries no source address,
+   because no caller asked for the token — and the per-address mint quota
+   counts unattributable mints in a single bucket. Three re-homes therefore
+   occupy **3 of the 5** slots in that bucket for a rolling 24 hours after the
+   flip. In practice it should bind on nothing: with `trust_proxy = null` the
+   socket peer is always present, so real mints are attributed and never land
+   in that bucket. If proxy attribution is wrong, the next two unattributable
+   mints succeed and the third is refused for a day — fail-closed, and a
+   symptom worth chasing rather than a hole.
 2. **Leaves the operator's tokens alone.** The bootstrap admin token is refused
    as a re-home target outright, and any admin-scoped token is too. The
    operator's two upload tokens stay on the bootstrap principal because you did
@@ -224,8 +255,11 @@ What it does, in one transaction:
    moment. Deleted and disabled drafts keep the clock they had, so the sweep
    still reclaims their storage on schedule — re-arming those would hold
    content nobody can reach for another 90 days at exactly the moment cost
-   starts mattering. Only the retention anchor moves; `updated_at` still means
-   "when the content last changed".
+   starts mattering. A *disabled* draft is the sharper case: it is a page an
+   operator took down, and its clock running out is how the takedown finishes.
+   Re-arming it would hand abuse another 90 days of paid storage. Only the
+   retention anchor moves; `updated_at` still means "when the content last
+   changed".
 4. **Asserts and drops** the retired anonymous sentinel. With zero
    sentinel-owned drafts and no version or upload event still naming the
    sentinel token, both rows go. Otherwise the drop is **deferred** and the
@@ -243,6 +277,15 @@ What it does, in one transaction:
 A refusal writes nothing at all. Every precondition is checked inside the same
 transaction, before the first write, so a refused flip leaves the database
 exactly as it found it. Resolve the condition the message names and rerun.
+
+**Once step 7 has pinned the welcome draft, this command will not run again.**
+The flip refuses on `draft_already_pinned`, because "nothing pre-existing is
+pinned" is one of its preconditions and the welcome pin makes that false. This
+is deliberate — it is what stops a late rerun from re-arming every clock a
+second time — but know that it means **the flip is not rerunnable after step 7
+without unpinning the welcome draft first**. If you have to rerun after the
+pin, unpin, rerun, and pin again, and understand that the rerun re-arms
+everything from the new moment.
 
 Read the post-surgery inspection before moving on. **Earliest anchor** should
 be 90 days out from the moment you ran, and **Pinned drafts** should still be

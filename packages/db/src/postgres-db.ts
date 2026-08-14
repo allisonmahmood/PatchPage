@@ -1150,14 +1150,19 @@ async function inspectWith(query: FlipQuery): Promise<GoPublicFlipInspection> {
              api_tokens.scopes @> '"admin"'::jsonb AS admin,
              count(drafts.id) AS live_draft_count
       FROM api_tokens
-      JOIN draft_versions
+      LEFT JOIN draft_versions
         ON draft_versions.created_by_api_token_id = api_tokens.id
         AND draft_versions.version_number = $1
-      JOIN drafts
+      LEFT JOIN drafts
         ON drafts.id = draft_versions.draft_id
         AND drafts.deleted_at IS NULL
         AND drafts.disabled_at IS NULL
       GROUP BY api_tokens.id, api_tokens.name, api_tokens.account_id, api_tokens.scopes
+      -- An admin token at zero still earns a line: it is the one the runbook
+      -- tells the operator to look for, and a uniformity check that vanishes
+      -- when the count happens to be zero proves nothing. Ordinary tokens at
+      -- zero stay out, so this does not grow with every self-service mint.
+      HAVING count(drafts.id) > 0 OR api_tokens.scopes @> '"admin"'::jsonb
       ORDER BY count(drafts.id) DESC, api_tokens.id
     `,
     [FIRST_VERSION_NUMBER]

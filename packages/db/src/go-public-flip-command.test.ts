@@ -13,7 +13,7 @@
 
 import { readFile } from "node:fs/promises";
 import { describe, expect, it } from "vitest";
-import { parseArguments } from "./go-public-flip-command.js";
+import { GoPublicFlipUsageError, parseArguments } from "./go-public-flip-command.js";
 import {
   GoPublicFlipPreconditionError,
   isGoPublicFlipPreconditionError
@@ -30,7 +30,11 @@ async function readRunbook(): Promise<string> {
 describe("go-public flip command arguments", () => {
   it("inspects by default and writes only when --apply is typed", () => {
     expect(parseArguments([])).toEqual({ reHomeApiTokenIds: [], apply: false });
-    expect(parseArguments(["--apply"])).toEqual({ reHomeApiTokenIds: [], apply: true });
+    // A no-re-home flip has to say so; see the refusal test below.
+    expect(parseArguments(["--apply", "--no-re-home"])).toEqual({
+      reHomeApiTokenIds: [],
+      apply: true
+    });
   });
 
   it("takes re-home targets as a comma list, repeatably, and trims them", () => {
@@ -48,11 +52,46 @@ describe("go-public flip command arguments", () => {
     // A repeated target would re-home one token twice in one run. The port
     // would treat the second as already-re-homed and report it, which reads
     // like a successful no-op rather than the typo it is.
-    expect(() => parseArguments(["--re-home", "tok_a,tok_a"])).toThrow(/Repeated re-home target/);
+    expect(() => parseArguments(["--re-home", "tok_a,tok_a"])).toThrow(
+      /Repeated re-home target/
+    );
     // `--re-home --apply` would otherwise swallow the flag as a token ID.
     expect(() => parseArguments(["--re-home", "--apply"])).toThrow(/needs a comma/);
     expect(() => parseArguments(["--re-home"])).toThrow(/needs a comma/);
     expect(() => parseArguments(["--dry-run"])).toThrow(/Unknown argument: --dry-run/);
+    expect(() => parseArguments(["--no-re-home", "--re-home", "tok_a"])).toThrow(
+      /opposite things/
+    );
+  });
+
+  it("makes every refusal a usage error, so none of them dumps a stack", () => {
+    // The entry point answers this one type with the usage text. A parse
+    // failure that arrived as a bare Error would reach an operator mid-flip as
+    // a stack trace instead.
+    for (const argv of [
+      ["--dry-run"],
+      ["--re-home"],
+      ["--re-home", "--apply"],
+      ["--re-home", "tok_a,tok_a"],
+      ["--no-re-home", "--re-home", "tok_a"],
+      ["--apply"]
+    ]) {
+      expect(() => parseArguments(argv)).toThrow(GoPublicFlipUsageError);
+    }
+  });
+
+  it("will not flip without re-homing anyone unless that is said out loud", () => {
+    // `--apply` pasted without the token IDs is otherwise a legal flip that
+    // re-arms every clock and re-homes nobody — and the retry costs another 90
+    // days on every draft, because re-arming is the one step that is not free
+    // to run twice.
+    expect(() => parseArguments(["--apply"])).toThrow(/would flip without re-homing/);
+    expect(parseArguments(["--apply", "--no-re-home"])).toEqual({
+      reHomeApiTokenIds: [],
+      apply: true
+    });
+    // Inspection never writes, so it needs no such ceremony.
+    expect(parseArguments([])).toEqual({ reHomeApiTokenIds: [], apply: false });
   });
 });
 
@@ -97,13 +136,29 @@ describe("the runbook and the command it documents", () => {
     const runbook = await readRunbook();
     const flags = new Set(runbook.match(/--[a-z][a-z-]*/g) ?? []);
     // `--filter` and `--new` belong to pnpm and the publishing CLI; everything
-    // else the runbook types at this command has to parse.
+    // else the runbook types at this command has to parse. Value-taking flags
+    // are given a value rather than being swapped for another flag — a pin
+    // that rewrites the thing it is pinning never fails.
+    const foreign = new Set(["--filter", "--new", "--json"]);
+    // The smallest argv in which each flag is legal on its own terms:
+    // `--re-home` needs its value, and `--apply` needs a re-home decision.
+    const minimalArgv: Record<string, string[]> = {
+      "--re-home": ["--re-home", "tok_probe"],
+      "--apply": ["--apply", "--no-re-home"]
+    };
+
+    let checked = 0;
     for (const flag of flags) {
-      if (flag === "--filter" || flag === "--new" || flag === "--json") continue;
-      expect(() => parseArguments([flag === "--re-home" ? "--apply" : flag])).not.toThrow(
-        /Unknown argument/
-      );
+      if (foreign.has(flag)) continue;
+      expect(() => parseArguments(minimalArgv[flag] ?? [flag])).not.toThrow();
+      checked += 1;
     }
+    // The runbook really does type this command's flags at it; a rewrite that
+    // dropped them all would otherwise pass this test vacuously.
+    expect(checked).toBeGreaterThanOrEqual(3);
+    expect(flags.has("--re-home")).toBe(true);
+    expect(flags.has("--no-re-home")).toBe(true);
+    expect(flags.has("--apply")).toBe(true);
   });
 
   it("still states the decisions a reader must not have to rediscover", async () => {
@@ -130,7 +185,20 @@ describe("the runbook and the command it documents", () => {
 
     // The rollback lever, and what it is not.
     expect(runbook).toContain("The environment variable is the rollback lever.");
-    expect(runbook).toContain("The kill switch is the emergency lever**, not the rollback lever");
+    // The sentence, not its emphasis: a reword of the bolding should not fail
+    // a test whose subject is what the runbook says.
+    expect(runbook.replace(/\*\*/g, "")).toContain(
+      "The kill switch is the emergency lever, not the rollback lever"
+    );
+
+    // The rerun behaviour an operator meets after step 7, and the mint-quota
+    // cost of the flip's own mint records.
+    expect(runbook).toContain("draft_already_pinned");
+    expect(runbook).toContain("3 of the 5");
+
+    // #106's rollout order is load-bearing: the skill installs live from the
+    // default branch, so it has to be there before the instance opens.
+    expect(runbook).toContain("skill onboarding");
   });
 
   it("keeps its runnable steps out of shell fences, as the Azure guide does", async () => {

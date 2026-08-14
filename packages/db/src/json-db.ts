@@ -1393,12 +1393,16 @@ function inspectState(state: JsonDbState): GoPublicFlipInspection {
   const liveDraftTallies: LiveDraftTally[] = [];
   for (const token of state.apiTokens) {
     const liveDraftCount = liveByToken.get(token.id) ?? 0;
-    if (liveDraftCount === 0) continue;
+    const admin = token.scopes.includes("admin");
+    // An admin token at zero still earns a line: it is the one the runbook
+    // tells the operator to look for, and a uniformity check that vanishes
+    // when the count happens to be zero proves nothing.
+    if (liveDraftCount === 0 && !admin) continue;
     liveDraftTallies.push({
       apiTokenId: token.id,
       apiTokenName: token.name,
       principalId: token.accountId,
-      admin: token.scopes.includes("admin"),
+      admin,
       liveDraftCount
     });
   }
