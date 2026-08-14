@@ -214,7 +214,14 @@ jobs:
           node - "$RUNNER_TEMP/patchpage-pack.json" <<'NODE'
           const fs = require("node:fs");
 
-          const pack = JSON.parse(fs.readFileSync(process.argv[2], "utf8"))[0];
+          // npm 11 printed an array; npm 12 prints an object keyed by package name.
+          const parsed = JSON.parse(fs.readFileSync(process.argv[2], "utf8"));
+          const packs = Array.isArray(parsed) ? parsed : Object.values(parsed ?? {});
+          if (packs.length !== 1) {
+            console.error(`Expected npm pack JSON to describe exactly one package, got ${packs.length}`);
+            process.exit(1);
+          }
+          const [pack] = packs;
           const required = ["dist/index.js", "skills/patchpage/SKILL.md", "LICENSE", "README.md"];
           const files = new Set(pack.files.map((file) => file.path));
           const missing = required.filter((file) => !files.has(file));
@@ -230,8 +237,14 @@ jobs:
           const fs = require("node:fs");
           const path = require("node:path");
 
-          const pack = JSON.parse(fs.readFileSync(process.argv[2], "utf8"))[0];
-          process.stdout.write(path.resolve(process.argv[3], pack.filename));
+          // npm 11 printed an array; npm 12 prints an object keyed by package name.
+          const parsed = JSON.parse(fs.readFileSync(process.argv[2], "utf8"));
+          const packs = Array.isArray(parsed) ? parsed : Object.values(parsed ?? {});
+          if (packs.length !== 1) {
+            console.error(`Expected npm pack JSON to describe exactly one package, got ${packs.length}`);
+            process.exit(1);
+          }
+          process.stdout.write(path.resolve(process.argv[3], packs[0].filename));
           NODE
           )"
 
