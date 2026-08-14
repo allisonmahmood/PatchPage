@@ -86,7 +86,7 @@ variables {
   server_image = "registry.invalid/patchpage-server@sha256:0000000000000000000000000000000000000000000000000000000000000000"
 }
 
-run "keeps_anonymous_uploads_disabled_by_default" {
+run "keeps_self_service_tokens_disabled_by_default" {
   command = plan
 
   variables {
@@ -97,26 +97,49 @@ run "keeps_anonymous_uploads_disabled_by_default" {
   assert {
     condition = anytrue([
       for setting in azurerm_container_app.server.template[0].container[0].env :
-      setting.name == "PATCHPAGE_ALLOW_ANONYMOUS_UPLOADS" ? try(setting.value == "false", false) : false
+      setting.name == "PATCHPAGE_ALLOW_SELF_SERVICE_TOKENS" ? try(setting.value == "false", false) : false
     ])
-    error_message = "Anonymous uploads must remain disabled by default in the Container App environment."
+    error_message = "Self-service token minting must remain disabled by default in the Container App environment."
   }
 }
 
-run "wires_anonymous_upload_operator_opt_in" {
+run "wires_self_service_token_operator_opt_in" {
   command = plan
 
   variables {
-    subscription_id         = "00000000-0000-0000-0000-000000000000"
-    public_base_url         = "https://drafts.self-hoster.dev"
-    allow_anonymous_uploads = true
+    subscription_id           = "00000000-0000-0000-0000-000000000000"
+    public_base_url           = "https://drafts.self-hoster.dev"
+    allow_self_service_tokens = true
   }
 
   assert {
     condition = anytrue([
       for setting in azurerm_container_app.server.template[0].container[0].env :
-      setting.name == "PATCHPAGE_ALLOW_ANONYMOUS_UPLOADS" ? try(setting.value == "true", false) : false
+      setting.name == "PATCHPAGE_ALLOW_SELF_SERVICE_TOKENS" ? try(setting.value == "true", false) : false
     ])
-    error_message = "The anonymous-upload operator setting must reach the Container App environment."
+    error_message = "The self-service token operator setting must reach the Container App environment."
+  }
+}
+
+run "never_wires_a_retired_anonymous_upload_variable" {
+  command = plan
+
+  variables {
+    subscription_id           = "00000000-0000-0000-0000-000000000000"
+    public_base_url           = "https://drafts.self-hoster.dev"
+    allow_self_service_tokens = true
+  }
+
+  # A deploy of this commit must boot: the server refuses to start when either
+  # retired variable is present in its environment.
+  assert {
+    condition = alltrue([
+      for setting in azurerm_container_app.server.template[0].container[0].env :
+      !contains([
+        "PATCHPAGE_ALLOW_ANONYMOUS_UPLOADS",
+        "PATCHPAGE_ANONYMOUS_CREATE_RATE_LIMIT_PER_MINUTE"
+      ], setting.name)
+    ])
+    error_message = "Retired anonymous-upload variables must never reach the Container App environment."
   }
 }

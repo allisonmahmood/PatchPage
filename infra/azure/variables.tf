@@ -373,8 +373,8 @@ variable "max_html_bytes" {
   default     = 524288
 }
 
-variable "allow_anonymous_uploads" {
-  description = "Allow callers without an Authorization header to create new unlisted drafts."
+variable "allow_self_service_tokens" {
+  description = "Allow callers to mint their own publishing token. Every upload still requires a bearer token."
   type        = bool
   default     = false
   nullable    = false
@@ -412,19 +412,19 @@ variable "authenticated_upload_rate_limit_per_minute" {
   }
 }
 
-variable "anonymous_create_rate_limit_per_minute" {
-  description = "Anonymous-create attempts allowed per canonical client IP per minute."
+variable "self_service_mint_rate_limit_per_minute" {
+  description = "Self-service token mint attempts allowed per canonical client IP per minute."
   type        = number
   default     = 5
   nullable    = false
 
   validation {
     condition = (
-      var.anonymous_create_rate_limit_per_minute >= 1 &&
-      var.anonymous_create_rate_limit_per_minute <= 10000 &&
-      floor(var.anonymous_create_rate_limit_per_minute) == var.anonymous_create_rate_limit_per_minute
+      var.self_service_mint_rate_limit_per_minute >= 1 &&
+      var.self_service_mint_rate_limit_per_minute <= 10000 &&
+      floor(var.self_service_mint_rate_limit_per_minute) == var.self_service_mint_rate_limit_per_minute
     )
-    error_message = "anonymous_create_rate_limit_per_minute must be an integer from 1 through 10000."
+    error_message = "self_service_mint_rate_limit_per_minute must be an integer from 1 through 10000."
   }
 }
 

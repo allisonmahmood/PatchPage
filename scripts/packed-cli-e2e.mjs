@@ -2186,7 +2186,7 @@ async function startServerAttempt({ publicBaseUrl, metadataPath, objectDir, serv
       PORT: new URL(publicBaseUrl).port,
       PATCHPAGE_PUBLIC_BASE_URL: publicBaseUrl,
       PATCHPAGE_BOOTSTRAP_API_TOKEN: bootstrapToken,
-      PATCHPAGE_ALLOW_ANONYMOUS_UPLOADS: "true",
+      PATCHPAGE_ALLOW_SELF_SERVICE_TOKENS: "true",
       PATCHPAGE_MAX_HTML_BYTES: String(512 * 1024),
       PATCHPAGE_DB_DRIVER: "json",
       PATCHPAGE_DB_FILE: metadataPath,
@@ -2194,7 +2194,7 @@ async function startServerAttempt({ publicBaseUrl, metadataPath, objectDir, serv
       PATCHPAGE_STORAGE_DIR: objectDir,
       PATCHPAGE_PROTECTED_API_RATE_LIMIT_PER_MINUTE: "10000",
       PATCHPAGE_AUTHENTICATED_UPLOAD_RATE_LIMIT_PER_MINUTE: "10000",
-      PATCHPAGE_ANONYMOUS_CREATE_RATE_LIMIT_PER_MINUTE: "10000"
+      PATCHPAGE_SELF_SERVICE_MINT_RATE_LIMIT_PER_MINUTE: "10000"
     },
     [
       "DATABASE_URL",

@@ -604,7 +604,7 @@
 )</code></pre>
       <div class="note note-warn">
         <span class="note-title">About the hosted default</span>
-        <p>The CLI defaults to <code>https://post.patchyhq.com</code>. This is the maintainer's private instance: it has no public token signup and must not be assumed to accept anonymous uploads.</p>
+        <p>The CLI defaults to <code>https://post.patchyhq.com</code>. This is the maintainer's private instance: it has no public token signup and issues no tokens to outside callers.</p>
       </div>
     </section>
 
@@ -612,15 +612,8 @@
       <h2>Access is explicit</h2>
       <div class="task-grid">
         <article class="task">
-          <h3><span class="num">1</span> Token-authenticated publishing <span class="pill pill-done">Default</span></h3>
-          <p>Self-hosted servers require an API token by default. Authenticated uploads can create drafts and update drafts the publisher owns; uploading the same known file updates its cached draft unless <code>--new</code> is passed.</p>
-        </article>
-
-        <article class="task">
-          <h3><span class="num">2</span> Optional anonymous creation <span class="pill pill-warn">Opt-in</span></h3>
-          <p>A self-hoster may explicitly enable create-only anonymous uploads. With no environment or stored credentials, the CLI automatically attempts an anonymous create. If credentials exist, their failures are returned rather than retried anonymously; <code>--anonymous</code> explicitly bypasses them and always starts a new draft.</p>
-          <pre><code>PATCHPAGE_URL='https://patchpage.example.com'
-npx --yes patchpage upload './plan.html' --anonymous --api-url "$PATCHPAGE_URL"</code></pre>
+          <h3><span class="num">1</span> Token-authenticated publishing <span class="pill pill-done">Required</span></h3>
+          <p>Every upload requires a bearer API token, on every configuration. A self-hosted server rejects a request that carries no token with 401, and a present but invalid token stays 401. Authenticated uploads create drafts and update drafts the publisher owns; uploading the same known file updates its cached draft unless <code>--new</code> is passed.</p>
         </article>
       </div>
 
@@ -640,9 +633,9 @@ npx --yes patchpage upload './plan.html' --anonymous --api-url "$PATCHPAGE_URL"<
               <td>Create new drafts or update drafts owned by the publisher.</td>
             </tr>
             <tr>
-              <td>Anonymous upload</td>
-              <td>Self-hoster opt-in</td>
-              <td>Create only; no ownership-based updates or cached draft reuse.</td>
+              <td>Upload without a token</td>
+              <td>Rejected with 401</td>
+              <td>Retired posture; no server setting restores it.</td>
             </tr>
             <tr>
               <td>Draft URL</td>
@@ -662,7 +655,7 @@ npx --yes patchpage upload './plan.html' --anonymous --api-url "$PATCHPAGE_URL"<
     <section id="artifact">
       <h2>The artifact contract</h2>
       <article class="task">
-        <h3><span class="num">3</span> Safe, portable HTML <span class="pill pill-done">Ready</span></h3>
+        <h3><span class="num">2</span> Safe, portable HTML <span class="pill pill-done">Ready</span></h3>
         <p>Each upload is one complete HTML document with inline CSS and no JavaScript, forms, iframes, external fonts, or external design assets.</p>
         <ul class="check">
           <li class="is-done">Semantic headings and readable body copy</li>

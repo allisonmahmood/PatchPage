@@ -61,25 +61,18 @@ workflow:
 Behavior:
 
 - The hosted default is `https://post.patchyhq.com`, the maintainer's private instance,
-  which does not offer public token signup. Do not assume it accepts anonymous uploads.
-- Self-hosted servers require a PatchPage API token by default. An operator may explicitly
-  enable create-only anonymous uploads with `PATCHPAGE_ALLOW_ANONYMOUS_UPLOADS=true`;
-  point the CLI at that server with `--api-url` or `PATCHPAGE_API_URL`. Self-hosting guide:
+  which does not offer public token signup. It issues no tokens to outside callers.
+- Every upload requires a PatchPage API token, on every configuration. A request with no
+  bearer token is rejected with 401, and an invalid one stays 401. Self-host a server and
+  point the CLI at it with `--api-url` or `PATCHPAGE_API_URL`. Self-hosting guide:
   https://github.com/allisonmahmood/PatchPage/blob/main/docs/SELF_HOSTING.md
-- Upload credential precedence is explicit `--anonymous`, then `PATCHPAGE_API_TOKEN`, then
-  stored credentials. When neither environment nor stored credentials exist, `upload`
-  automatically attempts anonymous creation. Authentication failures never retry anonymously.
-- Authenticated uploads use the per-file cache, so uploading the same local file updates its
-  known draft unless `--new` is passed. Anonymous uploads always create a fresh server-identified
-  draft, ignore cached IDs, and never write results to that cache. Use `--anonymous` to bypass
-  available credentials; do not combine it with update-only `--draft`.
+- Upload credential precedence is `PATCHPAGE_API_TOKEN`, then stored credentials. With
+  neither, the upload fails; there is no credential-free path to fall back on, and an
+  authentication failure is reported as-is.
+- Uploads use the per-file cache, so uploading the same local file updates its known draft
+  unless `--new` is passed. `--draft` is update-only and targets a draft your account owns.
+- The `--anonymous` flag is deprecated and no longer selects a working mode. Do not pass it.
 - Draft view URLs are public and unlisted. CLI state lives under `~/.patchpage`.
-
-To force create-only anonymous mode on an opted-in self-hosted server:
-
-```bash
-npx --yes patchpage upload './plan.html' --anonymous --api-url 'https://patchpage.example.com'
-```
 
 Set credentials with:
 
@@ -139,8 +132,8 @@ Blocked or unsafe:
 
 ## Pitfalls
 
-- Authentication gates ownership and updates; an operator's anonymous opt-in permits creation
-  only. Neither mode makes draft viewers private.
+- Authentication gates publishing, ownership, and updates. It does not make draft viewers
+  private.
 - Do not publish sensitive or confidential material unless public-link visibility is acceptable.
 - Do not tell the user an API token makes drafts private.
 - Never put an API token in a positional argument. Use the hidden prompt for a person or

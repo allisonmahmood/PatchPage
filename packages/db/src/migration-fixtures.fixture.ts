@@ -85,28 +85,6 @@ CREATE TABLE IF NOT EXISTS upload_events (
 
 CREATE INDEX IF NOT EXISTS draft_versions_draft_id_idx ON draft_versions(draft_id);
 CREATE INDEX IF NOT EXISTS upload_events_draft_id_idx ON upload_events(draft_id);
-
-INSERT INTO accounts (id, name)
-VALUES ('acct_anonymous', 'Anonymous Uploads')
-ON CONFLICT (id) DO UPDATE
-SET name = EXCLUDED.name,
-    updated_at = now();
-
-INSERT INTO api_tokens (id, account_id, name, token_hash, scopes, revoked_at)
-VALUES (
-  'tok_anonymous',
-  'acct_anonymous',
-  'Anonymous Upload Audit Actor',
-  'internal:anonymous:no-bearer-token',
-  '[]'::jsonb,
-  '1970-01-01T00:00:00.000Z'::timestamptz
-)
-ON CONFLICT (id) DO UPDATE
-SET account_id = EXCLUDED.account_id,
-    name = EXCLUDED.name,
-    token_hash = EXCLUDED.token_hash,
-    scopes = EXCLUDED.scopes,
-    revoked_at = EXCLUDED.revoked_at;
 `;
 
 /** The rows a deployed database already holds, in the shape each driver stores. */

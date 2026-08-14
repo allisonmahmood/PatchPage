@@ -23,14 +23,17 @@ const surfaces = Object.fromEntries(
     ])
   )
 );
+// Tokenless upload is retired: no instance accepts an upload without a bearer
+// token, on any configuration. These patterns fail the build if a shipped
+// surface still advertises the retired posture.
 const forbiddenClaimPatterns = [
   /anonymous(?: uploads?| creation| access)?[^.]{0,60}(?:is |are )?(?:enabled|allowed|available) by default/i,
   /(?:allows?|enables?|uses?) anonymous (?:uploads?|creation|access) by default|by default[^.]{0,60}(?:allows?|enables?) anonymous/i,
-  /(?:tokens?|token authentication)[^.]{0,60}(?:not required|optional) by default/i,
-  /(?:when|if)[^.]{0,100}credentials? (?:exist|are present),?\s+(?:(?:the CLI )?(?:automatically )?(?:attempts?|uses?|falls? back|retries?) (?:an )?anonymous|anonymous (?:is|will be) (?:attempted|used))/i,
-  /(?:credential|authentication) failures?\s+(?:retry|fall back)[^.]{0,60}anonymous/i,
-  /(?:retry|fall back)[^.]{0,80}(?:after|on)[^.]{0,60}(?:credential|authentication) failures?/i,
-  /--anonymous[^.]{0,60}(?:does not|doesn't|cannot|can't)[^.]{0,40}(?:bypass|force|override)/i
+  /(?:tokens?|token authentication)[^.]{0,60}(?:not required|optional)/i,
+  /(?:opt(?:ed)?[ -]in|opt in|explicitly enabled?|may enable|can enable)[^.]{0,100}anonymous (?:uploads?|creation|create|access)/i,
+  /anonymous (?:uploads?|creation|create|access)[^.]{0,100}(?:opt(?:ed)?[ -]in|explicitly enabled?)/i,
+  /(?:automatically )?(?:attempts?|falls? back to|retries? with) (?:an )?anonymous (?:upload|create|creation)/i,
+  /PATCHPAGE_ALLOW_ANONYMOUS_UPLOADS\s*=\s*true/i
 ];
 
 for (const name of ["rootReadme", "cliReadme", "skill", "operatorSkill"]) {
@@ -56,46 +59,24 @@ for (const name of ["rootReadme", "cliReadme", "selfHosting", "skill", "showcase
     /public(?:,\s*| and )unlisted/i,
     `${surfacePaths[name]} must describe viewer links as public and unlisted`
   );
-  assert.match(
-    text,
-    /(?:tokens?|token authentication)[^.]{0,120}by default|by default[^.]{0,120}tokens?/i,
-    `${surfacePaths[name]} must describe token authentication as the default`
-  );
   assert.match(text, /self-host/i, `${surfacePaths[name]} must identify the self-hosted mode`);
-  assert.match(text, /anonymous/i, `${surfacePaths[name]} must describe anonymous creation`);
   assert.match(
     text,
-    /(?:opt(?:ed)?[ -]in|explicitly enable)[^.]{0,100}anonymous|anonymous[^.]{0,100}(?:opt(?:ed)?[ -]in|explicitly enable)/i,
-    `${surfacePaths[name]} must describe anonymous creation as a self-hoster opt-in`
+    /(?:every|each|all|any) upload[^.]{0,100}(?:requires?|needs?)[^.]{0,60}(?:API )?token|no[^.]{0,60}upload[^.]{0,60}without[^.]{0,30}token|uploads?[^.]{0,60}(?:always )?requires?[^.]{0,40}(?:API )?token/i,
+    `${surfacePaths[name]} must state that every upload requires a token`
   );
-  assertTermsNear(
+  assert.match(
     text,
-    /(?:automatic|when neither|with no environment)/i,
-    [/(?:environment|PATCHPAGE_API_TOKEN)/i, /stored/i, /anonymous/i],
-    {
-      label: `${surfacePaths[name]} automatic anonymous behavior`,
-      radius: 320
-    }
+    /(?:on |under |in )(?:every|any) configuration|regardless of[^.]{0,60}configuration|no configuration[^.]{0,80}(?:accepts?|admits?|allows?)/i,
+    `${surfacePaths[name]} must state that the token requirement holds on every configuration`
   );
-  assertTermsNear(text, /--anonymous/i, [/(?:bypass|force|explicit)/i], {
-    label: `${surfacePaths[name]} explicit anonymous override`,
-    radius: 220
-  });
   for (const contradiction of forbiddenClaimPatterns) {
     assert.doesNotMatch(
       text,
       contradiction,
-      `${surfacePaths[name]} contradicts the finalized authentication and anonymous contract`
+      `${surfacePaths[name]} contradicts the finalized authentication contract`
     );
   }
-}
-
-for (const name of ["cliReadme", "selfHosting", "skill", "showcase"]) {
-  assert.match(
-    visibleText(surfaces[name]),
-    /failures?[^.]{0,120}(?:never|do not|does not|rather than|instead of)[^.]{0,80}(?:retry|retried|fall(?:s)? back)[^.]{0,50}anonymous|(?:never|do not|does not)[^.]{0,80}(?:retry|fall back)[^.]{0,50}anonymous/i,
-    `${surfacePaths[name]} must positively state that credential failures do not retry anonymously`
-  );
 }
 
 for (const name of ["rootReadme", "cliReadme", "skill", "showcase"]) {
@@ -114,11 +95,6 @@ for (const name of ["rootReadme", "cliReadme", "skill", "showcase"]) {
     text,
     /(?:does not offer|has no) public token signup/i,
     `${surfacePaths[name]} must say that the maintainer instance has no public token signup`
-  );
-  assert.match(
-    text,
-    /(?:does not claim)[^.]{0,160}(?:anonymous|enabled them)|(?:do not assume|must not be assumed)[^.]{0,120}anonymous/i,
-    `${surfacePaths[name]} must not imply anonymous uploads work on the maintainer instance`
   );
 }
 
@@ -601,20 +577,6 @@ async function pathExists(candidate) {
 
 function visibleText(source) {
   return source.replace(/<[^>]*>/g, " ").replace(/\s+/g, " ");
-}
-
-function assertTermsNear(text, anchor, required, { label, radius }) {
-  const matches = text.matchAll(
-    new RegExp(anchor.source, [...new Set(`${anchor.flags}g`)].join(""))
-  );
-  for (const match of matches) {
-    const window = text.slice(
-      Math.max(0, match.index - radius),
-      match.index + match[0].length + radius
-    );
-    if (required.every((pattern) => pattern.test(window))) return;
-  }
-  assert.fail(`${label} must place ${required.join(", ")} near ${anchor}`);
 }
 
 function decodeHtmlCode(source) {

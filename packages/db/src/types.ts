@@ -9,11 +9,6 @@ export interface ApiTokenAuth {
   scopes: string[];
 }
 
-export interface AnonymousUploadPrincipal {
-  accountId: string;
-  apiTokenId: string;
-}
-
 export interface DraftRecord {
   id: string;
   accountId: string;
@@ -101,10 +96,6 @@ export interface DraftVersionLookup {
   version: DraftVersionRecord | null;
 }
 
-export interface DraftModerationOptions {
-  canModerateAnonymous?: boolean;
-}
-
 export interface DbDriverOptions {
   /**
    * The ordered migration list to run. Defaults to the shipped
@@ -124,7 +115,6 @@ export interface PatchPageDb {
   initialize(bootstrapApiToken: string | null): Promise<void>;
   /** The applied migration IDs this database records, in apply order. */
   listAppliedMigrations(): Promise<string[]>;
-  getAnonymousUploadPrincipal(): Promise<AnonymousUploadPrincipal>;
   findApiTokenByToken(token: string): Promise<ApiTokenAuth | null>;
   createApiToken(input: CreateApiTokenInput): Promise<{ id: string; name: string }>;
   /**
@@ -146,17 +136,8 @@ export interface PatchPageDb {
    * and never brings a draft back.
    */
   recordDraftVisit(draftId: string): Promise<void>;
-  disableDraft(
-    draftId: string,
-    accountId: string,
-    reason: string,
-    options?: DraftModerationOptions
-  ): Promise<boolean>;
-  deleteDraft(
-    draftId: string,
-    accountId: string,
-    options?: DraftModerationOptions
-  ): Promise<boolean>;
+  disableDraft(draftId: string, accountId: string, reason: string): Promise<boolean>;
+  deleteDraft(draftId: string, accountId: string): Promise<boolean>;
   close(): Promise<void>;
 }
 

@@ -17,16 +17,40 @@ interface TrustedProxyRange {
   end: bigint;
 }
 
+/**
+ * The single source for the acceptable-use policy URL. Every later consumer —
+ * the self-service mint response, the served-draft footer, and the README —
+ * reads this constant rather than repeating the literal.
+ *
+ * Working value pending operator confirmation before the public flip; the
+ * source copy is `docs/ACCEPTABLE_USE.md`.
+ */
+export const ACCEPTABLE_USE_URL = "https://patchyhq.com/acceptable-use";
+
+/**
+ * Environment variables retired by the trust-model cutover, each mapped to the
+ * successor that replaces it. Setting a retired variable is a hard startup
+ * failure: a self-hoster's deliberate security posture must never be silently
+ * ignored. See `docs/adr/ADR-0001-trust-model-no-tokenless-upload.md`.
+ */
+const RETIRED_ENV_VARS: ReadonlyArray<readonly [retired: string, successor: string]> = [
+  ["PATCHPAGE_ALLOW_ANONYMOUS_UPLOADS", "PATCHPAGE_ALLOW_SELF_SERVICE_TOKENS"],
+  [
+    "PATCHPAGE_ANONYMOUS_CREATE_RATE_LIMIT_PER_MINUTE",
+    "PATCHPAGE_SELF_SERVICE_MINT_RATE_LIMIT_PER_MINUTE"
+  ]
+];
+
 export interface ServerConfig {
   port: number;
   publicBaseUrl: string;
   trustProxy: false | number | string[];
   bootstrapApiToken: string | null;
-  allowAnonymousUploads: boolean;
+  allowSelfServiceTokens: boolean;
   maxHtmlBytes: number;
   protectedApiRateLimitPerMinute: number;
   authenticatedUploadRateLimitPerMinute: number;
-  anonymousCreateRateLimitPerMinute: number;
+  selfServiceMintRateLimitPerMinute: number;
   draftCreateRateLimitPerMinute: number;
   /**
    * The live-draft ceiling one token may hold. Counted from the database on
@@ -44,6 +68,8 @@ export interface ServerConfig {
 }
 
 export function getServerConfig(env: NodeJS.ProcessEnv = process.env): ServerConfig {
+  assertNoRetiredEnvVars(env);
+
   const databaseUrl = stringValue(env.DATABASE_URL);
   const dbDriver = enumValue(env.PATCHPAGE_DB_DRIVER, ["postgres", "json"] as const) ??
     (databaseUrl ? "postgres" : "json");
@@ -53,9 +79,9 @@ export function getServerConfig(env: NodeJS.ProcessEnv = process.env): ServerCon
     publicBaseUrl: stringValue(env.PATCHPAGE_PUBLIC_BASE_URL) ?? "http://localhost:3000",
     trustProxy: trustProxyValue(env.PATCHPAGE_TRUST_PROXY),
     bootstrapApiToken: stringValue(env.PATCHPAGE_BOOTSTRAP_API_TOKEN),
-    allowAnonymousUploads: strictBoolValue(
-      "PATCHPAGE_ALLOW_ANONYMOUS_UPLOADS",
-      env.PATCHPAGE_ALLOW_ANONYMOUS_UPLOADS,
+    allowSelfServiceTokens: strictBoolValue(
+      "PATCHPAGE_ALLOW_SELF_SERVICE_TOKENS",
+      env.PATCHPAGE_ALLOW_SELF_SERVICE_TOKENS,
       false
     ),
     maxHtmlBytes: intValue(env.PATCHPAGE_MAX_HTML_BYTES, 512 * 1024),
@@ -69,9 +95,9 @@ export function getServerConfig(env: NodeJS.ProcessEnv = process.env): ServerCon
       env.PATCHPAGE_AUTHENTICATED_UPLOAD_RATE_LIMIT_PER_MINUTE,
       20
     ),
-    anonymousCreateRateLimitPerMinute: rateLimitPerMinuteValue(
-      "PATCHPAGE_ANONYMOUS_CREATE_RATE_LIMIT_PER_MINUTE",
-      env.PATCHPAGE_ANONYMOUS_CREATE_RATE_LIMIT_PER_MINUTE,
+    selfServiceMintRateLimitPerMinute: rateLimitPerMinuteValue(
+      "PATCHPAGE_SELF_SERVICE_MINT_RATE_LIMIT_PER_MINUTE",
+      env.PATCHPAGE_SELF_SERVICE_MINT_RATE_LIMIT_PER_MINUTE,
       5
     ),
     draftCreateRateLimitPerMinute: rateLimitPerMinuteValue(
@@ -103,6 +129,19 @@ export function requireConfigValue(name: string, value: string | null | undefine
     throw new Error(`Missing required environment variable: ${name}`);
   }
   return value;
+}
+
+function assertNoRetiredEnvVars(env: NodeJS.ProcessEnv): void {
+  for (const [retired, successor] of RETIRED_ENV_VARS) {
+    // An empty or whitespace-only value is treated as unset, matching how every
+    // other value in this module reads its environment.
+    if (stringValue(env[retired]) === null) continue;
+    throw new Error(
+      `${retired} has been retired and is no longer honored. ` +
+        `PatchPage never accepts an upload without a bearer token. ` +
+        `Remove ${retired} and use ${successor} instead.`
+    );
+  }
 }
 
 function stringValue(value: string | undefined): string | null {
