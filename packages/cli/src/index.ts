@@ -696,9 +696,15 @@ function asRecord(value: unknown): Record<string, unknown> | null {
     : null;
 }
 
+/**
+ * Appended to a 401/403 from the default instance only. Like whoami's
+ * no-token copy, this must never claim the instance's minting posture: a
+ * rejected request here means the key that was sent is bad, whatever the
+ * instance's policy on handing out new ones.
+ */
 function defaultHostHint(apiUrl: string): string {
   if (apiUrl !== DEFAULT_API_URL) return "";
-  return `\nNote: ${DEFAULT_API_URL} is the maintainer's private instance and does not issue public tokens.\nTo run your own server, see ${SELF_HOST_DOCS_URL} and point the CLI at it with --api-url or PATCHPAGE_API_URL.`;
+  return `\nThe publishing key sent to ${DEFAULT_API_URL} was not accepted. Save a working one with: patchpage auth set --api-url ${DEFAULT_API_URL}\nTo run your own instance instead, see ${SELF_HOST_DOCS_URL} and point the CLI at it with --api-url or PATCHPAGE_API_URL.`;
 }
 
 function readHtmlFile(file: string): string {

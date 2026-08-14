@@ -6,6 +6,17 @@ All notable changes to PatchPage are documented in this file. The format is base
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-08-14
+
+### Changed
+
+- The hint the CLI appends to a 401/403 from the default instance no longer claims the
+  instance "does not issue public tokens". Like `whoami`, the copy is now
+  posture-neutral: a rejected request means the publishing key that was sent is bad,
+  so the hint names the next action (`patchpage auth set`, or pointing the CLI at your
+  own instance) without asserting the instance's minting policy. This clears the last
+  hard gate in `docs/GO_PUBLIC_FLIP.md` before the go-public flip.
+
 ## [0.2.0] - 2026-08-14
 
 ### Added
