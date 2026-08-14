@@ -142,6 +142,30 @@ describe("getServerConfig", () => {
     }
   });
 
+  it("leaves server-side analytics unconfigured unless a key is set", () => {
+    expect(getServerConfig({}).posthogApiKey).toBeNull();
+    expect(getServerConfig({ PATCHPAGE_POSTHOG_API_KEY: "   " }).posthogApiKey).toBeNull();
+    expect(getServerConfig({ PATCHPAGE_POSTHOG_API_KEY: "phc_key" }).posthogApiKey).toBe(
+      "phc_key"
+    );
+  });
+
+  it("defaults the analytics host and requires a configured one to be an http URL", () => {
+    expect(getServerConfig({}).posthogHost).toBe("https://us.i.posthog.com");
+    expect(
+      getServerConfig({ PATCHPAGE_POSTHOG_HOST: "https://eu.i.posthog.com" }).posthogHost
+    ).toBe("https://eu.i.posthog.com");
+    expect(
+      getServerConfig({ PATCHPAGE_POSTHOG_HOST: "http://posthog.internal:8000" }).posthogHost
+    ).toBe("http://posthog.internal:8000");
+
+    for (const value of ["us.i.posthog.com", "ftp://posthog.example", "javascript:0", "//x"]) {
+      expect(() => getServerConfig({ PATCHPAGE_POSTHOG_HOST: value })).toThrow(
+        /PATCHPAGE_POSTHOG_HOST/
+      );
+    }
+  });
+
   it("defaults to postgres db when DATABASE_URL is present", () => {
     const config = getServerConfig({ DATABASE_URL: "postgres://example" });
 

@@ -22,6 +22,7 @@ import {
   validateHtml
 } from "@patchpage/core";
 import type { UploadMetadata } from "@patchpage/core";
+import { DisabledAnalytics, type Analytics } from "./analytics.js";
 import { createExpirySweep, type ExpirySweepResult } from "./expiry-sweep.js";
 import { getDraftPublicUrl } from "./public-url.js";
 import {
@@ -50,6 +51,11 @@ export interface CreateAppOptions {
   db: PatchPageDb;
   storage: HtmlStorage;
   clock?: () => number;
+  /**
+   * Where business events are reported. Left out, the app reports nothing —
+   * which is what an instance with no analytics key configured runs with.
+   */
+  analytics?: Analytics;
 }
 
 interface UploadBody {
@@ -180,9 +186,12 @@ export function createApp(options: CreateAppOptions): FastifyInstance {
   const protectedApi = (requiredScope?: string, hookOptions: ProtectedApiHookOptions = {}) =>
     protectedApiRouteHook(requiredScope, hookOptions);
 
+  const analytics = options.analytics ?? new DisabledAnalytics(app.log);
+
   const expirySweep = createExpirySweep({
     db: options.db,
     storage: options.storage,
+    analytics,
     log: app.log
   });
   app.decorate("sweepExpiredDrafts", () => expirySweep.run());
@@ -216,6 +225,15 @@ export function createApp(options: CreateAppOptions): FastifyInstance {
       name: cleanText(body.name) || "CLI API Token",
       token,
       scopes
+    });
+
+    // A token minted is a token minted, whichever door it came through. The
+    // flag is what tells the operator's own issuing apart from the self-service
+    // flow, so the event list stays one narrative rather than two.
+    analytics.capture({
+      name: "token.minted",
+      principalId: auth.accountId,
+      properties: { apiTokenId: apiToken.id, selfService: false }
     });
 
     return reply.status(201).send({
@@ -253,7 +271,14 @@ export function createApp(options: CreateAppOptions): FastifyInstance {
     );
 
     mintScope.post(SELF_SERVICE_MINT_PATH, async (request, reply) =>
-      mintSelfServiceToken(options, rateLimiters.selfServiceMint, clock, request, reply)
+      mintSelfServiceToken(
+        options,
+        analytics,
+        rateLimiters.selfServiceMint,
+        clock,
+        request,
+        reply
+      )
     );
   });
 
@@ -420,6 +445,19 @@ export function createApp(options: CreateAppOptions): FastifyInstance {
         publicBaseUrl: options.config.publicBaseUrl
       });
 
+      // Reported once the upload is committed, so the event describes a draft
+      // that exists. The size is the stored bytes, not the content.
+      analytics.capture({
+        name: requestedDraftId ? "draft.updated" : "draft.created",
+        principalId: auth.accountId,
+        properties: {
+          draftId: upload.draftId,
+          apiTokenId: auth.id,
+          versionNumber: upload.versionNumber,
+          htmlBytes: uploadInput.fileSize
+        }
+      });
+
       return reply.status(requestedDraftId ? 200 : 201).send({
         ok: true,
         ...upload,
@@ -442,6 +480,12 @@ export function createApp(options: CreateAppOptions): FastifyInstance {
         canModerateAnyPrincipal: hasScope(auth, "admin")
       });
       if (!disabled) return reply.status(404).send({ ok: false, error: "Draft not found." });
+
+      analytics.capture({
+        name: "draft.disabled",
+        principalId: auth.accountId,
+        properties: { draftId, admin: hasScope(auth, "admin") }
+      });
       return { ok: true };
     }
   );
@@ -479,6 +523,12 @@ export function createApp(options: CreateAppOptions): FastifyInstance {
         canModerateAnyPrincipal: hasScope(auth, "admin")
       });
       if (!deleted) return reply.status(404).send({ ok: false, error: "Draft not found." });
+
+      analytics.capture({
+        name: "draft.deleted",
+        principalId: auth.accountId,
+        properties: { draftId, admin: hasScope(auth, "admin") }
+      });
       return { ok: true };
     }
   );
@@ -525,10 +575,20 @@ export function createApp(options: CreateAppOptions): FastifyInstance {
       // draft, shortens its clock, or touches its token: a page comes down
       // only when an operator decides it should, so filing the same report a
       // thousand times changes exactly as much as filing it once.
+      const reason = cleanText((request.body as { reason?: unknown } | null)?.reason);
       await options.db.recordDraftReport({
         draftId: draft.id,
         sourceIp: request.ip || null,
-        reason: cleanText((request.body as { reason?: unknown } | null)?.reason)
+        reason
+      });
+
+      // The event belongs to the principal whose draft was flagged, never to
+      // the reader who flagged it: no address, and whether a reason was typed
+      // rather than what it said.
+      analytics.capture({
+        name: "draft.reported",
+        principalId: draft.accountId,
+        properties: { draftId: draft.id, reasonGiven: reason !== null }
       });
 
       applyReportPageHeaders(reply);
@@ -573,6 +633,7 @@ export function createApp(options: CreateAppOptions): FastifyInstance {
  */
 async function mintSelfServiceToken(
   options: CreateAppOptions,
+  analytics: Analytics,
   mintLimiter: FixedWindowRateLimiter,
   clock: () => number,
   request: FastifyRequest,
@@ -613,10 +674,19 @@ async function mintSelfServiceToken(
   }
 
   const token = `pp_${randomToken(32)}`;
-  await options.db.mintSelfServiceToken({
+  const minted = await options.db.mintSelfServiceToken({
     token,
     name: selfServiceTokenName(clock()),
     sourceIp
+  });
+
+  // The principal and its token, and nothing about where the mint came from:
+  // the source address is what the mint quota counts and what the mint record
+  // keeps, not something to report.
+  analytics.capture({
+    name: "token.minted",
+    principalId: minted.accountId,
+    properties: { apiTokenId: minted.apiTokenId, selfService: true }
   });
 
   // The plaintext appears here and nowhere else, exactly once. Only its hash is
