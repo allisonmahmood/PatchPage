@@ -18,11 +18,24 @@ import {
   JSON_MIGRATION_LEDGER_KEY,
   SCHEMA_MIGRATIONS
 } from "./migrations.js";
+import {
+  GoPublicFlipPreconditionError,
+  isInService,
+  pendingMigrationIds,
+  reHomeDisposition
+} from "./go-public-flip.js";
+import {
+  BOOTSTRAP_API_TOKEN_ID,
+  BOOTSTRAP_PRINCIPAL_ID,
+  RETIRED_ANONYMOUS_API_TOKEN_ID,
+  RETIRED_ANONYMOUS_PRINCIPAL_ID
+} from "./internal-principals.js";
 import { countsTowardMintQuota } from "./mint-quota.js";
 import { expiryAfterUpload, expiryAfterVisit, isExpired } from "./retention.js";
 import { UploadTargetError } from "./types.js";
 import type { JsonMigrationState, SchemaMigration } from "./migrations.js";
 import type {
+  AnonymousSentinelOutcome,
   ApiTokenAuth,
   ApiTokenRevocation,
   CreateApiTokenInput,
@@ -32,6 +45,10 @@ import type {
   DraftReportRecord,
   DraftVersionLookup,
   DraftVersionRecord,
+  GoPublicFlipInput,
+  GoPublicFlipInspection,
+  GoPublicFlipOutcome,
+  LiveDraftTally,
   MintSelfServiceTokenInput,
   MintSelfServiceTokenResult,
   ModeratedDraftRecord,
@@ -40,6 +57,7 @@ import type {
   RecordDraftReportInput,
   RecordUploadInput,
   RecordUploadResult,
+  ReHomedApiToken,
   UploadTargetInput
 } from "./types.js";
 
@@ -555,6 +573,147 @@ export class JsonFilePatchPageDb implements PatchPageDb {
       draft.pinnedAt = null;
       return { value: true, changed: true };
     });
+  }
+
+  async inspectGoPublicFlip(): Promise<GoPublicFlipInspection> {
+    const state = await this.readState();
+    return inspectState(state);
+  }
+
+  async applyGoPublicFlip(input: GoPublicFlipInput): Promise<GoPublicFlipOutcome> {
+    const outcome = await this.mutateState<Omit<GoPublicFlipOutcome, "after">>((state) => {
+      const flippedAt = this.nowIso();
+
+      // Every refusal is raised before the first assignment below, so a thrown
+      // precondition leaves the state exactly as it was found.
+      const pending = pendingMigrationIds(state.schemaMigrations);
+      if (pending.length > 0) {
+        throw new GoPublicFlipPreconditionError("migrations_pending", pending.join(", "));
+      }
+      if (!state.accounts.some((row) => row.id === BOOTSTRAP_PRINCIPAL_ID)) {
+        throw new GoPublicFlipPreconditionError(
+          "bootstrap_principal_missing",
+          BOOTSTRAP_PRINCIPAL_ID
+        );
+      }
+      const pinned = state.drafts.filter((row) => row.pinnedAt !== null);
+      if (pinned.length > 0) {
+        throw new GoPublicFlipPreconditionError(
+          "draft_already_pinned",
+          pinned.map((row) => row.id).join(", ")
+        );
+      }
+
+      const planned: { token: ApiTokenRow; move: boolean }[] = [];
+      for (const apiTokenId of input.reHomeApiTokenIds) {
+        const token = state.apiTokens.find((row) => row.id === apiTokenId);
+        if (!token) {
+          throw new GoPublicFlipPreconditionError("rehome_target_unknown", apiTokenId);
+        }
+        if (token.id === BOOTSTRAP_API_TOKEN_ID) {
+          throw new GoPublicFlipPreconditionError("rehome_target_is_bootstrap_token", apiTokenId);
+        }
+        if (token.scopes.includes("admin")) {
+          throw new GoPublicFlipPreconditionError("rehome_target_has_admin_scope", apiTokenId);
+        }
+        const tokensOnPrincipal = state.apiTokens.filter(
+          (row) => row.accountId === token.accountId
+        ).length;
+        const disposition = reHomeDisposition(token.accountId, tokensOnPrincipal);
+        if (disposition === "shared") {
+          throw new GoPublicFlipPreconditionError("rehome_target_principal_shared", apiTokenId);
+        }
+        planned.push({ token, move: disposition === "rehome" });
+      }
+
+      const reHomed: ReHomedApiToken[] = planned.map(({ token, move }) => {
+        if (!move) {
+          return {
+            apiTokenId: token.id,
+            apiTokenName: token.name,
+            principalId: token.accountId,
+            alreadyReHomed: true
+          };
+        }
+
+        // The same three rows a self-service mint writes, minus the token: the
+        // holder keeps the one they already have. The principal carries the
+        // provenance mark and a mint record names it, because a mark that no
+        // record derives would break the one invariant those two rows have —
+        // and marking it is the fail-closed direction, since any later
+        // guardrail keyed on "self-service" should reach a re-homed token too.
+        // The record's address is null: no caller asked for this token, and
+        // inventing an address would be inventing forensics.
+        const principal: AccountRow = {
+          id: newInternalId("acct"),
+          name: token.name,
+          createdAt: flippedAt,
+          updatedAt: flippedAt,
+          selfServiceMintedAt: flippedAt
+        };
+        state.accounts.push(principal);
+        state.tokenMints.push({
+          id: newInternalId("mint"),
+          accountId: principal.id,
+          apiTokenId: token.id,
+          sourceIp: null,
+          createdAt: flippedAt
+        });
+        // The drafts stay behind on the bootstrap principal. That is the
+        // accepted consequence, not an oversight: this token's holder loses
+        // edit rights over everything they published before the flip.
+        token.accountId = principal.id;
+
+        return {
+          apiTokenId: token.id,
+          apiTokenName: token.name,
+          principalId: principal.id,
+          alreadyReHomed: false
+        };
+      });
+
+      const sentinelDrafts = state.drafts.filter(
+        (row) => row.accountId === RETIRED_ANONYMOUS_PRINCIPAL_ID
+      );
+      const sentinelHistoryRows = countSentinelHistoryRows(state);
+
+      // The uniform re-arm. Sentinel-owned drafts in service are in this set
+      // like any other, which is exactly the revoked-style treatment they are
+      // owed: a full window from the flip, with top-ups already frozen by the
+      // revocation stamp their token has carried since it was seeded. Only the
+      // anchor moves — `updatedAt` still means "when the content last changed".
+      const expiresAt = expiryAfterUpload(this.clock());
+      let reArmedDraftCount = 0;
+      let leftOnTheirClockCount = 0;
+      for (const draft of state.drafts) {
+        if (!isInService(draft)) {
+          leftOnTheirClockCount += 1;
+          continue;
+        }
+        draft.expiresAt = expiresAt;
+        reArmedDraftCount += 1;
+      }
+
+      const anonymousSentinel = dropAnonymousSentinel(
+        state,
+        sentinelDrafts.length,
+        sentinelHistoryRows,
+        sentinelDrafts.filter(isInService).length
+      );
+
+      return {
+        value: {
+          flippedAt,
+          reHomed,
+          reArmedDraftCount,
+          leftOnTheirClockCount,
+          anonymousSentinel
+        },
+        changed: true
+      };
+    });
+
+    return { ...outcome, after: await this.inspectGoPublicFlip() };
   }
 
   async recordDraftReport(input: RecordDraftReportInput): Promise<DraftReportRecord> {
@@ -1164,6 +1323,120 @@ function emptyState(): JsonMigrationState {
   return {};
 }
 
+/** Versions and upload events still naming the retired sentinel token. */
+function countSentinelHistoryRows(state: JsonDbState): number {
+  const versions = state.draftVersions.filter(
+    (row) => row.createdByApiTokenId === RETIRED_ANONYMOUS_API_TOKEN_ID
+  ).length;
+  const events = state.uploadEvents.filter(
+    (row) => row.apiTokenId === RETIRED_ANONYMOUS_API_TOKEN_ID
+  ).length;
+  return versions + events;
+}
+
+/**
+ * Assert-and-drop. The rows go only when the sentinel owns no drafts *and* no
+ * version or upload event still names its token — the second condition is what
+ * the Postgres foreign keys would enforce anyway, checked here so both drivers
+ * refuse for the same reason instead of one throwing a constraint error.
+ */
+function dropAnonymousSentinel(
+  state: JsonDbState,
+  draftCount: number,
+  historyRowCount: number,
+  reArmedDraftCount: number
+): AnonymousSentinelOutcome {
+  const principalIndex = state.accounts.findIndex(
+    (row) => row.id === RETIRED_ANONYMOUS_PRINCIPAL_ID
+  );
+  const tokenIndex = state.apiTokens.findIndex((row) => row.id === RETIRED_ANONYMOUS_API_TOKEN_ID);
+
+  if (draftCount > 0) {
+    return { disposition: "retained_drafts_present", draftCount, reArmedDraftCount };
+  }
+  if (historyRowCount > 0) {
+    return { disposition: "retained_history_present", draftCount, reArmedDraftCount };
+  }
+  if (principalIndex < 0 && tokenIndex < 0) {
+    return { disposition: "absent", draftCount, reArmedDraftCount };
+  }
+
+  if (tokenIndex >= 0) state.apiTokens.splice(tokenIndex, 1);
+  if (principalIndex >= 0) state.accounts.splice(principalIndex, 1);
+  return { disposition: "dropped", draftCount, reArmedDraftCount };
+}
+
+function inspectState(state: JsonDbState): GoPublicFlipInspection {
+  const creatorByDraftId = new Map<string, string>();
+  for (const version of state.draftVersions) {
+    if (version.versionNumber !== FIRST_VERSION_NUMBER) continue;
+    creatorByDraftId.set(version.draftId, version.createdByApiTokenId);
+  }
+
+  const liveByToken = new Map<string, number>();
+  let draftsInService = 0;
+  let draftsOutOfService = 0;
+  let earliestInServiceExpiry: string | null = null;
+  for (const draft of state.drafts) {
+    if (!isInService(draft)) {
+      draftsOutOfService += 1;
+      continue;
+    }
+    draftsInService += 1;
+    if (earliestInServiceExpiry === null || draft.expiresAt < earliestInServiceExpiry) {
+      earliestInServiceExpiry = draft.expiresAt;
+    }
+    const creator = creatorByDraftId.get(draft.id);
+    if (creator) liveByToken.set(creator, (liveByToken.get(creator) ?? 0) + 1);
+  }
+
+  const liveDraftTallies: LiveDraftTally[] = [];
+  for (const token of state.apiTokens) {
+    const liveDraftCount = liveByToken.get(token.id) ?? 0;
+    const admin = token.scopes.includes("admin");
+    // An admin token at zero still earns a line: it is the one the runbook
+    // tells the operator to look for, and a uniformity check that vanishes
+    // when the count happens to be zero proves nothing.
+    if (liveDraftCount === 0 && !admin) continue;
+    liveDraftTallies.push({
+      apiTokenId: token.id,
+      apiTokenName: token.name,
+      principalId: token.accountId,
+      admin,
+      liveDraftCount
+    });
+  }
+  liveDraftTallies.sort(
+    (left, right) =>
+      right.liveDraftCount - left.liveDraftCount || left.apiTokenId.localeCompare(right.apiTokenId)
+  );
+
+  return {
+    appliedMigrations: [...state.schemaMigrations],
+    pendingMigrations: pendingMigrationIds(state.schemaMigrations),
+    bootstrapPrincipalPresent: state.accounts.some((row) => row.id === BOOTSTRAP_PRINCIPAL_ID),
+    bootstrapPrincipalApiTokenIds: state.apiTokens
+      .filter((row) => row.accountId === BOOTSTRAP_PRINCIPAL_ID)
+      .map((row) => row.id)
+      .sort(),
+    pinnedDraftIds: state.drafts
+      .filter((row) => row.pinnedAt !== null)
+      .map((row) => row.id)
+      .sort(),
+    anonymousSentinel: {
+      principalPresent: state.accounts.some((row) => row.id === RETIRED_ANONYMOUS_PRINCIPAL_ID),
+      tokenPresent: state.apiTokens.some((row) => row.id === RETIRED_ANONYMOUS_API_TOKEN_ID),
+      draftCount: state.drafts.filter((row) => row.accountId === RETIRED_ANONYMOUS_PRINCIPAL_ID)
+        .length,
+      historyRowCount: countSentinelHistoryRows(state)
+    },
+    draftsInService,
+    draftsOutOfService,
+    earliestInServiceExpiry,
+    liveDraftTallies
+  };
+}
+
 function ensureBootstrapState(
   state: JsonDbState,
   bootstrapApiToken: string | null,
@@ -1171,12 +1444,12 @@ function ensureBootstrapState(
 ): void {
   if (!bootstrapApiToken) return;
 
-  const account = state.accounts.find((row) => row.id === "acct_bootstrap");
+  const account = state.accounts.find((row) => row.id === BOOTSTRAP_PRINCIPAL_ID);
   if (account) {
     account.updatedAt = now;
   } else {
     state.accounts.push({
-      id: "acct_bootstrap",
+      id: BOOTSTRAP_PRINCIPAL_ID,
       name: "Bootstrap Account",
       createdAt: now,
       updatedAt: now,
@@ -1185,15 +1458,15 @@ function ensureBootstrapState(
     });
   }
 
-  const token = state.apiTokens.find((row) => row.id === "tok_bootstrap");
+  const token = state.apiTokens.find((row) => row.id === BOOTSTRAP_API_TOKEN_ID);
   if (token) {
     token.tokenHash = sha256(bootstrapApiToken);
     token.scopes = ["admin", "upload"];
     token.revokedAt = null;
   } else {
     state.apiTokens.push({
-      id: "tok_bootstrap",
-      accountId: "acct_bootstrap",
+      id: BOOTSTRAP_API_TOKEN_ID,
+      accountId: BOOTSTRAP_PRINCIPAL_ID,
       name: "Bootstrap API Token",
       tokenHash: sha256(bootstrapApiToken),
       scopes: ["admin", "upload"],

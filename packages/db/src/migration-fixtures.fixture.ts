@@ -177,6 +177,137 @@ export function deployedJsonStateFixture(
   };
 }
 
+/**
+ * The retired anonymous-upload sentinel, as a database that predates the
+ * trust-model cutover still holds it. Nothing creates these rows any more, so
+ * the only way to exercise the go-public flip's assert-and-drop is to write
+ * them back exactly as the removed seeding did — hash and revocation stamp
+ * included, both of which are the literals that shipped.
+ */
+export const RETIRED_ANONYMOUS_TOKEN_HASH = "internal:anonymous:no-bearer-token";
+export const RETIRED_ANONYMOUS_REVOKED_AT = "1970-01-01T00:00:00.000Z";
+export const RETIRED_ANONYMOUS_DRAFT_ID = "anondraft001";
+export const RETIRED_ANONYMOUS_VERSION_ID = "ver_anon_one";
+/** An anchor already in the past, so a re-arm is visible rather than assumed. */
+export const RETIRED_ANONYMOUS_DRAFT_EXPIRES_AT = "2026-02-01T00:00:00.000Z";
+
+/** What a sentinel-seeded database holds, in the shape each driver stores. */
+export const SEED_RETIRED_ANONYMOUS_SENTINEL_SQL = `
+INSERT INTO accounts (id, name) VALUES ('acct_anonymous', 'Anonymous Uploads');
+INSERT INTO api_tokens (id, account_id, name, token_hash, scopes, revoked_at)
+VALUES ('tok_anonymous', 'acct_anonymous', 'Anonymous Upload Token',
+  '${RETIRED_ANONYMOUS_TOKEN_HASH}', '["upload"]'::jsonb,
+  '${RETIRED_ANONYMOUS_REVOKED_AT}'::timestamptz);
+`;
+
+export const SEED_RETIRED_ANONYMOUS_DRAFT_SQL = `
+INSERT INTO drafts (id, account_id, title, current_version_id, expires_at)
+VALUES ('${RETIRED_ANONYMOUS_DRAFT_ID}', 'acct_anonymous', 'Anonymous draft',
+  '${RETIRED_ANONYMOUS_VERSION_ID}', '${RETIRED_ANONYMOUS_DRAFT_EXPIRES_AT}'::timestamptz);
+INSERT INTO draft_versions (
+  id, draft_id, version_number, object_key, content_hash, file_size,
+  created_by_api_token_id, original_filename
+)
+VALUES (
+  '${RETIRED_ANONYMOUS_VERSION_ID}', '${RETIRED_ANONYMOUS_DRAFT_ID}', 1,
+  'drafts/${RETIRED_ANONYMOUS_DRAFT_ID}/versions/${RETIRED_ANONYMOUS_VERSION_ID}.html',
+  'sha256:anon', 9, 'tok_anonymous', 'anon.html'
+);
+`;
+
+/**
+ * History naming the sentinel token with no sentinel-owned draft behind it —
+ * the case the drop has to refuse for a reason of its own, because Postgres'
+ * foreign key would otherwise refuse it as a constraint error the operator has
+ * to decode. Contrived on purpose: it is the guard, not the expected state.
+ */
+export const SEED_RETIRED_ANONYMOUS_ORPHAN_HISTORY_SQL = `
+INSERT INTO upload_events (id, draft_id, api_token_id, event_type)
+VALUES ('evt_anon_orphan', '${LEGACY_DRAFT_ID}', 'tok_anonymous', 'draft.created');
+`;
+
+/** The sentinel rows as the JSON driver stores them. */
+export function retiredAnonymousSentinelJsonRows(): {
+  account: Record<string, unknown>;
+  apiToken: Record<string, unknown>;
+} {
+  return {
+    account: {
+      id: "acct_anonymous",
+      name: "Anonymous Uploads",
+      createdAt: LEGACY_TIMESTAMP,
+      updatedAt: LEGACY_TIMESTAMP,
+      selfServiceMintedAt: null
+    },
+    apiToken: {
+      id: "tok_anonymous",
+      accountId: "acct_anonymous",
+      name: "Anonymous Upload Token",
+      tokenHash: RETIRED_ANONYMOUS_TOKEN_HASH,
+      scopes: ["upload"],
+      createdAt: LEGACY_TIMESTAMP,
+      lastUsedAt: null,
+      revokedAt: RETIRED_ANONYMOUS_REVOKED_AT
+    }
+  };
+}
+
+/** A sentinel-owned draft and its first version, as the JSON driver stores them. */
+export function retiredAnonymousDraftJsonRows(): {
+  draft: Record<string, unknown>;
+  version: Record<string, unknown>;
+} {
+  return {
+    draft: {
+      id: RETIRED_ANONYMOUS_DRAFT_ID,
+      accountId: "acct_anonymous",
+      title: "Anonymous draft",
+      visibility: "unlisted",
+      currentVersionId: RETIRED_ANONYMOUS_VERSION_ID,
+      repoOrg: null,
+      repoName: null,
+      createdAt: LEGACY_TIMESTAMP,
+      updatedAt: LEGACY_TIMESTAMP,
+      expiresAt: RETIRED_ANONYMOUS_DRAFT_EXPIRES_AT,
+      pinnedAt: null,
+      deletedAt: null,
+      disabledAt: null,
+      disabledReason: null
+    },
+    version: {
+      id: RETIRED_ANONYMOUS_VERSION_ID,
+      draftId: RETIRED_ANONYMOUS_DRAFT_ID,
+      versionNumber: 1,
+      objectKey: `drafts/${RETIRED_ANONYMOUS_DRAFT_ID}/versions/${RETIRED_ANONYMOUS_VERSION_ID}.html`,
+      contentHash: "sha256:anon",
+      fileSize: 9,
+      createdByApiTokenId: "tok_anonymous",
+      sourceIp: null,
+      userAgent: null,
+      cliVersion: null,
+      gitBranch: null,
+      gitCommitSha: null,
+      originalFilename: "anon.html",
+      createdAt: LEGACY_TIMESTAMP
+    }
+  };
+}
+
+/** An upload event naming the sentinel token, as the JSON driver stores it. */
+export function retiredAnonymousOrphanHistoryJsonRow(): Record<string, unknown> {
+  return {
+    id: "evt_anon_orphan",
+    draftId: LEGACY_DRAFT_ID,
+    draftVersionId: LEGACY_VERSION_ID,
+    apiTokenId: "tok_anonymous",
+    eventType: "draft.created",
+    sourceIp: null,
+    userAgent: null,
+    metadataJson: {},
+    createdAt: LEGACY_TIMESTAMP
+  };
+}
+
 export const PROBE_ADD_MIGRATION_ID = "9990_probe_add_drafts_review_note";
 export const PROBE_REQUIRE_MIGRATION_ID = "9991_probe_require_drafts_review_note";
 
