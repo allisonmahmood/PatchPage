@@ -307,7 +307,9 @@ sh infra/azure/ops.sh stale-lease-recovery
 
 Source-local retention is not an independent backup. Before accepting durable production data or changing a persistent resource, configure independently protected Blob and PostgreSQL backups outside the workload resource group, document the accepted RPO/RTO, and complete an isolated end-to-end restore. Re-run that drill at least every 90 days. Geo-replication improves regional availability but replicates deletion; management locks protect control-plane deletion but not Blob data-plane deletion.
 
-Workload Storage defaults to geo-redundant replication (`GRS`). Existing environments that still use `LRS` will plan an in-place Storage account update on the first infrastructure apply after that default change; review cost and replication behavior before approving. PostgreSQL flexible-server backups remain platform-local by default (`geo_redundant_backup_enabled` is unset); regional database recovery therefore depends on the independent backup drill above rather than Storage GRS symmetry.
+Workload Storage defaults to locally redundant replication (`LRS`). That default changed with the cost posture below: drafts are cheap to re-publish and expire on a 90-day clock, so a paid replica in a second region protects against a class of failure this service does not promise to survive. Existing environments that still use `GRS` will plan an in-place Storage account update on the first infrastructure apply after that default change, and that update reduces regional redundancy — review it deliberately rather than approving it as noise, and set `storage_replication_type` explicitly if your deployment does need geo-redundancy. PostgreSQL flexible-server backups remain platform-local by default (`geo_redundant_backup_enabled` is unset); regional database recovery therefore depends on the independent backup drill above rather than Storage replication symmetry.
+
+Blob versioning, the 30-day delete-retention windows, and both management locks are unchanged by that default. `LRS` weakens none of them: what it drops is cross-region replication, not accidental-deletion recovery.
 
 PostgreSQL backup retention defaults to 35 days (`postgres_backup_retention_days`). Existing environments left on the platform default (about 7 days) will plan an in-place flexible-server update on the first infrastructure apply after that default change; review the added backup storage cost before approving.
 
@@ -444,6 +446,84 @@ Complete this verification in the real deployment:
 
 This verification remains an operator responsibility after deploy. Repeat it whenever Azure ingress behavior, DNS paths, custom domains, CDN/WAF layers, proxy source ranges, or Container App networking changes. Repository and OpenTofu tests validate parsing and environment wiring only; they do not establish the hosted trust boundary.
 
+## Cost posture, the circuit breaker, and the kill switch
+
+The public instance targets roughly $100/month. The circuit breaker is $200/month, and tripping it fires an automated, total, fail-closed kill switch: serving and uploads both go off, together, and bringing them back is an operator decision. The whole mechanism is `kill_switch.tf`; this section is what an operator needs to know about it.
+
+**The kill switch is one named thing.** The Automation runbook `PatchPage-KillSwitch`, in the Automation account named by the `kill_switch_automation_account_name` output. It POSTs the Container Apps stop operation, which terminates every replica and leaves the app in running status `Stopped`. Serving and uploads are the same HTTP surface on the same ingress, so one stop takes both off — there is no half-state where reads still work and writes do not.
+
+**Two independent triggers point at it**, both through the single action group `ag-patchpage-kill-switch-<environment>`:
+
+- **The spend threshold — the circuit breaker itself.** A subscription consumption budget at `monthly_circuit_breaker_amount` (default 200), acting at 100% of **actual** spend. Azure's consumption budget is the mechanism, but what it implements here is a breaker rather than an alert: crossing it acts, and no human confirms first. Actual rather than forecast is deliberate — it accepts Azure's cost-data lag, which can be most of a day, in exchange for never going dark on a projection that a quiet afternoon would have falsified.
+- **The egress tripwire.** A metric alert on the Container App metric `TxBytes` (portal name "Network Out Bytes", namespace `Microsoft.App/containerApps`), `Total` aggregation over a rolling `P1D` window evaluated every `PT15M`, firing above `egress_tripwire_bytes_per_day` (default 100 GiB). `TxBytes` is the bytes the app actually put on the wire. This trigger reads no cost data at all, so a stalled billing pipeline cannot silence both.
+
+Either one alone fires the kill. The runbook is idempotent, so the second trigger arriving while the instance is already dark is harmless.
+
+**What the egress tripwire does and does not see.** It measures the Container App's outbound bytes, and nothing else. That is the whole egress path today, because every draft is served by the app reading from private Blob storage — nothing is fetched by a reader directly from the storage account. #97 originally scoped a storage-account bytes-out metric alongside this one; #106 and #117 collapsed that to a single named tripwire, which is what is implemented here. Record the consequence: **any future change that lets bytes reach readers without passing through the Container App — a CDN, a reverse proxy, public blob access, or SAS-URL redirects — leaves the instance with no egress tripwire at all** until this alert is extended or joined by a storage-account one. That is one of the reasons "no CDN and no reverse proxy" is a standing invariant rather than a preference.
+
+**Restore is an operator decision, enforced as a permission.** The Automation account's identity holds a custom role whose entire permission set is `Microsoft.App/containerApps/read` and `Microsoft.App/containerApps/stop/action`. There is no start action, no write, and no reach outside that one Container App. The automation is mechanically unable to bring the service back. `tofu apply` will not restore it either — running status is not a field this configuration manages, so a stopped app stays stopped across applies.
+
+**The blob size alarm is not a kill trigger.** A metric alert on `BlobCapacity` (namespace `Microsoft.Storage/storageAccounts/blobServices`, `Average` over `P1D`) fires above `blob_capacity_alarm_bytes` (default 50 GiB) into the notification-only action group. Stored bytes are a slow, cheap, recoverable problem that the 90-day draft expiry is already draining; the response is an operator looking at what is accumulating, not an outage.
+
+Both thresholds are **binary** units — 50 GiB (53,687,091,200 bytes) and 100 GiB (107,374,182,400 bytes) — where the spec writes "50 GB" and "~100 GB/day". That is a deliberate 7% reading of an unhedged number, taken because Azure reports and displays storage and network figures in binary units: 50 GiB shows in the portal as exactly `50 GiB`, where the decimal 50,000,000,000 shows as `46.57 GiB` and reads like a typo an operator would be tempted to "fix". Neither alarm has a consequence that 7% changes — one notifies, and the other is a tripwire whose job is to catch a runaway, not to bill anyone. If you would rather match the spec's decimal numbers exactly, set `blob_capacity_alarm_bytes = 50000000000` and `egress_tripwire_bytes_per_day = 100000000000`; nothing else has to change.
+
+### Standing invariants
+
+These are properties of the deployment, not preferences. Changing any of them is a decision that has to revisit `kill_switch.tf`.
+
+- **Replicas are min 1 / max 1.** This is a correctness precondition, not a capacity setting: the rate limiter counts in one process's memory, so every per-minute limit is per replica. Any change that raises `max_replicas` above 1 must replace the in-memory limiter with a shared-store one **in the same change**. Raising the count first is not a smaller step; it is a silent quota outage.
+- **No CDN and no reverse proxy at launch.** The instance serves its own bytes, which is exactly why the egress tripwire is load-bearing — there is no cache layer between a hot draft and the bandwidth bill.
+- **No WAF, no bot-blocking, no challenges or human-checks on draft URLs.** Draft links must stay fetchable by agents. Rate limits and expiry are the abuse controls; the ingress postconditions already pin the absence of IP restrictions.
+- **Escalation lever order when the cheap layers are outrun: friction, then money, then expiry.** Tighten rate limits and quotas first, raise the circuit breaker deliberately second, shorten the draft clock last. Reaching for money first is how a free service becomes an expensive one.
+
+### Before this is live
+
+The Terraform is complete, but four things need an operator:
+
+0. **Check you can create a custom role.** The kill switch's least-privilege role is an `azurerm_role_definition`, which needs `Microsoft.Authorization/roleDefinitions/write` — Owner or User Access Administrator on the subscription. This is a right beyond the role *assignments* the stack already creates, so an apply that has worked before can fail here. If your tenant forbids custom roles, the fallback is `Contributor` scoped to the single Container App; that widens the blast radius from "can stop this app" to "can delete this app", so make it a deliberate, recorded change rather than a quick unblock.
+
+1. **Set `budget_start_date` to the first of the month you apply in.** Azure rejects a start date that is not the first of a month, and rejects one too far in the past when a budget is first created. The default will go stale.
+2. **Set `operator_alert_email`, then complete Azure's verification for it.** Azure now sends a one-time verification to new action-group email receivers, and an unverified address receives nothing. So "I configured the address" is not the same as "I will be told" — send a test notification from the action group and confirm it arrives. Without a working address both action groups still exist and the kill switch still fires — it does not depend on anyone reading mail — but you would learn the instance went dark from the Azure Monitor alert history rather than from a message.
+3. **Diarise `kill_switch_webhook_expiry`.** Azure caps Automation webhook lifetime at ten years and the default is set near that cap. Past that date both triggers still fire and the runbook still exists, but nothing invokes it — a silent single point of failure shared by both triggers, and the one failure mode in this design that neither trigger's independence protects against. An expired webhook cannot be revived; rotation means recreating it, which changes the URI the action group calls, so do it as a planned apply rather than under pressure.
+
+The `Az.Accounts` module the runbook needs is no longer on this list: `kill_switch.tf` imports it explicitly at a pinned version (`kill_switch_az_accounts_version`) rather than relying on the Automation account's defaults, so a missing module now fails at apply instead of during an incident. What remains is to bump that pin deliberately when the version ages out of support.
+
+The metric names and namespaces above are validated by Azure at apply time rather than by this repository's tests, so a typo surfaces as a failed apply rather than as an alert that never fires. That is deliberate: `skip_metric_validation` is left off.
+
+### Kill switch fire drill
+
+Rehearse this before the instance goes public, and after any change to `kill_switch.tf`. The drill is a manual procedure on purpose — there is no `ops.sh` command for it, because a scripted "take the service down" command is a footgun, and because restoring service must stay a deliberate act rather than the second half of a script. For the same reason the commands below are shown as data rather than in a runnable fence: this guide's shell fences are reserved for `ops.sh` commands.
+
+Read the two names the drill needs from the OpenTofu outputs first (`kill_switch_automation_account_name`, `kill_switch_runbook_name`, `resource_group_name`, `container_app_name`).
+
+**1. Fire the kill action.** Prefer the portal's "Test action group" on the kill action group: it exercises the webhook hop, which is the part with an expiry on it and the part no other step covers. Starting the runbook directly is the fallback — note that `az automation runbook start` comes from the Azure CLI's **experimental** `automation` extension, so treat a CLI-side failure here as a tooling problem rather than evidence about the kill switch.
+
+```txt
+az automation runbook start \
+  --resource-group <resource_group_name> \
+  --automation-account-name <kill_switch_automation_account_name> \
+  --name PatchPage-KillSwitch
+```
+
+**2. Observe the instance go dark.** The running status must become `Stopped`, and the public base URL must stop answering. Check both — the running status is the mechanism, the dead URL is the promise.
+
+```txt
+az containerapp show \
+  --resource-group <resource_group_name> \
+  --name <container_app_name> \
+  --query properties.runningStatus
+```
+
+**3. Confirm the automation cannot undo it.** Nothing to run: the role grants no start action. Note in the drill record that the kill switch identity's permissions were read from `kill_switch.tf` and carry `stop` only.
+
+**4. Restore, as the operator.** There is no `az containerapp start` command in the CLI, so the start operation is called through the ARM REST route with your own credentials — which is the point, since this is the step the automation cannot take.
+
+```txt
+az rest --method post --url "https://management.azure.com/subscriptions/<subscription>/resourceGroups/<resource_group_name>/providers/Microsoft.App/containerApps/<container_app_name>/start?api-version=2025-01-01"
+```
+
+**5. Verify service is back.** Running status returns to `Running`, and the public base URL serves a draft again. Record how long steps 1 through 5 took; that number is the instance's real recovery time and belongs in the go-public flip record.
+
 ## Intentional retirement
 
 There is no routine teardown command for a durable PatchPage environment. Retiring only the app while retaining PostgreSQL and Blob data is a separate operation and must not touch the persistent resources.
@@ -471,3 +551,4 @@ Never use retirement to repair state, DNS, certificates, image rollout, or envir
 - Keep `trust_proxy = null` until the live forwarding chain has passed the HITL verification above; an incorrect trust rule permits spoofed audit attribution.
 - Never paste subscription or tenant IDs, caller details, Activity Log claims, state lineage, resource IDs, domain-verification values, certificate rows, unlisted draft URLs, tokens, connection strings, storage keys, or backup evidence into public issues, PRs, logs, or chat.
 - Management locks and `prevent_destroy` reduce accidental control-plane deletion; they are not authorization boundaries and do not replace independently tested backups.
+- The kill switch Automation webhook URI is a capability: anyone holding it can take the instance dark. It is deliberately not an OpenTofu output and must not be printed, pasted, or committed. The blast radius is bounded — the worst it buys is an outage the operator can reverse, and the identity behind it can do nothing else — but treat it as a secret and rotate it with `kill_switch_webhook_expiry`.

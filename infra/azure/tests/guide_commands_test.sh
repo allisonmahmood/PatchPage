@@ -3817,6 +3817,89 @@ server_image_precondition_is_pinned() {
   ' "$1/container_app.tf"
 }
 
+# Returns 0 when each of the consumption budget's notification blocks names the
+# action group that matches its own threshold, 1 otherwise. Takes the directory
+# holding kill_switch.tf so the check itself can be meta-tested against a
+# sabotaged copy. Deliberately reports status instead of calling fail.
+#
+# The generic resource-scoped scan used for the two metric alerts cannot express
+# this. A budget carries two notification blocks -- the breaker at 100% pointing
+# at the kill group, and the advisory at the cost target pointing at the notice
+# group -- so a scan that asks "does this resource mention the kill group
+# anywhere" stays green after the two groups are swapped. That swap is the whole
+# mistake worth catching: it would turn the ~$100 advisory into an outage and
+# leave the $200 breaker merely sending mail, and both notifications would still
+# look entirely reasonable in isolation.
+#
+# So the pairing is what gets asserted, per block and in both directions:
+# whichever notification names the kill group must be the 100% one, whichever
+# notification is the 100% one must name the kill group, there must be exactly
+# one of it, at least one notification must reach the notice group, and no
+# notification may name a group this check has never heard of.
+budget_notifications_pair_threshold_with_action_group() {
+  awk '
+    BEGIN {
+      kill_group = "[azurerm_monitor_action_group.kill_switch.id]"
+      notice_group = "[azurerm_monitor_action_group.operator_notice.id]"
+    }
+    $0 == "resource \"azurerm_consumption_budget_subscription\" \"circuit_breaker\" {" {
+      in_resource = 1
+      depth = 1
+      next
+    }
+    in_resource {
+      line = $0
+      opens = gsub(/\{/, "{", line)
+      line = $0
+      closes = gsub(/\}/, "}", line)
+      if (!in_notification && $0 ~ /^[[:space:]]*notification[[:space:]]*\{[[:space:]]*$/) {
+        in_notification = 1
+        notification_depth = 1
+        seen_threshold = ""
+        seen_groups = ""
+        depth += opens - closes
+        next
+      }
+      if (in_notification) {
+        # threshold_type is not threshold: the character after the name has to
+        # be whitespace or the equals sign, which "_" is not.
+        if (match($0, /^[[:space:]]*threshold[[:space:]]*=[[:space:]]*/)) {
+          rest = substr($0, RSTART + RLENGTH)
+          gsub(/[[:space:]]+$/, "", rest)
+          seen_threshold = rest
+        }
+        if (match($0, /^[[:space:]]*contact_groups[[:space:]]*=[[:space:]]*/)) {
+          rest = substr($0, RSTART + RLENGTH)
+          gsub(/[[:space:]]+$/, "", rest)
+          seen_groups = rest
+        }
+        notification_depth += opens - closes
+        if (notification_depth <= 0) {
+          in_notification = 0
+          if (seen_groups == kill_group) {
+            kill_notifications++
+            if (seen_threshold != "100") broken = 1
+          } else if (seen_groups == notice_group) {
+            notice_notifications++
+            if (seen_threshold == "100") broken = 1
+          } else {
+            broken = 1
+          }
+          if (seen_threshold == "100" && seen_groups != kill_group) broken = 1
+        }
+      }
+      depth += opens - closes
+      if (depth <= 0) {
+        exit (broken || kill_notifications != 1 || notice_notifications < 1) ? 1 : 0
+      }
+    }
+    END {
+      if (!in_resource) exit 1
+      exit (broken || kill_notifications != 1 || notice_notifications < 1) ? 1 : 0
+    }
+  ' "$1"/*.tf
+}
+
 # Returns 0 when every command that loads the shared operation-lease library
 # declares its data-plane auth mode, and declares the one it is supposed to, 1
 # otherwise. Takes the cmd directory so the check itself can be meta-tested
@@ -4911,6 +4994,132 @@ test_public_safe_runbook_static() {
       fail "management lock $lock_resource is not scoped to $expected_scope"
     fi
   done
+
+  # Which action group each cost trigger is pointed at.
+  #
+  # Exactly the gap the lock scopes above have, for exactly the same reason.
+  # Under the per-type mock_resource defaults in the tftest suites, every
+  # azurerm_monitor_action_group mocks to one id, so a plan assertion that "the
+  # egress tripwire fires the kill action group" is equally satisfied by a
+  # tripwire wired to the notice group. tests/cost_posture.tftest.hcl closes
+  # that behaviourally with per-address override_resource ids; this closes it
+  # again by reading the expression rather than its value, and the two fail for
+  # different reasons.
+  #
+  # Two entries, and the second is the one that matters most. The blob size
+  # alarm must notify and must never kill: 50 GiB of stored drafts is a slow,
+  # cheap, recoverable problem, and quietly repointing that alarm at the kill
+  # group would convert an operator's reading task into an outage. Stating the
+  # non-kill wiring here means it cannot drift silently in either direction.
+  #
+  # Both entries are metric alerts, whose `action` block carries exactly one
+  # action_group_id, so "this resource names that group" is the whole of the
+  # wiring and a resource-scoped scan says everything there is to say.
+  #
+  # The consumption budget is deliberately not an entry here. It carries two
+  # notification blocks naming two different groups, so the same scan could only
+  # assert that the kill group appears *somewhere* inside it -- which stays
+  # green if the 100% and 50% groups are swapped, the one mistake worth
+  # catching. It gets its own block-aware check below instead.
+  #
+  # resource|attribute|expected_expression
+  for cost_trigger_spec in \
+    'azurerm_monitor_metric_alert.egress_tripwire|action_group_id|azurerm_monitor_action_group.kill_switch.id' \
+    'azurerm_monitor_metric_alert.blob_capacity|action_group_id|azurerm_monitor_action_group.operator_notice.id'; do
+    trigger_resource="${cost_trigger_spec%%|*}"
+    trigger_remainder="${cost_trigger_spec#*|}"
+    trigger_attribute="${trigger_remainder%%|*}"
+    expected_target="${trigger_remainder#*|}"
+    resource_type="${trigger_resource%%.*}"
+    resource_name="${trigger_resource#*.}"
+    if ! awk -v rtype="$resource_type" -v rname="$resource_name" \
+      -v attr="$trigger_attribute" -v expected="$expected_target" '
+      $0 == ("resource \"" rtype "\" \"" rname "\" {") {
+        in_resource = 1
+        depth = 1
+        next
+      }
+      in_resource {
+        line = $0
+        opens = gsub(/\{/, "{", line)
+        line = $0
+        closes = gsub(/\}/, "}", line)
+        depth += opens - closes
+        if (match($0, "^[[:space:]]*" attr "[[:space:]]*=[[:space:]]*")) {
+          rest = substr($0, RSTART + RLENGTH)
+          gsub(/[[:space:]]+$/, "", rest)
+          if (rest == expected) {
+            found = 1
+          }
+        }
+        if (depth <= 0) {
+          exit !found
+        }
+      }
+      END {
+        if (!in_resource || !found) exit 1
+      }
+    ' "$azure_tf_dir"/*.tf; then
+      fail "cost trigger $trigger_resource does not point $trigger_attribute at $expected_target"
+    fi
+  done
+
+  # The budget's two notifications, each paired with the group that matches its
+  # own threshold. See the function's comment for why the generic scan above
+  # cannot say this.
+  budget_notifications_pair_threshold_with_action_group "$azure_tf_dir" ||
+    fail "the consumption budget's notifications are not each paired with the action group matching their threshold"
+
+  # Meta-test it: swapping the kill and notice groups between the two
+  # notifications must be rejected. Without this the check could quietly become
+  # the weaker "mentions the kill group somewhere" scan it exists to replace.
+  budget_probe_dir="$TMP_DIR/budget-notification-probe"
+  rm -rf "$budget_probe_dir"
+  mkdir -p "$budget_probe_dir" ||
+    fail "could not create the budget notification probe directory"
+  sed -e 's/azurerm_monitor_action_group\.kill_switch\.id/PP_SWAP_PLACEHOLDER/g' \
+    -e 's/azurerm_monitor_action_group\.operator_notice\.id/azurerm_monitor_action_group.kill_switch.id/g' \
+    -e 's/PP_SWAP_PLACEHOLDER/azurerm_monitor_action_group.operator_notice.id/g' \
+    "$azure_tf_dir/kill_switch.tf" > "$budget_probe_dir/kill_switch.tf" ||
+    fail "could not build the swapped budget notification probe"
+  if cmp -s "$azure_tf_dir/kill_switch.tf" "$budget_probe_dir/kill_switch.tf"; then
+    fail "the budget notification probe did not swap anything"
+  fi
+  if budget_notifications_pair_threshold_with_action_group "$budget_probe_dir"; then
+    fail "the budget notification check accepts the kill and notice groups swapped"
+  fi
+  rm -rf "$budget_probe_dir"
+
+  # The kill switch's privilege, which is the whole of what makes it
+  # fail-closed. The role carries stop and not start, so the automation is
+  # mechanically unable to bring the service back and restoring it is an
+  # operator decision in the permission model rather than only in the runbook's
+  # prose. cost_posture.tftest.hcl asserts the action list; this states the
+  # absent action by name, so a future edit that adds start has to delete a line
+  # that says why it must not.
+  if awk '
+    $0 == "resource \"azurerm_role_definition\" \"kill_switch\" {" {
+      in_resource = 1
+      depth = 1
+      next
+    }
+    in_resource {
+      line = $0
+      opens = gsub(/\{/, "{", line)
+      line = $0
+      closes = gsub(/\}/, "}", line)
+      depth += opens - closes
+      if ($0 ~ /containerApps\/start\/action/) {
+        found_start = 1
+      }
+      if (depth <= 0) {
+        exit found_start ? 0 : 1
+      }
+    }
+    END { exit found_start ? 0 : 1 }
+  ' "$azure_tf_dir"/*.tf; then
+    fail "the kill switch role grants a Container App start action; restoring service must stay an operator decision"
+  fi
 
   # The Container App create-time server_image gate is invisible to plan-time
   # `tofu test`: expect_failures on azurerm_container_app.server is satisfied by

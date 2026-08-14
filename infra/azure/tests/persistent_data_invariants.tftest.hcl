@@ -40,6 +40,46 @@ mock_provider "azurerm" {
       principal_id = "00000000-0000-0000-0000-000000000001"
     }
   }
+
+  # The cost posture in kill_switch.tf made five more computed ids reach
+  # another resource's *configuration*, which is the condition the note above
+  # describes: the Container App id now flows into a role definition, a role
+  # assignment, a metric alert scope and the runbook body, and the Automation
+  # account, webhook and action group ids flow into the action group and the
+  # two alerts. Every suite that plans this configuration therefore has to mock
+  # them well enough for the real azurerm validators, including the suites that
+  # assert nothing about any of it. tests/cost_posture.tftest.hcl is where they
+  # are actually asserted.
+  mock_resource "azurerm_container_app" {
+    defaults = {
+      id = "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg-mock/providers/Microsoft.App/containerApps/ca-mock"
+    }
+  }
+
+  mock_resource "azurerm_automation_account" {
+    defaults = {
+      id = "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg-mock/providers/Microsoft.Automation/automationAccounts/aa-mock"
+    }
+  }
+
+  mock_resource "azurerm_automation_webhook" {
+    defaults = {
+      id  = "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg-mock/providers/Microsoft.Automation/automationAccounts/aa-mock/webhooks/wh-mock"
+      uri = "https://mock.webhook.automation.invalid/webhooks?token=mock"
+    }
+  }
+
+  mock_resource "azurerm_role_definition" {
+    defaults = {
+      role_definition_resource_id = "/subscriptions/00000000-0000-0000-0000-000000000000/providers/Microsoft.Authorization/roleDefinitions/00000000-0000-0000-0000-000000000002"
+    }
+  }
+
+  mock_resource "azurerm_monitor_action_group" {
+    defaults = {
+      id = "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg-mock/providers/Microsoft.Insights/actionGroups/ag-mock"
+    }
+  }
 }
 
 # Pin the registry name suffix. With computed values now resolved at plan time an
@@ -64,9 +104,17 @@ run "protects_persistent_data_by_default" {
   command = plan
 
 
+  # Locally redundant, deliberately. Geo-redundancy was the earlier default and
+  # was dropped with the cost posture: drafts are cheap to re-publish, they
+  # expire on a 90-day clock, and a paid replica in a second region protects
+  # against a class of failure this free service is not promising to survive.
+  # What is still protected is accidental deletion, which is what the versioning,
+  # retention and lock assertions below are for -- LRS does not weaken any of
+  # them. tests/cost_posture.tftest.hcl asserts the same default from the cost
+  # side; this one is here because it is a durability decision too.
   assert {
-    condition     = azurerm_storage_account.drafts.account_replication_type == "GRS"
-    error_message = "Expected geo-redundant Storage replication by default."
+    condition     = azurerm_storage_account.drafts.account_replication_type == "LRS"
+    error_message = "Expected locally redundant Storage replication by default."
   }
 
   assert {

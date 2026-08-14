@@ -227,7 +227,30 @@ resource "azurerm_container_app" "server" {
   }
 
   template {
-    min_replicas = 0
+    # STANDING INVARIANT: exactly one replica, min and max.
+    #
+    # This is not a capacity setting and it is not a cost setting -- it is a
+    # correctness precondition for the rate limiter. The limiter counts
+    # attempts in the server's own memory, so every per-minute limit above is
+    # really per replica. Take PATCHPAGE_DRAFT_CREATE_RATE_LIMIT_PER_MINUTE,
+    # which is 10: at one replica it means ten creates a minute per token, at
+    # two it silently means twenty, and at N it means 10N -- with no error
+    # anywhere and nothing in a test to notice.
+    #
+    # PATCHPAGE_LIVE_DRAFTS_PER_TOKEN is not affected, and the difference is
+    # the point: it is counted from the database, so it holds at any replica
+    # count. Only the in-memory per-minute limits depend on this invariant.
+    #
+    # So the rule is: any change that raises max_replicas above 1 must, in the
+    # same change, replace the in-memory limiter with a shared-store one.
+    # Raising the count first and "doing the limiter next" is not a smaller
+    # step -- it is a quota outage that looks like normal operation.
+    #
+    # min_replicas is 1 rather than 0 for a different reason: scale-to-zero
+    # trades a cold start on the first request for a few dollars a month, and
+    # the first request is very often a person opening a link somebody just
+    # sent them. tests/cost_posture.tftest.hcl pins both numbers.
+    min_replicas = 1
     max_replicas = 1
 
     container {

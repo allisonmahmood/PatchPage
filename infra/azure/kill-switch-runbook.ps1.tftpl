@@ -1,0 +1,59 @@
+<#
+    PatchPage kill switch.
+
+    Takes the public instance dark: one POST to the Container Apps stop
+    operation, which terminates every replica and leaves the app in
+    runningStatus "Stopped". Serving and uploads are the same HTTP surface, so
+    stopping the app takes both off in one action -- there is no partial state
+    where reads still work and writes do not.
+
+    Fail-closed by construction, in two senses:
+
+      * The kill needs one successful call. Anything else -- a non-success
+        status, a transport failure, an expired token -- throws, the Automation
+        job is recorded Failed, and the operator sees a failed job rather than a
+        silent no-op. It never reports success it did not get.
+      * The identity this runbook runs as holds a custom role carrying exactly
+        containerApps/read and containerApps/stop/action. It cannot start the
+        app again, cannot edit it, and cannot touch anything else in the
+        subscription. Restoring service is therefore not merely "an operator
+        decision" by convention; the automation is mechanically incapable of it.
+
+    Invoked by an Azure Monitor action group webhook. Both triggers -- the $200
+    actual-spend circuit breaker and the ~100 GiB/day egress tripwire -- point
+    at that one action group, so both arrive here. The runbook is idempotent:
+    stopping an already-stopped app succeeds, so a second trigger firing while
+    the instance is already dark is harmless.
+#>
+
+param(
+    [Parameter(Mandatory = $false)]
+    [object] $WebhookData
+)
+
+$ErrorActionPreference = 'Stop'
+
+$ContainerAppResourceId = '${container_app_id}'
+$StopApiVersion = '${stop_api_version}'
+
+Write-Output 'PatchPage kill switch invoked.'
+
+if ($null -ne $WebhookData) {
+    Write-Output "Trigger: $($WebhookData.WebhookName)"
+}
+
+# The Automation account's system-assigned identity. No secret is stored
+# anywhere in this runbook or in the Automation account.
+Connect-AzAccount -Identity | Out-Null
+
+$stopPath = "$ContainerAppResourceId/stop?api-version=$StopApiVersion"
+$response = Invoke-AzRestMethod -Method POST -Path $stopPath
+
+# 200 is a completed stop, 202 an accepted long-running one. Anything else is a
+# failure to go dark and must be loud.
+if ($response.StatusCode -ne 200 -and $response.StatusCode -ne 202) {
+    throw "PatchPage kill switch could not stop the container app: HTTP $($response.StatusCode). The instance may still be serving."
+}
+
+Write-Output "Kill switch fired: stop accepted with HTTP $($response.StatusCode)."
+Write-Output 'Serving and uploads are both off. Restoring the service is an operator decision; this runbook cannot start the app.'

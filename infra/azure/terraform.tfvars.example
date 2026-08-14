@@ -10,11 +10,42 @@ public_base_url = "https://patchpage.your-domain.invalid"
 # the trusted-proxy HITL verification in README.md.
 trust_proxy = null
 
-# Persistent-data recovery defaults. Geo-redundant replication and the
-# retention windows can be adjusted within the validated values.
-storage_replication_type       = "GRS"
+# Persistent-data recovery defaults. Replication and the retention windows can
+# be adjusted within the validated values. LRS is the cost-posture default;
+# raising it to a geo-redundant type is a deliberate durability purchase.
+storage_replication_type       = "LRS"
 storage_delete_retention_days  = 30
 postgres_backup_retention_days = 35
+
+# Cost posture. See "Cost posture, the circuit breaker, and the kill switch" in
+# README.md before changing any of these; the defaults are the public
+# instance's ratified posture rather than tuning knobs.
+#
+# budget_start_date must be the first of the month you apply in: Azure rejects a
+# start date that is not the first of a month, and rejects one too far in the
+# past when the budget is first created. The default here will go stale.
+monthly_circuit_breaker_amount      = 200
+monthly_cost_target_amount = 100
+budget_start_date          = "2026-08-01T00:00:00Z"
+
+# 100 GiB/day of Container App egress fires the kill switch. 50 GiB of total
+# blob storage only notifies.
+egress_tripwire_bytes_per_day = 107374182400
+blob_capacity_alarm_bytes     = 53687091200
+
+# Set this. Without it the kill switch still fires -- it does not depend on
+# anyone reading mail -- but nothing tells you that it did.
+operator_alert_email = null
+
+# Azure caps Automation webhook lifetime at ten years. Past this date both
+# triggers still fire and the runbook still exists, but nothing invokes it.
+kill_switch_webhook_expiry = "2036-01-01T00:00:00Z"
+
+# The runbook needs Az.Accounts for Connect-AzAccount and Invoke-AzRestMethod.
+# It is imported explicitly at this exact version rather than inherited from the
+# Automation account's defaults, so a missing module fails at apply instead of
+# during an incident. Bump deliberately when it ages out of support.
+kill_switch_az_accounts_version = "5.5.2"
 
 # Application safety defaults. These match the server defaults and may be
 # lowered or raised within the documented validation bounds.

@@ -300,9 +300,9 @@ variable "server_image" {
 }
 
 variable "storage_replication_type" {
-  description = "Azure Storage account replication type."
+  description = "Azure Storage account replication type. Defaults to locally redundant: drafts are cheap to re-publish and expire on a 90-day clock, so geo-redundancy is a premium this service does not buy. A self-hoster with different durability needs can still pick any of the listed types."
   type        = string
-  default     = "GRS"
+  default     = "LRS"
   nullable    = false
 
   validation {
@@ -457,5 +457,119 @@ variable "live_drafts_per_token" {
       floor(var.live_drafts_per_token) == var.live_drafts_per_token
     )
     error_message = "live_drafts_per_token must be an integer from 1 through 1000000."
+  }
+}
+
+# --- cost posture: circuit breaker, kill switch, and alarms ------------------
+#
+# Every number the cost posture turns on is a variable so a self-hoster can size
+# the guardrails to their own bill, but the defaults are the public instance's
+# ratified posture and changing them is a decision, not a tuning exercise.
+
+variable "monthly_circuit_breaker_amount" {
+  description = "Monthly spend, in the billing account's currency, at which the circuit breaker fires the kill switch and the instance goes dark."
+  type        = number
+  default     = 200
+  nullable    = false
+
+  validation {
+    condition     = var.monthly_circuit_breaker_amount > 0
+    error_message = "monthly_circuit_breaker_amount must be greater than zero."
+  }
+}
+
+variable "monthly_cost_target_amount" {
+  description = "Monthly spend the service is aiming to stay under. Advisory only: crossing it notifies the operator and never takes the service down."
+  type        = number
+  default     = 100
+  nullable    = false
+
+  validation {
+    condition     = var.monthly_cost_target_amount > 0
+    error_message = "monthly_cost_target_amount must be greater than zero."
+  }
+
+  validation {
+    # A target at or above the breaker would collapse the advisory notice and
+    # the outage into one event, which defeats having a target at all.
+    condition     = var.monthly_cost_target_amount < var.monthly_circuit_breaker_amount
+    error_message = "monthly_cost_target_amount must be below monthly_circuit_breaker_amount so the advisory notice arrives before the circuit breaker fires."
+  }
+}
+
+variable "budget_start_date" {
+  description = "First day of the month the consumption budget starts tracking, as RFC 3339 UTC. Azure rejects a start date that is not the first of a month, and rejects one too far in the past when the budget is first created, so set this to the month you apply in."
+  type        = string
+  default     = "2026-08-01T00:00:00Z"
+  nullable    = false
+
+  validation {
+    condition     = can(regex("^[0-9]{4}-(?:0[1-9]|1[0-2])-01T00:00:00Z$", var.budget_start_date))
+    error_message = "budget_start_date must be the first day of a month at midnight UTC, formatted as YYYY-MM-01T00:00:00Z."
+  }
+}
+
+variable "egress_tripwire_bytes_per_day" {
+  description = "Container App TxBytes over a rolling day, in bytes, above which the egress tripwire fires the kill switch. The default is 100 GiB."
+  type        = number
+  default     = 107374182400
+  nullable    = false
+
+  validation {
+    condition = (
+      var.egress_tripwire_bytes_per_day >= 1073741824 &&
+      floor(var.egress_tripwire_bytes_per_day) == var.egress_tripwire_bytes_per_day
+    )
+    error_message = "egress_tripwire_bytes_per_day must be a whole number of bytes and at least 1 GiB; a tripwire below that would fire on ordinary traffic."
+  }
+}
+
+variable "blob_capacity_alarm_bytes" {
+  description = "Total blob storage, in bytes, above which the operator is notified. The default is 50 GiB. Notification only: this alarm never fires the kill switch."
+  type        = number
+  default     = 53687091200
+  nullable    = false
+
+  validation {
+    condition = (
+      var.blob_capacity_alarm_bytes >= 1073741824 &&
+      floor(var.blob_capacity_alarm_bytes) == var.blob_capacity_alarm_bytes
+    )
+    error_message = "blob_capacity_alarm_bytes must be a whole number of bytes and at least 1 GiB."
+  }
+}
+
+variable "kill_switch_webhook_expiry" {
+  description = "Expiry of the Automation webhook the action group calls to fire the kill switch, as RFC 3339 UTC. Azure caps webhook lifetime at ten years. Past this date the alerts still fire and the runbook still exists, but nothing invokes it, so rotating this before it lapses is a standing operator chore."
+  type        = string
+  default     = "2036-01-01T00:00:00Z"
+  nullable    = false
+
+  validation {
+    condition     = can(regex("^[0-9]{4}-(?:0[1-9]|1[0-2])-(?:0[1-9]|[12][0-9]|3[01])T[0-2][0-9]:[0-5][0-9]:[0-5][0-9]Z$", var.kill_switch_webhook_expiry))
+    error_message = "kill_switch_webhook_expiry must be an RFC 3339 UTC timestamp, formatted as YYYY-MM-DDTHH:MM:SSZ."
+  }
+}
+
+variable "operator_alert_email" {
+  description = "Address notified when the kill switch fires and when advisory thresholds are crossed. Null leaves both action groups without an email receiver; the kill switch still fires, and alerts are still visible in Azure Monitor."
+  type        = string
+  default     = null
+
+  validation {
+    condition     = var.operator_alert_email == null ? true : can(regex("^[^@[:space:]]+@[^@[:space:]]+\\.[^@[:space:]]+$", var.operator_alert_email))
+    error_message = "operator_alert_email must be null or a single email address."
+  }
+}
+
+variable "kill_switch_az_accounts_version" {
+  description = "Az.Accounts version imported into the kill switch Automation account. Connect-AzAccount and Invoke-AzRestMethod both come from this module, so the runbook cannot run without it. Pinned rather than left to the account's defaults so a missing module fails at apply instead of during an incident; bump it deliberately when the pinned version ages out of support."
+  type        = string
+  default     = "5.5.2"
+  nullable    = false
+
+  validation {
+    condition     = can(regex("^[0-9]+\\.[0-9]+\\.[0-9]+$", var.kill_switch_az_accounts_version))
+    error_message = "kill_switch_az_accounts_version must be an exact three-part version, as published on the PowerShell Gallery."
   }
 }
