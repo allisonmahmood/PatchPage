@@ -53,7 +53,7 @@ An operator's act of permanently disabling an auth token. Revoked is a state the
 _Avoid_: ban, token deletion
 
 **Report**:
-A reader's flag on a served draft asking the operator to review it. Filing one is acknowledged immediately and has no automatic consequence; disabling, deleting, or revoking is always an operator decision.
+A reader's flag on a served draft asking the operator to review it. Filing one is acknowledged immediately and has no automatic consequence; disabling, deleting, or revoking is always an operator decision. Filing is rate limited per source address per minute, which bounds how many rows one address can write and nothing more — being limited is never a judgement about the page, and no volume of reports moves the operator's hand.
 _Avoid_: takedown request (a report may lead to a takedown; it is not one)
 
 **Serving guarantee**:

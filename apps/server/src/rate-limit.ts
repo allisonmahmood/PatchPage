@@ -23,17 +23,19 @@ export interface RateLimitConfig {
   authenticatedUploadRateLimitPerMinute: number;
   selfServiceMintRateLimitPerMinute: number;
   draftCreateRateLimitPerMinute: number;
+  reportRateLimitPerMinute: number;
 }
 
 export interface RateLimiters {
   protectedApi: FixedWindowRateLimiter;
   authenticatedUpload: FixedWindowRateLimiter;
   /**
-   * Self-service mints per minute, keyed by source address — the only limiter
-   * on an unauthenticated route, since a caller asking for its first token has
-   * no token to key on yet. This is the fast half of the mint guardrail; the
-   * per-day ceiling is a database count, so a restart empties this bucket but
-   * not that one.
+   * Self-service mints per minute, keyed by source address rather than by
+   * token, since a caller asking for its first token has no token to key on
+   * yet. One of the two limiters on an unauthenticated route, alongside
+   * `report` below. This is the fast half of the mint guardrail; the per-day
+   * ceiling is a database count, so a restart empties this bucket but not that
+   * one.
    */
   selfServiceMint: FixedWindowRateLimiter;
   /**
@@ -42,6 +44,15 @@ export interface RateLimiters {
    * count, so a restart resets this bucket but not that ceiling.
    */
   draftCreate: FixedWindowRateLimiter;
+  /**
+   * Reports filed per minute, keyed by source address. The other limiter on an
+   * unauthenticated route, and keyed that way for the same reason as the mint
+   * one: a reader flagging a page carries no credential to key on. It bounds
+   * how many rows one address can write and nothing else — a report has no
+   * automatic consequence at any volume, so this is a disk guardrail, never a
+   * moderation decision.
+   */
+  report: FixedWindowRateLimiter;
 }
 
 export interface CreateRateLimitersOptions {
@@ -88,6 +99,10 @@ export function createRateLimiters(
     draftCreate: new FixedWindowRateLimiter({
       ...base,
       limit: config.draftCreateRateLimitPerMinute
+    }),
+    report: new FixedWindowRateLimiter({
+      ...base,
+      limit: config.reportRateLimitPerMinute
     })
   };
 }

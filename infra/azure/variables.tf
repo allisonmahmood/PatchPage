@@ -444,6 +444,22 @@ variable "draft_create_rate_limit_per_minute" {
   }
 }
 
+variable "report_rate_limit_per_minute" {
+  description = "Reports allowed per canonical client IP per minute on the unauthenticated report endpoint."
+  type        = number
+  default     = 10
+  nullable    = false
+
+  validation {
+    condition = (
+      var.report_rate_limit_per_minute >= 1 &&
+      var.report_rate_limit_per_minute <= 10000 &&
+      floor(var.report_rate_limit_per_minute) == var.report_rate_limit_per_minute
+    )
+    error_message = "report_rate_limit_per_minute must be an integer from 1 through 10000."
+  }
+}
+
 variable "live_drafts_per_token" {
   description = "Live drafts one API token may hold at once. Counted from the database, so it survives restarts."
   type        = number

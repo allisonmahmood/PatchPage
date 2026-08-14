@@ -63,6 +63,12 @@ export interface ServerConfig {
   selfServiceMintsPerIpPerDay: number;
   draftCreateRateLimitPerMinute: number;
   /**
+   * How many reports one source address may file per minute. The report POST is
+   * the service's other unauthenticated write, so it is bounded the same way
+   * the mint route is — by address, in memory, per minute.
+   */
+  reportRateLimitPerMinute: number;
+  /**
    * The live-draft ceiling one token may hold. Counted from the database on
    * every create, so it survives a restart — unlike the per-minute limiters.
    */
@@ -127,6 +133,15 @@ export function getServerConfig(env: NodeJS.ProcessEnv = process.env): ServerCon
     draftCreateRateLimitPerMinute: rateLimitPerMinuteValue(
       "PATCHPAGE_DRAFT_CREATE_RATE_LIMIT_PER_MINUTE",
       env.PATCHPAGE_DRAFT_CREATE_RATE_LIMIT_PER_MINUTE,
+      10
+    ),
+    // Ten, not five: a reported page is often shared, and several readers
+    // behind one office or carrier NAT flagging it within a minute is the
+    // ordinary case, not the attack. The attack it does stop is one address
+    // writing rows without end.
+    reportRateLimitPerMinute: rateLimitPerMinuteValue(
+      "PATCHPAGE_REPORT_RATE_LIMIT_PER_MINUTE",
+      env.PATCHPAGE_REPORT_RATE_LIMIT_PER_MINUTE,
       10
     ),
     liveDraftsPerToken: boundedIntegerValue(

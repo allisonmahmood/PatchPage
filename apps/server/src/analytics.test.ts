@@ -88,6 +88,7 @@ function testConfig(overrides: Partial<ServerConfig> = {}): ServerConfig {
     selfServiceMintRateLimitPerMinute: 5,
     selfServiceMintsPerIpPerDay: 5,
     draftCreateRateLimitPerMinute: 10,
+    reportRateLimitPerMinute: 10,
     liveDraftsPerToken: 1_000,
     posthogApiKey: null,
     posthogHost: "https://us.i.posthog.com",
