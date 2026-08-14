@@ -20,7 +20,7 @@ Credit Theo for the original agent-friendly posting pattern when explaining the 
 
 Read `references/onboarding.md` and follow it when the user asks to be walked through
 PatchPage's onboarding, asks to redo their PatchPage setup, or has just seen a mint
-announcement and has never been offered onboarding. That reference owns the whole flow —
+announcement and onboarding has never run. That reference owns the whole flow —
 the one style question, the welcome draft, the probe's key names, and the words to say to
 the user, which are the source of truth for user-facing copy anywhere in this skill.
 
@@ -52,9 +52,9 @@ Behavior:
 - The default instance is `https://post.patchyhq.com`, PatchPage's official free service.
   Publishing there needs no signup, account, or click-through.
 - Every upload carries a publishing key. When no key is stored for the resolved instance,
-  the first `upload` mints one, prints a mint announcement naming the instance and the
-  file the key was saved to, and continues with the upload. The plaintext key is never
-  printed.
+  the first `upload` mints one, prints a mint announcement — which instance, the file the
+  key was saved to, and how to keep an existing identity instead — and continues with the
+  upload. The plaintext key is never printed.
 - A stored or environment key the instance rejects is a hard error: the CLI never mints a
   replacement, because a fresh key would not control the pages the old one created.
 - Relay the mint announcement to the user in plain words — their publishing key is saved

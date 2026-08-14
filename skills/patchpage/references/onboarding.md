@@ -17,8 +17,8 @@ second step reads, verbatim:
 > Then walk me through PatchPage's onboarding: set up how my pages should look and publish
 > my welcome page.
 
-Run onboarding as soon as the skill is installed. This sentence is the only primary
-trigger: `npx skills add` runs nothing by itself.
+Run onboarding as soon as the install that prompt requested finishes. The sentence is the
+only primary trigger: `npx skills add` runs nothing by itself.
 
 **Lazy fallback — after a mint announcement.** An `upload` just printed a mint
 announcement and onboarding has never run. Offer it once — "Want me to spend two minutes
