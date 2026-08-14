@@ -7,6 +7,7 @@ import { UploadTargetError } from "./types.js";
 import type { SchemaMigration } from "./migrations.js";
 import type {
   ApiTokenAuth,
+  ApiTokenRevocation,
   CreateApiTokenInput,
   DbDriverOptions,
   DraftRecord,
@@ -16,7 +17,9 @@ import type {
   DraftVersionRecord,
   MintSelfServiceTokenInput,
   MintSelfServiceTokenResult,
+  ModeratedDraftRecord,
   PatchPageDb,
+  PrincipalDraftListing,
   RecordDraftReportInput,
   RecordUploadInput,
   RecordUploadResult,
@@ -43,6 +46,19 @@ const MIGRATION_ADVISORY_LOCK_KEY = 5150324118422001n;
 /** A draft's creating token is the one recorded on its first version. */
 const FIRST_VERSION_NUMBER = 1;
 
+/**
+ * A draft with the token that created it, for the moderation loop. `$2` is the
+ * first version number; the join is outer so a draft always answers, even when
+ * its first version is somehow missing.
+ */
+const MODERATED_DRAFT_SELECT = `
+  SELECT drafts.*, first_version.created_by_api_token_id
+  FROM drafts
+  LEFT JOIN draft_versions AS first_version
+    ON first_version.draft_id = drafts.id
+    AND first_version.version_number = $2
+`;
+
 export class PostgresPatchPageDb implements PatchPageDb {
   private readonly pool: pg.Pool;
   private readonly migrations: readonly SchemaMigration[];
@@ -62,9 +78,11 @@ export class PostgresPatchPageDb implements PatchPageDb {
    * `expires_at` and `token_mints.created_at` are on this clock here, because
    * both are anchors a window is measured from — retention's and the mint
    * quota's. Every other stamp in this driver (`last_used_at`, the remaining
-   * `created_at` columns, `disabled_at`, `deleted_at`) stays on SQL
-   * `now()`, where it is a column default or a `SET x = now()` clause, while
-   * the JSON driver puts all of its stamps on the injected clock. See the note
+   * `created_at` columns, `disabled_at`, `deleted_at`, `revoked_at`) stays on
+   * SQL `now()`, where it is a column default or a `SET x = now()` clause,
+   * while the JSON driver puts all of its stamps on the injected clock.
+   * `revoked_at` belongs on that side because the revocation freeze keys on the
+   * column being non-null, never on the instant it holds. See the note
    * on `JsonFilePatchPageDb.nowIso` — the drivers agree on the retention anchor
    * and drift on the rest under a wound-forward clock, which is deliberate.
    * Do not "fix" one driver's non-retention stamps without the other's.
@@ -197,6 +215,48 @@ export class PostgresPatchPageDb implements PatchPageDb {
     } finally {
       client.release();
     }
+  }
+
+  async revokeApiToken(apiTokenId: string): Promise<ApiTokenRevocation | null> {
+    // Read the row under a lock, stamp it only if it is not already stamped,
+    // and report the state it was in beforehand — one statement, so two
+    // concurrent revocations of the same token cannot both claim the first.
+    // The first revocation's stamp stands: it is when top-ups froze.
+    const result = await this.pool.query(
+      `
+        WITH prior AS (
+          SELECT id, account_id, name, revoked_at
+          FROM api_tokens
+          WHERE id = $1
+          FOR UPDATE
+        ),
+        revoked AS (
+          UPDATE api_tokens
+          SET revoked_at = now()
+          FROM prior
+          WHERE api_tokens.id = prior.id AND prior.revoked_at IS NULL
+          RETURNING api_tokens.revoked_at
+        )
+        SELECT prior.id,
+               prior.account_id,
+               prior.name,
+               COALESCE((SELECT revoked_at FROM revoked), prior.revoked_at) AS revoked_at,
+               prior.revoked_at IS NOT NULL AS already_revoked
+        FROM prior
+      `,
+      [apiTokenId]
+    );
+
+    const row = result.rows[0];
+    if (!row) return null;
+
+    return {
+      id: row.id,
+      accountId: row.account_id,
+      name: row.name,
+      revokedAt: toIso(row.revoked_at),
+      alreadyRevoked: Boolean(row.already_revoked)
+    };
   }
 
   async countLiveDraftsByCreatorApiToken(apiTokenId: string): Promise<number> {
@@ -427,13 +487,50 @@ export class PostgresPatchPageDb implements PatchPageDb {
     };
   }
 
+  async findDraftForModeration(draftId: string): Promise<ModeratedDraftRecord | null> {
+    const result = await this.pool.query(
+      `
+        ${MODERATED_DRAFT_SELECT}
+        WHERE drafts.id = $1
+        LIMIT 1
+      `,
+      [draftId, FIRST_VERSION_NUMBER]
+    );
+    return result.rows[0] ? mapModeratedDraft(result.rows[0]) : null;
+  }
+
+  async listDraftsByPrincipal(
+    principalId: string,
+    limit: number
+  ): Promise<PrincipalDraftListing> {
+    const capped = Math.max(0, limit);
+    // One row past the limit is how truncation is detected without a count.
+    const result = await this.pool.query(
+      `
+        ${MODERATED_DRAFT_SELECT}
+        WHERE drafts.account_id = $1
+          AND drafts.deleted_at IS NULL
+        ORDER BY drafts.created_at DESC, drafts.id DESC
+        LIMIT $3
+      `,
+      [principalId, FIRST_VERSION_NUMBER, capped + 1]
+    );
+
+    return {
+      drafts: result.rows.slice(0, capped).map(mapModeratedDraft),
+      truncated: result.rows.length > capped
+    };
+  }
+
   async recordDraftVisit(draftId: string): Promise<void> {
     const now = this.clock();
     // One predicate says both halves of the visit rule: `expires_at` below the
     // topped-up anchor is exactly "less than the visit-extension window
     // remains", and it is also exactly "this move does not shorten the clock".
     // The not-expired term keeps a visit from reviving an expired draft — and,
-    // because a pin means not expired, keeps topping a pinned draft up.
+    // because a pin means not expired, keeps topping a pinned draft up. The
+    // NOT EXISTS is the revocation freeze: once the draft's creating token is
+    // revoked, its clock only runs down.
     await this.pool.query(
       `
         UPDATE drafts
@@ -443,11 +540,20 @@ export class PostgresPatchPageDb implements PatchPageDb {
           AND disabled_at IS NULL
           AND ${notExpired(3)}
           AND expires_at < $2::timestamptz
+          AND NOT EXISTS (
+            SELECT 1
+            FROM draft_versions
+            JOIN api_tokens ON api_tokens.id = draft_versions.created_by_api_token_id
+            WHERE draft_versions.draft_id = drafts.id
+              AND draft_versions.version_number = $4
+              AND api_tokens.revoked_at IS NOT NULL
+          )
       `,
       [
         draftId,
         new Date(now + DRAFT_VISIT_EXTENSION_WINDOW_MS).toISOString(),
-        new Date(now).toISOString()
+        new Date(now).toISOString(),
+        FIRST_VERSION_NUMBER
       ]
     );
   }
@@ -689,6 +795,10 @@ function mapDraft(row: any): DraftRecord {
     disabledAt: row.disabled_at ? toIso(row.disabled_at) : null,
     disabledReason: row.disabled_reason
   };
+}
+
+function mapModeratedDraft(row: any): ModeratedDraftRecord {
+  return { ...mapDraft(row), createdByApiTokenId: row.created_by_api_token_id ?? null };
 }
 
 function mapDraftVersion(row: any): DraftVersionRecord {

@@ -833,3 +833,16 @@ The [`infra/azure`](../infra/azure) OpenTofu directory is an Azure-specific work
 ## Security
 
 No instance publishes without credentials: every upload requires a bearer token, and no configuration accepts one that carries none. `PATCHPAGE_ALLOW_SELF_SERVICE_TOKENS` defaults to `false`; keep it `false` unless you intentionally plan to accept public token-minting traffic and have an appropriate external abuse-control layer, and read [Self-service minting](#self-service-minting) — particularly the proxy-boundary warning — before turning it on. An ordinary `upload` token can disable or delete only the drafts it owns; the `admin` scope additionally moderates any principal's draft, which is the operator's takedown path. Treat `PATCHPAGE_BOOTSTRAP_API_TOKEN` as a secret, and remember that draft viewer URLs are public and unlisted — anyone with a link can view the rendered HTML unless you add your own viewer access controls.
+
+### Moderation
+
+Four admin-scoped endpoints resolve a report end to end, so no operator ever edits rows by hand:
+
+- `GET /api/drafts/:draftId` — the draft's owning principal and the token that created it. It answers for a draft that is already disabled, deleted, or expired, because those are exactly the ones reports arrive about. Once the expiry sweep has hard-deleted the draft, the row is gone and this answers 404 — the report outlives the page it was about.
+- `GET /api/principals/:principalId/drafts` — that principal's other drafts, newest first. Deleted drafts are omitted; disabled ones are not. A `truncated` answer means the principal holds more than one page: **deleting** drafts is what reveals the rest, because deleting is what removes them from this list — disabling a draft leaves it on the page.
+- `POST /api/drafts/:draftId/disable` and `DELETE /api/drafts/:draftId` — per-draft takedown, as above.
+- `POST /api/tokens/:apiTokenId/revoke` — revoke the token.
+
+Revocation is a state the token enters, never a deletion: the row survives with its mint provenance, and a revoked token authenticates nothing — the caller sees the same 401 any bad credential gets. Revoking twice is the same answer with the original timestamp, because that moment is when the token's drafts stopped receiving visit top-ups. Those drafts stay up and run out whatever retention clock they had left; nothing extends them again. There is no un-revoke; issue a replacement token instead.
+
+Two things revocation does not do. A **pinned** draft is exempt from expiry, so revoking its creating token will never age it out — if the moderation read shows `pinnedAt`, unpin, disable, or delete the page yourself. And revocation is scoped to the token, not the principal: where an operator has minted several tokens on one principal, a surviving sibling can still update that principal's drafts and reset their retention clock. Self-service mints are 1:1 with their principal, so this only arises for operator-created tokens.

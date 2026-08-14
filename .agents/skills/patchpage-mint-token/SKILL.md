@@ -187,14 +187,81 @@ land in `~/.patchpage/credentials.json`; every save creates or repairs that file
 owner-only permissions on Unix. Omit `--api-url` only when targeting the CLI's built-in
 default host.
 
+## Resolving a report: from a page to the token behind it
+
+Four admin-scoped endpoints close the loop. Row surgery is no longer the procedure — do
+not hand-edit `revoked_at` or the JSON state file.
+
+Put the admin credential in a protected header file first, exactly as Step 2 does, so it
+never reaches a process argument list or the shell history:
+
+```bash
+API=https://your.instance
+MODERATION_HEADER_FILE="$(mktemp)"
+chmod 600 "$MODERATION_HEADER_FILE"
+(set +x; umask 077; printf 'authorization: Bearer %s\n' "$ADMIN_TOKEN" \
+  > "$MODERATION_HEADER_FILE")
+unset ADMIN_TOKEN
+```
+
+Then walk the loop, substituting the IDs each step hands you:
+
+```bash
+# 1. The reported URL's draft ID -> the principal and the token that created it.
+curl --fail --silent --show-error --header "@$MODERATION_HEADER_FILE" \
+  "$API/api/drafts/DRAFT_ID"
+
+# 2. Everything else that principal is holding, newest first, up to 200 at a time.
+#    Deleted drafts are omitted; disabled ones are not. `truncated: true` means
+#    there are more: DELETING drafts is what reveals them, because deleting is what
+#    takes them off this list. Disabling a page leaves it here.
+curl --fail --silent --show-error --header "@$MODERATION_HEADER_FILE" \
+  "$API/api/principals/PRINCIPAL_ID/drafts"
+
+# 3. Take individual pages down: disable hides one, delete removes it.
+curl --fail --silent --show-error --request POST \
+  --header "@$MODERATION_HEADER_FILE" --header "content-type: application/json" \
+  --data '{"reason":"acceptable use"}' "$API/api/drafts/DRAFT_ID/disable"
+curl --fail --silent --show-error --request DELETE \
+  --header "@$MODERATION_HEADER_FILE" "$API/api/drafts/DRAFT_ID"
+
+# 4. Revoke the token itself, then discard the header file.
+curl --fail --silent --show-error --request POST \
+  --header "@$MODERATION_HEADER_FILE" "$API/api/tokens/API_TOKEN_ID/revoke"
+rm -f "$MODERATION_HEADER_FILE"
+```
+
 ## Revoking tokens
 
-There is no list or revoke API endpoint yet. Revoke by setting the token's `revoked_at`
-timestamp — `UPDATE api_tokens SET revoked_at = now() WHERE id = '...'` (postgres driver)
-or setting `revokedAt` on its entry in the JSON state file (json driver); both drivers
-read the store on every request, so the change takes effect immediately. Never DELETE the
-row: `draft_versions` references it, so postgres rejects the delete for any token that has
-uploaded — and revocation is a state we keep for the audit trail, not an erasure.
+`POST /api/tokens/<apiTokenId>/revoke` sets the token's revoked-at state. Both drivers
+read the store on every request, so it takes effect immediately: from that moment the
+token authenticates nothing, and the caller sees the same 401 any bad credential gets.
+
+Revoked is a **state, never a deletion**. The row survives with its mint provenance for
+later review, and the endpoint never removes it — `draft_versions` references the token, so
+postgres would reject the delete for anything that has ever uploaded anyway.
+
+Revoking is idempotent: a second call returns `alreadyRevoked: true` and the *original*
+`revokedAt`, because that moment is when the token's drafts stopped receiving visit
+top-ups. Their clocks only run down from there — the pages stay up until draft expiry
+takes them, and no visit extends them again. There is no un-revoke; a replacement
+credential is a fresh mint.
+
+An unknown token ID answers 404. Revocation does not touch the token's drafts: disable or
+delete those individually if they should come down before their clocks run out.
+
+Two cases where revoking alone will not age a page out:
+
+- **A pinned draft is exempt from expiry.** If step 1's read shows `pinnedAt`, the clock
+  will never take that page however long you wait — unpin, disable, or delete it yourself.
+- **Revocation is scoped to the token, not the principal.** Where you have minted several
+  tokens on one principal, a surviving sibling can still update that principal's drafts and
+  reset their 90-day window. Revoke every token on the principal, or delete the drafts. A
+  self-service token is 1:1 with its principal, so this only bites operator-created tokens.
+
+Revoking works the same way whichever way the token was created: an operator mint from
+`POST /api/tokens` and a self-service mint both answer to this endpoint by token ID, and
+neither loses its mint record.
 
 ## Pitfalls
 

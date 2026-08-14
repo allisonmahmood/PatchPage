@@ -937,6 +937,15 @@ describe("PatchPage server", () => {
       authenticatedError: "Request target is too long."
     },
     {
+      // The moderation read registers the same bare shape DELETE does, so its
+      // overlong parameter is a too-long target rather than a missing route.
+      label: "GET overlong route parameter",
+      protectedTarget: `/api/drafts/${"x".repeat(101)}`,
+      method: "GET",
+      authenticatedStatus: 414,
+      authenticatedError: "Request target is too long."
+    },
+    {
       label: "pin overlong route parameter",
       protectedTarget: `/api/drafts/${"x".repeat(101)}/pin`,
       authenticatedStatus: 414,
@@ -2595,6 +2604,491 @@ describe("PatchPage server", () => {
       await clocked.close();
     }
   });
+
+  it("answers an admin draft read with the principal and the token to revoke", async () => {
+    const moderated = await createModerationApp("moderation-read");
+
+    try {
+      const created = await createDraft(moderated.app, moderated.publisherToken, "Reported");
+      expect(created.statusCode).toBe(201);
+      const { draftId } = created.json() as { draftId: string };
+
+      const read = await moderated.app.inject({
+        method: "GET",
+        url: `/api/drafts/${draftId}`,
+        headers: { authorization: "Bearer dev-token" }
+      });
+      expect(read.statusCode).toBe(200);
+      expect(read.json()).toMatchObject({
+        ok: true,
+        draft: {
+          id: draftId,
+          principalId: moderated.principalId,
+          createdByApiTokenId: moderated.publisherApiTokenId,
+          title: "Reported",
+          deletedAt: null,
+          disabledAt: null
+        }
+      });
+
+      // The moderation surface is the operator's alone. An ordinary token is
+      // refused for its scope, and no token at all never reaches the route.
+      const ordinary = await moderated.app.inject({
+        method: "GET",
+        url: `/api/drafts/${draftId}`,
+        headers: { authorization: `Bearer ${moderated.publisherToken}` }
+      });
+      expect(ordinary.statusCode).toBe(403);
+      expect(ordinary.json()).toEqual({
+        ok: false,
+        error: "API token does not have the required scope."
+      });
+
+      const tokenless = await moderated.app.inject({
+        method: "GET",
+        url: `/api/drafts/${draftId}`
+      });
+      expect(tokenless.statusCode).toBe(401);
+
+      const unknown = await moderated.app.inject({
+        method: "GET",
+        url: "/api/drafts/zzzzzzzzzzzz",
+        headers: { authorization: "Bearer dev-token" }
+      });
+      expect(unknown.statusCode).toBe(404);
+      expect(unknown.json()).toEqual({ ok: false, error: "Draft not found." });
+
+      // A draft the operator has already taken down still answers: a report
+      // arrives about pages that are off as often as pages that are on.
+      const disabled = await moderated.app.inject({
+        method: "POST",
+        url: `/api/drafts/${draftId}/disable`,
+        headers: { authorization: "Bearer dev-token" },
+        payload: { reason: "operator policy" }
+      });
+      expect(disabled.statusCode).toBe(200);
+
+      const afterDisable = await moderated.app.inject({
+        method: "GET",
+        url: `/api/drafts/${draftId}`,
+        headers: { authorization: "Bearer dev-token" }
+      });
+      expect(afterDisable.statusCode).toBe(200);
+      expect((afterDisable.json() as { draft: { disabledReason: string } }).draft
+        .disabledReason).toBe("operator policy");
+    } finally {
+      await moderated.close();
+    }
+  });
+
+  it("lists a principal's drafts for an admin and nobody else", async () => {
+    const moderated = await createModerationApp("moderation-list");
+
+    try {
+      // A day between creates, so "newest first" is asserted against an order
+      // the clock decided rather than one two same-millisecond writes fell into.
+      const first = await createDraft(moderated.app, moderated.publisherToken, "One");
+      moderated.advanceDays(1);
+      const second = await createDraft(moderated.app, moderated.publisherToken, "Two");
+      moderated.advanceDays(1);
+      const removed = await createDraft(moderated.app, moderated.publisherToken, "Gone");
+      const removedDraftId = (removed.json() as { draftId: string }).draftId;
+      const deletion = await moderated.app.inject({
+        method: "DELETE",
+        url: `/api/drafts/${removedDraftId}`,
+        headers: { authorization: "Bearer dev-token" }
+      });
+      expect(deletion.statusCode).toBe(200);
+
+      const listed = await moderated.app.inject({
+        method: "GET",
+        url: `/api/principals/${moderated.principalId}/drafts`,
+        headers: { authorization: "Bearer dev-token" }
+      });
+      expect(listed.statusCode).toBe(200);
+      const body = listed.json() as {
+        principalId: string;
+        truncated: boolean;
+        drafts: { id: string; createdByApiTokenId: string }[];
+      };
+      expect(body.principalId).toBe(moderated.principalId);
+      expect(body.truncated).toBe(false);
+      // Newest first, and the one already deleted is not on the list.
+      expect(body.drafts.map((draft) => draft.id)).toEqual([
+        (second.json() as { draftId: string }).draftId,
+        (first.json() as { draftId: string }).draftId
+      ]);
+      expect(body.drafts[0]?.createdByApiTokenId).toBe(moderated.publisherApiTokenId);
+
+      const ordinary = await moderated.app.inject({
+        method: "GET",
+        url: `/api/principals/${moderated.principalId}/drafts`,
+        headers: { authorization: `Bearer ${moderated.publisherToken}` }
+      });
+      expect(ordinary.statusCode).toBe(403);
+
+      const tokenless = await moderated.app.inject({
+        method: "GET",
+        url: `/api/principals/${moderated.principalId}/drafts`
+      });
+      expect(tokenless.statusCode).toBe(401);
+
+      // A principal nobody has ever published under is an empty list, not a 404:
+      // "this principal holds nothing" is an answer, not a missing resource.
+      const stranger = await moderated.app.inject({
+        method: "GET",
+        url: "/api/principals/acct_holds_nothing/drafts",
+        headers: { authorization: "Bearer dev-token" }
+      });
+      expect(stranger.statusCode).toBe(200);
+      expect(stranger.json()).toEqual({
+        ok: true,
+        principalId: "acct_holds_nothing",
+        drafts: [],
+        truncated: false
+      });
+    } finally {
+      await moderated.close();
+    }
+  });
+
+  it("revokes a token idempotently and leaves it indistinguishable from a bad one", async () => {
+    const moderated = await createModerationApp("moderation-revoke");
+
+    try {
+      const created = await createDraft(moderated.app, moderated.publisherToken, "Abusive");
+      const { draftId } = created.json() as { draftId: string };
+
+      const revokeUrl = `/api/tokens/${moderated.publisherApiTokenId}/revoke`;
+      const ordinary = await moderated.app.inject({
+        method: "POST",
+        url: revokeUrl,
+        headers: { authorization: `Bearer ${moderated.publisherToken}` }
+      });
+      expect(ordinary.statusCode).toBe(403);
+
+      // Self-service minting put an unauthenticated route next door, under the
+      // same `/api/tokens/` prefix. Revoking must never be swept into that
+      // carve-out: a tokenless caller gets nowhere near it.
+      const tokenlessRevoke = await moderated.app.inject({
+        method: "POST",
+        url: revokeUrl
+      });
+      expect(tokenlessRevoke.statusCode).toBe(401);
+      expect(tokenlessRevoke.json()).toEqual({
+        ok: false,
+        error: "Missing or invalid API token."
+      });
+
+      const revoked = await moderated.app.inject({
+        method: "POST",
+        url: revokeUrl,
+        headers: { authorization: "Bearer dev-token" }
+      });
+      expect(revoked.statusCode).toBe(200);
+      const revocation = revoked.json() as {
+        alreadyRevoked: boolean;
+        apiToken: { id: string; name: string; principalId: string; revokedAt: string };
+      };
+      expect(revocation.alreadyRevoked).toBe(false);
+      expect(revocation.apiToken).toMatchObject({
+        id: moderated.publisherApiTokenId,
+        name: "Reported publisher",
+        principalId: moderated.principalId
+      });
+      expect(revocation.apiToken.revokedAt).toEqual(expect.any(String));
+
+      // Idempotent, and the first moment stands — it is when top-ups froze.
+      const again = await moderated.app.inject({
+        method: "POST",
+        url: revokeUrl,
+        headers: { authorization: "Bearer dev-token" }
+      });
+      expect(again.statusCode).toBe(200);
+      expect(again.json()).toEqual({
+        ok: true,
+        alreadyRevoked: true,
+        apiToken: revocation.apiToken
+      });
+
+      const unknown = await moderated.app.inject({
+        method: "POST",
+        url: "/api/tokens/tok_never_existed/revoke",
+        headers: { authorization: "Bearer dev-token" }
+      });
+      expect(unknown.statusCode).toBe(404);
+      expect(unknown.json()).toEqual({ ok: false, error: "API token not found." });
+
+      // The revoked token can do nothing anywhere, and says nothing about
+      // itself doing it: the same 401 any garbage credential gets.
+      for (const request of [
+        { method: "GET" as const, url: "/api/me" },
+        {
+          method: "POST" as const,
+          url: "/api/uploads",
+          payload: { html: draftHtml("Still trying") }
+        },
+        {
+          method: "POST" as const,
+          url: "/api/uploads",
+          payload: { draftId, html: draftHtml("Still trying") }
+        },
+        {
+          method: "POST" as const,
+          url: `/api/drafts/${draftId}/disable`,
+          payload: { reason: "cover tracks" }
+        },
+        { method: "DELETE" as const, url: `/api/drafts/${draftId}` }
+      ]) {
+        const revokedAttempt = await moderated.app.inject({
+          ...request,
+          headers: { authorization: `Bearer ${moderated.publisherToken}` }
+        });
+        const nonsenseAttempt = await moderated.app.inject({
+          ...request,
+          headers: { authorization: "Bearer not-a-token-at-all" }
+        });
+        expect(revokedAttempt.statusCode).toBe(401);
+        expect(revokedAttempt.json()).toEqual(nonsenseAttempt.json());
+      }
+
+      // The drafts stay up. Revocation is not a takedown.
+      const served = await moderated.app.inject({ method: "GET", url: `/d/${draftId}` });
+      expect(served.statusCode).toBe(200);
+      expect(served.body).toContain("Abusive");
+
+      // And the row survives its revocation, so the loop can still read it.
+      const read = await moderated.app.inject({
+        method: "GET",
+        url: `/api/drafts/${draftId}`,
+        headers: { authorization: "Bearer dev-token" }
+      });
+      expect(read.statusCode).toBe(200);
+      expect((read.json() as { draft: { createdByApiTokenId: string } }).draft
+        .createdByApiTokenId).toBe(moderated.publisherApiTokenId);
+    } finally {
+      await moderated.close();
+    }
+  });
+
+  it("lets a revoked token's drafts run out the clock they had left", async () => {
+    const clocked = await createClockedApp("revocation-freeze");
+
+    try {
+      const minted = await clocked.app.inject({
+        method: "POST",
+        url: "/api/tokens",
+        headers: { authorization: "Bearer dev-token" },
+        payload: { name: "Reported publisher", scopes: ["upload"] }
+      });
+      const { token, apiToken } = minted.json() as {
+        token: string;
+        apiToken: { id: string };
+      };
+      const created = await createDraft(clocked.app, token, "Runs down");
+      const { draftId } = created.json() as { draftId: string };
+
+      // Day 80, ten days left: a visit before the revocation tops the clock up
+      // to day 110, and that extension is not taken away afterwards.
+      clocked.advanceDays(80);
+      expect(
+        (await clocked.app.inject({ method: "GET", url: `/d/${draftId}` })).statusCode
+      ).toBe(200);
+
+      clocked.advanceDays(1);
+      const revoked = await clocked.app.inject({
+        method: "POST",
+        url: `/api/tokens/${apiToken.id}/revoke`,
+        headers: { authorization: "Bearer dev-token" }
+      });
+      expect(revoked.statusCode).toBe(200);
+
+      // Day 105, five days left. Before the freeze this visit would have bought
+      // another thirty; now it buys nothing, however popular the page is.
+      clocked.advanceDays(24);
+      for (let visit = 0; visit < 3; visit += 1) {
+        const stillServed = await clocked.app.inject({
+          method: "GET",
+          url: `/d/${draftId}`
+        });
+        expect(stillServed.statusCode).toBe(200);
+        expect(stillServed.body).toContain("Runs down");
+      }
+
+      clocked.advanceDays(4);
+      expect(
+        (await clocked.app.inject({ method: "GET", url: `/d/${draftId}` })).statusCode
+      ).toBe(200);
+
+      // Day 111: the clock only ran down, and it has run out.
+      clocked.advanceDays(2);
+      expect(
+        (await clocked.app.inject({ method: "GET", url: `/d/${draftId}` })).statusCode
+      ).toBe(404);
+    } finally {
+      await clocked.close();
+    }
+  });
+
+  it("resolves a reader's report on a self-service page through to revocation", async () => {
+    // The whole story on the posture the public instance actually runs: the
+    // publisher asked the service for its own key, with no operator involved.
+    const clocked = await createClockedApp("self-service-moderation", {
+      config: { ...testConfig(), allowSelfServiceTokens: true }
+    });
+
+    try {
+      const minted = await clocked.app.inject({
+        method: "POST",
+        url: "/api/tokens/self-service",
+        remoteAddress: "203.0.113.7"
+      });
+      expect(minted.statusCode).toBe(201);
+      const { token } = minted.json() as { token: string };
+
+      const reportedUpload = await createDraft(clocked.app, token, "Abusive page");
+      expect(reportedUpload.statusCode).toBe(201);
+      const { draftId } = reportedUpload.json() as { draftId: string };
+      const sibling = await createDraft(clocked.app, token, "Second abusive page");
+      const siblingDraftId = (sibling.json() as { draftId: string }).draftId;
+
+      // A reader flags it. The report is stored and acknowledged, and the page
+      // is still up: no volume of reports is a takedown.
+      const filed = await clocked.app.inject({
+        method: "POST",
+        url: `/report/${draftId}`,
+        headers: { "content-type": "application/x-www-form-urlencoded" },
+        payload: "reason=This+is+abuse"
+      });
+      expect(filed.statusCode).toBe(200);
+      expect(
+        (await clocked.app.inject({ method: "GET", url: `/d/${draftId}` })).statusCode
+      ).toBe(200);
+
+      // Step 1 — the reported URL names the principal and the token to revoke.
+      const read = await clocked.app.inject({
+        method: "GET",
+        url: `/api/drafts/${draftId}`,
+        headers: { authorization: "Bearer dev-token" }
+      });
+      expect(read.statusCode).toBe(200);
+      const reported = (
+        read.json() as {
+          draft: { principalId: string; createdByApiTokenId: string };
+        }
+      ).draft;
+
+      // A self-service mint is 1:1 with a fresh principal, so the culprit is
+      // not the operator's own — which is what makes revoking it surgical.
+      const operator = await clocked.app.inject({
+        method: "GET",
+        url: "/api/me",
+        headers: { authorization: "Bearer dev-token" }
+      });
+      expect(reported.principalId).not.toBe(
+        (operator.json() as { accountId: string }).accountId
+      );
+
+      // Step 2 — and the sibling page comes with it.
+      const listed = await clocked.app.inject({
+        method: "GET",
+        url: `/api/principals/${reported.principalId}/drafts`,
+        headers: { authorization: "Bearer dev-token" }
+      });
+      expect(listed.statusCode).toBe(200);
+      const held = (listed.json() as { drafts: { id: string }[] }).drafts;
+      expect([...held.map((draft) => draft.id)].sort()).toEqual(
+        [draftId, siblingDraftId].sort()
+      );
+
+      // Step 3 — revoke. Provenance makes no difference to it: this is the same
+      // endpoint, the same answer shape, and the same effect as on a token the
+      // operator minted by hand.
+      const revoked = await clocked.app.inject({
+        method: "POST",
+        url: `/api/tokens/${reported.createdByApiTokenId}/revoke`,
+        headers: { authorization: "Bearer dev-token" }
+      });
+      expect(revoked.statusCode).toBe(200);
+      expect(revoked.json()).toMatchObject({
+        ok: true,
+        alreadyRevoked: false,
+        apiToken: {
+          id: reported.createdByApiTokenId,
+          principalId: reported.principalId
+        }
+      });
+
+      // The key is dead everywhere, and because the principal was its alone,
+      // nothing else can reach the pages it left behind.
+      expect((await createDraft(clocked.app, token, "Another")).statusCode).toBe(401);
+      expect(
+        (await updateDraft(clocked.app, token, draftId, "Rewritten")).statusCode
+      ).toBe(401);
+
+      // The pages stay up and keep their remaining clock — and the freeze holds
+      // for a self-service token exactly as it does for an operator's.
+      clocked.advanceDays(80);
+      expect(
+        (await clocked.app.inject({ method: "GET", url: `/d/${draftId}` })).statusCode
+      ).toBe(200);
+
+      clocked.advanceDays(11);
+      for (const gone of [draftId, siblingDraftId]) {
+        expect(
+          (await clocked.app.inject({ method: "GET", url: `/d/${gone}` })).statusCode
+        ).toBe(404);
+      }
+    } finally {
+      await clocked.close();
+    }
+  });
+
+  it("answers a moderation read for a draft the expiry sweep has already taken", async () => {
+    const clocked = await createClockedApp("moderation-after-sweep");
+
+    try {
+      const created = await createDraft(clocked.app, "dev-token", "Reported then expired");
+      const { draftId } = created.json() as { draftId: string };
+
+      const filed = await clocked.app.inject({
+        method: "POST",
+        url: `/report/${draftId}`,
+        headers: { "content-type": "application/x-www-form-urlencoded" },
+        payload: "reason=Worth+a+look"
+      });
+      expect(filed.statusCode).toBe(200);
+
+      clocked.advanceDays(91);
+      expect(await clocked.app.sweepExpiredDrafts()).toMatchObject({ deleted: 1 });
+
+      // A report outlives the page it was about, so the operator can still
+      // arrive at a draft ID with nothing left behind it. The loop's first step
+      // has nothing to name and says so — an ordinary 404, not a fall over.
+      const read = await clocked.app.inject({
+        method: "GET",
+        url: `/api/drafts/${draftId}`,
+        headers: { authorization: "Bearer dev-token" }
+      });
+      expect(read.statusCode).toBe(404);
+      expect(read.json()).toEqual({ ok: false, error: "Draft not found." });
+
+      const operator = await clocked.app.inject({
+        method: "GET",
+        url: "/api/me",
+        headers: { authorization: "Bearer dev-token" }
+      });
+      const listed = await clocked.app.inject({
+        method: "GET",
+        url: `/api/principals/${(operator.json() as { accountId: string }).accountId}/drafts`,
+        headers: { authorization: "Bearer dev-token" }
+      });
+      expect(listed.statusCode).toBe(200);
+      expect(listed.json()).toMatchObject({ ok: true, drafts: [], truncated: false });
+    } finally {
+      await clocked.close();
+    }
+  });
 });
 
 describe("self-service minting", () => {
@@ -3282,6 +3776,15 @@ type ClockedApp = {
 type ClockedAppOptions = {
   openDb?: (file: string, clock: () => number) => JsonFilePatchPageDb;
   openStorage?: (storageDir: string) => FileSystemHtmlStorage;
+  /** Overrides `testConfig()`, for a clocked app that needs a posture changed. */
+  config?: ServerConfig;
+};
+
+type ModerationApp = ClockedApp & {
+  /** The publisher a report is about: plaintext token, its ID, its principal. */
+  publisherToken: string;
+  publisherApiTokenId: string;
+  principalId: string;
 };
 
 const DAY_MS = 24 * 60 * 60 * 1000;
@@ -3429,7 +3932,7 @@ async function createClockedApp(
   await db.initialize("dev-token");
   const storageDir = path.join(tempDir, `${label}-drafts`);
   const storage = openStorage(storageDir);
-  const app = createApp({ config: testConfig(), db, storage, clock });
+  const app = createApp({ config: options.config ?? testConfig(), db, storage, clock });
 
   return {
     app,
@@ -3442,6 +3945,43 @@ async function createClockedApp(
       await app.close();
       await db.close();
     }
+  };
+}
+
+/**
+ * A clocked app plus a publisher whose token came from the *existing* admin
+ * mint — the moderation loop's demo path has no dependency on self-service
+ * minting. Its principal is the bootstrap one, because an admin mint hangs a
+ * new token off the minting principal rather than making a fresh one; the loop
+ * reads and lists by principal either way. A self-service mint is 1:1 instead,
+ * which the revocation test alongside this one covers.
+ */
+async function createModerationApp(label: string): Promise<ModerationApp> {
+  const clocked = await createClockedApp(label);
+
+  const minted = await clocked.app.inject({
+    method: "POST",
+    url: "/api/tokens",
+    headers: { authorization: "Bearer dev-token" },
+    payload: { name: "Reported publisher", scopes: ["upload"] }
+  });
+  expect(minted.statusCode).toBe(201);
+  const publisher = minted.json() as { token: string; apiToken: { id: string } };
+
+  // Ask the publisher which principal it is, rather than reading the store: the
+  // moderation loop's answers have to agree with what the API already says.
+  const identity = await clocked.app.inject({
+    method: "GET",
+    url: "/api/me",
+    headers: { authorization: `Bearer ${publisher.token}` }
+  });
+  expect(identity.statusCode).toBe(200);
+
+  return {
+    ...clocked,
+    publisherToken: publisher.token,
+    publisherApiTokenId: publisher.apiToken.id,
+    principalId: (identity.json() as { accountId: string }).accountId
   };
 }
 

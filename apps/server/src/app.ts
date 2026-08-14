@@ -7,6 +7,7 @@ import { isUploadTargetError } from "@patchpage/db";
 import type {
   ApiTokenAuth,
   DraftRecord,
+  ModeratedDraftRecord,
   PatchPageDb,
   RecordUploadInput,
   RecordUploadResult
@@ -130,6 +131,17 @@ const FASTIFY_DEFAULT_MAX_PARAM_LENGTH = 100;
  * turns its overlong-parameter answer into a 404.
  */
 const REGISTERED_DRAFT_POST_SUFFIXES = new Set(["disable", "pin", "unpin"]);
+/**
+ * How many of a principal's drafts one moderation list read returns, newest
+ * first. A truncated answer says so rather than pretending to be whole.
+ *
+ * The list omits deleted drafts and keeps disabled ones, so *deleting* is the
+ * only act that drains a page of results: work the page, read again, see the
+ * rest. Disabling takes a draft out of service and leaves it on this list —
+ * which is right, because a disabled draft is still one the operator may want
+ * to come back and delete.
+ */
+const MODERATION_DRAFT_LIST_LIMIT = 200;
 const PRE_ROUTING_API_ERROR_TARGET = "/api/__patchpage_pre_routing_error__";
 const preRoutingApiErrorStatus = Symbol("preRoutingApiErrorStatus");
 
@@ -244,6 +256,68 @@ export function createApp(options: CreateAppOptions): FastifyInstance {
       mintSelfServiceToken(options, rateLimiters.selfServiceMint, clock, request, reply)
     );
   });
+
+  // Revocation is the moderation loop's last step and its only irreversible
+  // one. It sets a state, never deletes: the row survives with its mint
+  // provenance, the token's drafts stay up until expiry with their top-ups
+  // frozen, and the token itself becomes indistinguishable from a bad one on
+  // every route. There is no un-revoke — a replacement is a fresh mint.
+  app.post(
+    "/api/tokens/:apiTokenId/revoke",
+    { onRequest: protectedApi("admin") },
+    async (request, reply) => {
+      const apiTokenId = (request.params as { apiTokenId: string }).apiTokenId;
+      const revocation = await options.db.revokeApiToken(apiTokenId);
+      if (!revocation) {
+        return reply.status(404).send({ ok: false, error: "API token not found." });
+      }
+
+      // Idempotent: revoking twice is the same answer, with the original
+      // moment intact, because that moment is when the freeze began.
+      return {
+        ok: true,
+        alreadyRevoked: revocation.alreadyRevoked,
+        apiToken: {
+          id: revocation.id,
+          name: revocation.name,
+          principalId: revocation.accountId,
+          revokedAt: revocation.revokedAt
+        }
+      };
+    }
+  );
+
+  // The moderation loop's first step: a reported URL, answered with the
+  // principal behind it and the token to revoke. Admin-scoped, and deliberately
+  // answering for drafts that are already disabled, deleted, or expired — the
+  // operator is asked about pages that are off as often as pages that are on.
+  app.get("/api/drafts/:draftId", { onRequest: protectedApi("admin") }, async (request, reply) => {
+    const draftId = (request.params as { draftId: string }).draftId;
+    const draft = await options.db.findDraftForModeration(draftId);
+    if (!draft) return reply.status(404).send({ ok: false, error: "Draft not found." });
+    return { ok: true, draft: moderationDraftView(draft) };
+  });
+
+  // The second step: everything else that principal is holding, so one report
+  // resolves the whole principal rather than the single page that was flagged.
+  app.get(
+    "/api/principals/:principalId/drafts",
+    { onRequest: protectedApi("admin") },
+    async (request) => {
+      const principalId = (request.params as { principalId: string }).principalId;
+      const listing = await options.db.listDraftsByPrincipal(
+        principalId,
+        MODERATION_DRAFT_LIST_LIMIT
+      );
+
+      return {
+        ok: true,
+        principalId,
+        drafts: listing.drafts.map(moderationDraftView),
+        truncated: listing.truncated
+      };
+    }
+  );
 
   app.post(
     "/api/uploads",
@@ -751,7 +825,7 @@ function registeredApiParamRoutingErrorStatus(
   method: string | undefined,
   rawPath: string
 ): PreRoutingApiErrorStatus | undefined {
-  if (method !== "POST" && method !== "DELETE") return undefined;
+  if (method !== "GET" && method !== "POST" && method !== "DELETE") return undefined;
 
   const [leading, rawApi, rawDrafts, rawParameter, rawSuffix, ...extraSegments] =
     rawPath.split("/");
@@ -775,6 +849,9 @@ function registeredApiParamRoutingErrorStatus(
     return exactRegisteredRoute ? 414 : 404;
   }
 
+  // GET and DELETE both register the bare `/api/drafts/:draftId` shape and
+  // nothing under it, so an overlong parameter there is a too-long target and
+  // anything deeper is a route that never existed.
   return rawSuffix === undefined ? 414 : 404;
 }
 
@@ -895,6 +972,32 @@ function sendLiveDraftQuotaExceeded(reply: FastifyReply, quota: number): Fastify
     code: "live_draft_quota_exceeded",
     quota
   });
+}
+
+/**
+ * A draft as the moderation surface reports it. Spelled out field by field on
+ * purpose: the record grows over time, and an operator response is not the
+ * place for whatever a future column happens to hold.
+ *
+ * "Principal" rather than "account" — the moderation loop is operator-facing,
+ * and the glossary's word for the ownership row is what it should hear.
+ */
+function moderationDraftView(draft: ModeratedDraftRecord): Record<string, unknown> {
+  return {
+    id: draft.id,
+    principalId: draft.accountId,
+    createdByApiTokenId: draft.createdByApiTokenId,
+    title: draft.title,
+    createdAt: draft.createdAt,
+    updatedAt: draft.updatedAt,
+    expiresAt: draft.expiresAt,
+    // A pinned draft is exempt from expiry, so an operator deciding whether to
+    // let a page age out needs to know the clock is not going to take it.
+    pinnedAt: draft.pinnedAt,
+    deletedAt: draft.deletedAt,
+    disabledAt: draft.disabledAt,
+    disabledReason: draft.disabledReason
+  };
 }
 
 function sendApiNotFound(reply: FastifyReply): void {

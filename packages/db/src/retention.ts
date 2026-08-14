@@ -14,6 +14,11 @@
  *   the sweep leaves it alone, and unpinning simply hands the draft back to the
  *   clock it was always carrying.
  *
+ * One thing outside this module can stop the second rule: revoking a draft's
+ * creating token freezes its top-ups, so the clock only runs down from there.
+ * That is a question about the token, not about time, so the drivers answer it
+ * where they read the visit — see `recordDraftVisit` on the port.
+ *
  * Both drivers answer to these functions so the two agree by construction.
  * The Postgres driver restates the visit rule as one SQL predicate; the
  * equivalence is asserted by the driver-parametrized contract suite, not by
