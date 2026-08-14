@@ -515,7 +515,7 @@ function mintFailureMessage(apiUrl: string, response: Response, body: any): stri
       `Could not get a publishing token: ${apiUrl} has reached its limit of new tokens ` +
       "for your network over the last 24 hours.\n" +
       `Copy an existing token from another machine and save it with: ${authSetAction}, ` +
-      "or try again once the oldest of those mints is 24 hours old."
+      "or try again once the oldest of those tokens is 24 hours old."
     );
   }
   if (body?.code === "rate_limited") {

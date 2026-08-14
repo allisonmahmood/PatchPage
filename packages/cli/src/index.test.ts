@@ -1385,7 +1385,7 @@ describe("auto-mint on first upload", () => {
         `Could not get a publishing token: ${server.apiUrl} has reached its limit of new tokens ` +
           "for your network over the last 24 hours.\nCopy an existing token from another " +
           `machine and save it with: patchpage auth set --api-url ${server.apiUrl}, or try ` +
-          "again once the oldest of those mints is 24 hours old.\n"
+          "again once the oldest of those tokens is 24 hours old.\n"
       );
       expect(server.mints).toHaveLength(1);
       expect(server.requests).toEqual([]);
