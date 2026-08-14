@@ -80,6 +80,10 @@ export function renderHome(options: { publicBaseUrl: string }): string {
  * that carries the form under its own headers, one to the acceptable use policy.
  * With JavaScript disabled this footer is unchanged, because there is no
  * JavaScript in it to disable.
+ *
+ * Exactly those two links, and no brand credit: this is someone else's published
+ * page, and the spec asks the footer for a report path and the policy behind it.
+ * The welcome draft carries the patchyhq.com credit in its own content.
  */
 export function renderDraftWrapper(options: {
   draft: DraftRecord;
@@ -88,7 +92,6 @@ export function renderDraftWrapper(options: {
   homeUrl: string;
 }): string {
   const title = escapeHtml(options.draft.title || "PatchPage Draft");
-  const homeUrl = escapeHtml(options.homeUrl || "/");
   const reportPath = escapeHtml(getDraftReportPath(options.draft.id));
 
   return `<!doctype html>
@@ -155,8 +158,6 @@ export function renderDraftWrapper(options: {
     referrerpolicy="no-referrer"
     srcdoc="${escapeAttribute(options.html)}"></iframe>
   <footer class="draft-footer">
-    <a href="${homeUrl}">Published with PatchPage</a>
-    <span class="sep" aria-hidden="true">&middot;</span>
     <a href="${escapeHtml(ACCEPTABLE_USE_URL)}">Acceptable use</a>
     <span class="sep" aria-hidden="true">&middot;</span>
     <a href="${reportPath}">Report this page</a>

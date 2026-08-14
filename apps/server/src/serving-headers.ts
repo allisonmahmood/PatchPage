@@ -18,6 +18,15 @@
 
 export const DRAFT_ROBOTS_TAG = "noindex";
 
+/**
+ * Document-wide, on served drafts and on the report pages alike. The draft's
+ * own frame is already `referrerpolicy="no-referrer"`, and this says the same
+ * thing one level up: following the footer's links — to the acceptable use
+ * policy, or to the report page — must not hand anyone the draft URL that the
+ * reader was on. An unlisted page's URL is the only thing keeping it unlisted.
+ */
+export const NO_REFERRER_POLICY = "no-referrer";
+
 export const DRAFT_CONTENT_SECURITY_POLICY = [
   "default-src 'none'",
   "style-src 'unsafe-inline'",

@@ -37,6 +37,7 @@ import {
 import {
   DRAFT_CONTENT_SECURITY_POLICY,
   DRAFT_ROBOTS_TAG,
+  NO_REFERRER_POLICY,
   NO_STORE_CACHE_CONTROL,
   REPORT_PAGE_CONTENT_SECURITY_POLICY,
   servedDraftCacheControl
@@ -448,6 +449,7 @@ async function renderDraft(
   reply: FastifyReply
 ): Promise<void> {
   reply.header("X-Robots-Tag", DRAFT_ROBOTS_TAG);
+  reply.header("Referrer-Policy", NO_REFERRER_POLICY);
 
   const { draft, version } = await options.db.findDraftVersion(draftId, versionNumber);
   if (!draft || !version) {
@@ -512,12 +514,14 @@ async function findReportableDraft(
  */
 function applyReportPageHeaders(reply: FastifyReply): void {
   reply.header("X-Robots-Tag", DRAFT_ROBOTS_TAG);
+  reply.header("Referrer-Policy", NO_REFERRER_POLICY);
   reply.header("Content-Security-Policy", REPORT_PAGE_CONTENT_SECURITY_POLICY);
   // `Cache-Control` is left to the global hook, which makes it `no-store`.
 }
 
 function sendDraftNotFound(reply: FastifyReply): FastifyReply {
   reply.header("X-Robots-Tag", DRAFT_ROBOTS_TAG);
+  reply.header("Referrer-Policy", NO_REFERRER_POLICY);
   return reply.status(404).type("text/html").send(renderNotFound());
 }
 

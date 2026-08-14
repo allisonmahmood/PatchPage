@@ -2026,10 +2026,12 @@ describe("PatchPage server", () => {
       const response = await served.app.inject({ method: "GET", url });
       expect(response.statusCode).toBe(200);
 
-      // The reader's channel to the operator, on both URL shapes.
+      // The reader's channel to the operator, on both URL shapes. The footer
+      // carries these two links and no others.
       expect(response.body).toContain(`href="/report/${served.draftId}"`);
       expect(response.body).toContain("Report this page");
       expect(response.body).toContain(`href="${ACCEPTABLE_USE_URL}"`);
+      expect(response.headers["referrer-policy"]).toBe("no-referrer");
 
       // The footer is links, not script, because the draft policy forbids
       // script and forbids a form submitting from here.
@@ -2067,6 +2069,7 @@ describe("PatchPage server", () => {
     expect(form.headers["content-security-policy"]).not.toContain("script");
     expect(form.headers["cache-control"]).toBe("no-store");
     expect(form.headers["x-robots-tag"]).toBe("noindex");
+    expect(form.headers["referrer-policy"]).toBe("no-referrer");
     expect(form.headers["set-cookie"]).toBeUndefined();
 
     // Step two is that form submitting itself. No JavaScript ran to get here.
@@ -2081,15 +2084,11 @@ describe("PatchPage server", () => {
     expect(filed.body).toContain("Report received");
     expect(filed.headers["cache-control"]).toBe("no-store");
     expect(filed.headers["x-robots-tag"]).toBe("noindex");
+    expect(filed.headers["referrer-policy"]).toBe("no-referrer");
     expect(filed.headers["set-cookie"]).toBeUndefined();
 
-    const stored = await served.db.listDraftReports(served.draftId);
-    expect(stored).toHaveLength(1);
-    expect(stored[0]?.draftId).toBe(served.draftId);
-    expect(stored[0]?.reason).toBe("Impersonates my company");
-    expect(Number.isNaN(Date.parse(stored[0]?.createdAt ?? ""))).toBe(false);
-
-    // A reader with nothing to add is still a report worth storing.
+    // A reader with nothing to add is acknowledged the same way. What the two
+    // submissions *stored* is the DB contract suite's to prove, not this seam's.
     const bare = await served.app.inject({
       method: "POST",
       url: reportUrl,
@@ -2097,12 +2096,37 @@ describe("PatchPage server", () => {
       payload: ""
     });
     expect(bare.statusCode).toBe(200);
-    const both = await served.db.listDraftReports(served.draftId);
-    expect(both).toHaveLength(2);
-    expect(both.map((report) => report.reason).sort()).toEqual([
-      "Impersonates my company",
-      null
-    ]);
+    expect(bare.body).toContain("Report received");
+
+    await served.close();
+  });
+
+  it("keeps the report form parser out of the API", async () => {
+    const served = await createServedDraft("report-parser-scope");
+
+    // The urlencoded parser is registered in the report routes' own plugin
+    // scope. If it ever leaked to the root instance, these would parse instead
+    // of being refused, and a form post would become a valid API call.
+    for (const url of ["/api/uploads", "/api/tokens"]) {
+      const response = await served.app.inject({
+        method: "POST",
+        url,
+        headers: {
+          authorization: "Bearer dev-token",
+          "content-type": "application/x-www-form-urlencoded"
+        },
+        payload: "html=%3Cp%3Ehi%3C%2Fp%3E&name=leaked"
+      });
+      expect(response.statusCode).toBe(415);
+    }
+
+    // And the API's ordinary answers are untouched either way.
+    const me = await served.app.inject({
+      method: "GET",
+      url: "/api/me",
+      headers: { authorization: "Bearer dev-token" }
+    });
+    expect(me.statusCode).toBe(200);
 
     await served.close();
   });
@@ -2123,7 +2147,6 @@ describe("PatchPage server", () => {
       // Every reader is acknowledged; none of them is a takedown.
       expect(filed.statusCode).toBe(200);
     }
-    expect(await served.db.listDraftReports(served.draftId)).toHaveLength(40);
 
     for (const url of [served.latestUrl, served.versionUrl]) {
       const after = await served.app.inject({ method: "GET", url });
@@ -2174,8 +2197,47 @@ describe("PatchPage server", () => {
         expect(response.headers["cache-control"]).toBe("no-store");
         expect(response.headers["set-cookie"]).toBeUndefined();
       }
-      expect(await served.db.listDraftReports(draftId)).toEqual([]);
     }
+
+    await served.close();
+  });
+
+  /**
+   * The one report test here that reads the store, because these two facts do
+   * not exist anywhere else. What a report *is* once stored — its reason, its
+   * trimming, its scoping to one draft — is the DB contract suite's, proved on
+   * both drivers. What only this seam can answer is whether the app hands the
+   * store the right things: the reader's resolved address, and nothing at all
+   * for a draft nobody could have read. Same shape as the upload path's
+   * source-IP attribution test.
+   */
+  it("attributes a filed report to the reader's address, and writes nothing for an unreadable draft", async () => {
+    const served = await createServedDraft("report-attribution");
+
+    const filed = await served.app.inject({
+      method: "POST",
+      url: `/report/${served.draftId}`,
+      remoteAddress: "198.51.100.23",
+      headers: { "content-type": "application/x-www-form-urlencoded" },
+      payload: "reason=From+a+specific+address"
+    });
+    expect(filed.statusCode).toBe(200);
+
+    const stored = await served.db.listDraftReports(served.draftId);
+    expect(stored).toHaveLength(1);
+    expect(stored[0]?.sourceIp).toBe("198.51.100.23");
+
+    // A made-up ID is never a way to write a row: the handler resolves the
+    // draft before it stores anything.
+    const missing = await served.app.inject({
+      method: "POST",
+      url: "/report/doesnotexist1",
+      remoteAddress: "198.51.100.24",
+      headers: { "content-type": "application/x-www-form-urlencoded" },
+      payload: "reason=Nothing+here"
+    });
+    expect(missing.statusCode).toBe(404);
+    expect(await served.db.listDraftReports("doesnotexist1")).toEqual([]);
 
     await served.close();
   });
