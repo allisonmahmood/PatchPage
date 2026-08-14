@@ -45,6 +45,14 @@ const JSON_ROW_COLLECTIONS = [
   "uploadEvents"
 ] as const;
 
+/**
+ * The retention window as of `0003_drafts_expiry_columns`, frozen here on
+ * purpose. A merged migration's behavior must not follow a later retuning of
+ * the live policy, so this deliberately does not read `retention.ts` — and the
+ * Postgres step spells the same 90 days out in SQL.
+ */
+const MIGRATION_0003_BACKFILL_WINDOW_MS = 90 * 24 * 60 * 60 * 1000;
+
 export const SCHEMA_MIGRATIONS: readonly SchemaMigration[] = [
   {
     id: "0001_baseline_schema",
@@ -126,6 +134,32 @@ export const SCHEMA_MIGRATIONS: readonly SchemaMigration[] = [
     // Ownership lookups (a principal's live drafts) scan by account today.
     // JSON has no index concept, so this migration has no JSON step.
     postgres: `CREATE INDEX IF NOT EXISTS drafts_account_id_idx ON drafts(account_id);`
+  },
+  {
+    id: "0003_drafts_expiry_columns",
+    // The retention clock's anchor. Backfilling to migration time + the full
+    // window is what keeps the deploy itself from expiring anything: every
+    // pre-existing draft leaves this step with a whole window ahead of it.
+    // The default is a floor, not the path — the drivers write the anchor from
+    // their injected clock so a test can move it.
+    postgres: `
+      ALTER TABLE drafts ADD COLUMN IF NOT EXISTS expires_at TIMESTAMPTZ;
+      UPDATE drafts SET expires_at = now() + interval '90 days' WHERE expires_at IS NULL;
+      ALTER TABLE drafts ALTER COLUMN expires_at SET NOT NULL;
+      ALTER TABLE drafts ALTER COLUMN expires_at SET DEFAULT now() + interval '90 days';
+      CREATE INDEX IF NOT EXISTS drafts_expires_at_idx ON drafts(expires_at);
+    `,
+    json(state) {
+      const drafts = state.drafts;
+      if (!Array.isArray(drafts)) return;
+
+      const backfill = new Date(Date.now() + MIGRATION_0003_BACKFILL_WINDOW_MS).toISOString();
+      for (const draft of drafts) {
+        if (!draft || typeof draft !== "object") continue;
+        const row = draft as Record<string, unknown>;
+        if (typeof row.expiresAt !== "string") row.expiresAt = backfill;
+      }
+    }
   }
 ];
 

@@ -20,8 +20,12 @@ _Avoid_: account (in product language)
 The guardrail that removes a draft for good when its retention clock runs out. An upload resets the clock to the full window; a visit tops the remaining time up to the visit-extension window. Expiry is a hard delete — content and record both gone, no recovery — and applies to every draft regardless of who owns it, unless the draft is pinned.
 _Avoid_: soft delete, archival, retention (for the act of deleting — retention is the clock, expiry is the consequence)
 
+**Visit**:
+One successful serving of a draft page, at either its latest or a version URL. A visit is the only thing besides an upload that moves a retention clock, and it only ever moves it forward: with less than the visit-extension window left it tops the draft up to exactly that window, and otherwise changes nothing at all. A visit never brings back a draft that has already expired.
+_Avoid_: view, hit, page load (a visit is a serving that succeeded, not a request that arrived)
+
 **Live draft**:
-A draft that still counts against its creator's quota: neither deleted nor disabled. A draft leaves the tally the moment it is deleted or disabled, and for good when expiry hard-deletes it. Which token created it is fixed at creation; a later update by another token never moves it.
+A draft that still counts against its creator's quota: neither deleted nor disabled. A draft leaves the tally the moment it is deleted or disabled, and for good when expiry hard-deletes it — an expired draft still counts until the sweep removes it, because its row and its stored content are both still there. Which token created it is fixed at creation; a later update by another token never moves it.
 _Avoid_: active draft, published draft (every draft is published), open draft
 
 **Draft quota**:

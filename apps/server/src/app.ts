@@ -363,6 +363,10 @@ async function renderDraft(
   }
 
   const html = await options.storage.getHtmlObject(version.objectKey);
+  // The page is real and about to be sent, so this is a visit. It is what keeps
+  // a draft that people still read from ageing out; the database decides
+  // whether the clock actually moves, and writes nothing when it does not.
+  await options.db.recordDraftVisit(draft.id);
   reply.header("Content-Security-Policy", DRAFT_CONTENT_SECURITY_POLICY);
   reply.header("Cache-Control", servedDraftCacheControl(versionNumber));
   return reply.type("text/html").send(

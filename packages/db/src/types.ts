@@ -24,6 +24,8 @@ export interface DraftRecord {
   repoName: string | null;
   createdAt: string;
   updatedAt: string;
+  /** The retention clock's anchor: the draft is expired once this is past. */
+  expiresAt: string;
   deletedAt: string | null;
   disabledAt: string | null;
   disabledReason: string | null;
@@ -109,6 +111,13 @@ export interface DbDriverOptions {
    * `SCHEMA_MIGRATIONS`; overridden to exercise a migration end to end.
    */
   migrations?: readonly SchemaMigration[];
+  /**
+   * Epoch milliseconds, `Date.now` by default — the same shape the server and
+   * the rate limiters take. The retention clock reads it, so a driver and the
+   * app in front of it want the *same* function: give `createApp` one clock and
+   * its database another and expiry will not move when the app's clock does.
+   */
+  clock?: () => number;
 }
 
 export interface PatchPageDb {
@@ -128,7 +137,15 @@ export interface PatchPageDb {
   countLiveDraftsByCreatorApiToken(apiTokenId: string): Promise<number>;
   assertUploadTarget(input: UploadTargetInput): Promise<void>;
   recordUpload(input: RecordUploadInput): Promise<RecordUploadResult>;
+  /** Expired drafts are absent here, exactly as deleted and disabled ones are. */
   findDraftVersion(draftId: string, versionNumber?: number): Promise<DraftVersionLookup>;
+  /**
+   * Tops a served draft's retention clock up to the visit-extension window when
+   * less than that remains. A no-op otherwise, including for a draft that is
+   * already expired, deleted, or disabled — a visit never shortens the clock
+   * and never brings a draft back.
+   */
+  recordDraftVisit(draftId: string): Promise<void>;
   disableDraft(
     draftId: string,
     accountId: string,

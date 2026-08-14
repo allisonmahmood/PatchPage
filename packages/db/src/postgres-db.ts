@@ -6,6 +6,7 @@ import {
   ANONYMOUS_UPLOAD_PRINCIPAL
 } from "./internal-principals.js";
 import { SCHEMA_MIGRATIONS } from "./migrations.js";
+import { DRAFT_VISIT_EXTENSION_WINDOW_MS, expiryAfterUpload } from "./retention.js";
 import { UploadTargetError } from "./types.js";
 import type { SchemaMigration } from "./migrations.js";
 import type {
@@ -35,10 +36,21 @@ const FIRST_VERSION_NUMBER = 1;
 export class PostgresPatchPageDb implements PatchPageDb {
   private readonly pool: pg.Pool;
   private readonly migrations: readonly SchemaMigration[];
+  private readonly clock: () => number;
 
   constructor(connectionString: string, options: DbDriverOptions = {}) {
     this.pool = new Pool({ connectionString });
     this.migrations = options.migrations ?? SCHEMA_MIGRATIONS;
+    this.clock = options.clock ?? Date.now;
+  }
+
+  /**
+   * The retention clock's reading, as a value Postgres compares against
+   * `expires_at`. Deliberately not SQL `now()`: the clock is injectable, and
+   * `now()` would make the window untestable and drift from the JSON driver.
+   */
+  private nowIso(): string {
+    return new Date(this.clock()).toISOString();
   }
 
   async initialize(bootstrapApiToken: string | null): Promise<void> {
@@ -153,8 +165,9 @@ export class PostgresPatchPageDb implements PatchPageDb {
                 AND account_id = $2
                 AND deleted_at IS NULL
                 AND disabled_at IS NULL
+                AND expires_at >= $3::timestamptz
             `,
-            [input.draftId, input.accountId]
+            [input.draftId, input.accountId, this.nowIso()]
           )
         : await this.pool.query("SELECT 1 FROM drafts WHERE id = $1", [input.draftId]);
 
@@ -173,6 +186,8 @@ export class PostgresPatchPageDb implements PatchPageDb {
 
       const repoOrg = cleanText(input.metadata.repoOrg);
       const repoName = cleanText(input.metadata.repoName);
+      // An upload — first version or fifth — restarts the whole window.
+      const expiresAt = expiryAfterUpload(this.clock());
       let title: string;
       let versionNumber: number;
 
@@ -185,9 +200,10 @@ export class PostgresPatchPageDb implements PatchPageDb {
               AND account_id = $2
               AND deleted_at IS NULL
               AND disabled_at IS NULL
+              AND expires_at >= $3::timestamptz
             FOR UPDATE
           `,
-          [input.draftId, input.accountId]
+          [input.draftId, input.accountId, this.nowIso()]
         );
         const existingDraft = existingResult.rows[0] || null;
         if (!existingDraft) {
@@ -212,13 +228,22 @@ export class PostgresPatchPageDb implements PatchPageDb {
         const createdDraft = await client.query(
           `
             INSERT INTO drafts (
-              id, account_id, title, visibility, current_version_id, repo_org, repo_name
+              id, account_id, title, visibility, current_version_id, repo_org, repo_name,
+              expires_at
             )
-            VALUES ($1, $2, $3, 'unlisted', $4, $5, $6)
+            VALUES ($1, $2, $3, 'unlisted', $4, $5, $6, $7::timestamptz)
             ON CONFLICT (id) DO NOTHING
             RETURNING id
           `,
-          [input.draftId, input.accountId, title, input.versionId, repoOrg, repoName]
+          [
+            input.draftId,
+            input.accountId,
+            title,
+            input.versionId,
+            repoOrg,
+            repoName,
+            expiresAt
+          ]
         );
         if (!createdDraft.rowCount) {
           throw new UploadTargetError("draft_conflict");
@@ -258,10 +283,11 @@ export class PostgresPatchPageDb implements PatchPageDb {
               title = $2,
               repo_org = COALESCE($3, repo_org),
               repo_name = COALESCE($4, repo_name),
-              updated_at = now()
+              updated_at = now(),
+              expires_at = $6::timestamptz
           WHERE id = $5
         `,
-        [input.versionId, title, repoOrg, repoName, input.draftId]
+        [input.versionId, title, repoOrg, repoName, input.draftId, expiresAt]
       );
 
       await client.query(
@@ -312,9 +338,10 @@ export class PostgresPatchPageDb implements PatchPageDb {
         WHERE id = $1
           AND deleted_at IS NULL
           AND disabled_at IS NULL
+          AND expires_at >= $2::timestamptz
         LIMIT 1
       `,
-      [draftId]
+      [draftId, this.nowIso()]
     );
     const draft = draftResult.rows[0] ? mapDraft(draftResult.rows[0]) : null;
     if (!draft) return { draft: null, version: null };
@@ -337,6 +364,30 @@ export class PostgresPatchPageDb implements PatchPageDb {
       draft,
       version: versionResult.rows[0] ? mapDraftVersion(versionResult.rows[0]) : null
     };
+  }
+
+  async recordDraftVisit(draftId: string): Promise<void> {
+    const now = this.clock();
+    // One predicate says both halves of the visit rule: `expires_at` below the
+    // topped-up anchor is exactly "less than the visit-extension window
+    // remains", and it is also exactly "this move does not shorten the clock".
+    // The lower bound keeps a visit from reviving an already-expired draft.
+    await this.pool.query(
+      `
+        UPDATE drafts
+        SET expires_at = $2::timestamptz
+        WHERE id = $1
+          AND deleted_at IS NULL
+          AND disabled_at IS NULL
+          AND expires_at >= $3::timestamptz
+          AND expires_at < $2::timestamptz
+      `,
+      [
+        draftId,
+        new Date(now + DRAFT_VISIT_EXTENSION_WINDOW_MS).toISOString(),
+        new Date(now).toISOString()
+      ]
+    );
   }
 
   async disableDraft(
@@ -504,6 +555,7 @@ function mapDraft(row: any): DraftRecord {
     repoName: row.repo_name,
     createdAt: toIso(row.created_at),
     updatedAt: toIso(row.updated_at),
+    expiresAt: toIso(row.expires_at),
     deletedAt: row.deleted_at ? toIso(row.deleted_at) : null,
     disabledAt: row.disabled_at ? toIso(row.disabled_at) : null,
     disabledReason: row.disabled_reason
