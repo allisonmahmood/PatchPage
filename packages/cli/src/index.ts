@@ -387,8 +387,10 @@ function buildStatusReport(apiUrlOverride?: string): StatusReport {
   return {
     instanceUrl: instance.apiUrl,
     instanceSource: instance.source,
-    // Mirrors the credential chain the upload path walks, so "no token" here
-    // is exactly the condition that makes the next upload mint one.
+    // Walks the credential chain the upload path walks, so true means an
+    // upload would have this token to send. False is the narrower claim "no
+    // token this command can vouch for": it also covers the state below that
+    // the probe declined to interpret but upload still stops on.
     hasToken: environmentToken !== undefined || stored !== undefined,
     // Only a stored credential carries provenance. A token supplied by the
     // environment, and an entry written before `source` existed, both report

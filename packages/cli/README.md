@@ -79,9 +79,11 @@ patchpage status --json
 # }
 ```
 
-`instanceSource` names the link of the precedence chain that chose `instanceUrl`: `flag` (`--api-url`), `env` (`PATCHPAGE_API_URL`), `config` (the saved `config.json`), or `default`. `hasToken` follows the same credential chain an upload would walk, so `false` is exactly the state in which the next upload has no token to send. `tokenSource` is the stored credential's own `source` (`mint` or `auth-set`); it is `null` when there is no token, when the token came from `PATCHPAGE_API_TOKEN`, or when the stored entry predates that field. The token itself is never printed.
+`instanceSource` names the link of the precedence chain that chose `instanceUrl`: `flag` (`--api-url`), `env` (`PATCHPAGE_API_URL`), `config` (the saved `config.json`), or `default`. `hasToken` walks the same credential chain an upload would, so `true` means an upload would have that token to send. Read `false` as *no token this command can vouch for* — usually nothing is stored, but it also covers local state the probe declined to interpret. `tokenSource` is the stored credential's own `source` (`mint` or `auth-set`); it is `null` when there is no token, when the token came from `PATCHPAGE_API_TOKEN`, or when the stored entry predates that field. The token itself is never printed.
 
-Local state the probe cannot read is reported as no token rather than raised as an error — the commands that would actually spend a token keep failing closed on it.
+Local state the probe cannot read — a file in the retired single-instance format, malformed JSON, an unreadable file, or an invalid entry for this instance — is reported as `hasToken: false` rather than raised as an error, because a probe that cannot answer is worse than one that answers narrowly. The commands that would actually spend a token keep failing closed on exactly those files: `upload` and `whoami` stop with an error naming the file and its next action, and never treat it as a reason to publish without credentials.
+
+So this report is a picture of local state, not a prediction of what `upload` will do. `hasToken: false` does not promise the next upload proceeds without a token, and it never means this machine has no token — a token may be sitting in a file the probe refused to guess about.
 
 ### `patchpage validate <file>`
 

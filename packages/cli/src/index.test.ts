@@ -1831,12 +1831,16 @@ describe("patchpage status", () => {
   });
 
   it("reports the default style by existence alone", () => {
-    const before = makeStateDir();
-    const after = makeStateDir();
-    writeFileSync(path.join(after, "style.md"), "# Default style\n");
+    const beforeStateDir = makeStateDir();
+    const afterStateDir = makeStateDir();
+    writeFileSync(path.join(afterStateDir, "style.md"), "# Default style\n");
 
-    expect(styleReport(runCli(["status", "--json"], undefined, before))).toBe(false);
-    expect(styleReport(runCli(["status", "--json"], undefined, after))).toBe(true);
+    const before = runCli(["status", "--json"], undefined, beforeStateDir);
+    const after = runCli(["status", "--json"], undefined, afterStateDir);
+
+    expect([before.status, after.status]).toEqual([0, 0]);
+    expect([before.stderr, after.stderr]).toEqual(["", ""]);
+    expect([styleReport(before), styleReport(after)]).toEqual([false, true]);
   });
 
   it.runIf(canDenyReads)("never opens the default style it reports", () => {
