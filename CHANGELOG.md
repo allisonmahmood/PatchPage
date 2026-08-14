@@ -6,8 +6,26 @@ All notable changes to PatchPage are documented in this file. The format is base
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-08-14
+
 ### Added
 
+- The CLI now auto-mints a publishing token on first upload. When `upload` resolves an
+  instance with no stored token and no `PATCHPAGE_API_TOKEN` in the environment, it
+  requests one from that instance's self-service endpoint, saves it before announcing it,
+  and prints the mint announcement: which instance, where the token was saved
+  (`~/.patchpage/credentials.json`), and how to reuse an existing identity from another
+  machine instead. Auto-mint is never silent and never fires while any token is
+  configured — a rejected token is an error, not a reason to mint again — and only the
+  resolved instance is ever asked. Each refusal (self-service disabled, per-network mint
+  quota exhausted, rate-limited) produces a plain-language error naming the cause and the
+  next action.
+- `patchpage status --json`, the local-only onboarding probe. It reports what publishing
+  state this machine already holds for the resolved instance — keys `instanceUrl`,
+  `instanceSource` (`flag` | `env` | `config` | `default`), `hasToken`, `tokenSource`
+  (`mint` | `auth-set` | null), `stateDir`, `hasDefaultStyle`, `cliVersion` — without ever
+  touching the network, and exits 0 in every configured and unconfigured state: it
+  answers rather than passing or failing.
 - Added the go-public flip: the one-shot data surgery that turns the maintainer's private
   instance into the free public service, plus the operator runbook that choreographs it
   (`docs/GO_PUBLIC_FLIP.md`). The surgery re-homes named teammate tokens onto fresh 1:1
@@ -35,6 +53,14 @@ All notable changes to PatchPage are documented in this file. The format is base
   was owned by `acct_anonymous`; it is replaced by a general capability, so `admin` now
   reaches any principal's draft. Ordinary tokens are unchanged and still reach only the
   drafts they own.
+- **Breaking:** CLI state is now host-keyed. `credentials.json` stores one token per
+  instance and `drafts.json` caches drafts per instance, so switching `--api-url` (or
+  `PATCHPAGE_API_URL`) can no longer send one instance's token to another or update the
+  wrong instance's draft. The retired single-instance format is not migrated and there is
+  no compatibility shim: commands that would spend a token stop on the old file with
+  instructions (copy the token out if still needed, delete the file, re-save with
+  `patchpage auth set`), and the old draft cache is likewise rejected with instructions
+  to delete it — already-published drafts are unaffected.
 - **Breaking, deliberate:** `PATCHPAGE_ALLOW_ANONYMOUS_UPLOADS` and
   `PATCHPAGE_ANONYMOUS_CREATE_RATE_LIMIT_PER_MINUTE` are retired. Setting either one now
   **fails startup** with an error naming its successor, rather than being silently ignored,
@@ -70,6 +96,13 @@ All notable changes to PatchPage are documented in this file. The format is base
   Existing environments left on the platform default (about 7 days) will see an in-place
   flexible-server update on the first infrastructure apply after upgrade; review the added
   backup storage cost before approving.
+
+### Deprecated
+
+- `upload --anonymous` is deprecated and ignored. Tokenless upload no longer exists
+  anywhere (see Removed), so the flag prints a warning and the upload proceeds with a
+  publishing token as always — minted automatically if none is stored. The flag will be
+  removed in a later release.
 
 ## [0.1.1] - 2026-07-14
 
