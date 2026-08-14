@@ -2,7 +2,7 @@
 
 Command-line uploader for [PatchPage](https://github.com/allisonmahmood/PatchPage), a self-hostable service for publishing static HTML drafts behind unlisted, link-viewable URLs. Every upload requires a bearer API token, on every configuration; draft viewer URLs are public and unlisted, so anyone with the link can view the rendered artifact.
 
-The CLI defaults to the host `https://post.patchyhq.com`, which is the maintainer's private instance and does not offer public token signup. To use PatchPage yourself, deploy your own server and point the CLI at it with `--api-url` or the `PATCHPAGE_API_URL` environment variable. See the [self-hosting guide](https://github.com/allisonmahmood/PatchPage/blob/main/docs/SELF_HOSTING.md).
+The CLI defaults to the host `https://post.patchyhq.com`, which is the maintainer's private instance and issues no tokens to outside callers. To use PatchPage yourself, deploy your own server and point the CLI at it with `--api-url` or the `PATCHPAGE_API_URL` environment variable. See the [self-hosting guide](https://github.com/allisonmahmood/PatchPage/blob/main/docs/SELF_HOSTING.md).
 
 ## Install and use
 
@@ -107,7 +107,7 @@ patchpage upload ./plan.html
 
 Credential selection is deterministic: `PATCHPAGE_API_TOKEN` wins over the token stored for the resolved instance. When neither exists, the CLI mints a publishing token for that instance and uses it. Every upload carries a bearer token; no configuration accepts a credential-free upload, and an authentication failure is reported as-is rather than retried without credentials.
 
-With credentials, uploading a file the CLI has seen before updates that same draft (a new version). If that cached draft is unavailable, the upload fails; pass `--new` to create a brand-new draft with a server-generated ID. `--draft <draft-id>` is update-only: it can add a version to an existing active draft owned by your account, but it never creates a draft at a caller-chosen ID. Unknown, unavailable, or unowned targets fail with the same generic update error.
+With credentials, uploading a file the CLI has seen before updates that same draft (a new version). If that cached draft is unavailable, the upload fails; pass `--new` to create a brand-new draft with a server-generated ID. `--draft <draft-id>` is update-only: it can add a version to an existing active draft your own token owns, but it never creates a draft at a caller-chosen ID. Unknown, unavailable, or unowned targets fail with the same generic update error.
 
 ## Flags
 

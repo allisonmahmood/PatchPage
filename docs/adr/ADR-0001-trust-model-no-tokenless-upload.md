@@ -62,7 +62,9 @@ Separate the two ideas. Keep the bearer token; delete the signup.
 
 7. **A lost token is unrecoverable by design.** There is no identity behind it
    to verify. Its drafts stay up until expiry or moderation, and nothing
-   self-service can touch them. Admin revocation is the abuse kill switch.
+   self-service can touch them. Admin revocation is the abuse kill switch, and
+   the `admin` scope retains per-draft disable and delete over any principal's
+   drafts — the operator's moderation reach is unchanged by this decision.
 
 8. **Retiring the old configuration is a startup failure, not a silent
    ignore.** `PATCHPAGE_ALLOW_ANONYMOUS_UPLOADS` is replaced by
@@ -82,13 +84,16 @@ posture; silently dropping that line and booting anyway would be the one failure
 mode worse than downtime. The breaking rename is accepted deliberately: this
 lands pre-launch, when there are effectively no self-hosters to break.
 
-**Moderation gets simpler and narrower.** With no shared sentinel owner, the
-admin carve-out that let admin-scoped credentials moderate anonymous-owned
-drafts has no subject and is deleted. Draft disable and delete are now strictly
-own-account operations; admin scope grants no cross-account reach. The
-moderation loop the operator actually needs — reported draft to owning
-principal, list that principal's drafts, revoke its token — is built explicitly
-against real principals rather than inherited implicitly from a carve-out.
+**Moderation stops being a carve-out and becomes a capability.** The old admin
+reach was keyed on the sentinel: an admin-scoped credential could disable or
+delete a draft only if that draft was owned by `acct_anonymous`. With the
+sentinel gone that carve-out has no subject, so it is replaced — not dropped —
+by a general moderation capability granted by the `admin` scope, keyed on
+nothing but the scope. Ordinary tokens still reach only what they own. This is
+what lets the existing per-draft disable and delete complete the operator's
+moderation loop against real principals; the rest of that loop — reported draft
+to owning principal, list that principal's drafts, revoke its token — is built
+separately.
 
 **Every draft is attributable, quota-able, and revocable from birth.** Per-token
 quotas, per-IP mint limits, expiry clocks, and report-driven takedown all have a

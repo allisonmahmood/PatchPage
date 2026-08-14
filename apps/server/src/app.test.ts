@@ -253,28 +253,44 @@ describe("PatchPage server", () => {
     }
   });
 
-  it("restricts draft moderation to the owning account, admin scope included", async () => {
+  it("lets admin credentials alone moderate another principal's draft", async () => {
     const config = testConfig();
     const db = new JsonFilePatchPageDb(path.join(tempDir, "moderation-db.json"));
     await db.initialize("admin-token");
     const admin = await db.findApiTokenByToken("admin-token");
     if (!admin) throw new Error("Expected bootstrap authentication.");
+    await db.createApiToken({
+      accountId: admin.accountId,
+      name: "Ordinary token",
+      token: "ordinary-token",
+      scopes: ["upload"]
+    });
     const storage = new FileSystemHtmlStorage(path.join(tempDir, "moderation-drafts"));
     const app = createApp({ config, db, storage });
-    const createOwnDraft = async () => {
-      const upload = await app.inject({
-        method: "POST",
-        url: "/api/uploads",
-        headers: { authorization: "Bearer admin-token" },
-        payload: {
-          html: "<!doctype html><html><head><title>Moderate me</title></head><body></body></html>"
-        }
+    let foreignDraftSequence = 0;
+    const createForeignDraft = async (): Promise<string> => {
+      foreignDraftSequence += 1;
+      const draftId = `zzzzzzzzzzz${foreignDraftSequence}`;
+      await db.recordUpload({
+        intent: "create",
+        draftId,
+        versionId: `ver_foreign_${foreignDraftSequence}`,
+        accountId: "acct_foreign",
+        apiTokenId: admin.id,
+        title: "Another principal's draft",
+        objectKey: `drafts/${draftId}/versions/ver_foreign_${foreignDraftSequence}.html`,
+        contentHash: `sha256:foreign${foreignDraftSequence}`,
+        fileSize: 1,
+        filename: "foreign.html",
+        metadata: {},
+        sourceIp: null,
+        userAgent: "vitest"
       });
-      return (upload.json() as { draftId: string }).draftId;
+      return draftId;
     };
 
     try {
-      const disableDraftId = await createOwnDraft();
+      const disableDraftId = await createForeignDraft();
       for (const request of [
         { method: "GET" as const, url: "/api/me" },
         {
@@ -288,53 +304,39 @@ describe("PatchPage server", () => {
         expect(tokenlessOperation.statusCode).toBe(401);
       }
 
-      const ownDisable = await app.inject({
+      // An ordinary upload token reaches only what it owns.
+      const ordinaryDisable = await app.inject({
+        method: "POST",
+        url: `/api/drafts/${disableDraftId}/disable`,
+        headers: { authorization: "Bearer ordinary-token" },
+        payload: { reason: "not a moderator" }
+      });
+      expect(ordinaryDisable.statusCode).toBe(404);
+
+      // The operator's takedown path: admin scope reaches any principal's draft,
+      // which is what completes the moderation loop.
+      const adminDisable = await app.inject({
         method: "POST",
         url: `/api/drafts/${disableDraftId}/disable`,
         headers: { authorization: "Bearer admin-token" },
-        payload: { reason: "owner policy" }
+        payload: { reason: "operator policy" }
       });
-      expect(ownDisable.statusCode).toBe(200);
+      expect(adminDisable.statusCode).toBe(200);
 
-      const deleteDraftId = await createOwnDraft();
-      const ownDelete = await app.inject({
+      const deleteDraftId = await createForeignDraft();
+      const ordinaryDelete = await app.inject({
+        method: "DELETE",
+        url: `/api/drafts/${deleteDraftId}`,
+        headers: { authorization: "Bearer ordinary-token" }
+      });
+      expect(ordinaryDelete.statusCode).toBe(404);
+
+      const adminDelete = await app.inject({
         method: "DELETE",
         url: `/api/drafts/${deleteDraftId}`,
         headers: { authorization: "Bearer admin-token" }
       });
-      expect(ownDelete.statusCode).toBe(200);
-
-      // Admin scope buys no cross-account moderation: ownership is the only key.
-      const foreignDraftId = "zzzzzzzzzzzz";
-      await db.recordUpload({
-        intent: "create",
-        draftId: foreignDraftId,
-        versionId: "ver_foreign_owner",
-        accountId: "acct_foreign",
-        apiTokenId: admin.id,
-        title: "Foreign ordinary draft",
-        objectKey: `drafts/${foreignDraftId}/versions/ver_foreign_owner.html`,
-        contentHash: "sha256:foreign",
-        fileSize: 1,
-        filename: "foreign.html",
-        metadata: {},
-        sourceIp: null,
-        userAgent: "vitest"
-      });
-      const crossAccountAdminDisable = await app.inject({
-        method: "POST",
-        url: `/api/drafts/${foreignDraftId}/disable`,
-        headers: { authorization: "Bearer admin-token" },
-        payload: { reason: "admin policy" }
-      });
-      expect(crossAccountAdminDisable.statusCode).toBe(404);
-
-      const crossAccountAdminDelete = await app.inject({
-        method: "DELETE",
-        url: `/api/drafts/${foreignDraftId}`,
-        headers: { authorization: "Bearer admin-token" }
-      });
-      expect(crossAccountAdminDelete.statusCode).toBe(404);
+      expect(adminDelete.statusCode).toBe(200);
     } finally {
       await app.close();
       await db.close();

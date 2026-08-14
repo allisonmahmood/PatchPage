@@ -96,6 +96,16 @@ export interface DraftVersionLookup {
   version: DraftVersionRecord | null;
 }
 
+export interface DraftModerationOptions {
+  /**
+   * Lets the caller moderate a draft owned by any principal, not just its own.
+   * This is the operator's moderation reach, granted by the `admin` scope; it is
+   * keyed on nothing but that scope. (It replaces a carve-out that reached only
+   * the retired anonymous sentinel account.)
+   */
+  canModerateAnyPrincipal?: boolean;
+}
+
 export interface DbDriverOptions {
   /**
    * The ordered migration list to run. Defaults to the shipped
@@ -136,8 +146,17 @@ export interface PatchPageDb {
    * and never brings a draft back.
    */
   recordDraftVisit(draftId: string): Promise<void>;
-  disableDraft(draftId: string, accountId: string, reason: string): Promise<boolean>;
-  deleteDraft(draftId: string, accountId: string): Promise<boolean>;
+  disableDraft(
+    draftId: string,
+    accountId: string,
+    reason: string,
+    options?: DraftModerationOptions
+  ): Promise<boolean>;
+  deleteDraft(
+    draftId: string,
+    accountId: string,
+    options?: DraftModerationOptions
+  ): Promise<boolean>;
   close(): Promise<void>;
 }
 

@@ -52,9 +52,10 @@ ledger existed reaches it by having the baseline replayed over its live schema,
 which is why **every step must be idempotent on its own** even though the ledger
 normally prevents a second run.
 
-`initialize()` migrates, then seeds (the dedicated internal owner/audit actor,
-the bootstrap token). Seeding is not a migration: it re-runs on every startup and
-must stay idempotent.
+`initialize()` migrates, then seeds the bootstrap token when one is configured.
+Seeding is not a migration: it re-runs on every startup and must stay idempotent.
+(The retired anonymous owner/audit actor used to be seeded here too; the
+trust-model cutover removed it, and no sentinel principal is seeded now.)
 
 Two objects are easy to confuse, so they are named here. **`0002_drafts_account_id_index`
 and `0003_drafts_expiry_columns` are the shipped additive migrations** — both

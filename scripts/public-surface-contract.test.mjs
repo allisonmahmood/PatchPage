@@ -91,10 +91,13 @@ for (const name of ["rootReadme", "cliReadme", "skill", "showcase"]) {
     /private instance/i,
     `${surfacePaths[name]} must identify the maintainer instance`
   );
+  // Both context glossaries avoid "signup" as domain vocabulary, so the
+  // contract enforces the meaning rather than that word: the maintainer
+  // instance hands out no tokens to callers who are not its operator.
   assert.match(
     text,
-    /(?:does not offer|has no) public token signup/i,
-    `${surfacePaths[name]} must say that the maintainer instance has no public token signup`
+    /(?:issues|hands out|offers) no[^.]{0,40}tokens?|does not issue[^.]{0,40}tokens?/i,
+    `${surfacePaths[name]} must say the maintainer instance issues no tokens to outside callers`
   );
 }
 
@@ -619,7 +622,7 @@ function assertAuthenticatedQuickStartContract(surfacePath, commands) {
     ...commands.matchAll(/\b(?:npx\s+(?:--yes\s+)?)?patchpage\s+(auth|whoami|validate|upload)\b/g)
   ];
   const sequence = matches.map((match) => match[1]);
-  if (!sequence.includes("auth") || commands.includes("--anonymous")) {
+  if (!sequence.includes("auth")) {
     return;
   }
   const npxCount = [...commands.matchAll(/\bnpx\b/g)].length;

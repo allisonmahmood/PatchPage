@@ -666,7 +666,7 @@ After the minting block succeeds, the CLI is already configured for your instanc
 
 ## Pointing the CLI at your instance
 
-The CLI defaults to `https://post.patchyhq.com`, which is the maintainer's private instance and has no public token signup. The minting block selects the self-hosted origin explicitly and saves the new credential. On another machine, use this fail-closed quick start with a scoped token in a protected owner-readable file:
+The CLI defaults to `https://post.patchyhq.com`, which is the maintainer's private instance and issues no tokens to outside callers. The minting block selects the self-hosted origin explicitly and saves the new credential. On another machine, use this fail-closed quick start with a scoped token in a protected owner-readable file:
 
 ```sh
 (
@@ -706,7 +706,7 @@ patchpage upload ./plan.html --draft "$DRAFT_ID"
 
 The `--draft` option is update-only: the target must already be active and owned by the authenticated account, and unknown, deleted, disabled, or unowned targets all return the same generic unavailable response without creating a draft. Use `--new` for an explicit create; `--new` and `--draft` cannot be combined.
 
-`patchpage upload` needs a credential: `PATCHPAGE_API_TOKEN`, or a token stored by `auth set`. With neither, the request carries no bearer token and the server rejects it with 401. Authentication failures are returned directly and are never retried without credentials. The CLI's `--anonymous` flag is deprecated and no longer selects a working mode; the credential-free request it produces is rejected with 401 as well.
+`patchpage upload` needs a credential: `PATCHPAGE_API_TOKEN`, or a token stored by `auth set`. With neither, the request carries no bearer token and the server rejects it with 401. Authentication failures are returned directly and are never retried without credentials. The CLI's `--anonymous` flag is retired and no longer selects a working mode; the credential-free request it produces is rejected with 401 as well.
 
 `auth set` reads the token from a non-echoing terminal prompt. Automation that needs to persist credentials must explicitly pipe one token to `--token-stdin`:
 
@@ -779,4 +779,4 @@ The [`infra/azure`](../infra/azure) OpenTofu directory is an Azure-specific work
 
 ## Security
 
-No instance publishes without credentials: every upload requires a bearer token, and no configuration accepts one that carries none. `PATCHPAGE_ALLOW_SELF_SERVICE_TOKENS` defaults to `false` and gates no route today; keep it `false` unless you intentionally plan to accept public token-minting traffic and have an appropriate external abuse-control layer. Draft disable and delete are strictly own-account operations: the `admin` scope mints tokens and grants no cross-account moderation. Treat `PATCHPAGE_BOOTSTRAP_API_TOKEN` as a secret, and remember that draft viewer URLs are public and unlisted — anyone with a link can view the rendered HTML unless you add your own viewer access controls.
+No instance publishes without credentials: every upload requires a bearer token, and no configuration accepts one that carries none. `PATCHPAGE_ALLOW_SELF_SERVICE_TOKENS` defaults to `false` and gates no route today; keep it `false` unless you intentionally plan to accept public token-minting traffic and have an appropriate external abuse-control layer. An ordinary `upload` token can disable or delete only the drafts it owns; the `admin` scope additionally moderates any principal's draft, which is the operator's takedown path. Treat `PATCHPAGE_BOOTSTRAP_API_TOKEN` as a secret, and remember that draft viewer URLs are public and unlisted — anyone with a link can view the rendered HTML unless you add your own viewer access controls.

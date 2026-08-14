@@ -280,7 +280,9 @@ export function createApp(options: CreateAppOptions): FastifyInstance {
       const draftId = (request.params as { draftId: string }).draftId;
       const reason =
         cleanText((request.body as { reason?: unknown } | null)?.reason) || "Disabled.";
-      const disabled = await options.db.disableDraft(draftId, auth.accountId, reason);
+      const disabled = await options.db.disableDraft(draftId, auth.accountId, reason, {
+        canModerateAnyPrincipal: hasScope(auth, "admin")
+      });
       if (!disabled) return reply.status(404).send({ ok: false, error: "Draft not found." });
       return { ok: true };
     }
@@ -293,7 +295,9 @@ export function createApp(options: CreateAppOptions): FastifyInstance {
       const auth = authenticatedRequest(request);
 
       const draftId = (request.params as { draftId: string }).draftId;
-      const deleted = await options.db.deleteDraft(draftId, auth.accountId);
+      const deleted = await options.db.deleteDraft(draftId, auth.accountId, {
+        canModerateAnyPrincipal: hasScope(auth, "admin")
+      });
       if (!deleted) return reply.status(404).send({ ok: false, error: "Draft not found." });
       return { ok: true };
     }

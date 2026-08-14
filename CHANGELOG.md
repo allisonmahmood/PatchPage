@@ -13,14 +13,15 @@ All notable changes to PatchPage are documented in this file. The format is base
   is `401`, and a present-but-invalid bearer stays `401` rather than being downgraded. The
   anonymous branch of the API guard, its per-IP anonymous-create limiter, and the internal
   `acct_anonymous`/`tok_anonymous` sentinel principals and their seed code are all gone.
-  Because there is no longer a shared sentinel owner to moderate, the admin carve-out that
-  let admin-scoped credentials disable or delete anonymous-owned drafts is also gone: draft
-  disable and delete are now strictly own-account operations and admin scope grants no
-  cross-account reach. The rationale is recorded in
-  `docs/adr/ADR-0001-trust-model-no-tokenless-upload.md`.
+  The rationale is recorded in `docs/adr/ADR-0001-trust-model-no-tokenless-upload.md`.
 
 ### Changed
 
+- Admin moderation of drafts is no longer keyed on the retired anonymous sentinel. The old
+  carve-out let an `admin`-scoped credential disable or delete a draft only when that draft
+  was owned by `acct_anonymous`; it is replaced by a general capability, so `admin` now
+  reaches any principal's draft. Ordinary tokens are unchanged and still reach only the
+  drafts they own.
 - **Breaking, deliberate:** `PATCHPAGE_ALLOW_ANONYMOUS_UPLOADS` and
   `PATCHPAGE_ANONYMOUS_CREATE_RATE_LIMIT_PER_MINUTE` are retired. Setting either one now
   **fails startup** with an error naming its successor, rather than being silently ignored,

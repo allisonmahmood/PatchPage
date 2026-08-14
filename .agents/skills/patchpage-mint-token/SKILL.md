@@ -205,6 +205,7 @@ uploaded — and revocation is a state we keep for the audit trail, not an erasu
 - Never pass a token positionally to `patchpage auth set`; use the hidden prompt for a
   person or explicit `--token-stdin` for automation.
 - Tokens gate publishing, ownership, and updates. Draft view URLs stay public and unlisted
-  regardless; a token does not make a draft private. Draft disable and delete are strictly
-  own-account, so an `admin` scope grants no cross-account moderation.
+  regardless; a token does not make a draft private. An `upload` token disables or deletes
+  only the drafts it owns; an `admin` scope moderates any principal's draft, which is how
+  the operator takes down a reported page.
 - Do not hand the bootstrap token to CLI clients; mint per-client `upload` tokens instead.

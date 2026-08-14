@@ -61,7 +61,7 @@ workflow:
 Behavior:
 
 - The hosted default is `https://post.patchyhq.com`, the maintainer's private instance,
-  which does not offer public token signup. It issues no tokens to outside callers.
+  which issues no tokens to outside callers.
 - Every upload requires a PatchPage API token, on every configuration. A request with no
   bearer token is rejected with 401, and an invalid one stays 401. Self-host a server and
   point the CLI at it with `--api-url` or `PATCHPAGE_API_URL`. Self-hosting guide:
@@ -70,8 +70,8 @@ Behavior:
   neither, the upload fails; there is no credential-free path to fall back on, and an
   authentication failure is reported as-is.
 - Uploads use the per-file cache, so uploading the same local file updates its known draft
-  unless `--new` is passed. `--draft` is update-only and targets a draft your account owns.
-- The `--anonymous` flag is deprecated and no longer selects a working mode. Do not pass it.
+  unless `--new` is passed. `--draft` is update-only and targets a draft your own token owns.
+- The `--anonymous` flag is retired and no longer selects a working mode. Do not pass it.
 - Draft view URLs are public and unlisted. CLI state lives under `~/.patchpage`.
 
 Set credentials with:

@@ -1,6 +1,6 @@
 # PatchPage
 
-PatchPage is an open-source, self-hostable service for publishing static HTML drafts behind unlisted, link-viewable URLs. The default host, https://post.patchyhq.com, is the maintainer's private instance and does not offer public token signup. To use PatchPage yourself, deploy your own server (see [docs/SELF_HOSTING.md](docs/SELF_HOSTING.md)) and point the CLI at it with `--api-url` or the `PATCHPAGE_API_URL` environment variable.
+PatchPage is an open-source, self-hostable service for publishing static HTML drafts behind unlisted, link-viewable URLs. The default host, https://post.patchyhq.com, is the maintainer's private instance and issues no tokens to outside callers. To use PatchPage yourself, deploy your own server (see [docs/SELF_HOSTING.md](docs/SELF_HOSTING.md)) and point the CLI at it with `--api-url` or the `PATCHPAGE_API_URL` environment variable.
 
 Every upload requires a bearer API token, on every configuration. A request with no `Authorization` header is rejected with 401, and a present but invalid credential is never downgraded to an unauthenticated upload. Draft viewer URLs are public and unlisted: anyone with the link can view the rendered artifact. PatchPage is intended for agent-generated plans, briefs, architecture notes, reports, and other single-file HTML documents.
 
@@ -33,7 +33,7 @@ Set `PATCHPAGE_SETUP_TOKEN` in a secret environment variable, then run this self
 
 The example origin and setup token must come from a PatchPage server you control. The workflow pins that origin, clears inherited credential overrides, and verifies the stored token before validation or upload. See [docs/SELF_HOSTING.md](docs/SELF_HOSTING.md) for deploying a server and minting tokens.
 
-There is no tokenless upload path and no server setting that restores one. The CLI still accepts a `--anonymous` flag, but it is deprecated and no longer selects a working mode: the credential-free request it produces is rejected with 401. Self-hosters configure `PATCHPAGE_ALLOW_SELF_SERVICE_TOKENS` (default `false`); the retired `PATCHPAGE_ALLOW_ANONYMOUS_UPLOADS` and `PATCHPAGE_ANONYMOUS_CREATE_RATE_LIMIT_PER_MINUTE` variables now fail server startup instead of being ignored.
+There is no tokenless upload path and no server setting that restores one. The CLI still accepts a `--anonymous` flag, but it is retired and no longer selects a working mode: the credential-free request it produces is rejected with 401. Self-hosters configure `PATCHPAGE_ALLOW_SELF_SERVICE_TOKENS` (default `false`); the retired `PATCHPAGE_ALLOW_ANONYMOUS_UPLOADS` and `PATCHPAGE_ANONYMOUS_CREATE_RATE_LIMIT_PER_MINUTE` variables now fail server startup instead of being ignored.
 
 Full command and flag reference: [packages/cli/README.md](packages/cli/README.md).
 

@@ -208,35 +208,70 @@ function describeUploadContract(
       }
     });
 
-    it("moderates only the drafts the acting account owns", async () => {
+    it("moderates a draft for its owning principal or an authorized moderator", async () => {
       const harness = await createHarness();
-      const foreignAccountId = "acct_foreign";
-      const disabledDraftId = newDraftId();
-      const deletedDraftId = newDraftId();
+      // Every draft is created by the harness principal, which is a real row:
+      // `drafts.account_id` carries a foreign key, so an invented owner would
+      // fail to insert on Postgres while passing on the key-less JSON driver.
+      // A non-owner is expressed by the *acting* principal instead, which is
+      // only ever compared, never inserted.
+      const otherPrincipalId = `${harness.auth.accountId}_not`;
+      const ownerDisabledDraftId = newDraftId();
+      const ownerDeletedDraftId = newDraftId();
+      const moderatedDisabledDraftId = newDraftId();
+      const moderatedDeletedDraftId = newDraftId();
 
       try {
-        for (const draftId of [disabledDraftId, deletedDraftId]) {
-          await harness.db.recordUpload(
-            uploadInput("create", draftId, harness.auth, {
-              accountId: foreignAccountId
-            })
-          );
+        for (const draftId of [
+          ownerDisabledDraftId,
+          ownerDeletedDraftId,
+          moderatedDisabledDraftId,
+          moderatedDeletedDraftId
+        ]) {
+          await harness.db.recordUpload(uploadInput("create", draftId, harness.auth));
         }
 
-        // Ownership is the only key; no scope or carve-out widens it.
+        // Ordinary reach is ownership alone.
         await expect(
-          harness.db.disableDraft(disabledDraftId, harness.auth.accountId, "not the owner")
+          harness.db.disableDraft(ownerDisabledDraftId, otherPrincipalId, "not the owner")
         ).resolves.toBe(false);
         await expect(
-          harness.db.deleteDraft(deletedDraftId, harness.auth.accountId)
+          harness.db.deleteDraft(ownerDeletedDraftId, otherPrincipalId)
         ).resolves.toBe(false);
 
         await expect(
-          harness.db.disableDraft(disabledDraftId, foreignAccountId, "owner policy")
+          harness.db.disableDraft(
+            ownerDisabledDraftId,
+            harness.auth.accountId,
+            "owner policy"
+          )
         ).resolves.toBe(true);
         await expect(
-          harness.db.deleteDraft(deletedDraftId, foreignAccountId)
+          harness.db.deleteDraft(ownerDeletedDraftId, harness.auth.accountId)
         ).resolves.toBe(true);
+
+        // An authorized moderator reaches a draft it does not own. This is the
+        // operator's takedown path, keyed on nothing but the granted capability.
+        await expect(
+          harness.db.disableDraft(
+            moderatedDisabledDraftId,
+            otherPrincipalId,
+            "operator policy",
+            { canModerateAnyPrincipal: true }
+          )
+        ).resolves.toBe(true);
+        await expect(
+          harness.db.deleteDraft(moderatedDeletedDraftId, otherPrincipalId, {
+            canModerateAnyPrincipal: true
+          })
+        ).resolves.toBe(true);
+
+        // Moderation still cannot resurrect an already-deleted draft.
+        await expect(
+          harness.db.deleteDraft(moderatedDeletedDraftId, otherPrincipalId, {
+            canModerateAnyPrincipal: true
+          })
+        ).resolves.toBe(false);
       } finally {
         await harness.close();
       }

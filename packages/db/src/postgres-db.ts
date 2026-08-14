@@ -9,6 +9,7 @@ import type {
   CreateApiTokenInput,
   DbDriverOptions,
   DraftRecord,
+  DraftModerationOptions,
   DraftVersionLookup,
   DraftVersionRecord,
   PatchPageDb,
@@ -369,33 +370,38 @@ export class PostgresPatchPageDb implements PatchPageDb {
   async disableDraft(
     draftId: string,
     accountId: string,
-    reason: string
+    reason: string,
+    options: DraftModerationOptions = {}
   ): Promise<boolean> {
     const result = await this.pool.query(
       `
         UPDATE drafts
         SET disabled_at = now(), disabled_reason = $3, updated_at = now()
         WHERE id = $1
-          AND account_id = $2
+          AND (account_id = $2 OR $4)
           AND deleted_at IS NULL
         RETURNING id
       `,
-      [draftId, accountId, reason]
+      [draftId, accountId, reason, options.canModerateAnyPrincipal === true]
     );
     return Boolean(result.rowCount);
   }
 
-  async deleteDraft(draftId: string, accountId: string): Promise<boolean> {
+  async deleteDraft(
+    draftId: string,
+    accountId: string,
+    options: DraftModerationOptions = {}
+  ): Promise<boolean> {
     const result = await this.pool.query(
       `
         UPDATE drafts
         SET deleted_at = now(), updated_at = now()
         WHERE id = $1
-          AND account_id = $2
+          AND (account_id = $2 OR $3)
           AND deleted_at IS NULL
         RETURNING id
       `,
-      [draftId, accountId]
+      [draftId, accountId, options.canModerateAnyPrincipal === true]
     );
     return Boolean(result.rowCount);
   }

@@ -26,6 +26,7 @@ import type {
   CreateApiTokenInput,
   DbDriverOptions,
   DraftRecord,
+  DraftModerationOptions,
   DraftVersionLookup,
   DraftVersionRecord,
   PatchPageDb,
@@ -332,12 +333,16 @@ export class JsonFilePatchPageDb implements PatchPageDb {
   async disableDraft(
     draftId: string,
     accountId: string,
-    reason: string
+    reason: string,
+    options: DraftModerationOptions = {}
   ): Promise<boolean> {
     return this.mutateState((state) => {
       const draft =
         state.drafts.find(
-          (row) => row.id === draftId && row.accountId === accountId && !row.deletedAt
+          (row) =>
+            row.id === draftId &&
+            (row.accountId === accountId || options.canModerateAnyPrincipal === true) &&
+            !row.deletedAt
         ) || null;
       if (!draft) return { value: false, changed: false };
 
@@ -348,11 +353,18 @@ export class JsonFilePatchPageDb implements PatchPageDb {
     });
   }
 
-  async deleteDraft(draftId: string, accountId: string): Promise<boolean> {
+  async deleteDraft(
+    draftId: string,
+    accountId: string,
+    options: DraftModerationOptions = {}
+  ): Promise<boolean> {
     return this.mutateState((state) => {
       const draft =
         state.drafts.find(
-          (row) => row.id === draftId && row.accountId === accountId && !row.deletedAt
+          (row) =>
+            row.id === draftId &&
+            (row.accountId === accountId || options.canModerateAnyPrincipal === true) &&
+            !row.deletedAt
         ) || null;
       if (!draft) return { value: false, changed: false };
 
