@@ -1183,6 +1183,37 @@ describe("auto-mint on first upload", () => {
     }
   });
 
+  it("reports a minted token to the status probe without the probe minting one", async () => {
+    const stateDir = makeStateDir();
+    const htmlPath = path.join(stateDir, "probe-after-mint.html");
+    writeFileSync(htmlPath, "<!doctype html><title>Probe after mint</title>");
+    const server = await startUploadServer(createOnly("mnopqrstuvwx"));
+
+    try {
+      const apiArgs = ["--api-url", server.apiUrl];
+      const before = JSON.parse(
+        (await runCliAsync(["status", "--json", ...apiArgs], {}, stateDir)).stdout
+      ) as Record<string, unknown>;
+
+      const upload = await runCliAsync(["upload", htmlPath, ...apiArgs], {}, stateDir);
+
+      const after = JSON.parse(
+        (await runCliAsync(["status", "--json", ...apiArgs], {}, stateDir)).stdout
+      ) as Record<string, unknown>;
+
+      expect(upload.status).toBe(0);
+      // The probe reads state and nothing else: it reported the absence
+      // without creating a token, and the only mint came from the upload.
+      expect(before).toMatchObject({ hasToken: false, tokenSource: null });
+      expect(after).toMatchObject({ hasToken: true, tokenSource: "mint" });
+      expect(server.mints).toHaveLength(1);
+      // Two probes either side of the upload, and neither touched the network.
+      expect(server.requests).toHaveLength(1);
+    } finally {
+      await server.close();
+    }
+  });
+
   it("mints from upload alone, never from whoami or validate", async () => {
     const stateDir = makeStateDir();
     const htmlPath = path.join(stateDir, "read-only.html");
