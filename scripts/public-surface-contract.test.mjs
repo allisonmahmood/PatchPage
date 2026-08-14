@@ -166,8 +166,13 @@ for (const name of ["rootReadme", "cliReadme", "showcase"]) {
 {
   const onboarding = surfaces.onboarding;
   assert.ok(
-    onboarding.includes(
-      "Then walk me through PatchPage's onboarding: set up how my pages should look and publish"
+    // Blockquote markers and wrapping stripped; the sentence must land in full.
+    onboarding
+      .replace(/^[^\S\r\n]*>[^\S\r\n]?/gm, " ")
+      .replace(/\s+/g, " ")
+      .includes(
+      "Then walk me through PatchPage's onboarding: set up how my pages should look and " +
+        "publish my welcome page."
     ),
     `${surfacePaths.onboarding} must quote the setup prompt's onboarding sentence verbatim`
   );
@@ -176,6 +181,26 @@ for (const name of ["rootReadme", "cliReadme", "showcase"]) {
     /status --json/,
     `${surfacePaths.onboarding} must probe with status --json`
   );
+  for (const key of [
+    "instanceUrl",
+    "instanceSource",
+    "hasToken",
+    "tokenSource",
+    "stateDir",
+    "hasDefaultStyle",
+    "cliVersion"
+  ]) {
+    assert.ok(
+      onboarding.includes(`\`${key}\``),
+      `${surfacePaths.onboarding} must quote the pinned status --json key ${key}`
+    );
+  }
+  for (const value of ["flag", "env", "config", "default", "mint", "auth-set"]) {
+    assert.ok(
+      onboarding.includes(`\`${value}\``),
+      `${surfacePaths.onboarding} must list the pinned probe value ${value}`
+    );
+  }
   assert.match(
     onboarding,
     /no per-session first-run check/i,

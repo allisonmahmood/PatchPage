@@ -6,8 +6,11 @@ checks whether it exists. There is one file, not one per instance.
 
 ## Rules for the file
 
-- **Self-contained brief.** A future session applies it with no other context: everything
-  needed to style a page lives in the file, not behind pointers into this skill.
+- **Self-contained brief.** A future session applies it with nothing but the skill in
+  hand: everything needed to style a page lives in the file. The one exception is
+  `references/patchy-plan-style.md`, which ships with the skill and so is always
+  available — deferring to it, as Example A does, is still self-contained. Never point at
+  anything outside the bundle.
 - **Records the choice, not only the values**, so no session re-asks the style question.
   This is why the default answer writes the file too.
 - **Prose plus tokens, no schema.** Agents read it, so write it the way

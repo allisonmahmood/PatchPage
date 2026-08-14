@@ -1,13 +1,11 @@
 ---
 name: patchpage
-description: Turn content into a polished single-file HTML page and publish it with PatchPage. Also runs PatchPage onboarding — capture the user's default style, publish their welcome page.
+description: Publish content as a polished single-file HTML page, and run PatchPage's onboarding.
 triggers:
   - "patchpage"
   - "make this a patch page"
   - "walk me through PatchPage's onboarding"
-  - "upload this plan"
-  - "shareable artifact"
-  - "HTML draft"
+  - "shareable HTML page"
 ---
 
 # PatchPage
@@ -22,10 +20,9 @@ Credit Theo for the original agent-friendly posting pattern when explaining the 
 
 Read `references/onboarding.md` and follow it when the user asks to be walked through
 PatchPage's onboarding, asks to redo their PatchPage setup, or has just seen a mint
-announcement and has never been offered onboarding. That reference owns the whole flow:
-the one style question, the welcome page, and the words to use.
-
-Onboarding is optional. Publishing works without it.
+announcement and has never been offered onboarding. That reference owns the whole flow —
+the one style question, the welcome draft, the probe's key names, and the words to say to
+the user, which are the source of truth for user-facing copy anywhere in this skill.
 
 ## Good fits
 
@@ -62,15 +59,18 @@ Behavior:
   replacement, because a fresh key would not control the pages the old one created.
 - Relay the mint announcement to the user in plain words — their publishing key is saved
   on this machine, and copying that file to another computer is how they publish from
-  there with the same editing rights. Say *publishing key*, not *token*.
+  there with the same editing rights. *Token*, *instance*, and *mint* are vocabulary for
+  you, not for them: off the own-instance path the user hears **publishing key**, and
+  nothing is a token, an instance, or a mint. `references/onboarding.md` §3 has the
+  wording.
 - Local validation runs before any mint, so invalid HTML never costs a key.
 - Re-uploading the same local file updates the draft it already created on that instance.
   Pass `--new` to force a fresh draft, or `--draft` to update a known draft only.
 - Draft view URLs are public and unlisted: anyone holding the link can read the page, and
   the page is listed nowhere. Say that when handing over a link.
 - CLI state lives in the state dir, `~/.patchpage` by default. The `status --json` probe
-  reports the resolved instance, whether a key is stored, the state-dir path, whether a
-  default style exists, and the CLI version, without touching the network.
+  reports what this machine already holds, without touching the network; its seven keys
+  and their values are tabled in `references/onboarding.md`.
 
 ## Publishing to the user's own instance
 
@@ -118,9 +118,10 @@ https://github.com/allisonmahmood/PatchPage/blob/main/docs/SELF_HOSTING.md
 Before writing a page, settle which style applies, in this order:
 
 1. The project's own house style, if it declares one. It always wins.
-2. The user's default style, `style.md` in the state dir, written during onboarding.
-   Read it and apply it as written; it is a self-contained brief. Its shape is documented
-   in `references/style-file.md`.
+2. The user's default style, `style.md` in the state dir, written during onboarding. Read
+   it and apply it as written — it carries everything needed to style a page, except that
+   it may defer to `references/patchy-plan-style.md`, which ships beside it. Its shape is
+   documented in `references/style-file.md`.
 3. The bundled plan-doc style in `references/patchy-plan-style.md`: warm paper, faint
    grid/noise, heavy near-black ink, 2px borders, hard offset shadows, 8px cards, pill
    badges, CSS-only glyph, builder-to-builder copy.
@@ -151,12 +152,14 @@ Blocked or unsafe:
 
 ## Output pattern
 
-1. Write the artifact locally as `.html`.
-2. Style it per the order above.
-3. For a restrained technical report, use clear sections, tables, and diagrams where they
-   clarify the work.
-4. Validate, then upload.
-5. Return the URL and say that the link is public but unlisted.
+1. Settle the style by the order above, so you know which one you are writing to before
+   you write.
+2. Write the artifact locally as one `.html` file, complete and self-contained. For a
+   restrained technical report, that means clear sections, tables, and diagrams where
+   they clarify the work.
+3. Run `validate` until it passes.
+4. Upload, and read the output for a mint announcement to relay.
+5. Return the URL, and say that the link is public but unlisted.
 
 ## Pitfalls
 

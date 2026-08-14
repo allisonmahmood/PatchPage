@@ -1,7 +1,10 @@
 # Onboarding
 
 Agent-led first-time setup: capture how the user's pages should look, then publish their
-welcome page. One question, then a live link.
+welcome draft. One question, then a live link.
+
+The user's own words for it are "my welcome page" — that is the setup prompt's phrasing and
+it is what to say out loud. *Welcome draft* is the term for it here.
 
 Onboarding is always optional. It makes later publishing nicer; publishing works fine
 without it.
@@ -35,15 +38,18 @@ Run the onboarding probe once, at the start:
 npx --yes patchpage status --json
 ```
 
-It is local-only and answers rather than passes or fails. Keys:
+It is local-only and answers rather than passes or fails. All seven keys, and what each one
+settles:
 
-| Key | Use it to |
-| --- | --- |
-| `stateDir` | Locate `style.md` — it goes in this directory. |
-| `hasDefaultStyle` | `true` → onboarding already ran. Say what the current default look is and ask keep-or-redo instead of asking cold. |
-| `hasToken` | `true` → they already publish. The welcome upload reuses that key, so no key is minted and there is no announcement to relay. |
-| `instanceUrl`, `instanceSource` | Anything other than the default with a non-`default` source means they already point at their own deployment. Confirm it; do not ask. |
-| `cliVersion` | Only worth mentioning if something later misbehaves. |
+| Key | Values | Use it to |
+| --- | --- | --- |
+| `instanceUrl` | the resolved instance URL | Know where the welcome draft will go. Anything other than `https://post.patchyhq.com` means they already run their own — confirm it, do not ask. |
+| `instanceSource` | `flag` \| `env` \| `config` \| `default` | Know what pointed the CLI there, so you can say it back: `config` is a saved choice, `env` and `flag` came from this session's environment and will not persist. |
+| `hasToken` | boolean | `true` → they already publish. The welcome upload reuses that key, so nothing is minted and there is no announcement to relay. |
+| `tokenSource` | `mint` \| `auth-set` \| `null` | Tell a key this machine minted (`mint`) from one saved by hand for their own instance (`auth-set`). `null` with `hasToken: true` means the key comes from the environment, not the state dir — say so rather than promising the saved-file story. |
+| `stateDir` | absolute path | Locate `style.md` — it goes in this directory. |
+| `hasDefaultStyle` | boolean | `true` → onboarding already ran. Say what the current default look is and ask keep-or-redo instead of asking cold. |
+| `cliVersion` | version string | Only worth mentioning if something later misbehaves. |
 
 ## The conversation
 
@@ -55,12 +61,11 @@ never reach them outside the own-instance path; the credential is their **publis
 Offer exactly two options:
 
 1. **The PatchPage look** (the default): warm paper, bold ink, hand-built and friendly.
-   One sentence. Do not make them read a style guide.
-2. **Match my website**: ask for the URL and capture it per `style-file.md` — read the
-   code *and* view the pages, take the design system rather than the swatches, sample an
-   inner page as well as the hero. Play the read back in one line before saving ("deep
-   forest green, cream, serif headings, plain-spoken — sound right?") and fold in
-   corrections until they agree.
+   Describe it in one sentence.
+2. **Match my website**: ask for the URL, then capture it by the method in
+   `style-file.md`. Play the read back in one line before saving ("deep forest green,
+   cream, serif headings, plain-spoken — sound right?") and fold in corrections until
+   they agree.
 
 Either answer writes `style.md` into the state dir, in the shape `style-file.md`
 specifies. Writing it for the default answer too is what stops every later session from
@@ -75,12 +80,12 @@ knows they are; everyone else would only be confused by the question.
 
 Switch to the own-instance path the moment the user asserts their own deployment — "we
 host our own", "use our server at …", any phrasing, at any point in the conversation.
-There, operator vocabulary is correct: take the server URL, save the token their operator
-issued through a hidden prompt with `patchpage auth set --api-url`, and confirm it with
-`patchpage whoami` before continuing. See the own-instance section of `SKILL.md`. If the
-probe already showed a non-default instance, confirm rather than re-ask.
+There, operator vocabulary is correct: take their instance's API URL, save the token their
+operator issued through a hidden prompt with `patchpage auth set --api-url`, and confirm it
+with `patchpage whoami` before continuing. See the own-instance section of `SKILL.md`. If
+the probe already showed a non-default instance, confirm rather than re-ask.
 
-### 3. Publish the welcome page
+### 3. Publish the welcome draft
 
 Write `welcome.html` from `welcome-draft.html` in this directory, restyled to the chosen
 look — the structure and copy are the deliverable, the styling is theirs — then:
@@ -97,7 +102,10 @@ announcement in plain words rather than pasting it:
 > update or delete your pages later. To publish from another computer with the same
 > rights, copy that file across; I can help when the time comes."
 
-If the probe reported `hasToken: true`, no key is minted and there is nothing to relay.
+If the probe reported `hasToken: true`, nothing is minted and there is nothing to relay —
+and check `tokenSource` before describing what they hold: `mint` or `auth-set` means the key
+is a file in the state dir, `null` means it came from the environment, so the copy-the-file
+story does not apply.
 
 Then hand over the URL with the one fact that matters: **anyone with the link can see it,
 and it isn't listed anywhere.**
@@ -123,7 +131,7 @@ plan", "update my page", "take that page down". One line, not a manual.
 > this machine; it's what lets you edit or delete your pages later. Next time you want a
 > page, just say "make this a patch page".
 
-### Custom path — style from a website, user asserts their own server
+### Custom path — style from a website, user asserts their own instance
 
 > **Agent**: One quick question — looks. The PatchPage look, or match your website?
 >
