@@ -2142,21 +2142,48 @@ describe("PatchPage server", () => {
   });
 
   it("never lets reports take a draft down, however many arrive", async () => {
+    // Four windows at the configured rate is the same forty reports this test
+    // always filed, now arriving at a rate the instance accepts. What it proves
+    // is unchanged: volume is not a takedown.
     const served = await createServedDraft("report-bomb");
+    const limit = testConfig().reportRateLimitPerMinute;
+    const windows = 4;
 
     const before = await served.app.inject({ method: "GET", url: served.latestUrl });
     expect(before.statusCode).toBe(200);
 
-    for (let index = 0; index < 40; index += 1) {
-      const filed = await served.app.inject({
+    for (let window = 0; window < windows; window += 1) {
+      for (let index = 0; index < limit; index += 1) {
+        const filed = await served.app.inject({
+          method: "POST",
+          url: `/report/${served.draftId}`,
+          headers: { "content-type": "application/x-www-form-urlencoded" },
+          payload: `reason=Bomb+${window}-${index}`
+        });
+        // Every reader within the limit is acknowledged; none is a takedown.
+        expect(filed.statusCode).toBe(200);
+      }
+
+      // And the one that overruns the window is refused as a rate limit —
+      // never as anything about the page, which is still being served.
+      const overrun = await served.app.inject({
         method: "POST",
         url: `/report/${served.draftId}`,
         headers: { "content-type": "application/x-www-form-urlencoded" },
-        payload: `reason=Bomb+${index}`
+        payload: "reason=One+too+many"
       });
-      // Every reader is acknowledged; none of them is a takedown.
-      expect(filed.statusCode).toBe(200);
+      expect(overrun.statusCode).toBe(429);
+      expect(overrun.json()).toMatchObject({ ok: false, code: "rate_limited" });
+      expect(
+        (await served.app.inject({ method: "GET", url: served.latestUrl })).statusCode
+      ).toBe(200);
+
+      served.advanceMs(60_000);
     }
+
+    // Forty reports landed, and the store holds every one of them.
+    expect(limit * windows).toBe(40);
+    expect(await served.db.listDraftReports(served.draftId)).toHaveLength(40);
 
     for (const url of [served.latestUrl, served.versionUrl]) {
       const after = await served.app.inject({ method: "GET", url });
@@ -2175,6 +2202,70 @@ describe("PatchPage server", () => {
     expect(
       (await served.app.inject({ method: "GET", url: served.latestUrl })).statusCode
     ).toBe(404);
+
+    await served.close();
+  });
+
+  it("bounds how fast one address may file reports, and lets the window roll off", async () => {
+    const served = await createServedDraft("report-rate-limit", {
+      reportRateLimitPerMinute: 3
+    });
+    const reader = "198.51.100.40";
+    const file = async (
+      reason: string,
+      remoteAddress = reader
+    ): Promise<Awaited<ReturnType<typeof served.app.inject>>> =>
+      served.app.inject({
+        method: "POST",
+        url: `/report/${served.draftId}`,
+        remoteAddress,
+        headers: { "content-type": "application/x-www-form-urlencoded" },
+        payload: `reason=${reason}`
+      });
+
+    // Under the limit, nothing about filing a report has changed: the reader
+    // is acknowledged with the same page, and the row is stored.
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      const filed = await file(`Under+${attempt}`);
+      expect(filed.statusCode).toBe(200);
+      expect(filed.headers["content-type"]).toContain("text/html");
+      expect(filed.body).toContain("Report received");
+    }
+
+    // The fourth in the same minute is the API's ordinary rate-limited answer.
+    const limited = await file("Over");
+    expect(limited.statusCode).toBe(429);
+    expect(limited.headers["retry-after"]).toBe("60");
+    expect(limited.json()).toMatchObject({
+      ok: false,
+      code: "rate_limited",
+      retryAfterSeconds: 60
+    });
+
+    // Nothing was written for it — the limiter is consumed before the draft is
+    // even looked up, so a flood costs neither a read nor a row.
+    expect(await served.db.listDraftReports(served.draftId)).toHaveLength(3);
+
+    // The bucket is that reader's alone; another address files freely.
+    const neighbour = await file("From+elsewhere", "198.51.100.41");
+    expect(neighbour.statusCode).toBe(200);
+    expect(neighbour.body).toContain("Report received");
+
+    // Reading the page and opening the report form are untouched by any of it:
+    // the limiter is on the write, and a rate-limited reader can still see
+    // both the draft and the form.
+    for (const url of [served.latestUrl, `/report/${served.draftId}`]) {
+      const response = await served.app.inject({ method: "GET", url, remoteAddress: reader });
+      expect(response.statusCode).toBe(200);
+      expect(response.headers["content-type"]).toContain("text/html");
+    }
+
+    // A minute later the window has rolled off and the reader files again.
+    served.advanceMs(60_000);
+    const afterWindow = await file("A+minute+later");
+    expect(afterWindow.statusCode).toBe(200);
+    expect(afterWindow.body).toContain("Report received");
+    expect(await served.db.listDraftReports(served.draftId)).toHaveLength(5);
 
     await served.close();
   });
@@ -3442,16 +3533,27 @@ interface ServedDraft {
   draftId: string;
   latestUrl: string;
   versionUrl: string;
+  /**
+   * Winds the clock the app and its database share. The per-minute limiters
+   * read it, so this is how a test crosses a rate-limit window boundary
+   * without waiting a minute.
+   */
+  advanceMs: (ms: number) => void;
   close: () => Promise<void>;
 }
 
-async function createServedDraft(label: string): Promise<ServedDraft> {
+async function createServedDraft(
+  label: string,
+  overrides: Partial<ServerConfig> = {}
+): Promise<ServedDraft> {
   const safeLabel = label.replaceAll(/[^a-z0-9]/gi, "-");
-  const config = testConfig();
-  const db = new JsonFilePatchPageDb(path.join(tempDir, `${safeLabel}-db.json`));
+  const config: ServerConfig = { ...testConfig(), ...overrides };
+  let now = Date.UTC(2026, 0, 1);
+  const clock = (): number => now;
+  const db = new JsonFilePatchPageDb(path.join(tempDir, `${safeLabel}-db.json`), { clock });
   await db.initialize("dev-token");
   const storage = new FileSystemHtmlStorage(path.join(tempDir, `${safeLabel}-drafts`));
-  const app = createApp({ config, db, storage });
+  const app = createApp({ config, db, storage, clock });
 
   const upload = await app.inject({
     method: "POST",
@@ -3470,6 +3572,9 @@ async function createServedDraft(label: string): Promise<ServedDraft> {
     draftId: body.draftId,
     latestUrl: `/d/${body.draftId}`,
     versionUrl: `/d/${body.draftId}/v/${body.versionNumber}`,
+    advanceMs(ms) {
+      now += ms;
+    },
     close: async () => {
       await app.close();
       await db.close();
@@ -4021,6 +4126,7 @@ function testConfig(): ServerConfig {
     selfServiceMintRateLimitPerMinute: 5,
     selfServiceMintsPerIpPerDay: 5,
     draftCreateRateLimitPerMinute: 10,
+    reportRateLimitPerMinute: 10,
     liveDraftsPerToken: 1_000,
     posthogApiKey: null,
     posthogHost: "https://us.i.posthog.com",

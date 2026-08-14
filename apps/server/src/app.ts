@@ -567,6 +567,17 @@ export function createApp(options: CreateAppOptions): FastifyInstance {
     });
 
     reportScope.post("/report/:draftId", async (request, reply) => {
+      // Before the draft lookup, not after: the limiter is here so a flood of
+      // reports costs the instance neither a read nor a row. It answers in the
+      // same rate-limited shape every other limiter here does — one contract
+      // for one rejection — and being limited says nothing about the page: a
+      // report has no automatic consequence at any volume.
+      const reportAttempt = rateLimiters.report.consume(request.ip || "");
+      if (!reportAttempt.allowed) {
+        sendRateLimited(reply, reportAttempt);
+        return reply;
+      }
+
       const draftId = (request.params as { draftId: string }).draftId;
       const draft = await findReportableDraft(options, draftId);
       if (!draft) return sendDraftNotFound(reply);

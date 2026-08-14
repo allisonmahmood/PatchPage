@@ -191,6 +191,7 @@ PATCHPAGE_PROTECTED_API_RATE_LIMIT_PER_MINUTE=60
 PATCHPAGE_AUTHENTICATED_UPLOAD_RATE_LIMIT_PER_MINUTE=20
 PATCHPAGE_SELF_SERVICE_MINT_RATE_LIMIT_PER_MINUTE=5
 PATCHPAGE_DRAFT_CREATE_RATE_LIMIT_PER_MINUTE=10
+PATCHPAGE_REPORT_RATE_LIMIT_PER_MINUTE=10
 
 # Per-token quotas
 PATCHPAGE_LIVE_DRAFTS_PER_TOKEN=1000
@@ -236,7 +237,7 @@ Notes on values:
 - `PATCHPAGE_PUBLIC_BASE_URL` is used to build the public draft URLs returned by uploads and rendered in the viewer. Set it to the externally reachable origin (scheme + host, no trailing slash). The Azure OpenTofu example requires a deployer-owned HTTPS origin; the application itself retains its `http://localhost:3000` default for local development.
 - `PATCHPAGE_TRUST_PROXY` controls whether Fastify derives `request.ip` from `X-Forwarded-For`. Leave it undefined unless every route to the server has a verified trust boundary. See [Client IP attribution behind proxies](#client-ip-attribution-behind-proxies).
 - `PATCHPAGE_MAX_HTML_BYTES` caps the size of a single HTML document (default 524288 = 512 KiB).
-- `PATCHPAGE_PROTECTED_API_RATE_LIMIT_PER_MINUTE`, `PATCHPAGE_AUTHENTICATED_UPLOAD_RATE_LIMIT_PER_MINUTE`, `PATCHPAGE_SELF_SERVICE_MINT_RATE_LIMIT_PER_MINUTE`, and `PATCHPAGE_DRAFT_CREATE_RATE_LIMIT_PER_MINUTE` are decimal integers from `1` through `10000`. Defaults are `60`, `20`, `5`, and `10`.
+- `PATCHPAGE_PROTECTED_API_RATE_LIMIT_PER_MINUTE`, `PATCHPAGE_AUTHENTICATED_UPLOAD_RATE_LIMIT_PER_MINUTE`, `PATCHPAGE_SELF_SERVICE_MINT_RATE_LIMIT_PER_MINUTE`, `PATCHPAGE_DRAFT_CREATE_RATE_LIMIT_PER_MINUTE`, and `PATCHPAGE_REPORT_RATE_LIMIT_PER_MINUTE` are decimal integers from `1` through `10000`. Defaults are `60`, `20`, `5`, `10`, and `10`.
 - `PATCHPAGE_LIVE_DRAFTS_PER_TOKEN` is a decimal integer from `1` through `1000000` and defaults to `1000`. See [Per-token draft quotas](#per-token-draft-quotas).
 - `PATCHPAGE_ALLOW_SELF_SERVICE_TOKENS` is a strict `true`/`false` value and defaults to `false`. It gates the self-service mint route (`POST /api/tokens/self-service`) and nothing else; while it is `false` that route refuses every caller and your instance keeps its admin-only token posture. It never admits an upload that carries no bearer token. See [Self-service minting](#self-service-minting).
 - `PATCHPAGE_SELF_SERVICE_MINTS_PER_IP_PER_DAY` is a decimal integer from `1` through `1000000` and defaults to `5`. It applies only while self-service minting is on.
@@ -251,8 +252,9 @@ PatchPage applies deterministic fixed-window in-memory limits inside each server
 
 - Protected `/api` requests are limited to `PATCHPAGE_PROTECTED_API_RATE_LIMIT_PER_MINUTE` attempts per minute per canonical Fastify `request.ip`. That IP follows `PATCHPAGE_TRUST_PROXY`, so configure the proxy boundary before relying on IP-based buckets.
 - Authenticated upload requests are limited to `PATCHPAGE_AUTHENTICATED_UPLOAD_RATE_LIMIT_PER_MINUTE` attempts per minute per API token database identity. Rotating the raw bearer secret for the same token record does not create a fresh upload bucket.
-- `PATCHPAGE_SELF_SERVICE_MINT_RATE_LIMIT_PER_MINUTE` limits self-service mints per minute per canonical Fastify `request.ip`, on instances where minting is enabled. It is the only limiter on an unauthenticated route, because a caller asking for its first token has no token to key on.
+- `PATCHPAGE_SELF_SERVICE_MINT_RATE_LIMIT_PER_MINUTE` limits self-service mints per minute per canonical Fastify `request.ip`, on instances where minting is enabled. It is keyed by address rather than by token because a caller asking for its first token has no token to key on.
 - Draft *creates* are additionally limited to `PATCHPAGE_DRAFT_CREATE_RATE_LIMIT_PER_MINUTE` per minute per creating token. An upload carrying a `draftId` is an update and never consumes this bucket. Because the request body decides create versus update, this bucket is consumed after body parsing, unlike the buckets above.
+- `PATCHPAGE_REPORT_RATE_LIMIT_PER_MINUTE` limits filed reports (`POST /report/:draftId`) per minute per canonical Fastify `request.ip`. This is the service's other unauthenticated write, and like the mint route it is keyed by address because a reader flagging a page carries no credential. The bucket is consumed *before* the draft is looked up, so a flood costs neither a metadata read nor a stored row. Opening the report form (`GET /report/:draftId`) consumes nothing. The limit bounds write volume and nothing else: a report has no automatic consequence at any volume, so hitting it never affects the reported page. See [Moderation](#moderation).
 
 When a bucket is exceeded, PatchPage returns HTTP `429` with JSON `{ "ok": false, "code": "rate_limited", ... }` and an integer `Retry-After` header. Each limiter tracks up to `10000` live keys in memory. If all live key slots are occupied, an unseen key receives the same bounded `429` response until the earliest live bucket resets. Live buckets are never evicted to make room for an unseen key, because eviction would let an attacker bypass limits by cycling key values.
 

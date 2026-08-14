@@ -23,6 +23,7 @@ export interface RateLimitConfig {
   authenticatedUploadRateLimitPerMinute: number;
   selfServiceMintRateLimitPerMinute: number;
   draftCreateRateLimitPerMinute: number;
+  reportRateLimitPerMinute: number;
 }
 
 export interface RateLimiters {
@@ -42,6 +43,14 @@ export interface RateLimiters {
    * count, so a restart resets this bucket but not that ceiling.
    */
   draftCreate: FixedWindowRateLimiter;
+  /**
+   * Reports filed per minute, keyed by source address. The other limiter on an
+   * unauthenticated route, and for the same reason: a reader flagging a page
+   * has no token to key on. It bounds how many rows one address can write and
+   * nothing else — a report has no automatic consequence at any volume, so
+   * this is a disk guardrail, never a moderation decision.
+   */
+  report: FixedWindowRateLimiter;
 }
 
 export interface CreateRateLimitersOptions {
@@ -88,6 +97,10 @@ export function createRateLimiters(
     draftCreate: new FixedWindowRateLimiter({
       ...base,
       limit: config.draftCreateRateLimitPerMinute
+    }),
+    report: new FixedWindowRateLimiter({
+      ...base,
+      limit: config.reportRateLimitPerMinute
     })
   };
 }

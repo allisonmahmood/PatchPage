@@ -128,7 +128,8 @@ describe("FixedWindowRateLimiter", () => {
         protectedApiRateLimitPerMinute: 60,
         authenticatedUploadRateLimitPerMinute: 20,
         selfServiceMintRateLimitPerMinute: 5,
-        draftCreateRateLimitPerMinute: 10
+        draftCreateRateLimitPerMinute: 10,
+        reportRateLimitPerMinute: 10
       },
       {
         clock: () => now,
@@ -163,7 +164,8 @@ describe("FixedWindowRateLimiter", () => {
         protectedApiRateLimitPerMinute: 60,
         authenticatedUploadRateLimitPerMinute: 20,
         selfServiceMintRateLimitPerMinute: 5,
-        draftCreateRateLimitPerMinute: 10
+        draftCreateRateLimitPerMinute: 10,
+        reportRateLimitPerMinute: 10
       },
       {
         clock: () => now,
@@ -204,7 +206,8 @@ describe("FixedWindowRateLimiter", () => {
         protectedApiRateLimitPerMinute: 60,
         authenticatedUploadRateLimitPerMinute: 20,
         selfServiceMintRateLimitPerMinute: 3,
-        draftCreateRateLimitPerMinute: 10
+        draftCreateRateLimitPerMinute: 10,
+        reportRateLimitPerMinute: 10
       },
       {
         clock: () => now,
@@ -233,6 +236,49 @@ describe("FixedWindowRateLimiter", () => {
 
     now = 61_000;
     expect(limiters.selfServiceMint.consume("198.51.100.7")).toMatchObject({
+      allowed: true,
+      resetAt: 121_000
+    });
+  });
+
+  it("exposes a real report limiter keyed by source address", () => {
+    let now = 1_000;
+    const limiters = createRateLimiters(
+      {
+        protectedApiRateLimitPerMinute: 60,
+        authenticatedUploadRateLimitPerMinute: 20,
+        selfServiceMintRateLimitPerMinute: 5,
+        draftCreateRateLimitPerMinute: 10,
+        reportRateLimitPerMinute: 4
+      },
+      {
+        clock: () => now,
+        maxKeys: 10
+      }
+    );
+
+    for (let attempt = 0; attempt < 4; attempt += 1) {
+      expect(limiters.report.consume("198.51.100.9")).toMatchObject({
+        allowed: true,
+        resetAt: 61_000
+      });
+    }
+
+    expect(limiters.report.consume("198.51.100.9")).toMatchObject({
+      allowed: false,
+      retryAfterSeconds: 60,
+      resetAt: 61_000
+    });
+    // Another reader files freely, and the mint bucket — the other limiter on
+    // an unauthenticated route, keyed the same way — is untouched by any of it.
+    expect(limiters.report.consume("198.51.100.10")).toMatchObject({ allowed: true });
+    expect(limiters.selfServiceMint.consume("198.51.100.9")).toMatchObject({
+      allowed: true,
+      remaining: 4
+    });
+
+    now = 61_000;
+    expect(limiters.report.consume("198.51.100.9")).toMatchObject({
       allowed: true,
       resetAt: 121_000
     });
