@@ -1649,6 +1649,261 @@ describe("host-keyed local state", () => {
   );
 });
 
+describe("patchpage status", () => {
+  const packageVersion = (
+    JSON.parse(readFileSync(path.join(packageDir, "package.json"), "utf8")) as { version: string }
+  ).version;
+  // Proving the probe never opens style.md needs a file it could not open.
+  const canDenyReads = process.platform !== "win32" && process.getuid?.() !== 0;
+
+  it("reports an unconfigured machine against the default instance", () => {
+    const result = runCli(["status", "--json"]);
+    const report = JSON.parse(result.stdout) as Record<string, unknown>;
+
+    expect(result.status).toBe(0);
+    expect(result.stderr).toBe("");
+    // The skill quotes these names, so the key set is part of the interface.
+    expect(Object.keys(report)).toEqual([
+      "instanceUrl",
+      "instanceSource",
+      "hasToken",
+      "tokenSource",
+      "stateDir",
+      "hasDefaultStyle",
+      "cliVersion"
+    ]);
+    expect(report).toEqual({
+      instanceUrl: DEFAULT_API_URL,
+      instanceSource: "default",
+      hasToken: false,
+      tokenSource: null,
+      stateDir: result.stateDir,
+      hasDefaultStyle: false,
+      cliVersion: packageVersion
+    });
+    // A probe reports state; it never reports it as a failure.
+    expect(existsSync(path.join(result.stateDir, "credentials.json"))).toBe(false);
+  });
+
+  it("names which link of the precedence chain chose the instance", () => {
+    const stateDir = makeStateDir();
+    const configUrl = "https://config.test";
+    const environmentUrl = "https://environment.test";
+    const flagUrl = "https://flag.test:8443";
+
+    const byDefault = runCli(["status", "--json"], undefined, stateDir);
+    writeFileSync(
+      path.join(stateDir, "config.json"),
+      `${JSON.stringify({ apiUrl: configUrl }, null, 2)}\n`
+    );
+    const byConfig = runCli(["status", "--json"], undefined, stateDir);
+    const byEmptyEnvironment = runCli(["status", "--json"], undefined, stateDir, {
+      PATCHPAGE_API_URL: ""
+    });
+    const byEnvironment = runCli(["status", "--json"], undefined, stateDir, {
+      PATCHPAGE_API_URL: environmentUrl
+    });
+    // A trailing slash normalizes to the host key state is stored under.
+    const byFlag = runCli(["status", "--json", "--api-url", `${flagUrl}/`], undefined, stateDir, {
+      PATCHPAGE_API_URL: environmentUrl
+    });
+
+    const runs = [byDefault, byConfig, byEmptyEnvironment, byEnvironment, byFlag];
+    expect(runs.map((run) => run.status)).toEqual([0, 0, 0, 0, 0]);
+    expect(runs.map((run) => run.stderr)).toEqual(["", "", "", "", ""]);
+    expect(runs.map((run) => statusReport(run.stdout))).toEqual([
+      { instanceUrl: DEFAULT_API_URL, instanceSource: "default" },
+      { instanceUrl: configUrl, instanceSource: "config" },
+      // An empty environment variable means unset, exactly as it does elsewhere.
+      { instanceUrl: configUrl, instanceSource: "config" },
+      { instanceUrl: environmentUrl, instanceSource: "env" },
+      { instanceUrl: flagUrl, instanceSource: "flag" }
+    ]);
+  });
+
+  it("reports the stored token's source for the resolved instance only", () => {
+    const stateDir = makeStateDir();
+    const mintedUrl = "https://minted.test";
+    const configuredUrl = "https://configured.test";
+    const mintedToken = "pp_minted_secret";
+    const configuredToken = "pp_configured_secret";
+    writeFileSync(
+      path.join(stateDir, "credentials.json"),
+      `${JSON.stringify(
+        {
+          hosts: {
+            [mintedUrl]: {
+              token: mintedToken,
+              updatedAt: "2026-08-14T00:00:00.000Z",
+              source: "mint"
+            },
+            [configuredUrl]: {
+              token: configuredToken,
+              updatedAt: "2026-08-14T00:00:00.000Z",
+              source: "auth-set"
+            }
+          }
+        },
+        null,
+        2
+      )}\n`
+    );
+
+    const minted = runCli(["status", "--json", "--api-url", mintedUrl], undefined, stateDir);
+    const configured = runCli(
+      ["status", "--json", "--api-url", configuredUrl],
+      undefined,
+      stateDir
+    );
+    const unknown = runCli(
+      ["status", "--json", "--api-url", "https://unknown.test"],
+      undefined,
+      stateDir
+    );
+
+    const runs = [minted, configured, unknown];
+    expect(runs.map((run) => run.status)).toEqual([0, 0, 0]);
+    expect(runs.map((run) => tokenReport(run.stdout))).toEqual([
+      { hasToken: true, tokenSource: "mint" },
+      { hasToken: true, tokenSource: "auth-set" },
+      // A neighbouring instance's token is never counted as this one's.
+      { hasToken: false, tokenSource: null }
+    ]);
+    for (const run of runs) {
+      expect(`${run.stdout}${run.stderr}`).not.toContain(mintedToken);
+      expect(`${run.stdout}${run.stderr}`).not.toContain(configuredToken);
+    }
+  });
+
+  it("counts an environment token as a token with no stored provenance", () => {
+    const stateDir = makeStateDir();
+    const environmentToken = "pp_environment_secret";
+    const storedToken = "pp_stored_secret";
+    writeFileSync(
+      path.join(stateDir, "credentials.json"),
+      hostKeyedCredentials({ [DEFAULT_API_URL]: storedToken })
+    );
+
+    const result = runCli(["status", "--json"], undefined, stateDir, {
+      PATCHPAGE_API_TOKEN: environmentToken
+    });
+
+    expect(result.status).toBe(0);
+    expect(result.stderr).toBe("");
+    // The environment token is the one an upload would send, and it carries no
+    // provenance, so the stored entry it outranks is not reported as its source.
+    expect(tokenReport(result.stdout)).toEqual({ hasToken: true, tokenSource: null });
+    expect(`${result.stdout}${result.stderr}`).not.toContain(environmentToken);
+    expect(`${result.stdout}${result.stderr}`).not.toContain(storedToken);
+  });
+
+  it("stays answerable on credentials it cannot read", () => {
+    const legacyStateDir = makeStateDir();
+    writeFileSync(
+      path.join(legacyStateDir, "credentials.json"),
+      `${JSON.stringify({ apiToken: "pp_legacy_secret" }, null, 2)}\n`
+    );
+    const invalidStateDir = makeStateDir();
+    writeFileSync(path.join(invalidStateDir, "credentials.json"), "not-json\n");
+    const unreadableStateDir = makeStateDir();
+    mkdirSync(path.join(unreadableStateDir, "credentials.json"));
+    const invalidEntryStateDir = makeStateDir();
+    writeFileSync(
+      path.join(invalidEntryStateDir, "credentials.json"),
+      `${JSON.stringify({ hosts: { [DEFAULT_API_URL]: { token: "" } } }, null, 2)}\n`
+    );
+
+    const runs = [legacyStateDir, invalidStateDir, unreadableStateDir, invalidEntryStateDir].map(
+      (stateDir) => runCli(["status", "--json"], undefined, stateDir)
+    );
+
+    // Failing closed protects the commands that spend a token; the probe spends
+    // nothing, so unreadable state is reported rather than raised.
+    expect(runs.map((run) => run.status)).toEqual([0, 0, 0, 0]);
+    expect(runs.map((run) => run.stderr)).toEqual(["", "", "", ""]);
+    expect(runs.map((run) => tokenReport(run.stdout))).toEqual([
+      { hasToken: false, tokenSource: null },
+      { hasToken: false, tokenSource: null },
+      { hasToken: false, tokenSource: null },
+      { hasToken: false, tokenSource: null }
+    ]);
+    expect(runs.map((run) => run.stdout).join("")).not.toContain("pp_legacy_secret");
+  });
+
+  it("reports the default style by existence alone", () => {
+    const beforeStateDir = makeStateDir();
+    const afterStateDir = makeStateDir();
+    writeFileSync(path.join(afterStateDir, "style.md"), "# Default style\n");
+
+    const before = runCli(["status", "--json"], undefined, beforeStateDir);
+    const after = runCli(["status", "--json"], undefined, afterStateDir);
+
+    expect([before.status, after.status]).toEqual([0, 0]);
+    expect([before.stderr, after.stderr]).toEqual(["", ""]);
+    expect([styleReport(before), styleReport(after)]).toEqual([false, true]);
+  });
+
+  it.runIf(canDenyReads)("never opens the default style it reports", () => {
+    const stateDir = makeStateDir();
+    const stylePath = path.join(stateDir, "style.md");
+    writeFileSync(stylePath, "# Unreadable style\n");
+    chmodSync(stylePath, 0o000);
+
+    const result = runCli(["status", "--json"], undefined, stateDir);
+
+    expect(result.status).toBe(0);
+    expect(result.stderr).toBe("");
+    // style.md is skill-owned: a file the CLI could not read is still a file
+    // whose existence stops onboarding re-asking the style question.
+    expect(styleReport(result)).toBe(true);
+  });
+
+  it("never reaches the instance it reports", async () => {
+    const instance = await startUploadServer(createOnly("aaaabbbbcccc"));
+
+    try {
+      const reachable = await runCliAsync(["status", "--json", "--api-url", instance.apiUrl]);
+      // Nothing listens on port 1; a probe that dialled out would fail here.
+      const unroutable = runCli(["status", "--json", "--api-url", "http://127.0.0.1:1"]);
+
+      expect(reachable.status).toBe(0);
+      expect(reachable.stderr).toBe("");
+      expect(statusReport(reachable.stdout)).toEqual({
+        instanceUrl: instance.apiUrl,
+        instanceSource: "flag"
+      });
+      expect(instance.requests).toEqual([]);
+
+      expect(unroutable.status).toBe(0);
+      expect(unroutable.stderr).toBe("");
+      expect(statusReport(unroutable.stdout)).toEqual({
+        instanceUrl: "http://127.0.0.1:1",
+        instanceSource: "flag"
+      });
+    } finally {
+      await instance.close();
+    }
+  });
+
+  it("offers JSON as its only reporting format", () => {
+    const result = runCli(["status"]);
+
+    expect(result.status).toBe(1);
+    expect(result.stdout).toBe("");
+    expect(result.stderr).toBe("error: required option '--json' not specified\n");
+  });
+
+  it("documents itself as local-only in command help", () => {
+    const result = runCli(["status", "--help"]);
+
+    expect(result.status).toBe(0);
+    expect(result.stdout).toContain(
+      "Report local publishing state for the resolved instance. Never uses the network."
+    );
+    expect(result.stdout).toContain("--json           Print the report as JSON");
+  });
+});
+
 describe("PTY test driver", () => {
   it.runIf(supportsPythonPty)("hard-kills a child after the interaction deadline", () => {
     const stateDir = makeStateDir();
@@ -1899,6 +2154,21 @@ function hostKeyedDraftCache(
     null,
     2
   )}\n`;
+}
+
+/** The instance half of a status report, for comparing runs side by side. */
+function statusReport(stdout: string): { instanceUrl: unknown; instanceSource: unknown } {
+  const report = JSON.parse(stdout) as Record<string, unknown>;
+  return { instanceUrl: report.instanceUrl, instanceSource: report.instanceSource };
+}
+
+function tokenReport(stdout: string): { hasToken: unknown; tokenSource: unknown } {
+  const report = JSON.parse(stdout) as Record<string, unknown>;
+  return { hasToken: report.hasToken, tokenSource: report.tokenSource };
+}
+
+function styleReport(result: { stdout: string }): unknown {
+  return (JSON.parse(result.stdout) as Record<string, unknown>).hasDefaultStyle;
 }
 
 function readArgv(file: string): string[] {
