@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { getServerConfig } from "./index.js";
+import { ACCEPTABLE_USE_URL, getServerConfig } from "./index.js";
 
 describe("getServerConfig", () => {
   it("defaults to json db when DATABASE_URL is absent", () => {
@@ -16,7 +16,7 @@ describe("getServerConfig", () => {
 
     expect(config.protectedApiRateLimitPerMinute).toBe(60);
     expect(config.authenticatedUploadRateLimitPerMinute).toBe(20);
-    expect(config.anonymousCreateRateLimitPerMinute).toBe(5);
+    expect(config.selfServiceMintRateLimitPerMinute).toBe(5);
     expect(config.draftCreateRateLimitPerMinute).toBe(10);
   });
 
@@ -36,21 +36,45 @@ describe("getServerConfig", () => {
     }
   });
 
-  it("requires an explicit true boolean to enable anonymous uploads", () => {
-    expect(getServerConfig({}).allowAnonymousUploads).toBe(false);
+  it("requires an explicit true boolean to allow self-service tokens", () => {
+    expect(getServerConfig({}).allowSelfServiceTokens).toBe(false);
     expect(
-      getServerConfig({ PATCHPAGE_ALLOW_ANONYMOUS_UPLOADS: "false" })
-        .allowAnonymousUploads
+      getServerConfig({ PATCHPAGE_ALLOW_SELF_SERVICE_TOKENS: "false" })
+        .allowSelfServiceTokens
     ).toBe(false);
     expect(
-      getServerConfig({ PATCHPAGE_ALLOW_ANONYMOUS_UPLOADS: "true" })
-        .allowAnonymousUploads
+      getServerConfig({ PATCHPAGE_ALLOW_SELF_SERVICE_TOKENS: "true" })
+        .allowSelfServiceTokens
     ).toBe(true);
 
     for (const value of ["1", "0", "yes", "no", "on", "off", "enabled"]) {
       expect(() =>
-        getServerConfig({ PATCHPAGE_ALLOW_ANONYMOUS_UPLOADS: value })
-      ).toThrow(/PATCHPAGE_ALLOW_ANONYMOUS_UPLOADS/);
+        getServerConfig({ PATCHPAGE_ALLOW_SELF_SERVICE_TOKENS: value })
+      ).toThrow(/PATCHPAGE_ALLOW_SELF_SERVICE_TOKENS/);
+    }
+  });
+
+  it("refuses to start when a retired anonymous-upload variable is set", () => {
+    const retired = [
+      ["PATCHPAGE_ALLOW_ANONYMOUS_UPLOADS", "PATCHPAGE_ALLOW_SELF_SERVICE_TOKENS"],
+      [
+        "PATCHPAGE_ANONYMOUS_CREATE_RATE_LIMIT_PER_MINUTE",
+        "PATCHPAGE_SELF_SERVICE_MINT_RATE_LIMIT_PER_MINUTE"
+      ]
+    ] as const;
+
+    for (const [retiredName, successorName] of retired) {
+      // Any value at all is a failure, including the one that used to mean
+      // "keep the safe posture" — a deliberate setting is never ignored.
+      for (const value of ["true", "false", "5", "not-a-value"]) {
+        expect(() => getServerConfig({ [retiredName]: value })).toThrow(
+          new RegExp(`${retiredName}[\\s\\S]*${successorName}`)
+        );
+      }
+
+      // An empty or whitespace-only value reads as unset, as everywhere else.
+      expect(() => getServerConfig({ [retiredName]: "" })).not.toThrow();
+      expect(() => getServerConfig({ [retiredName]: "   " })).not.toThrow();
     }
   });
 
@@ -58,13 +82,13 @@ describe("getServerConfig", () => {
     const config = getServerConfig({
       PATCHPAGE_PROTECTED_API_RATE_LIMIT_PER_MINUTE: "120",
       PATCHPAGE_AUTHENTICATED_UPLOAD_RATE_LIMIT_PER_MINUTE: "40",
-      PATCHPAGE_ANONYMOUS_CREATE_RATE_LIMIT_PER_MINUTE: "10",
+      PATCHPAGE_SELF_SERVICE_MINT_RATE_LIMIT_PER_MINUTE: "10",
       PATCHPAGE_DRAFT_CREATE_RATE_LIMIT_PER_MINUTE: "30"
     });
 
     expect(config.protectedApiRateLimitPerMinute).toBe(120);
     expect(config.authenticatedUploadRateLimitPerMinute).toBe(40);
-    expect(config.anonymousCreateRateLimitPerMinute).toBe(10);
+    expect(config.selfServiceMintRateLimitPerMinute).toBe(10);
     expect(config.draftCreateRateLimitPerMinute).toBe(30);
   });
 
@@ -79,8 +103,8 @@ describe("getServerConfig", () => {
         "authenticatedUploadRateLimitPerMinute"
       ],
       [
-        "PATCHPAGE_ANONYMOUS_CREATE_RATE_LIMIT_PER_MINUTE",
-        "anonymousCreateRateLimitPerMinute"
+        "PATCHPAGE_SELF_SERVICE_MINT_RATE_LIMIT_PER_MINUTE",
+        "selfServiceMintRateLimitPerMinute"
       ],
       [
         "PATCHPAGE_DRAFT_CREATE_RATE_LIMIT_PER_MINUTE",
@@ -193,5 +217,12 @@ describe("getServerConfig", () => {
     expect(() => getServerConfig({ PATCHPAGE_TRUST_PROXY: value })).toThrow(
       /Invalid PATCHPAGE_TRUST_PROXY/
     );
+  });
+});
+
+describe("ACCEPTABLE_USE_URL", () => {
+  it("is the one absolute https URL every acceptable-use consumer reads", () => {
+    expect(ACCEPTABLE_USE_URL).toBe("https://patchyhq.com/acceptable-use");
+    expect(new URL(ACCEPTABLE_USE_URL).protocol).toBe("https:");
   });
 });

@@ -106,7 +106,7 @@ run "wires_default_rate_limits" {
           value = "20"
         },
         {
-          name  = "PATCHPAGE_ANONYMOUS_CREATE_RATE_LIMIT_PER_MINUTE"
+          name  = "PATCHPAGE_SELF_SERVICE_MINT_RATE_LIMIT_PER_MINUTE"
           value = "5"
         },
         {
@@ -134,7 +134,7 @@ run "wires_custom_rate_limits" {
     public_base_url                            = "https://drafts.self-hoster.dev"
     protected_api_rate_limit_per_minute        = 120
     authenticated_upload_rate_limit_per_minute = 40
-    anonymous_create_rate_limit_per_minute     = 10
+    self_service_mint_rate_limit_per_minute    = 10
     draft_create_rate_limit_per_minute         = 25
     live_drafts_per_token                      = 50
   }
@@ -151,7 +151,7 @@ run "wires_custom_rate_limits" {
           value = "40"
         },
         {
-          name  = "PATCHPAGE_ANONYMOUS_CREATE_RATE_LIMIT_PER_MINUTE"
+          name  = "PATCHPAGE_SELF_SERVICE_MINT_RATE_LIMIT_PER_MINUTE"
           value = "10"
         },
         {
@@ -243,40 +243,40 @@ run "rejects_too_large_authenticated_upload_rate_limit" {
   expect_failures = [var.authenticated_upload_rate_limit_per_minute]
 }
 
-run "rejects_zero_anonymous_create_rate_limit" {
+run "rejects_zero_self_service_mint_rate_limit" {
   command = plan
 
   variables {
-    subscription_id                        = "00000000-0000-0000-0000-000000000000"
-    public_base_url                        = "https://drafts.self-hoster.dev"
-    anonymous_create_rate_limit_per_minute = 0
+    subscription_id                         = "00000000-0000-0000-0000-000000000000"
+    public_base_url                         = "https://drafts.self-hoster.dev"
+    self_service_mint_rate_limit_per_minute = 0
   }
 
-  expect_failures = [var.anonymous_create_rate_limit_per_minute]
+  expect_failures = [var.self_service_mint_rate_limit_per_minute]
 }
 
-run "rejects_fractional_anonymous_create_rate_limit" {
+run "rejects_fractional_self_service_mint_rate_limit" {
   command = plan
 
   variables {
-    subscription_id                        = "00000000-0000-0000-0000-000000000000"
-    public_base_url                        = "https://drafts.self-hoster.dev"
-    anonymous_create_rate_limit_per_minute = 1.5
+    subscription_id                         = "00000000-0000-0000-0000-000000000000"
+    public_base_url                         = "https://drafts.self-hoster.dev"
+    self_service_mint_rate_limit_per_minute = 1.5
   }
 
-  expect_failures = [var.anonymous_create_rate_limit_per_minute]
+  expect_failures = [var.self_service_mint_rate_limit_per_minute]
 }
 
-run "rejects_too_large_anonymous_create_rate_limit" {
+run "rejects_too_large_self_service_mint_rate_limit" {
   command = plan
 
   variables {
-    subscription_id                        = "00000000-0000-0000-0000-000000000000"
-    public_base_url                        = "https://drafts.self-hoster.dev"
-    anonymous_create_rate_limit_per_minute = 10001
+    subscription_id                         = "00000000-0000-0000-0000-000000000000"
+    public_base_url                         = "https://drafts.self-hoster.dev"
+    self_service_mint_rate_limit_per_minute = 10001
   }
 
-  expect_failures = [var.anonymous_create_rate_limit_per_minute]
+  expect_failures = [var.self_service_mint_rate_limit_per_minute]
 }
 
 run "rejects_zero_draft_create_rate_limit" {

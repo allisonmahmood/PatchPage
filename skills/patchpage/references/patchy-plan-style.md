@@ -12,7 +12,7 @@ briefings for PatchPage.
 - System fonts only.
 - Pure CSS imagery unless the user supplies assets.
 - The document must remain readable with CSS stripped.
-- Upload access requires authentication by default and may be configured for anonymous creation; draft viewer URLs are public/unlisted.
+- Every upload requires an API token, on every configuration; draft viewer URLs are public/unlisted.
 
 ## Brand Read
 

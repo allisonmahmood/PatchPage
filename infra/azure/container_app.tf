@@ -61,11 +61,11 @@ locals {
     NODE_ENV                                             = "production"
     PORT                                                 = "3000"
     PATCHPAGE_PUBLIC_BASE_URL                            = var.public_base_url
-    PATCHPAGE_ALLOW_ANONYMOUS_UPLOADS                    = tostring(var.allow_anonymous_uploads)
+    PATCHPAGE_ALLOW_SELF_SERVICE_TOKENS                  = tostring(var.allow_self_service_tokens)
     PATCHPAGE_MAX_HTML_BYTES                             = tostring(var.max_html_bytes)
     PATCHPAGE_PROTECTED_API_RATE_LIMIT_PER_MINUTE        = tostring(var.protected_api_rate_limit_per_minute)
     PATCHPAGE_AUTHENTICATED_UPLOAD_RATE_LIMIT_PER_MINUTE = tostring(var.authenticated_upload_rate_limit_per_minute)
-    PATCHPAGE_ANONYMOUS_CREATE_RATE_LIMIT_PER_MINUTE     = tostring(var.anonymous_create_rate_limit_per_minute)
+    PATCHPAGE_SELF_SERVICE_MINT_RATE_LIMIT_PER_MINUTE    = tostring(var.self_service_mint_rate_limit_per_minute)
     PATCHPAGE_DRAFT_CREATE_RATE_LIMIT_PER_MINUTE         = tostring(var.draft_create_rate_limit_per_minute)
     PATCHPAGE_LIVE_DRAFTS_PER_TOKEN                      = tostring(var.live_drafts_per_token)
     PATCHPAGE_DB_DRIVER                                  = "postgres"

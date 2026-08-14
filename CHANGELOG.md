@@ -6,8 +6,35 @@ All notable changes to PatchPage are documented in this file. The format is base
 
 ## [Unreleased]
 
+### Removed
+
+- Tokenless ("anonymous") upload is removed everywhere. No instance accepts an upload
+  without a bearer token, on any configuration: a tokenless request to the upload endpoint
+  is `401`, and a present-but-invalid bearer stays `401` rather than being downgraded. The
+  anonymous branch of the API guard, its per-IP anonymous-create limiter, and the internal
+  `acct_anonymous`/`tok_anonymous` sentinel principals and their seed code are all gone.
+  The rationale is recorded in `docs/adr/ADR-0001-trust-model-no-tokenless-upload.md`.
+
 ### Changed
 
+- Admin moderation of drafts is no longer keyed on the retired anonymous sentinel. The old
+  carve-out let an `admin`-scoped credential disable or delete a draft only when that draft
+  was owned by `acct_anonymous`; it is replaced by a general capability, so `admin` now
+  reaches any principal's draft. Ordinary tokens are unchanged and still reach only the
+  drafts they own.
+- **Breaking, deliberate:** `PATCHPAGE_ALLOW_ANONYMOUS_UPLOADS` and
+  `PATCHPAGE_ANONYMOUS_CREATE_RATE_LIMIT_PER_MINUTE` are retired. Setting either one now
+  **fails startup** with an error naming its successor, rather than being silently ignored,
+  so a self-hoster's deliberate security posture is never quietly reinterpreted. Replace
+  them with `PATCHPAGE_ALLOW_SELF_SERVICE_TOKENS` (strict `true`/`false`, default `false`)
+  and `PATCHPAGE_SELF_SERVICE_MINT_RATE_LIMIT_PER_MINUTE` (decimal integer `1` through
+  `10000`, default `5`). An empty or whitespace-only value still reads as unset. The two new
+  settings parse and validate today but gate nothing yet: they configure the self-service
+  token minting that lands in a later change, and neither ever admits a tokenless upload.
+  The matching OpenTofu variables are renamed `allow_anonymous_uploads` ->
+  `allow_self_service_tokens` and `anonymous_create_rate_limit_per_minute` ->
+  `self_service_mint_rate_limit_per_minute`, and the Container App environment map is
+  updated in the same change so a deploy of this commit boots.
 - The Azure self-hosting example now uses [OpenTofu](https://opentofu.org) instead of
   Terraform. CI pins OpenTofu 1.12.5; the runbooks call `tofu`; install it with
   `brew install opentofu`. There is no state migration: the state format is compatible and

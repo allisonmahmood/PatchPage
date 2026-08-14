@@ -13,17 +13,16 @@ triggers:
 # Minting PatchPage API Tokens
 
 Use this skill when an agent or a new machine needs authenticated upload and update access
-to a PatchPage server that the user operates. Servers require an `upload`-scoped API token
-by default. An operator may opt in to anonymous creation, but anonymous callers cannot own
-or update drafts, so credentials remain the path for stable per-file draft workflows.
+to a PatchPage server that the user operates. Every upload requires an `upload`-scoped API
+token, on every configuration: a request with no bearer token is rejected with 401, and no
+server setting relaxes that. A minted token is the only way to publish, own, and update drafts.
 
 This is an operator-side skill. It lives in the repo for people who run their own
 PatchPage server; it is intentionally hidden from the public skill install
 (`metadata.internal`) and is not shipped in the npm package. If your user does not operate
 the target server, stop: only the server operator can issue tokens. The CLI's default host,
-`https://post.patchyhq.com`, is the maintainer's private instance, does not issue public
-tokens, and must not be assumed to accept anonymous uploads — self-host instead (see
-`docs/SELF_HOSTING.md`).
+`https://post.patchyhq.com`, is the maintainer's private instance and does not issue public
+tokens — self-host instead (see `docs/SELF_HOSTING.md`).
 
 ## How token issuance works
 
@@ -205,6 +204,8 @@ uploaded — and revocation is a state we keep for the audit trail, not an erasu
   a fresh one.
 - Never pass a token positionally to `patchpage auth set`; use the hidden prompt for a
   person or explicit `--token-stdin` for automation.
-- Tokens gate authenticated publishing, ownership, and updates. Optional anonymous access
-  is create-only. Draft view URLs stay public and unlisted in either mode.
+- Tokens gate publishing, ownership, and updates. Draft view URLs stay public and unlisted
+  regardless; a token does not make a draft private. An `upload` token disables or deletes
+  only the drafts it owns; an `admin` scope moderates any principal's draft, which is how
+  the operator takes down a reported page.
 - Do not hand the bootstrap token to CLI clients; mint per-client `upload` tokens instead.

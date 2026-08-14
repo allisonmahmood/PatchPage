@@ -21,14 +21,12 @@ export interface FixedWindowRateLimiterDiagnostics {
 export interface RateLimitConfig {
   protectedApiRateLimitPerMinute: number;
   authenticatedUploadRateLimitPerMinute: number;
-  anonymousCreateRateLimitPerMinute: number;
   draftCreateRateLimitPerMinute: number;
 }
 
 export interface RateLimiters {
   protectedApi: FixedWindowRateLimiter;
   authenticatedUpload: FixedWindowRateLimiter;
-  anonymousCreate: FixedWindowRateLimiter;
   /**
    * Draft creates per minute, keyed by the creating token. Only per-minute
    * limits live in memory; the long-window live-draft quota is a database
@@ -73,10 +71,6 @@ export function createRateLimiters(
     authenticatedUpload: new FixedWindowRateLimiter({
       ...base,
       limit: config.authenticatedUploadRateLimitPerMinute
-    }),
-    anonymousCreate: new FixedWindowRateLimiter({
-      ...base,
-      limit: config.anonymousCreateRateLimitPerMinute
     }),
     draftCreate: new FixedWindowRateLimiter({
       ...base,

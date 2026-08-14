@@ -9,11 +9,6 @@ export interface ApiTokenAuth {
   scopes: string[];
 }
 
-export interface AnonymousUploadPrincipal {
-  accountId: string;
-  apiTokenId: string;
-}
-
 export interface DraftRecord {
   id: string;
   accountId: string;
@@ -102,7 +97,13 @@ export interface DraftVersionLookup {
 }
 
 export interface DraftModerationOptions {
-  canModerateAnonymous?: boolean;
+  /**
+   * Lets the caller moderate a draft owned by any principal, not just its own.
+   * This is the operator's moderation reach, granted by the `admin` scope; it is
+   * keyed on nothing but that scope. (It replaces a carve-out that reached only
+   * the retired anonymous sentinel account.)
+   */
+  canModerateAnyPrincipal?: boolean;
 }
 
 export interface DbDriverOptions {
@@ -124,7 +125,6 @@ export interface PatchPageDb {
   initialize(bootstrapApiToken: string | null): Promise<void>;
   /** The applied migration IDs this database records, in apply order. */
   listAppliedMigrations(): Promise<string[]>;
-  getAnonymousUploadPrincipal(): Promise<AnonymousUploadPrincipal>;
   findApiTokenByToken(token: string): Promise<ApiTokenAuth | null>;
   createApiToken(input: CreateApiTokenInput): Promise<{ id: string; name: string }>;
   /**

@@ -121,13 +121,12 @@ describe("FixedWindowRateLimiter", () => {
     expect(removed).toEqual([]);
   });
 
-  it("exposes a real anonymous-create limiter at five attempts per IP", () => {
+  it("exposes a real authenticated-upload limiter at twenty attempts per token", () => {
     let now = 1_000;
     const limiters = createRateLimiters(
       {
         protectedApiRateLimitPerMinute: 60,
         authenticatedUploadRateLimitPerMinute: 20,
-        anonymousCreateRateLimitPerMinute: 5,
         draftCreateRateLimitPerMinute: 10
       },
       {
@@ -136,21 +135,21 @@ describe("FixedWindowRateLimiter", () => {
       }
     );
 
-    for (let attempt = 0; attempt < 5; attempt += 1) {
-      expect(limiters.anonymousCreate.consume("203.0.113.9")).toMatchObject({
+    for (let attempt = 0; attempt < 20; attempt += 1) {
+      expect(limiters.authenticatedUpload.consume("tok_example")).toMatchObject({
         allowed: true,
         resetAt: 61_000
       });
     }
 
-    expect(limiters.anonymousCreate.consume("203.0.113.9")).toMatchObject({
+    expect(limiters.authenticatedUpload.consume("tok_example")).toMatchObject({
       allowed: false,
       retryAfterSeconds: 60,
       resetAt: 61_000
     });
 
     now = 61_000;
-    expect(limiters.anonymousCreate.consume("203.0.113.9")).toMatchObject({
+    expect(limiters.authenticatedUpload.consume("tok_example")).toMatchObject({
       allowed: true,
       resetAt: 121_000
     });
@@ -162,7 +161,6 @@ describe("FixedWindowRateLimiter", () => {
       {
         protectedApiRateLimitPerMinute: 60,
         authenticatedUploadRateLimitPerMinute: 20,
-        anonymousCreateRateLimitPerMinute: 5,
         draftCreateRateLimitPerMinute: 10
       },
       {

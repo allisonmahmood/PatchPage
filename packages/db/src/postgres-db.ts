@@ -1,16 +1,10 @@
 import pg from "pg";
 import { newInternalId, sha256 } from "@patchpage/core";
-import {
-  ANONYMOUS_INTERNAL_REVOKED_AT,
-  ANONYMOUS_INTERNAL_TOKEN_HASH,
-  ANONYMOUS_UPLOAD_PRINCIPAL
-} from "./internal-principals.js";
 import { SCHEMA_MIGRATIONS } from "./migrations.js";
 import { DRAFT_VISIT_EXTENSION_WINDOW_MS, expiryAfterUpload } from "./retention.js";
 import { UploadTargetError } from "./types.js";
 import type { SchemaMigration } from "./migrations.js";
 import type {
-  AnonymousUploadPrincipal,
   ApiTokenAuth,
   CreateApiTokenInput,
   DbDriverOptions,
@@ -63,7 +57,6 @@ export class PostgresPatchPageDb implements PatchPageDb {
 
   async initialize(bootstrapApiToken: string | null): Promise<void> {
     await this.migrate();
-    await this.ensureAnonymousUploadPrincipal();
     if (bootstrapApiToken) {
       await this.ensureBootstrapToken(bootstrapApiToken);
     }
@@ -77,30 +70,6 @@ export class PostgresPatchPageDb implements PatchPageDb {
 
     const result = await this.pool.query("SELECT id FROM schema_migrations ORDER BY id");
     return result.rows.map((row) => String(row.id));
-  }
-
-  async getAnonymousUploadPrincipal(): Promise<AnonymousUploadPrincipal> {
-    const result = await this.pool.query(
-      `
-        SELECT 1
-        FROM api_tokens
-        JOIN accounts ON accounts.id = api_tokens.account_id
-        WHERE api_tokens.id = $1
-          AND api_tokens.account_id = $2
-          AND api_tokens.token_hash = $3
-          AND api_tokens.revoked_at IS NOT NULL
-        LIMIT 1
-      `,
-      [
-        ANONYMOUS_UPLOAD_PRINCIPAL.apiTokenId,
-        ANONYMOUS_UPLOAD_PRINCIPAL.accountId,
-        ANONYMOUS_INTERNAL_TOKEN_HASH
-      ]
-    );
-    if (!result.rowCount) {
-      throw new Error("Anonymous upload principal is not initialized.");
-    }
-    return { ...ANONYMOUS_UPLOAD_PRINCIPAL };
   }
 
   async findApiTokenByToken(token: string): Promise<ApiTokenAuth | null> {
@@ -409,17 +378,11 @@ export class PostgresPatchPageDb implements PatchPageDb {
         UPDATE drafts
         SET disabled_at = now(), disabled_reason = $3, updated_at = now()
         WHERE id = $1
-          AND (account_id = $2 OR ($4 AND account_id = $5))
+          AND (account_id = $2 OR $4)
           AND deleted_at IS NULL
         RETURNING id
       `,
-      [
-        draftId,
-        accountId,
-        reason,
-        options.canModerateAnonymous === true,
-        ANONYMOUS_UPLOAD_PRINCIPAL.accountId
-      ]
+      [draftId, accountId, reason, options.canModerateAnyPrincipal === true]
     );
     return Boolean(result.rowCount);
   }
@@ -434,16 +397,11 @@ export class PostgresPatchPageDb implements PatchPageDb {
         UPDATE drafts
         SET deleted_at = now(), updated_at = now()
         WHERE id = $1
-          AND (account_id = $2 OR ($3 AND account_id = $4))
+          AND (account_id = $2 OR $3)
           AND deleted_at IS NULL
         RETURNING id
       `,
-      [
-        draftId,
-        accountId,
-        options.canModerateAnonymous === true,
-        ANONYMOUS_UPLOAD_PRINCIPAL.accountId
-      ]
+      [draftId, accountId, options.canModerateAnyPrincipal === true]
     );
     return Boolean(result.rowCount);
   }
@@ -495,38 +453,6 @@ export class PostgresPatchPageDb implements PatchPageDb {
         .catch(() => undefined);
       client.release();
     }
-  }
-
-  private async ensureAnonymousUploadPrincipal(): Promise<void> {
-    await this.pool.query(
-      `
-        INSERT INTO accounts (id, name)
-        VALUES ($1, 'Anonymous Uploads')
-        ON CONFLICT (id) DO UPDATE
-        SET name = EXCLUDED.name,
-            updated_at = now()
-      `,
-      [ANONYMOUS_UPLOAD_PRINCIPAL.accountId]
-    );
-
-    await this.pool.query(
-      `
-        INSERT INTO api_tokens (id, account_id, name, token_hash, scopes, revoked_at)
-        VALUES ($1, $2, 'Anonymous Upload Audit Actor', $3, '[]'::jsonb, $4::timestamptz)
-        ON CONFLICT (id) DO UPDATE
-        SET account_id = EXCLUDED.account_id,
-            name = EXCLUDED.name,
-            token_hash = EXCLUDED.token_hash,
-            scopes = EXCLUDED.scopes,
-            revoked_at = EXCLUDED.revoked_at
-      `,
-      [
-        ANONYMOUS_UPLOAD_PRINCIPAL.apiTokenId,
-        ANONYMOUS_UPLOAD_PRINCIPAL.accountId,
-        ANONYMOUS_INTERNAL_TOKEN_HASH,
-        ANONYMOUS_INTERNAL_REVOKED_AT
-      ]
-    );
   }
 
   private async ensureBootstrapToken(token: string): Promise<void> {

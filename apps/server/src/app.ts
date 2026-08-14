@@ -4,7 +4,6 @@ import Fastify from "fastify";
 import type { ServerConfig } from "@patchpage/config";
 import { isUploadTargetError } from "@patchpage/db";
 import type {
-  AnonymousUploadPrincipal,
   ApiTokenAuth,
   PatchPageDb,
   RecordUploadInput,
@@ -58,8 +57,6 @@ declare module "fastify" {
     auth?: ApiTokenAuth;
     authState?: ApiRequestAuthState;
     preBodyAuthorizedScopes?: Set<string>;
-    anonymousUploadPrincipal?: AnonymousUploadPrincipal;
-    preBodyAnonymousLimiterConsumed?: boolean;
     preBodyUploadLimiterConsumed?: boolean;
   }
 }
@@ -75,7 +72,6 @@ export type AuthorizationCredential =
   | { kind: "bearer"; token: string };
 
 interface ProtectedApiHookOptions {
-  anonymousCreateLimiter?: FixedWindowRateLimiter;
   uploadLimiter?: FixedWindowRateLimiter;
 }
 
@@ -87,7 +83,6 @@ type ApiRequestTargetPolicy =
       protected: true;
       requiredScope?: ApiPolicyScope;
       uploadLimit?: boolean;
-      anonymousCreate?: boolean;
     };
 
 const FASTIFY_DEFAULT_MAX_PARAM_LENGTH = 100;
@@ -120,10 +115,8 @@ export function createApp(options: CreateAppOptions): FastifyInstance {
     "onRequest",
     protectedApiPrefixGuard(
       options.db,
-      options.config.allowAnonymousUploads,
       rateLimiters.protectedApi,
-      rateLimiters.authenticatedUpload,
-      rateLimiters.anonymousCreate
+      rateLimiters.authenticatedUpload
     )
   );
 
@@ -172,23 +165,13 @@ export function createApp(options: CreateAppOptions): FastifyInstance {
     "/api/uploads",
     {
       onRequest: protectedApi("upload", {
-        uploadLimiter: rateLimiters.authenticatedUpload,
-        anonymousCreateLimiter: rateLimiters.anonymousCreate
+        uploadLimiter: rateLimiters.authenticatedUpload
       })
     },
     async (request, reply) => {
-      const principal = uploadRequestPrincipal(request);
+      const auth = authenticatedRequest(request);
 
       const body = (request.body || {}) as UploadBody;
-      if (
-        request.anonymousUploadPrincipal &&
-        Object.prototype.hasOwnProperty.call(body, "draftId")
-      ) {
-        return reply.status(400).send({
-          ok: false,
-          error: "Anonymous uploads must omit draftId."
-        });
-      }
       if (typeof body.html !== "string") {
         return reply.status(400).send({ ok: false, error: "Missing HTML document." });
       }
@@ -219,7 +202,7 @@ export function createApp(options: CreateAppOptions): FastifyInstance {
         // client parked at the quota is throttled instead of being free to
         // re-count the database at the higher upload-limit rate. The cost is
         // that such a client sees 403 flip to 429 once its bucket empties.
-        const createAttempt = rateLimiters.draftCreate.consume(principal.apiTokenId);
+        const createAttempt = rateLimiters.draftCreate.consume(auth.id);
         if (!createAttempt.allowed) {
           sendRateLimited(reply, createAttempt);
           return reply;
@@ -228,9 +211,7 @@ export function createApp(options: CreateAppOptions): FastifyInstance {
         // Recounted from the database every time, so the ceiling outlives a
         // restart. Concurrent creates can overshoot it by at most the burst the
         // per-minute limiter above allows through.
-        const liveDrafts = await options.db.countLiveDraftsByCreatorApiToken(
-          principal.apiTokenId
-        );
+        const liveDrafts = await options.db.countLiveDraftsByCreatorApiToken(auth.id);
         if (liveDrafts >= options.config.liveDraftsPerToken) {
           return sendLiveDraftQuotaExceeded(reply, options.config.liveDraftsPerToken);
         }
@@ -247,8 +228,8 @@ export function createApp(options: CreateAppOptions): FastifyInstance {
         intent: requestedDraftId ? "update" : "create",
         draftId,
         versionId,
-        accountId: principal.accountId,
-        apiTokenId: principal.apiTokenId,
+        accountId: auth.accountId,
+        apiTokenId: auth.id,
         title,
         objectKey,
         contentHash: contentHash(html),
@@ -300,7 +281,7 @@ export function createApp(options: CreateAppOptions): FastifyInstance {
       const reason =
         cleanText((request.body as { reason?: unknown } | null)?.reason) || "Disabled.";
       const disabled = await options.db.disableDraft(draftId, auth.accountId, reason, {
-        canModerateAnonymous: hasScope(auth, "admin")
+        canModerateAnyPrincipal: hasScope(auth, "admin")
       });
       if (!disabled) return reply.status(404).send({ ok: false, error: "Draft not found." });
       return { ok: true };
@@ -315,7 +296,7 @@ export function createApp(options: CreateAppOptions): FastifyInstance {
 
       const draftId = (request.params as { draftId: string }).draftId;
       const deleted = await options.db.deleteDraft(draftId, auth.accountId, {
-        canModerateAnonymous: hasScope(auth, "admin")
+        canModerateAnyPrincipal: hasScope(auth, "admin")
       });
       if (!deleted) return reply.status(404).send({ ok: false, error: "Draft not found." });
       return { ok: true };
@@ -396,10 +377,8 @@ async function renderDraft(
 
 function protectedApiPrefixGuard(
   db: PatchPageDb,
-  allowAnonymousUploads: boolean,
   protectedApiLimiter: FixedWindowRateLimiter,
-  authenticatedUploadLimiter: FixedWindowRateLimiter,
-  anonymousCreateLimiter: FixedWindowRateLimiter
+  authenticatedUploadLimiter: FixedWindowRateLimiter
 ) {
   return async (request: FastifyRequest, reply: FastifyReply): Promise<void> => {
     const targetPolicy = classifyApiRequestTargetPolicy(request.url);
@@ -414,32 +393,8 @@ function protectedApiPrefixGuard(
     const authState = await authenticateApiRequest(db, request);
     request.authState = authState;
 
-    if (
-      authState.kind === "missing" &&
-      allowAnonymousUploads &&
-      targetPolicy.anonymousCreate &&
-      !request.is404 &&
-      request.method === "POST"
-    ) {
-      const routingErrorStatus = (request.raw as MarkedIncomingMessage)[
-        preRoutingApiErrorStatus
-      ];
-      if (routingErrorStatus) {
-        sendPreRoutingApiError(reply, routingErrorStatus);
-        return;
-      }
-
-      const anonymousAttempt = anonymousCreateLimiter.consume(request.ip);
-      request.preBodyAnonymousLimiterConsumed = true;
-      if (!anonymousAttempt.allowed) {
-        sendRateLimited(reply, anonymousAttempt);
-        return;
-      }
-      request.anonymousUploadPrincipal = await db.getAnonymousUploadPrincipal();
-
-      return;
-    }
-
+    // No configuration admits a tokenless request: a missing credential and a
+    // present-but-invalid one are indistinguishable from here on.
     if (authState.kind === "missing" || authState.kind === "invalid") {
       reply.status(401).send({ ok: false, error: "Missing or invalid API token." });
       return;
@@ -481,17 +436,6 @@ function protectedApiPrefixGuard(
 
 function protectedApiRouteHook(requiredScope: string | undefined, options: ProtectedApiHookOptions) {
   return async (request: FastifyRequest, reply: FastifyReply): Promise<void> => {
-    if (request.anonymousUploadPrincipal && options.anonymousCreateLimiter) {
-      if (!request.preBodyAnonymousLimiterConsumed) {
-        const anonymousAttempt = options.anonymousCreateLimiter.consume(request.ip);
-        request.preBodyAnonymousLimiterConsumed = true;
-        if (!anonymousAttempt.allowed) {
-          sendRateLimited(reply, anonymousAttempt);
-        }
-      }
-      return;
-    }
-
     const auth = request.auth;
     if (!auth) {
       reply.status(401).send({ ok: false, error: "Missing or invalid API token." });
@@ -615,8 +559,7 @@ function classifyApiRequestTargetPolicy(requestTarget: string): ApiRequestTarget
     return {
       protected: true,
       requiredScope: "upload",
-      uploadLimit: true,
-      anonymousCreate: true
+      uploadLimit: true
     };
   }
   if (pathname === "/api/tokens") {
@@ -755,17 +698,6 @@ function authenticatedRequest(request: FastifyRequest): ApiTokenAuth {
     throw new Error("Authenticated request is missing API token auth state.");
   }
   return request.auth;
-}
-
-function uploadRequestPrincipal(request: FastifyRequest): {
-  accountId: string;
-  apiTokenId: string;
-} {
-  if (request.auth) {
-    return { accountId: request.auth.accountId, apiTokenId: request.auth.id };
-  }
-  if (request.anonymousUploadPrincipal) return request.anonymousUploadPrincipal;
-  throw new Error("Upload request is missing an authenticated or anonymous principal.");
 }
 
 function normalizeMetadata(value: unknown): UploadMetadata {

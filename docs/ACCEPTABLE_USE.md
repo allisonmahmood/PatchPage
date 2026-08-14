@@ -4,6 +4,12 @@
 `post.patchyhq.com`, operated by Patchy. It does not apply to self-hosted PatchPage
 instances, whose operators set their own rules.
 
+This file is the source copy. The published location is
+`https://patchyhq.com/acceptable-use`, exported from `@patchpage/config` as the single
+constant `ACCEPTABLE_USE_URL`. Every consumer that links this policy — the self-service
+mint response, the served-draft footer, and the README — reads that one constant rather
+than repeating the literal, so the URL changes in exactly one place.
+
 By publishing a page to the official instance you accept this policy. There is no
 signup and nothing to sign: publishing is acceptance.
 
