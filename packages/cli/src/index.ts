@@ -27,6 +27,8 @@ const STATE_DIR = readEnv("PATCHPAGE_STATE_DIR") ?? path.join(os.homedir(), ".pa
 const CONFIG_PATH = path.join(STATE_DIR, "config.json");
 const CREDENTIALS_PATH = path.join(STATE_DIR, "credentials.json");
 const DRAFTS_PATH = path.join(STATE_DIR, "drafts.json");
+/** Skill-owned. The CLI reports whether this exists and never reads it. */
+const STYLE_PATH = path.join(STATE_DIR, "style.md");
 
 class CliError extends Error {}
 
@@ -68,6 +70,20 @@ interface CliConfig {
 }
 
 type CredentialSource = "mint" | "auth-set";
+
+/** Which link of the URL precedence chain chose the resolved instance. */
+type InstanceSource = "flag" | "env" | "config" | "default";
+
+/** The onboarding probe's answer. Every key here is quoted by the skill. */
+interface StatusReport {
+  instanceUrl: string;
+  instanceSource: InstanceSource;
+  hasToken: boolean;
+  tokenSource: CredentialSource | null;
+  stateDir: string;
+  hasDefaultStyle: boolean;
+  cliVersion: string;
+}
 
 interface HostCredential {
   token: string;
@@ -161,6 +177,15 @@ program
     console.log(`Account: ${body.accountName} (${body.accountId})`);
     console.log(`API token: ${body.apiTokenName} (${body.apiTokenId})`);
     console.log(`Scopes: ${(body.scopes || []).join(", ")}`);
+  });
+
+program
+  .command("status")
+  .description("Report local publishing state for the resolved instance. Never uses the network.")
+  .requiredOption("--json", "Print the report as JSON")
+  .option("--api-url <url>", "Override the configured PatchPage API base URL")
+  .action((options: { apiUrl?: string }) => {
+    console.log(JSON.stringify(buildStatusReport(options.apiUrl), null, 2));
   });
 
 program
@@ -326,10 +351,69 @@ function readEnv(name: string): string | undefined {
  * distinct instances by design.
  */
 function resolveApiUrl(apiUrlOverride?: string): string {
-  const config = readJson<CliConfig>(CONFIG_PATH, {});
-  return normalizeApiUrl(
-    apiUrlOverride || readEnv("PATCHPAGE_API_URL") || config.apiUrl || DEFAULT_API_URL
-  );
+  return resolveInstance(apiUrlOverride).apiUrl;
+}
+
+/**
+ * The same resolution, carrying which link of the chain answered. Only the
+ * probe needs that; every other caller wants the URL alone.
+ */
+function resolveInstance(apiUrlOverride?: string): {
+  apiUrl: string;
+  source: InstanceSource;
+} {
+  if (apiUrlOverride) return { apiUrl: normalizeApiUrl(apiUrlOverride), source: "flag" };
+
+  const environmentUrl = readEnv("PATCHPAGE_API_URL");
+  if (environmentUrl) return { apiUrl: normalizeApiUrl(environmentUrl), source: "env" };
+
+  const configUrl = readJson<CliConfig>(CONFIG_PATH, {}).apiUrl;
+  if (configUrl) return { apiUrl: normalizeApiUrl(configUrl), source: "config" };
+
+  return { apiUrl: normalizeApiUrl(DEFAULT_API_URL), source: "default" };
+}
+
+/**
+ * Assembled from local state alone: every lookup below is a file or
+ * environment read, and nothing on this path may ever reach the network. The
+ * style file is skill-owned, so its existence is the only fact about it the
+ * CLI has — its contents are never opened.
+ */
+function buildStatusReport(apiUrlOverride?: string): StatusReport {
+  const instance = resolveInstance(apiUrlOverride);
+  const environmentToken = readEnv("PATCHPAGE_API_TOKEN");
+  const stored = environmentToken === undefined ? readProbeCredential(instance.apiUrl) : undefined;
+
+  return {
+    instanceUrl: instance.apiUrl,
+    instanceSource: instance.source,
+    // Mirrors the credential chain the upload path walks, so "no token" here
+    // is exactly the condition that makes the next upload mint one.
+    hasToken: environmentToken !== undefined || stored !== undefined,
+    // Only a stored credential carries provenance. A token supplied by the
+    // environment, and an entry written before `source` existed, both report
+    // null rather than a guess.
+    tokenSource: stored?.source ?? null,
+    stateDir: path.resolve(STATE_DIR),
+    hasDefaultStyle: existsSync(STYLE_PATH),
+    cliVersion: VERSION
+  };
+}
+
+/**
+ * The probe never fails on state it cannot read. Failing closed on a corrupt
+ * or retired credentials file protects the commands that would spend a token,
+ * and those keep doing it; reporting the same condition here as "no token we
+ * can vouch for" neither loses a token nor mints one. Exiting non-zero would
+ * only make the onboarding probe unanswerable exactly when someone needs the
+ * answer most.
+ */
+function readProbeCredential(apiUrl: string): HostCredential | undefined {
+  try {
+    return readStoredCredential(readCredentialFile().hosts, apiUrl);
+  } catch {
+    return undefined;
+  }
 }
 
 function readAuth(apiUrlOverride?: string): { apiUrl: string; apiToken: string } {

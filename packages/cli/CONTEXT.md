@@ -39,3 +39,7 @@ _Avoid_: token (in user-facing copy), password, account
 **Draft cache**:
 The per-instance record linking a local file to the draft it produced, so republishing the same file updates that draft instead of creating a new one.
 _Avoid_: upload history, manifest
+
+**Onboarding probe**:
+The local-only report of what publishing state this machine already holds for the resolved instance — `status --json`. Onboarding reads it once to skip questions it can already answer; it reaches no instance, and it answers rather than passing or failing, so it is never a per-session check.
+_Avoid_: health check, status check, doctor, preflight
