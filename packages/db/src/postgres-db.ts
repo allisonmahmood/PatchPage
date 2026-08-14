@@ -1,11 +1,23 @@
 import pg from "pg";
 import { newInternalId, sha256 } from "@patchpage/core";
+import {
+  GoPublicFlipPreconditionError,
+  pendingMigrationIds,
+  reHomeDisposition
+} from "./go-public-flip.js";
+import {
+  BOOTSTRAP_API_TOKEN_ID,
+  BOOTSTRAP_PRINCIPAL_ID,
+  RETIRED_ANONYMOUS_API_TOKEN_ID,
+  RETIRED_ANONYMOUS_PRINCIPAL_ID
+} from "./internal-principals.js";
 import { SCHEMA_MIGRATIONS } from "./migrations.js";
 import { mintQuotaWindowStart } from "./mint-quota.js";
 import { DRAFT_VISIT_EXTENSION_WINDOW_MS, expiryAfterUpload } from "./retention.js";
 import { UploadTargetError } from "./types.js";
 import type { SchemaMigration } from "./migrations.js";
 import type {
+  AnonymousSentinelOutcome,
   ApiTokenAuth,
   ApiTokenRevocation,
   CreateApiTokenInput,
@@ -15,6 +27,10 @@ import type {
   DraftReportRecord,
   DraftVersionLookup,
   DraftVersionRecord,
+  GoPublicFlipInput,
+  GoPublicFlipInspection,
+  GoPublicFlipOutcome,
+  LiveDraftTally,
   MintSelfServiceTokenInput,
   MintSelfServiceTokenResult,
   ModeratedDraftRecord,
@@ -23,6 +39,7 @@ import type {
   RecordDraftReportInput,
   RecordUploadInput,
   RecordUploadResult,
+  ReHomedApiToken,
   UploadTargetInput
 } from "./types.js";
 
@@ -684,6 +701,197 @@ export class PostgresPatchPageDb implements PatchPageDb {
     return Boolean(result.rowCount);
   }
 
+  async inspectGoPublicFlip(): Promise<GoPublicFlipInspection> {
+    const client = await this.pool.connect();
+    try {
+      return await inspectWith((text, values) => client.query(text, values));
+    } finally {
+      client.release();
+    }
+  }
+
+  async applyGoPublicFlip(input: GoPublicFlipInput): Promise<GoPublicFlipOutcome> {
+    const client = await this.pool.connect();
+    const flippedAt = this.nowIso();
+    let surgery: Omit<GoPublicFlipOutcome, "after">;
+
+    try {
+      await client.query("BEGIN");
+
+      // Every precondition is checked inside this transaction and before the
+      // first write, so a refusal rolls back to exactly the state it found.
+      const applied = await client.query("SELECT id FROM schema_migrations");
+      const pending = pendingMigrationIds(applied.rows.map((row) => String(row.id)));
+      if (pending.length > 0) {
+        throw new GoPublicFlipPreconditionError("migrations_pending", pending.join(", "));
+      }
+
+      const bootstrap = await client.query("SELECT id FROM accounts WHERE id = $1", [
+        BOOTSTRAP_PRINCIPAL_ID
+      ]);
+      if (!bootstrap.rowCount) {
+        throw new GoPublicFlipPreconditionError(
+          "bootstrap_principal_missing",
+          BOOTSTRAP_PRINCIPAL_ID
+        );
+      }
+
+      const pinned = await client.query(
+        "SELECT id FROM drafts WHERE pinned_at IS NOT NULL ORDER BY id"
+      );
+      if (pinned.rowCount) {
+        throw new GoPublicFlipPreconditionError(
+          "draft_already_pinned",
+          pinned.rows.map((row) => String(row.id)).join(", ")
+        );
+      }
+
+      const reHomed: ReHomedApiToken[] = [];
+      for (const apiTokenId of input.reHomeApiTokenIds) {
+        // Row-locked: a concurrent revocation or a second flip cannot move this
+        // token out from under the disposition decided on the next line.
+        const target = await client.query(
+          `
+            SELECT id, account_id, name, scopes,
+              (SELECT count(*) FROM api_tokens AS peer
+                WHERE peer.account_id = api_tokens.account_id) AS tokens_on_principal
+            FROM api_tokens
+            WHERE id = $1
+            FOR UPDATE
+          `,
+          [apiTokenId]
+        );
+        const row = target.rows[0];
+        if (!row) {
+          throw new GoPublicFlipPreconditionError("rehome_target_unknown", apiTokenId);
+        }
+        if (row.id === BOOTSTRAP_API_TOKEN_ID) {
+          throw new GoPublicFlipPreconditionError("rehome_target_is_bootstrap_token", apiTokenId);
+        }
+        if (normalizeScopes(row.scopes).includes("admin")) {
+          throw new GoPublicFlipPreconditionError("rehome_target_has_admin_scope", apiTokenId);
+        }
+
+        const disposition = reHomeDisposition(
+          String(row.account_id),
+          Number(row.tokens_on_principal)
+        );
+        if (disposition === "shared") {
+          throw new GoPublicFlipPreconditionError("rehome_target_principal_shared", apiTokenId);
+        }
+        if (disposition === "already") {
+          reHomed.push({
+            apiTokenId: String(row.id),
+            apiTokenName: String(row.name),
+            principalId: String(row.account_id),
+            alreadyReHomed: true
+          });
+          continue;
+        }
+
+        // The same three rows a self-service mint writes, minus the token: the
+        // holder keeps the one they already have. The principal carries the
+        // provenance mark and a mint record names it, because a mark no record
+        // derives would break the one invariant those two rows have — and
+        // marking it is the fail-closed direction, since any later guardrail
+        // keyed on "self-service" should reach a re-homed token too. The
+        // record's address is null: no caller asked for this token, and
+        // inventing an address would be inventing forensics.
+        const principalId = newInternalId("acct");
+        await client.query(
+          `
+            INSERT INTO accounts (id, name, self_service_minted_at)
+            VALUES ($1, $2, $3::timestamptz)
+          `,
+          [principalId, String(row.name), flippedAt]
+        );
+        // The mint stamp is on the injected clock for the same reason
+        // `mintSelfServiceToken` puts it there: the mint quota measures a
+        // window from it. See `nowIso`.
+        await client.query(
+          `
+            INSERT INTO token_mints (id, account_id, api_token_id, source_ip, created_at)
+            VALUES ($1, $2, $3, NULL, $4::timestamptz)
+          `,
+          [newInternalId("mint"), principalId, apiTokenId, flippedAt]
+        );
+        // The drafts stay behind on the bootstrap principal. That is the
+        // accepted consequence, not an oversight: this token's holder loses
+        // edit rights over everything they published before the flip.
+        await client.query("UPDATE api_tokens SET account_id = $2 WHERE id = $1", [
+          apiTokenId,
+          principalId
+        ]);
+
+        reHomed.push({
+          apiTokenId: String(row.id),
+          apiTokenName: String(row.name),
+          principalId,
+          alreadyReHomed: false
+        });
+      }
+
+      const sentinelDrafts = await client.query(
+        `
+          SELECT
+            count(*) AS total,
+            count(*) FILTER (
+              WHERE deleted_at IS NULL AND disabled_at IS NULL
+            ) AS in_service
+          FROM drafts
+          WHERE account_id = $1
+        `,
+        [RETIRED_ANONYMOUS_PRINCIPAL_ID]
+      );
+      const sentinelDraftCount = Number(sentinelDrafts.rows[0]?.total ?? 0);
+      const sentinelDraftsInService = Number(sentinelDrafts.rows[0]?.in_service ?? 0);
+      const sentinelHistoryRows = await countSentinelHistoryRows((text, values) =>
+        client.query(text, values)
+      );
+
+      // The uniform re-arm. Sentinel-owned drafts in service are in this set
+      // like any other, which is exactly the revoked-style treatment they are
+      // owed: a full window from the flip, with top-ups already frozen by the
+      // revocation stamp their token has carried since it was seeded. Only the
+      // anchor moves — `updated_at` still means "when the content last changed".
+      const reArmed = await client.query(
+        `
+          UPDATE drafts
+          SET expires_at = $1::timestamptz
+          WHERE deleted_at IS NULL AND disabled_at IS NULL
+          RETURNING id
+        `,
+        [expiryAfterUpload(this.clock())]
+      );
+      const outOfService = await client.query(
+        "SELECT count(*) AS total FROM drafts WHERE deleted_at IS NOT NULL OR disabled_at IS NOT NULL"
+      );
+
+      const anonymousSentinel = await dropAnonymousSentinel(
+        (text, values) => client.query(text, values),
+        sentinelDraftCount,
+        sentinelHistoryRows,
+        sentinelDraftsInService
+      );
+
+      await client.query("COMMIT");
+      surgery = {
+        flippedAt,
+        reHomed,
+        reArmedDraftCount: reArmed.rowCount ?? 0,
+        leftOnTheirClockCount: Number(outOfService.rows[0]?.total ?? 0),
+        anonymousSentinel
+      };
+    } catch (error) {
+      await client.query("ROLLBACK").catch(() => undefined);
+      throw error;
+    } finally {
+      client.release();
+    }
+
+    return { ...surgery, after: await this.inspectGoPublicFlip() };
+  }
+
   async recordDraftReport(input: RecordDraftReportInput): Promise<DraftReportRecord> {
     // One INSERT and nothing else: no trigger, no cascade, no UPDATE of the
     // draft. That is what makes report volume unable to move any state.
@@ -759,21 +967,22 @@ export class PostgresPatchPageDb implements PatchPageDb {
     await this.pool.query(
       `
         INSERT INTO accounts (id, name)
-        VALUES ('acct_bootstrap', 'Bootstrap Account')
+        VALUES ($1, 'Bootstrap Account')
         ON CONFLICT (id) DO UPDATE SET updated_at = now()
-      `
+      `,
+      [BOOTSTRAP_PRINCIPAL_ID]
     );
 
     await this.pool.query(
       `
         INSERT INTO api_tokens (id, account_id, name, token_hash, scopes)
-        VALUES ('tok_bootstrap', 'acct_bootstrap', 'Bootstrap API Token', $1, '["admin", "upload"]'::jsonb)
+        VALUES ($2, $3, 'Bootstrap API Token', $1, '["admin", "upload"]'::jsonb)
         ON CONFLICT (id) DO UPDATE
           SET token_hash = EXCLUDED.token_hash,
               scopes = EXCLUDED.scopes,
               revoked_at = NULL
       `,
-      [sha256(token)]
+      [sha256(token), BOOTSTRAP_API_TOKEN_ID, BOOTSTRAP_PRINCIPAL_ID]
     );
   }
 }
@@ -841,6 +1050,144 @@ function normalizeScopes(value: unknown): string[] {
     }
   }
   return [];
+}
+
+/**
+ * The one query shape the flip's reads share. Both the inspection and the
+ * surgery run against a single checked-out client — the surgery so its
+ * preconditions and writes are one transaction, the inspection so its several
+ * counts describe one instant rather than several.
+ */
+type FlipQuery = (
+  text: string,
+  values?: unknown[]
+) => Promise<{ rows: any[]; rowCount: number | null }>;
+
+/** Versions and upload events still naming the retired sentinel token. */
+async function countSentinelHistoryRows(query: FlipQuery): Promise<number> {
+  const result = await query(
+    `
+      SELECT
+        (SELECT count(*) FROM draft_versions WHERE created_by_api_token_id = $1)
+        + (SELECT count(*) FROM upload_events WHERE api_token_id = $1) AS total
+    `,
+    [RETIRED_ANONYMOUS_API_TOKEN_ID]
+  );
+  return Number(result.rows[0]?.total ?? 0);
+}
+
+/**
+ * Assert-and-drop. The rows go only when the sentinel owns no drafts *and* no
+ * version or upload event still names its token. The second condition is what
+ * this driver's foreign keys would enforce anyway; checking it here means both
+ * drivers refuse for the same stated reason instead of one raising a
+ * constraint error the operator has to decode.
+ */
+async function dropAnonymousSentinel(
+  query: FlipQuery,
+  draftCount: number,
+  historyRowCount: number,
+  reArmedDraftCount: number
+): Promise<AnonymousSentinelOutcome> {
+  if (draftCount > 0) {
+    return { disposition: "retained_drafts_present", draftCount, reArmedDraftCount };
+  }
+  if (historyRowCount > 0) {
+    return { disposition: "retained_history_present", draftCount, reArmedDraftCount };
+  }
+
+  const token = await query("DELETE FROM api_tokens WHERE id = $1 RETURNING id", [
+    RETIRED_ANONYMOUS_API_TOKEN_ID
+  ]);
+  const principal = await query("DELETE FROM accounts WHERE id = $1 RETURNING id", [
+    RETIRED_ANONYMOUS_PRINCIPAL_ID
+  ]);
+  const dropped = (token.rowCount ?? 0) + (principal.rowCount ?? 0) > 0;
+  return { disposition: dropped ? "dropped" : "absent", draftCount, reArmedDraftCount };
+}
+
+async function inspectWith(query: FlipQuery): Promise<GoPublicFlipInspection> {
+  const applied = (
+    await query("SELECT id FROM schema_migrations ORDER BY applied_at, id")
+  ).rows.map((row) => String(row.id));
+
+  const bootstrapTokens = await query(
+    "SELECT id FROM api_tokens WHERE account_id = $1 ORDER BY id",
+    [BOOTSTRAP_PRINCIPAL_ID]
+  );
+  const bootstrapPrincipal = await query("SELECT id FROM accounts WHERE id = $1", [
+    BOOTSTRAP_PRINCIPAL_ID
+  ]);
+  const pinned = await query("SELECT id FROM drafts WHERE pinned_at IS NOT NULL ORDER BY id");
+
+  const sentinel = await query(
+    `
+      SELECT
+        (SELECT count(*) FROM accounts WHERE id = $1) AS principal_present,
+        (SELECT count(*) FROM api_tokens WHERE id = $2) AS token_present,
+        (SELECT count(*) FROM drafts WHERE account_id = $1) AS draft_count
+    `,
+    [RETIRED_ANONYMOUS_PRINCIPAL_ID, RETIRED_ANONYMOUS_API_TOKEN_ID]
+  );
+
+  const draftCounts = await query(
+    `
+      SELECT
+        count(*) FILTER (WHERE deleted_at IS NULL AND disabled_at IS NULL) AS in_service,
+        count(*) FILTER (WHERE deleted_at IS NOT NULL OR disabled_at IS NOT NULL) AS out_of_service,
+        min(expires_at) FILTER (
+          WHERE deleted_at IS NULL AND disabled_at IS NULL
+        ) AS earliest_in_service_expiry
+      FROM drafts
+    `
+  );
+
+  const tallies = await query(
+    `
+      SELECT api_tokens.id,
+             api_tokens.name,
+             api_tokens.account_id,
+             api_tokens.scopes @> '"admin"'::jsonb AS admin,
+             count(drafts.id) AS live_draft_count
+      FROM api_tokens
+      JOIN draft_versions
+        ON draft_versions.created_by_api_token_id = api_tokens.id
+        AND draft_versions.version_number = $1
+      JOIN drafts
+        ON drafts.id = draft_versions.draft_id
+        AND drafts.deleted_at IS NULL
+        AND drafts.disabled_at IS NULL
+      GROUP BY api_tokens.id, api_tokens.name, api_tokens.account_id, api_tokens.scopes
+      ORDER BY count(drafts.id) DESC, api_tokens.id
+    `,
+    [FIRST_VERSION_NUMBER]
+  );
+
+  const earliest = draftCounts.rows[0]?.earliest_in_service_expiry;
+
+  return {
+    appliedMigrations: applied,
+    pendingMigrations: pendingMigrationIds(applied),
+    bootstrapPrincipalPresent: Boolean(bootstrapPrincipal.rowCount),
+    bootstrapPrincipalApiTokenIds: bootstrapTokens.rows.map((row) => String(row.id)),
+    pinnedDraftIds: pinned.rows.map((row) => String(row.id)),
+    anonymousSentinel: {
+      principalPresent: Number(sentinel.rows[0]?.principal_present ?? 0) > 0,
+      tokenPresent: Number(sentinel.rows[0]?.token_present ?? 0) > 0,
+      draftCount: Number(sentinel.rows[0]?.draft_count ?? 0),
+      historyRowCount: await countSentinelHistoryRows(query)
+    },
+    draftsInService: Number(draftCounts.rows[0]?.in_service ?? 0),
+    draftsOutOfService: Number(draftCounts.rows[0]?.out_of_service ?? 0),
+    earliestInServiceExpiry: earliest ? toIso(earliest) : null,
+    liveDraftTallies: tallies.rows.map((row): LiveDraftTally => ({
+      apiTokenId: String(row.id),
+      apiTokenName: String(row.name),
+      principalId: String(row.account_id),
+      admin: Boolean(row.admin),
+      liveDraftCount: Number(row.live_draft_count)
+    }))
+  };
 }
 
 function toIso(value: unknown): string {

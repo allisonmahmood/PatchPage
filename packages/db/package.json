@@ -15,7 +15,8 @@
     "test": "vitest run",
     "lint": "eslint src --ext .ts",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "db:migrate": "tsx src/migrate.ts"
+    "db:migrate": "tsx src/migrate.ts",
+    "db:go-public-flip": "tsx src/go-public-flip-command.ts"
   },
   "dependencies": {
     "@patchpage/config": "workspace:*",

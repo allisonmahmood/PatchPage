@@ -152,6 +152,121 @@ export interface ApiTokenRevocation {
   alreadyRevoked: boolean;
 }
 
+/**
+ * One token's live-draft tally, as the go-public flip's quota check reads it.
+ *
+ * The check has nothing to enforce — the ceiling is recounted from the database
+ * on every create, so it already applies to every token the moment the flip
+ * lands. What this makes visible is the *uniformity*: the bootstrap admin token
+ * appears in the list with a count like any other, because there is no
+ * exemption to find.
+ */
+export interface LiveDraftTally {
+  apiTokenId: string;
+  apiTokenName: string;
+  /** The principal this token authenticates as. */
+  principalId: string;
+  /** True when the token carries the `admin` scope. Changes nothing about the count. */
+  admin: boolean;
+  /** Drafts it created that are still live — neither deleted nor disabled. */
+  liveDraftCount: number;
+}
+
+/** What is left of the retired anonymous-upload sentinel principal. */
+export interface AnonymousSentinelState {
+  principalPresent: boolean;
+  tokenPresent: boolean;
+  /** Drafts owned by the sentinel principal, in any state. Expected zero. */
+  draftCount: number;
+  /**
+   * Versions and upload events still naming the sentinel token, which its row
+   * cannot be dropped ahead of.
+   */
+  historyRowCount: number;
+}
+
+/**
+ * The database as the go-public flip finds it — a read that writes nothing, so
+ * it is both the pre-flip dry run and the post-flip verification.
+ */
+export interface GoPublicFlipInspection {
+  /** Migration IDs this database records, in apply order. */
+  appliedMigrations: string[];
+  /** Shipped migration IDs it is still missing. A flip refuses while this is non-empty. */
+  pendingMigrations: string[];
+  bootstrapPrincipalPresent: boolean;
+  /** Tokens still on the bootstrap principal: the operator's own, plus anything not yet re-homed. */
+  bootstrapPrincipalApiTokenIds: string[];
+  /** Empty before the flip — nothing pre-existing is pinned — and the welcome draft alone after it. */
+  pinnedDraftIds: string[];
+  anonymousSentinel: AnonymousSentinelState;
+  draftsInService: number;
+  /** Deleted or disabled drafts, which the flip leaves on the clock they had. */
+  draftsOutOfService: number;
+  /**
+   * The nearest retention anchor among drafts in service, or `null` when there
+   * are none. This is the single strongest post-flip check: every draft in
+   * service was re-armed together, so this must be a full window out.
+   */
+  earliestInServiceExpiry: string | null;
+  /** Every token that created a draft still live, largest tally first. */
+  liveDraftTallies: LiveDraftTally[];
+}
+
+export interface GoPublicFlipInput {
+  /**
+   * The api-token IDs to re-home, each onto a fresh 1:1 principal. The teammate
+   * tokens, named explicitly from the operator's private token record — this
+   * operation never guesses which tokens are somebody else's.
+   */
+  reHomeApiTokenIds: readonly string[];
+}
+
+export interface ReHomedApiToken {
+  apiTokenId: string;
+  apiTokenName: string;
+  /** The fresh principal the token now authenticates as, and controls alone. */
+  principalId: string;
+  /** True when the token already controlled its own principal and this call changed nothing. */
+  alreadyReHomed: boolean;
+}
+
+/**
+ * What became of the retired sentinel rows. `dropped` and `absent` are the two
+ * expected endings; either `retained_*` means the assert did not hold and the
+ * operator has drafts or history to resolve before the rows can go.
+ */
+export type AnonymousSentinelDisposition =
+  | "absent"
+  | "dropped"
+  | "retained_drafts_present"
+  | "retained_history_present";
+
+export interface AnonymousSentinelOutcome {
+  disposition: AnonymousSentinelDisposition;
+  /** Drafts the assert found. Zero is the expected case. */
+  draftCount: number;
+  /**
+   * Sentinel-owned drafts in service, which the flip's uniform re-arm gave a
+   * full window from the flip. Their top-ups were already frozen: the sentinel
+   * token has carried a revocation stamp since it was seeded.
+   */
+  reArmedDraftCount: number;
+}
+
+export interface GoPublicFlipOutcome {
+  /** The instant every pre-existing draft is treated as having been uploaded at. */
+  flippedAt: string;
+  reHomed: ReHomedApiToken[];
+  /** Drafts in service whose retention clock this flip re-armed to a full window. */
+  reArmedDraftCount: number;
+  /** Deleted and disabled drafts, left on the clock they had so the sweep still reclaims them. */
+  leftOnTheirClockCount: number;
+  anonymousSentinel: AnonymousSentinelOutcome;
+  /** The database as the flip left it, read back after the surgery committed. */
+  after: GoPublicFlipInspection;
+}
+
 export interface UploadTargetInput {
   intent: "create" | "update";
   draftId: string;
@@ -357,6 +472,28 @@ export interface PatchPageDb {
    * this writes a row and changes nothing about the draft, its retention clock,
    * or its owning token.
    */
+  /**
+   * Reads the database as the go-public flip finds it, writing nothing. Run
+   * before the flip as its dry run and after it as its verification — the same
+   * read answers both questions, which is what keeps the two from drifting.
+   */
+  inspectGoPublicFlip(): Promise<GoPublicFlipInspection>;
+  /**
+   * The go-public flip's data surgery: re-home the named tokens onto fresh 1:1
+   * principals, re-arm every draft in service to a full retention window from
+   * this moment, and assert-and-drop the retired anonymous sentinel. One
+   * operator act against one database, all of it or none of it.
+   *
+   * Idempotent where it can be: a token already alone on its own principal is
+   * reported and left alone, and the sentinel rows are dropped once. Re-arming
+   * is not idempotent and is not meant to be — a second run moves every anchor
+   * forward again, which is why the runbook has the operator inspect first.
+   *
+   * Throws `GoPublicFlipPreconditionError` without writing anything when the
+   * database is not in a state the flip is safe to run against. See
+   * `go-public-flip.ts` for what each refusal means.
+   */
+  applyGoPublicFlip(input: GoPublicFlipInput): Promise<GoPublicFlipOutcome>;
   recordDraftReport(input: RecordDraftReportInput): Promise<DraftReportRecord>;
   /**
    * Every report filed against one draft, oldest first. This is the operator's

@@ -5,19 +5,29 @@ import path from "node:path";
 import pg from "pg";
 import { describe, expect, it } from "vitest";
 import { newDraftId, newInternalId, randomToken } from "@patchpage/core";
+import { isGoPublicFlipPreconditionError } from "./go-public-flip.js";
+import { BOOTSTRAP_API_TOKEN_ID, BOOTSTRAP_PRINCIPAL_ID } from "./internal-principals.js";
 import { JsonFilePatchPageDb } from "./json-db.js";
 import {
   DEPLOYED_POSTGRES_SCHEMA_SQL,
   deployedJsonStateFixture,
   LEGACY_ACCOUNT_ID,
+  LEGACY_API_TOKEN_ID,
   LEGACY_DRAFT_ID,
   LEGACY_TOKEN,
   PROBE_ADD_MIGRATION,
   PROBE_ADD_MIGRATION_ID,
   PROBE_REQUIRE_MIGRATION,
   PROBE_REQUIRE_MIGRATION_ID,
+  RETIRED_ANONYMOUS_DRAFT_ID,
+  retiredAnonymousDraftJsonRows,
+  retiredAnonymousOrphanHistoryJsonRow,
+  retiredAnonymousSentinelJsonRows,
   REVERT_PROBE_MIGRATIONS_SQL,
-  SEED_DEPLOYED_ROWS_SQL
+  SEED_DEPLOYED_ROWS_SQL,
+  SEED_RETIRED_ANONYMOUS_DRAFT_SQL,
+  SEED_RETIRED_ANONYMOUS_ORPHAN_HISTORY_SQL,
+  SEED_RETIRED_ANONYMOUS_SENTINEL_SQL
 } from "./migration-fixtures.fixture.js";
 import { SCHEMA_MIGRATION_IDS, SCHEMA_MIGRATIONS } from "./migrations.js";
 import { PostgresPatchPageDb } from "./postgres-db.js";
@@ -33,6 +43,13 @@ import type {
 type UploadIntent = "create" | "update";
 type IntendedRecordUploadInput = RecordUploadInput & { intent: UploadIntent };
 
+interface SentinelSeedOptions {
+  /** Give the sentinel principal a draft of its own, so the assert fails. */
+  withDraft?: boolean;
+  /** Leave an upload event naming the sentinel token with no sentinel draft behind it. */
+  withOrphanHistory?: boolean;
+}
+
 const DAY_MS = 24 * 60 * 60 * 1000;
 /** Where the retention tests start their clock. Any fixed instant would do. */
 const RETENTION_EPOCH = Date.UTC(2026, 0, 1);
@@ -45,6 +62,12 @@ interface ContractHarness {
   openDb(options?: DbDriverOptions): PatchPageDb;
   /** Rebuilds the store exactly as the code before this mechanism left it. */
   resetToDeployedSchema(): Promise<void>;
+  /**
+   * Writes the retired anonymous sentinel rows a pre-cutover database still
+   * holds. Nothing in shipped code creates them any more, so the go-public
+   * flip's assert-and-drop can only be exercised by putting them back.
+   */
+  seedRetiredAnonymousSentinel(options?: SentinelSeedOptions): Promise<void>;
   /** Rewrites the ledger, to resume from a prefix of the migration list. */
   setAppliedLedger(ids: readonly string[]): Promise<void>;
   /** Undoes the probe migrations so the store stays reusable across runs. */
@@ -1526,7 +1549,487 @@ function describeUploadContract(
         await harness.close();
       }
     });
+
+    // --- the go-public flip ---------------------------------------------------
+    //
+    // Every one of these starts from `resetToDeployedSchema`, which is the only
+    // way to get the same database on both drivers: the Postgres harness reuses
+    // one store across the whole run, and the flip's reads and writes are
+    // instance-wide by nature — it re-arms every draft and refuses on any pin,
+    // so a leftover row from another test would be part of the answer. The
+    // reset leaves exactly the legacy principal, its token and its one draft,
+    // and `initialize` adds the bootstrap pair on top.
+
+    it("re-homes named tokens onto fresh 1:1 principals and leaves the operator's alone", async () => {
+      const harness = await createHarness();
+      let now = RETENTION_EPOCH;
+
+      try {
+        const flip = await flipFixture(harness, () => now);
+        now = RETENTION_EPOCH + 40 * DAY_MS;
+
+        const outcome = await flip.db.applyGoPublicFlip({
+          reHomeApiTokenIds: flip.teammates.map((teammate) => teammate.id)
+        });
+
+        expect(outcome.reHomed).toHaveLength(3);
+        for (const reHomed of outcome.reHomed) {
+          expect(reHomed.alreadyReHomed).toBe(false);
+          expect(reHomed.principalId).not.toBe(BOOTSTRAP_PRINCIPAL_ID);
+        }
+        // 1:1 by construction — three tokens, three principals, no sharing.
+        expect(new Set(outcome.reHomed.map((entry) => entry.principalId)).size).toBe(3);
+
+        // The operator's two upload tokens and the bootstrap admin token stay
+        // exactly where they were.
+        expect(outcome.after.bootstrapPrincipalApiTokenIds).toEqual(
+          [
+            BOOTSTRAP_API_TOKEN_ID,
+            flip.secondAdminToken.id,
+            ...flip.operatorUploadTokens.map((token) => token.id)
+          ].sort()
+        );
+
+        // The token itself is untouched: same secret, now on its own principal.
+        const reAuthenticated = await flip.db.findApiTokenByToken(flip.teammateTokens[0]);
+        expect(reAuthenticated?.id).toBe(flip.teammates[0].id);
+        expect(reAuthenticated?.accountId).toBe(outcome.reHomed[0].principalId);
+        // Exactly like a self-service mint, so anything keyed on that provenance
+        // reaches a re-homed token too.
+        expect(reAuthenticated?.selfService).toBe(true);
+      } finally {
+        await harness.close();
+      }
+    });
+
+    it("leaves pre-flip drafts with the operator, so a re-homed token can no longer update them", async () => {
+      const harness = await createHarness();
+      let now = RETENTION_EPOCH;
+
+      try {
+        const flip = await flipFixture(harness, () => now);
+        now = RETENTION_EPOCH + 40 * DAY_MS;
+
+        const outcome = await flip.db.applyGoPublicFlip({
+          reHomeApiTokenIds: flip.teammates.map((teammate) => teammate.id)
+        });
+        const principalId = outcome.reHomed[0].principalId;
+        const preFlightDraftId = flip.teammateDraftIds[0];
+
+        // The draft did not move: it is still the operator's.
+        const moderated = await flip.db.findDraftForModeration(preFlightDraftId);
+        expect(moderated?.accountId).toBe(BOOTSTRAP_PRINCIPAL_ID);
+
+        // The accepted consequence, asserted rather than assumed: the teammate's
+        // cached mapping for this draft now errors on update. Do not "fix" this.
+        const refused = await flip.db
+          .assertUploadTarget({
+            intent: "update",
+            draftId: preFlightDraftId,
+            accountId: principalId
+          })
+          .then(
+            () => null,
+            (error: unknown) => error
+          );
+        expect(isUploadTargetError(refused)).toBe(true);
+        expect(refused).toMatchObject({ code: "draft_unavailable" });
+
+        // Everything the token creates from here is its own.
+        const freshDraftId = newDraftId();
+        const created = await flip.db.recordUpload(
+          uploadInput("create", freshDraftId, {
+            ...flip.teammates[0],
+            accountId: principalId
+          })
+        );
+        expect(created.versionNumber).toBe(1);
+        expect((await flip.db.findDraftForModeration(freshDraftId))?.accountId).toBe(principalId);
+      } finally {
+        await harness.close();
+      }
+    });
+
+    it("gives every draft in service a full window from the flip and leaves the rest on their clock", async () => {
+      const harness = await createHarness();
+      let now = RETENTION_EPOCH;
+
+      try {
+        const flip = await flipFixture(harness, () => now);
+
+        // A draft taken out of service before the flip, to prove the flip does
+        // not re-arm storage nobody can reach.
+        const retiredDraftId = flip.teammateDraftIds[2];
+        expect(await flip.db.deleteDraft(retiredDraftId, BOOTSTRAP_PRINCIPAL_ID)).toBe(true);
+        const anchorBefore = (await flip.db.findDraftForModeration(retiredDraftId))?.expiresAt;
+
+        const flipInstant = RETENTION_EPOCH + 40 * DAY_MS;
+        now = flipInstant;
+        const outcome = await flip.db.applyGoPublicFlip({
+          reHomeApiTokenIds: flip.teammates.map((teammate) => teammate.id)
+        });
+
+        const fullWindow = new Date(flipInstant + 90 * DAY_MS).toISOString();
+        // Every draft in service was re-armed together, so the nearest anchor
+        // in the whole store is a full window out. That single read is the
+        // strongest statement the flip can make about the clock.
+        expect(outcome.after.earliestInServiceExpiry).toBe(fullWindow);
+        // The legacy draft, the three teammate drafts and the operator's, minus
+        // the one taken out of service.
+        expect(outcome.reArmedDraftCount).toBe(flip.draftsInServiceCount - 1);
+        expect(outcome.leftOnTheirClockCount).toBe(1);
+
+        const anchorAfter = (await flip.db.findDraftForModeration(retiredDraftId))?.expiresAt;
+        expect(anchorAfter).toBe(anchorBefore);
+
+        // Nothing pre-existing is pinned: the welcome draft is the first pin,
+        // and the flip is not what sets it.
+        expect(outcome.after.pinnedDraftIds).toEqual([]);
+      } finally {
+        await harness.close();
+      }
+    });
+
+    it("asserts the anonymous sentinel owns nothing, then drops its rows", async () => {
+      const harness = await createHarness();
+      let now = RETENTION_EPOCH;
+
+      try {
+        await harness.resetToDeployedSchema();
+        const db = harness.openDb({ clock: () => now });
+        // Seeded after the migrations run: the reset rebuilds the schema as it
+        // was before they existed, and the sentinel rows are written in terms
+        // of columns those migrations add.
+        await db.initialize(randomToken());
+        await harness.seedRetiredAnonymousSentinel();
+
+        const before = await db.inspectGoPublicFlip();
+        expect(before.anonymousSentinel).toMatchObject({
+          principalPresent: true,
+          tokenPresent: true,
+          draftCount: 0,
+          historyRowCount: 0
+        });
+
+        now = RETENTION_EPOCH + DAY_MS;
+        const outcome = await db.applyGoPublicFlip({ reHomeApiTokenIds: [] });
+
+        expect(outcome.anonymousSentinel).toEqual({
+          disposition: "dropped",
+          draftCount: 0,
+          reArmedDraftCount: 0
+        });
+        expect(outcome.after.anonymousSentinel).toMatchObject({
+          principalPresent: false,
+          tokenPresent: false
+        });
+
+        // Dropped once, and a second flip finds nothing to drop rather than failing.
+        const again = await db.applyGoPublicFlip({ reHomeApiTokenIds: [] });
+        expect(again.anonymousSentinel.disposition).toBe("absent");
+      } finally {
+        await harness.close();
+      }
+    });
+
+    it("gives unexpected anonymous drafts revoked-style treatment and defers the drop", async () => {
+      const harness = await createHarness();
+      let now = RETENTION_EPOCH;
+
+      try {
+        await harness.resetToDeployedSchema();
+        const db = harness.openDb({ clock: () => now });
+        await db.initialize(randomToken());
+        await harness.seedRetiredAnonymousSentinel({ withDraft: true });
+
+        const flipInstant = RETENTION_EPOCH + 10 * DAY_MS;
+        now = flipInstant;
+        const outcome = await db.applyGoPublicFlip({ reHomeApiTokenIds: [] });
+
+        expect(outcome.anonymousSentinel).toEqual({
+          disposition: "retained_drafts_present",
+          draftCount: 1,
+          reArmedDraftCount: 1
+        });
+        // The rows stay: an operator has drafts to resolve first.
+        expect(outcome.after.anonymousSentinel).toMatchObject({
+          principalPresent: true,
+          tokenPresent: true,
+          draftCount: 1
+        });
+
+        // Ninety days from the flip like every other draft in service, and its
+        // top-ups were frozen before the flip ran: the sentinel token has
+        // carried a revocation stamp since the day it was seeded. A visit deep
+        // inside the top-up window therefore moves nothing.
+        const fullWindow = new Date(flipInstant + 90 * DAY_MS).toISOString();
+        const anchored = await db.findDraftForModeration(RETIRED_ANONYMOUS_DRAFT_ID);
+        expect(anchored?.expiresAt).toBe(fullWindow);
+
+        now = flipInstant + 75 * DAY_MS;
+        await db.recordDraftVisit(RETIRED_ANONYMOUS_DRAFT_ID);
+        expect((await db.findDraftForModeration(RETIRED_ANONYMOUS_DRAFT_ID))?.expiresAt).toBe(
+          fullWindow
+        );
+      } finally {
+        await harness.close();
+      }
+    });
+
+    it("refuses to drop a sentinel whose token still names history", async () => {
+      const harness = await createHarness();
+
+      try {
+        await harness.resetToDeployedSchema();
+        const db = harness.openDb({ clock: () => RETENTION_EPOCH });
+        await db.initialize(randomToken());
+        await harness.seedRetiredAnonymousSentinel({ withOrphanHistory: true });
+
+        const outcome = await db.applyGoPublicFlip({ reHomeApiTokenIds: [] });
+
+        // Not a refusal of the whole flip — the surgery lands, and only the
+        // drop waits. Postgres' foreign key would otherwise have failed the
+        // delete as a constraint error with nothing an operator can act on.
+        expect(outcome.anonymousSentinel).toMatchObject({
+          disposition: "retained_history_present",
+          draftCount: 0
+        });
+        expect(outcome.after.anonymousSentinel.tokenPresent).toBe(true);
+        expect(outcome.reArmedDraftCount).toBeGreaterThan(0);
+      } finally {
+        await harness.close();
+      }
+    });
+
+    it("counts the admin token's live drafts like every other token's", async () => {
+      const harness = await createHarness();
+      let now = RETENTION_EPOCH;
+
+      try {
+        const flip = await flipFixture(harness, () => now);
+        now = RETENTION_EPOCH + 40 * DAY_MS;
+
+        const outcome = await flip.db.applyGoPublicFlip({
+          reHomeApiTokenIds: flip.teammates.map((teammate) => teammate.id)
+        });
+
+        // The uniformity the flip has to establish, read straight back: the
+        // bootstrap admin token appears in the tally with a count like anyone
+        // else's, because there is no exemption anywhere to find.
+        const admin = outcome.after.liveDraftTallies.find(
+          (tally) => tally.apiTokenId === BOOTSTRAP_API_TOKEN_ID
+        );
+        expect(admin).toMatchObject({ admin: true, liveDraftCount: 1 });
+        expect(await flip.db.countLiveDraftsByCreatorApiToken(BOOTSTRAP_API_TOKEN_ID)).toBe(1);
+
+        // And every teammate is in the same list on the same terms.
+        for (const teammate of flip.teammates) {
+          expect(
+            outcome.after.liveDraftTallies.find((tally) => tally.apiTokenId === teammate.id)
+          ).toMatchObject({ admin: false, liveDraftCount: 1 });
+        }
+      } finally {
+        await harness.close();
+      }
+    });
+
+    it("re-reports an already re-homed token without moving it a second time", async () => {
+      const harness = await createHarness();
+      let now = RETENTION_EPOCH;
+
+      try {
+        const flip = await flipFixture(harness, () => now);
+        now = RETENTION_EPOCH + 40 * DAY_MS;
+
+        const first = await flip.db.applyGoPublicFlip({
+          reHomeApiTokenIds: flip.teammates.map((teammate) => teammate.id)
+        });
+        const second = await flip.db.applyGoPublicFlip({
+          reHomeApiTokenIds: flip.teammates.map((teammate) => teammate.id)
+        });
+
+        expect(second.reHomed.map((entry) => entry.alreadyReHomed)).toEqual([true, true, true]);
+        expect(second.reHomed.map((entry) => entry.principalId)).toEqual(
+          first.reHomed.map((entry) => entry.principalId)
+        );
+
+        // The legacy token has always been alone on a principal that is not the
+        // bootstrap one, which is the same structural state a re-home produces.
+        const legacy = await flip.db.applyGoPublicFlip({
+          reHomeApiTokenIds: [LEGACY_API_TOKEN_ID]
+        });
+        expect(legacy.reHomed).toEqual([
+          {
+            apiTokenId: LEGACY_API_TOKEN_ID,
+            apiTokenName: "Legacy API Token",
+            principalId: LEGACY_ACCOUNT_ID,
+            alreadyReHomed: true
+          }
+        ]);
+      } finally {
+        await harness.close();
+      }
+    });
+
+    it("refuses a flip it cannot make safely, and writes nothing when it does", async () => {
+      const harness = await createHarness();
+
+      try {
+        const flip = await flipFixture(harness, () => RETENTION_EPOCH);
+        // A second token on the legacy principal, so that principal is neither
+        // the bootstrap one nor 1:1 — the state the flip cannot read as either
+        // "not yet re-homed" or "already re-homed".
+        await flip.db.createApiToken({
+          accountId: LEGACY_ACCOUNT_ID,
+          name: "Legacy second token",
+          token: randomToken(),
+          scopes: ["upload"]
+        });
+        const anchorsBefore = await flip.db.inspectGoPublicFlip();
+
+        for (const [reHomeApiTokenIds, code] of [
+          [["tok_no_such_token"], "rehome_target_unknown"],
+          [[BOOTSTRAP_API_TOKEN_ID], "rehome_target_is_bootstrap_token"],
+          [[flip.secondAdminToken.id], "rehome_target_has_admin_scope"],
+          [[LEGACY_API_TOKEN_ID], "rehome_target_principal_shared"]
+        ] as const) {
+          const refusal = await flip.db
+            .applyGoPublicFlip({ reHomeApiTokenIds: [...reHomeApiTokenIds] })
+            .then(
+              () => null,
+              (error: unknown) => error
+            );
+          expect(isGoPublicFlipPreconditionError(refusal)).toBe(true);
+          expect(refusal).toMatchObject({ code });
+        }
+
+        // A pin is the fourth refusal, and the one that says the welcome draft
+        // is not the first pin after all.
+        expect(await flip.db.setDraftPinned(flip.teammateDraftIds[0], true)).toBe(true);
+        const pinned = await flip.db.applyGoPublicFlip({ reHomeApiTokenIds: [] }).then(
+          () => null,
+          (error: unknown) => error
+        );
+        expect(pinned).toMatchObject({ code: "draft_already_pinned" });
+        expect((pinned as Error).message).toContain(flip.teammateDraftIds[0]);
+        expect(await flip.db.setDraftPinned(flip.teammateDraftIds[0], false)).toBe(true);
+
+        // Nothing above wrote: every anchor, principal and tally is untouched.
+        const anchorsAfter = await flip.db.inspectGoPublicFlip();
+        expect(anchorsAfter).toEqual(anchorsBefore);
+      } finally {
+        await harness.close();
+      }
+    });
+
+    it("refuses to flip a database that is not at the current schema", async () => {
+      const harness = await createHarness();
+
+      try {
+        // Rows at the current schema, ledger wound back — the shape a Postgres
+        // database is in between a deploy that added a migration and the run
+        // that applies it. The handle carries the same truncated list, so
+        // nothing brings the ledger back up to date behind the flip's back;
+        // that matters for the JSON driver, which migrates on every read.
+        await flipFixture(harness, () => RETENTION_EPOCH);
+        await harness.setAppliedLedger(SCHEMA_MIGRATION_IDS.slice(0, 1));
+        const behind = harness.openDb({ migrations: SCHEMA_MIGRATIONS.slice(0, 1) });
+
+        const refusal = await behind.applyGoPublicFlip({ reHomeApiTokenIds: [] }).then(
+          () => null,
+          (error: unknown) => error
+        );
+        expect(refusal).toMatchObject({ code: "migrations_pending" });
+        expect((refusal as Error).message).toContain(SCHEMA_MIGRATION_IDS[1]);
+      } finally {
+        await harness.close();
+      }
+    });
   });
+
+  /**
+   * The instance as it stands the moment before the flip: the operator's
+   * bootstrap principal holding the admin token, two upload tokens of the
+   * operator's own and three teammates', with a draft apiece — plus the legacy
+   * principal and draft the reset leaves behind, standing in for the pre-flip
+   * history none of this touches.
+   */
+  async function flipFixture(
+    harness: ContractHarness,
+    clock: () => number
+  ): Promise<{
+    db: PatchPageDb;
+    teammates: ApiTokenAuth[];
+    teammateTokens: string[];
+    teammateDraftIds: string[];
+    operatorUploadTokens: ApiTokenAuth[];
+    adminUploadToken: ApiTokenAuth;
+    secondAdminToken: ApiTokenAuth;
+    draftsInServiceCount: number;
+  }> {
+    await harness.resetToDeployedSchema();
+    const bootstrapToken = randomToken();
+    const db = harness.openDb({ clock });
+    await db.initialize(bootstrapToken);
+
+    const adminUploadToken = await db.findApiTokenByToken(bootstrapToken);
+    if (!adminUploadToken) throw new Error("Expected bootstrap authentication.");
+
+    const issue = async (
+      name: string,
+      scopes: string[] = ["upload"]
+    ): Promise<[ApiTokenAuth, string]> => {
+      const token = randomToken();
+      await db.createApiToken({
+        accountId: BOOTSTRAP_PRINCIPAL_ID,
+        name,
+        token,
+        scopes
+      });
+      const auth = await db.findApiTokenByToken(token);
+      if (!auth) throw new Error(`Expected authentication for ${name}.`);
+      return [auth, token];
+    };
+
+    const teammates: ApiTokenAuth[] = [];
+    const teammateTokens: string[] = [];
+    const teammateDraftIds: string[] = [];
+    for (const name of ["Teammate one", "Teammate two", "Teammate three"]) {
+      const [auth, token] = await issue(name);
+      teammates.push(auth);
+      teammateTokens.push(token);
+      const draftId = newDraftId();
+      await db.recordUpload(uploadInput("create", draftId, auth));
+      teammateDraftIds.push(draftId);
+    }
+
+    const operatorUploadTokens: ApiTokenAuth[] = [];
+    for (const name of ["Operator laptop", "Operator CI"]) {
+      const [auth] = await issue(name);
+      operatorUploadTokens.push(auth);
+    }
+
+    // A second admin-scoped token, so the admin-scope refusal is reachable
+    // without going through the bootstrap token, which a different refusal
+    // catches first.
+    const [secondAdminToken] = await issue("Operator admin spare", ["admin", "upload"]);
+
+    // One draft from the admin token itself, so the quota tally has an admin
+    // line to show is counted like any other.
+    await db.recordUpload(uploadInput("create", newDraftId(), adminUploadToken));
+
+    // The legacy draft the reset leaves, three teammate drafts, one admin draft.
+    return {
+      db,
+      teammates,
+      teammateTokens,
+      teammateDraftIds,
+      operatorUploadTokens,
+      adminUploadToken,
+      secondAdminToken,
+      draftsInServiceCount: 5
+    };
+  }
 }
 
 describeUploadContract("JSON", createJsonHarness);
@@ -1605,6 +2108,21 @@ async function createJsonHarness(): Promise<ContractHarness> {
       stored.schemaMigrations = [...ids];
       await writeFile(filePath, `${JSON.stringify(stored, null, 2)}\n`, "utf8");
     },
+    async seedRetiredAnonymousSentinel(options = {}) {
+      const stored = JSON.parse(await readFile(filePath, "utf8")) as Record<string, unknown[]>;
+      const sentinel = retiredAnonymousSentinelJsonRows();
+      stored.accounts.push(sentinel.account);
+      stored.apiTokens.push(sentinel.apiToken);
+      if (options.withDraft) {
+        const owned = retiredAnonymousDraftJsonRows();
+        stored.drafts.push(owned.draft);
+        stored.draftVersions.push(owned.version);
+      }
+      if (options.withOrphanHistory) {
+        stored.uploadEvents.push(retiredAnonymousOrphanHistoryJsonRow());
+      }
+      await writeFile(filePath, `${JSON.stringify(stored, null, 2)}\n`, "utf8");
+    },
     async revertProbeMigrations() {
       // The temporary state file is discarded wholesale on close.
     },
@@ -1659,6 +2177,13 @@ async function createPostgresHarness(connectionString: string): Promise<Contract
       await runSql("DELETE FROM schema_migrations WHERE NOT (id = ANY($1::text[]))", [
         [...ids]
       ]);
+    },
+    async seedRetiredAnonymousSentinel(options = {}) {
+      await runSql(SEED_RETIRED_ANONYMOUS_SENTINEL_SQL);
+      if (options.withDraft) await runSql(SEED_RETIRED_ANONYMOUS_DRAFT_SQL);
+      if (options.withOrphanHistory) {
+        await runSql(SEED_RETIRED_ANONYMOUS_ORPHAN_HISTORY_SQL);
+      }
     },
     async revertProbeMigrations() {
       await runSql(REVERT_PROBE_MIGRATIONS_SQL);
