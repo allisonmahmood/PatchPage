@@ -28,6 +28,9 @@ interface TrustedProxyRange {
  */
 export const ACCEPTABLE_USE_URL = "https://patchyhq.com/acceptable-use";
 
+/** Where server-side analytics report when an instance configures a key but no host. */
+const DEFAULT_POSTHOG_HOST = "https://us.i.posthog.com";
+
 /**
  * Environment variables retired by the trust-model cutover, each mapped to the
  * successor that replaces it. Setting a retired variable is a hard startup
@@ -64,6 +67,14 @@ export interface ServerConfig {
    * every create, so it survives a restart — unlike the per-minute limiters.
    */
   liveDraftsPerToken: number;
+  /**
+   * The PostHog project key server-side analytics reports under, or `null` when
+   * the instance reports nothing. Unset is the default and the private-instance
+   * posture: no key, no capture, no client.
+   */
+  posthogApiKey: string | null;
+  /** Where capture requests go. Only read when a key is configured. */
+  posthogHost: string;
   dbDriver: "postgres" | "json";
   databaseUrl: string | null;
   jsonDbFile: string;
@@ -123,6 +134,12 @@ export function getServerConfig(env: NodeJS.ProcessEnv = process.env): ServerCon
       env.PATCHPAGE_LIVE_DRAFTS_PER_TOKEN,
       1_000,
       MAX_LIVE_DRAFTS_PER_TOKEN
+    ),
+    posthogApiKey: stringValue(env.PATCHPAGE_POSTHOG_API_KEY),
+    posthogHost: httpUrlValue(
+      "PATCHPAGE_POSTHOG_HOST",
+      env.PATCHPAGE_POSTHOG_HOST,
+      DEFAULT_POSTHOG_HOST
     ),
     dbDriver,
     databaseUrl,
@@ -344,6 +361,27 @@ function boundedIntegerValue(
     );
   }
   return Number(trimmed);
+}
+
+/**
+ * A URL the server will send requests to. Validated rather than passed through
+ * because a typo here is silent: analytics that go nowhere look exactly like
+ * analytics that are switched off.
+ */
+function httpUrlValue(name: string, value: string | undefined, fallback: string): string {
+  const trimmed = stringValue(value);
+  if (!trimmed) return fallback;
+
+  let parsed: URL;
+  try {
+    parsed = new URL(trimmed);
+  } catch {
+    throw new Error(`${name} must be an http or https URL, received: ${value}`);
+  }
+  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+    throw new Error(`${name} must be an http or https URL, received: ${value}`);
+  }
+  return trimmed;
 }
 
 function strictBoolValue(

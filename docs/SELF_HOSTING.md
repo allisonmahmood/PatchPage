@@ -203,6 +203,11 @@ PATCHPAGE_SELF_SERVICE_MINTS_PER_IP_PER_DAY=5
 # PATCHPAGE_ALLOW_SELF_SERVICE_TOKENS and
 # PATCHPAGE_SELF_SERVICE_MINT_RATE_LIMIT_PER_MINUTE instead.
 
+# Server-side analytics. Unset means off: no key, no capture, no client.
+PATCHPAGE_POSTHOG_API_KEY=
+# Defaults to https://us.i.posthog.com. Only read when a key is set.
+PATCHPAGE_POSTHOG_HOST=https://us.i.posthog.com
+
 # Metadata store: "postgres" or "json"
 # Defaults to "postgres" if DATABASE_URL is set, otherwise "json".
 PATCHPAGE_DB_DRIVER=postgres
@@ -235,6 +240,7 @@ Notes on values:
 - `PATCHPAGE_LIVE_DRAFTS_PER_TOKEN` is a decimal integer from `1` through `1000000` and defaults to `1000`. See [Per-token draft quotas](#per-token-draft-quotas).
 - `PATCHPAGE_ALLOW_SELF_SERVICE_TOKENS` is a strict `true`/`false` value and defaults to `false`. It gates the self-service mint route (`POST /api/tokens/self-service`) and nothing else; while it is `false` that route refuses every caller and your instance keeps its admin-only token posture. It never admits an upload that carries no bearer token. See [Self-service minting](#self-service-minting).
 - `PATCHPAGE_SELF_SERVICE_MINTS_PER_IP_PER_DAY` is a decimal integer from `1` through `1000000` and defaults to `5`. It applies only while self-service minting is on.
+- `PATCHPAGE_POSTHOG_API_KEY` and `PATCHPAGE_POSTHOG_HOST` configure server-side analytics. Leave the key unset — the default — and your instance reports nothing at all. See [Server-side analytics](#server-side-analytics).
 - `PATCHPAGE_ALLOW_ANONYMOUS_UPLOADS` and `PATCHPAGE_ANONYMOUS_CREATE_RATE_LIMIT_PER_MINUTE` are retired. Setting either one fails server startup with an error naming its replacement; neither is silently ignored, so a deliberate posture is never dropped on upgrade.
 - Uploads are authenticated on every path. A missing bearer token, and any malformed, invalid, revoked, or insufficiently scoped credential, is an authentication or authorization failure with no unauthenticated fallback.
 - When running from source, the `json` metadata driver and `filesystem` storage driver write under `.local/` by default. The supported image overrides those path defaults to `/data` as shown above. Both modes need no external services and suit a quick or single-instance self-host. For a durable multi-instance deployment, use `postgres` and a shared object store (`azure-blob`).
@@ -314,6 +320,29 @@ Both key on the canonical Fastify `request.ip`, which follows `PATCHPAGE_TRUST_P
 A self-service token's drafts are ordinary drafts in every respect that matters to the guardrails above: they carry the same retention clock, are swept on the same terms, and count against the same [per-token draft quota](#per-token-draft-quotas). Minting creates no exemption from anything.
 
 Turning the flag back off stops new mints; it does not revoke tokens already minted or remove the drafts they own.
+
+### Server-side analytics
+
+Off by default. Leave `PATCHPAGE_POSTHOG_API_KEY` unset and your instance builds no analytics client, opens no connection, and reports nothing — this is the private-instance posture and nothing else in the server changes with it.
+
+Setting a key turns on capture for seven business events, and only those seven:
+
+| Event | When | Properties |
+| --- | --- | --- |
+| `token.minted` | A self-service mint succeeds | `apiTokenId`, `selfService` |
+| `draft.created` | An upload creates a draft | `draftId`, `apiTokenId`, `versionNumber`, `htmlBytes` |
+| `draft.updated` | An upload adds a version | `draftId`, `apiTokenId`, `versionNumber`, `htmlBytes` |
+| `draft.reported` | A reader files a report | `draftId`, `reasonGiven` |
+| `draft.disabled` | A draft is disabled | `draftId`, `admin` |
+| `draft.deleted` | A draft is deleted | `draftId`, `admin` |
+| `draft.expired` | The expiry sweep takes a draft | `draftId`, `versionsRemoved` |
+
+Two properties of this are load-bearing rather than incidental:
+
+- **Readers stay unwatched.** Serving a draft is deliberately not an event. No analytics JavaScript is ever added to a served page — the draft content security policy permits no script source of any kind — no cookie is set, and no event carries a source address, the sentence a reader typed into a report, page content, a filename, or a URL. Events are attributed to the principal that acted; the ones no principal performed are attributed to the instance.
+- **Capture never affects a response.** Events are handed off without being awaited, capture failures are swallowed and logged, and requests to the analytics backend time out in three seconds. An analytics outage is invisible to everyone publishing or reading.
+
+`PATCHPAGE_POSTHOG_HOST` points capture somewhere other than the default `https://us.i.posthog.com` — PostHog's EU cloud, or a self-hosted PostHog. It must be an `http` or `https` URL; a malformed one fails startup rather than silently discarding every event.
 
 ### JSON metadata durability
 

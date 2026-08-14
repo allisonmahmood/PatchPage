@@ -3482,6 +3482,8 @@ function testConfig(): ServerConfig {
     selfServiceMintsPerIpPerDay: 5,
     draftCreateRateLimitPerMinute: 10,
     liveDraftsPerToken: 1_000,
+    posthogApiKey: null,
+    posthogHost: "https://us.i.posthog.com",
     dbDriver: "json",
     databaseUrl: null,
     jsonDbFile: path.join(tempDir, "db.json"),

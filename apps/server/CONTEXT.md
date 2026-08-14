@@ -60,6 +60,10 @@ _Avoid_: takedown request (a report may lead to a takedown; it is not one)
 A fixed promise about how a published draft reaches its reader, binding on every served response. There are four, and they hold together: pages are **share-a-link-never-be-found** (`X-Robots-Tag: noindex` keeps them out of search results, and that is the only measure taken against discovery); readers are **unwatched** (no cookies, no auth or session on the serving host, a fully locked CSP with no script sources and so no analytics JavaScript); draft URLs are **open to machines** — never bot-blocked, challenged, or put behind a WAF human-check, because an agent handed a pasted link must be able to fetch it; and caching is **keyed to URL shape** — a version URL names content that can never change, so it is cached for a year and marked immutable, while the latest-draft URL follows the draft and gets a short window that lets an update land on its own. Everything else, API routes included, stays `no-store`. A cache lifetime is never coupled to a CDN purge API: the window expiring is the only invalidation there is.
 _Avoid_: hardening, bot protection (the serving surface is deliberately open to machines), private (unlisted is not private)
 
+**Analytics event**:
+One business moment the instance reports to itself: a token minted, a draft created, updated, reported, disabled, deleted, or expired. Server-side and nothing else — a served draft carries no analytics JavaScript, so a **visit is never one**, and no event carries a reader's address, the sentence they typed, page content, a filename, or a URL. Reporting is fire-and-forget: a failure is a line in the log and no difference at all to the response. An instance with no key configured reports nothing, which is the default and the private-instance posture.
+_Avoid_: telemetry, tracking, pageview, metric (an analytics event names what happened in the domain, not what the process measured)
+
 **Circuit breaker**:
 The spend threshold beyond which the instance is no longer willing to operate. Crossing it fires the kill switch automatically; no human confirms first.
 _Avoid_: budget alert (an alert informs; the breaker acts)

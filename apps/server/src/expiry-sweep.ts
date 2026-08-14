@@ -1,5 +1,6 @@
 import type { PatchPageDb } from "@patchpage/db";
 import type { HtmlStorage } from "@patchpage/storage";
+import type { Analytics } from "./analytics.js";
 
 /**
  * The expiry sweep — the job that makes draft expiry real.
@@ -50,6 +51,11 @@ export interface ExpirySweepLog {
 export interface ExpirySweepOptions {
   db: PatchPageDb;
   storage: HtmlStorage;
+  /**
+   * Where a taken draft is reported. Left out, the sweep reports nothing and
+   * behaves exactly as it did.
+   */
+  analytics?: Analytics;
   log?: ExpirySweepLog;
 }
 
@@ -126,6 +132,14 @@ async function sweepDraft(
   }
 
   result.deleted += 1;
+  // Reported once the record is gone, which is the moment the draft stops
+  // existing. No principal performed it — the clock ran out.
+  options.analytics?.capture({
+    name: "draft.expired",
+    principalId: null,
+    properties: { draftId, versionsRemoved: objectKeys.length }
+  });
+
   for (const objectKey of objectKeys) {
     try {
       await options.storage.deleteHtmlObject(objectKey);

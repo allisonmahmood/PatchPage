@@ -1,6 +1,7 @@
 import { getServerConfig } from "@patchpage/config";
 import { createPatchPageDb } from "@patchpage/db";
 import { createHtmlStorage } from "@patchpage/storage";
+import { createAnalytics } from "./analytics.js";
 import { createApp } from "./app.js";
 
 const config = getServerConfig();
@@ -19,7 +20,17 @@ const storage = createHtmlStorage({
 
 await db.initialize(config.bootstrapApiToken);
 
-const app = createApp({ config, db, storage });
+// Reports nothing unless a key is configured, which is what a private instance
+// runs with.
+const analytics = createAnalytics(config, {
+  log: {
+    warn: (details, message) => {
+      console.warn(message, details);
+    }
+  }
+});
+
+const app = createApp({ config, db, storage, analytics });
 
 /**
  * How often the expiry sweep runs. Nothing depends on the exact period: a
@@ -43,6 +54,9 @@ expirySweepTimer.unref();
 const shutdown = async (): Promise<void> => {
   clearInterval(expirySweepTimer);
   await app.close();
+  // Last, and bounded by its own timeout: whatever is still queued gets one
+  // chance to go out, and a slow analytics backend never holds the shutdown.
+  await analytics.shutdown();
   await db.close();
 };
 
