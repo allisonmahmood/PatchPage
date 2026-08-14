@@ -2036,6 +2036,130 @@ describe("PatchPage server", () => {
 
     await served.close();
   });
+
+  it("stops serving and stops updating a draft once its retention clock runs out", async () => {
+    const clocked = await createClockedApp("expiry");
+
+    try {
+      const draftId = await publishDraft(clocked.app, "Ninety day page");
+
+      // A visit this early tops up nothing, so the clock still ends at day 90.
+      clocked.advanceDays(1);
+      const early = await clocked.app.inject({ method: "GET", url: `/d/${draftId}` });
+      expect(early.statusCode).toBe(200);
+      expect(early.body).toContain("Ninety day page");
+
+      clocked.advanceDays(90);
+      for (const url of [`/d/${draftId}`, `/d/${draftId}/v/1`]) {
+        const gone = await clocked.app.inject({ method: "GET", url });
+        expect(gone.statusCode).toBe(404);
+        expect(gone.headers["content-type"]).toContain("text/html");
+        expect(gone.body).not.toContain("Ninety day page");
+
+        // An expired draft's 404 is an ordinary draft-URL 404 and carries the
+        // same serving guarantees: still noindexed, and never cached — the page
+        // it replaced was cacheable, and this must not inherit that.
+        expect(gone.headers["x-robots-tag"]).toBe("noindex");
+        expect(gone.headers["cache-control"]).toBe("no-store");
+        expect(gone.headers["set-cookie"]).toBeUndefined();
+      }
+
+      const update = await clocked.app.inject({
+        method: "POST",
+        url: "/api/uploads",
+        headers: { authorization: "Bearer dev-token" },
+        payload: {
+          draftId,
+          html: "<!doctype html><html><head><title>Too late</title></head><body></body></html>"
+        }
+      });
+      expect(update.statusCode).toBe(404);
+      expect(update.json()).toEqual({ ok: false, error: "Draft not found." });
+    } finally {
+      await clocked.close();
+    }
+  });
+
+  it("keeps a visited draft alive, and lets it go once the visits stop", async () => {
+    const clocked = await createClockedApp("visit-topup");
+
+    try {
+      const draftId = await publishDraft(clocked.app, "Still visited");
+
+      // Ten days left on the upload's window: this visit tops it up to thirty.
+      clocked.advanceDays(80);
+      const inWindow = await clocked.app.inject({ method: "GET", url: `/d/${draftId}` });
+      expect(inWindow.statusCode).toBe(200);
+
+      // Day 95 — past where the upload alone would have ended it. The page is
+      // still here because it was visited, and this visit extends it again.
+      clocked.advanceDays(15);
+      const extended = await clocked.app.inject({ method: "GET", url: `/d/${draftId}` });
+      expect(extended.statusCode).toBe(200);
+      expect(extended.body).toContain("Still visited");
+
+      // Thirty-one days without a visit, and it is gone.
+      clocked.advanceDays(31);
+      const abandoned = await clocked.app.inject({ method: "GET", url: `/d/${draftId}` });
+      expect(abandoned.statusCode).toBe(404);
+    } finally {
+      await clocked.close();
+    }
+  });
+
+  it("serves a draft whose visit top-up write fails, without moving its clock", async () => {
+    const clocked = await createClockedApp(
+      "visit-write-failure",
+      (file, clock) => new VisitFailingJsonDb(file, { clock })
+    );
+
+    try {
+      const draftId = await publishDraft(clocked.app, "Survives a failed top-up");
+
+      // Ten days left, so this visit is one the clock would move — and the
+      // write throws. The reader still gets the page.
+      clocked.advanceDays(80);
+      const served = await clocked.app.inject({ method: "GET", url: `/d/${draftId}` });
+      expect(served.statusCode).toBe(200);
+      expect(served.body).toContain("Survives a failed top-up");
+
+      // Best-effort means exactly that: the page was served and the clock
+      // genuinely did not move, so the original window still ends it.
+      clocked.advanceDays(11);
+      const expired = await clocked.app.inject({ method: "GET", url: `/d/${draftId}` });
+      expect(expired.statusCode).toBe(404);
+    } finally {
+      await clocked.close();
+    }
+  });
+
+  it("restarts the whole window when a new version is published", async () => {
+    const clocked = await createClockedApp("upload-reset");
+
+    try {
+      const draftId = await publishDraft(clocked.app, "First cut");
+
+      clocked.advanceDays(80);
+      const republish = await clocked.app.inject({
+        method: "POST",
+        url: "/api/uploads",
+        headers: { authorization: "Bearer dev-token" },
+        payload: {
+          draftId,
+          html: "<!doctype html><html><head><title>Second cut</title></head><body></body></html>"
+        }
+      });
+      expect(republish.statusCode).toBe(200);
+
+      // Day 100: past the first window, well inside the one the update opened.
+      clocked.advanceDays(20);
+      const served = await clocked.app.inject({ method: "GET", url: `/d/${draftId}` });
+      expect(served.statusCode).toBe(200);
+      expect(served.body).toContain("Second cut");
+    } finally {
+      await clocked.close();
+    }
+  });
 });
 
 interface ServedDraft {
@@ -2363,6 +2487,66 @@ type ScopedTokenApp = {
   app: ReturnType<typeof createApp>;
   db: JsonFilePatchPageDb;
 };
+
+type ClockedApp = {
+  app: ReturnType<typeof createApp>;
+  advanceDays(days: number): void;
+  close(): Promise<void>;
+};
+
+const DAY_MS = 24 * 60 * 60 * 1000;
+
+/**
+ * An app whose clock can be wound forward months. The database gets the *same*
+ * clock: the retention clock is the database's, so an app-only clock would move
+ * the rate limiters and nothing else.
+ */
+async function createClockedApp(
+  label: string,
+  openDb: (file: string, clock: () => number) => JsonFilePatchPageDb = (file, clock) =>
+    new JsonFilePatchPageDb(file, { clock })
+): Promise<ClockedApp> {
+  let now = Date.UTC(2026, 0, 1);
+  const clock = (): number => now;
+  const db = openDb(path.join(tempDir, `${label}-db.json`), clock);
+  await db.initialize("dev-token");
+  const storage = new FileSystemHtmlStorage(path.join(tempDir, `${label}-drafts`));
+  const app = createApp({ config: testConfig(), db, storage, clock });
+
+  return {
+    app,
+    advanceDays(days) {
+      now += days * DAY_MS;
+    },
+    async close() {
+      await app.close();
+      await db.close();
+    }
+  };
+}
+
+async function publishDraft(
+  app: ReturnType<typeof createApp>,
+  title: string
+): Promise<string> {
+  const upload = await app.inject({
+    method: "POST",
+    url: "/api/uploads",
+    headers: { authorization: "Bearer dev-token" },
+    payload: {
+      html: `<!doctype html><html><head><title>${title}</title></head><body></body></html>`
+    }
+  });
+  expect(upload.statusCode).toBe(201);
+  return (upload.json() as { draftId: string }).draftId;
+}
+
+/** A store that can serve a draft but cannot record the visit that follows. */
+class VisitFailingJsonDb extends JsonFilePatchPageDb {
+  override async recordDraftVisit(): Promise<void> {
+    throw new Error("Forced visit top-up failure.");
+  }
+}
 
 function testConfig(): ServerConfig {
   return {

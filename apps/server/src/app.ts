@@ -363,6 +363,25 @@ async function renderDraft(
   }
 
   const html = await options.storage.getHtmlObject(version.objectKey);
+  // The page is real and already fetched, so this is a visit — the thing that
+  // keeps a draft people still visit from ageing out. The database decides
+  // whether the clock actually moves and writes nothing when it does not.
+  //
+  // Best-effort on purpose: this is a read path, and a reader who is one header
+  // away from their page should get it even if the top-up write fails. Losing a
+  // clock extension costs at most some retention; turning a fetched page into a
+  // 500 costs the reader the page itself.
+  //
+  // Only requests that reach the server are visits, and the cache headers below
+  // mean repeat reads inside the latest URL's window may not. That undercount is
+  // harmless: topping up needs one visit somewhere in the final stretch of a
+  // 30-day window, not a true read count — this is a retention clock, not
+  // analytics.
+  try {
+    await options.db.recordDraftVisit(draft.id);
+  } catch (error) {
+    reply.log.warn({ err: error, draftId: draft.id }, "Draft visit top-up failed.");
+  }
   reply.header("Content-Security-Policy", DRAFT_CONTENT_SECURITY_POLICY);
   reply.header("Cache-Control", servedDraftCacheControl(versionNumber));
   return reply.type("text/html").send(

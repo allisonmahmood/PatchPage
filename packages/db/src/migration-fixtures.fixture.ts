@@ -151,6 +151,8 @@ export function deployedJsonStateFixture(
     disabledAt: null,
     disabledReason: null
   };
+  // No `expiresAt`: a deployed state predates the retention clock, and the
+  // backfill in `0003_drafts_expiry_columns` is what makes it readable again.
   if (omitDraftField) delete draft[omitDraftField];
 
   return {

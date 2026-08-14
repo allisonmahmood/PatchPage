@@ -5,20 +5,45 @@ deployed instances and `json` for a single-file store. Both implement the same
 `PatchPageDb` port and are held to the same driver-parametrized contract suite
 in `src/upload-contract.test.ts`.
 
+## The retention clock
+
+Every draft carries one expiry anchor, `expiresAt`, and `src/retention.ts` owns
+the three rules that act on it: an upload restarts the full window, a visit tops
+the remaining time up to the visit window when less than that remains, and a
+draft is expired the moment `expiresAt` is past. Expired drafts are absent from
+`findDraftVersion` and refused as update targets, exactly as deleted and disabled
+ones are — the row itself stays until a sweep removes it.
+
+Both drivers answer to those functions, and the contract suite is what holds them
+to the same answers; the Postgres driver restates the visit rule as one SQL
+predicate rather than reading the row first.
+
+The clock is `DbDriverOptions.clock` — epoch milliseconds, `Date.now` by default,
+the same shape `createApp` and the rate limiters take. **A test that winds time
+forward must give the app and its database the same clock function.** Passing one
+only to `createApp` moves the rate limiters and leaves retention on wall time,
+which looks like the clock working and proves nothing.
+
 ## Schema migrations
 
 One ordered list in `src/migrations.ts` — `SCHEMA_MIGRATIONS` — is the schema for
-both drivers. Each entry has an ID and an optional step per driver:
+both drivers. Each entry has an ID and an optional step per driver, as
+`0003_drafts_expiry_columns` does for the retention clock's anchor:
 
 ```ts
 {
   id: "0003_drafts_expiry_columns",
-  postgres: `ALTER TABLE drafts ADD COLUMN IF NOT EXISTS expires_at TIMESTAMPTZ;`,
+  postgres: `ALTER TABLE drafts ADD COLUMN IF NOT EXISTS expires_at TIMESTAMPTZ; /* … */`,
   json(state) {
     /* default-fill `expiresAt` on every stored draft row */
   }
 }
 ```
+
+Read that one before writing a new column migration: it is the shipped worked
+example of an additive column with a backfill, and its Postgres step shows the
+whole additive sequence — add the column, backfill every existing row, only then
+constrain it.
 
 Both drivers keep a ledger of applied IDs — the `schema_migrations` table, the
 `schemaMigrations` array in the state file — so a migration runs once and
@@ -32,13 +57,13 @@ the bootstrap token). Seeding is not a migration: it re-runs on every startup an
 must stay idempotent.
 
 Two objects are easy to confuse, so they are named here. **`0002_drafts_account_id_index`
-is the shipped additive migration** — it ships permanently and is not superseded
-by the expiry columns; it exists because ownership lookups scan `drafts` by
-account. The **probe migrations in `src/migration-fixtures.fixture.ts` are
-test-only** and never ship: they exercise a column-level additive step on both
-drivers so the shipped schema needs no placeholder column. A later agent should
-not treat a probe as the pattern to copy for a real column — copy `0002` and the
-steps below.
+and `0003_drafts_expiry_columns` are the shipped additive migrations** — both
+ship permanently and neither supersedes the other; `0002` exists because
+ownership lookups scan `drafts` by account. The **probe migrations in
+`src/migration-fixtures.fixture.ts` are test-only** and never ship: they exercise
+a column-level additive step on both drivers without putting a placeholder column
+in the shipped schema. A later agent should not treat a probe as the pattern to
+copy for a real column — copy `0003` and the steps below.
 
 ### Postgres
 

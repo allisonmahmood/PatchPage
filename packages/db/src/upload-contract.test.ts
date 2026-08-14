@@ -32,6 +32,10 @@ import type {
 type UploadIntent = "create" | "update";
 type IntendedRecordUploadInput = RecordUploadInput & { intent: UploadIntent };
 
+const DAY_MS = 24 * 60 * 60 * 1000;
+/** Where the retention tests start their clock. Any fixed instant would do. */
+const RETENTION_EPOCH = Date.UTC(2026, 0, 1);
+
 interface ContractHarness {
   db: PatchPageDb;
   peerDb: PatchPageDb;
@@ -539,6 +543,242 @@ function describeUploadContract(
       }
     });
 
+    it("starts a full retention window on create and restarts it on every new version", async () => {
+      const harness = await createHarness();
+      const draftId = newDraftId();
+      let now = RETENTION_EPOCH;
+      const clocked = harness.openDb({ clock: () => now });
+
+      try {
+        await clocked.recordUpload(uploadInput("create", draftId, harness.auth));
+
+        now = RETENTION_EPOCH + 80 * DAY_MS;
+        await clocked.recordUpload(uploadInput("update", draftId, harness.auth));
+
+        // Past the window the create opened, inside the one the update opened.
+        now = RETENTION_EPOCH + 100 * DAY_MS;
+        expect((await clocked.findDraftVersion(draftId)).draft?.id).toBe(draftId);
+
+        now = RETENTION_EPOCH + 171 * DAY_MS;
+        expect((await clocked.findDraftVersion(draftId)).draft).toBeNull();
+      } finally {
+        await harness.close();
+      }
+    });
+
+    it("stops serving an expired draft and refuses it as an update target", async () => {
+      const harness = await createHarness();
+      const draftId = newDraftId();
+      let now = RETENTION_EPOCH;
+      const clocked = harness.openDb({ clock: () => now });
+
+      try {
+        await clocked.recordUpload(uploadInput("create", draftId, harness.auth));
+
+        now = RETENTION_EPOCH + 90 * DAY_MS - 1;
+        expect((await clocked.findDraftVersion(draftId)).version?.versionNumber).toBe(1);
+
+        now = RETENTION_EPOCH + 90 * DAY_MS + 1;
+        expect(await clocked.findDraftVersion(draftId)).toEqual({
+          draft: null,
+          version: null
+        });
+        expect(await clocked.findDraftVersion(draftId, 1)).toEqual({
+          draft: null,
+          version: null
+        });
+
+        const target = clocked.assertUploadTarget({
+          intent: "update",
+          draftId,
+          accountId: harness.auth.accountId
+        });
+        await expect(target).rejects.toMatchObject({
+          code: "draft_unavailable",
+          statusCode: 404
+        });
+
+        const update = await captureError(
+          clocked.recordUpload(uploadInput("update", draftId, harness.auth))
+        );
+        expect(isUploadTargetError(update)).toBe(true);
+        expect(update).toMatchObject({ code: "draft_unavailable", statusCode: 404 });
+
+        // Out of view is not out of the store — only the sweep frees the ID,
+        // so a create still collides with the row until then.
+        const recreated = await captureError(
+          clocked.recordUpload(uploadInput("create", draftId, harness.auth))
+        );
+        expect(recreated).toMatchObject({ code: "draft_conflict", statusCode: 409 });
+      } finally {
+        await harness.close();
+      }
+    });
+
+    it("serves a draft at the exact instant its clock reads out, and not past it", async () => {
+      const harness = await createHarness();
+      const draftId = newDraftId();
+      let now = RETENTION_EPOCH;
+      const clocked = harness.openDb({ clock: () => now });
+
+      try {
+        await clocked.recordUpload(uploadInput("create", draftId, harness.auth));
+
+        // The rule is `expiresAt < now`, so the anchor instant itself is still
+        // inside the window. A `<=` anywhere in either driver fails here.
+        now = RETENTION_EPOCH + 90 * DAY_MS;
+        expect((await clocked.findDraftVersion(draftId)).draft?.id).toBe(draftId);
+
+        now += 1;
+        expect((await clocked.findDraftVersion(draftId)).draft).toBeNull();
+      } finally {
+        await harness.close();
+      }
+    });
+
+    it("leaves the clock alone for a visit with exactly the visit window left", async () => {
+      const harness = await createHarness();
+      const draftId = newDraftId();
+      let now = RETENTION_EPOCH;
+      const clocked = harness.openDb({ clock: () => now });
+
+      try {
+        await clocked.recordUpload(uploadInput("create", draftId, harness.auth));
+
+        // Exactly the visit window remains. "Fewer than" is not met, so this is
+        // a no-op — and because a top-up here would land on the value already
+        // stored, the boundary is only visible as the write that never happens.
+        now = RETENTION_EPOCH + 60 * DAY_MS;
+        await clocked.recordDraftVisit(draftId);
+
+        now = RETENTION_EPOCH + 90 * DAY_MS;
+        expect((await clocked.findDraftVersion(draftId)).draft?.id).toBe(draftId);
+
+        now += 1;
+        expect((await clocked.findDraftVersion(draftId)).draft).toBeNull();
+      } finally {
+        await harness.close();
+      }
+    });
+
+    it("tops a visited draft up to the visit window when less than it remains", async () => {
+      const harness = await createHarness();
+      const draftId = newDraftId();
+      let now = RETENTION_EPOCH;
+      const clocked = harness.openDb({ clock: () => now });
+
+      try {
+        await clocked.recordUpload(uploadInput("create", draftId, harness.auth));
+
+        now = RETENTION_EPOCH + 70 * DAY_MS; // twenty days left
+        await clocked.recordDraftVisit(draftId);
+
+        now = RETENTION_EPOCH + 99 * DAY_MS; // past the window the upload opened
+        expect((await clocked.findDraftVersion(draftId)).draft?.id).toBe(draftId);
+
+        now = RETENTION_EPOCH + 101 * DAY_MS; // past the topped-up one
+        expect((await clocked.findDraftVersion(draftId)).draft).toBeNull();
+      } finally {
+        await harness.close();
+      }
+    });
+
+    it("leaves the clock untouched for a visit with more than the visit window left", async () => {
+      const harness = await createHarness();
+      const draftId = newDraftId();
+      let now = RETENTION_EPOCH;
+      const clocked = harness.openDb({ clock: () => now });
+
+      try {
+        await clocked.recordUpload(uploadInput("create", draftId, harness.auth));
+
+        now = RETENTION_EPOCH + 10 * DAY_MS; // eighty days left
+        await clocked.recordDraftVisit(draftId);
+
+        // Not shortened to the visit window...
+        now = RETENTION_EPOCH + 89 * DAY_MS;
+        expect((await clocked.findDraftVersion(draftId)).draft?.id).toBe(draftId);
+
+        // ...and not extended past the window the upload opened either.
+        now = RETENTION_EPOCH + 91 * DAY_MS;
+        expect((await clocked.findDraftVersion(draftId)).draft).toBeNull();
+      } finally {
+        await harness.close();
+      }
+    });
+
+    it("never revives an expired draft on a visit", async () => {
+      const harness = await createHarness();
+      const draftId = newDraftId();
+      let now = RETENTION_EPOCH;
+      const clocked = harness.openDb({ clock: () => now });
+
+      try {
+        await clocked.recordUpload(uploadInput("create", draftId, harness.auth));
+
+        now = RETENTION_EPOCH + 91 * DAY_MS;
+        await clocked.recordDraftVisit(draftId);
+        await clocked.recordDraftVisit(draftId);
+
+        expect((await clocked.findDraftVersion(draftId)).draft).toBeNull();
+        now = RETENTION_EPOCH + 92 * DAY_MS;
+        expect((await clocked.findDraftVersion(draftId)).draft).toBeNull();
+      } finally {
+        await harness.close();
+      }
+    });
+
+    it("accepts a visit to a draft nobody can be served as a no-op", async () => {
+      const harness = await createHarness();
+      const deletedDraftId = newDraftId();
+      const disabledDraftId = newDraftId();
+
+      try {
+        for (const draftId of [deletedDraftId, disabledDraftId]) {
+          await harness.db.recordUpload(uploadInput("create", draftId, harness.auth));
+        }
+        await harness.db.deleteDraft(deletedDraftId, harness.auth.accountId);
+        await harness.db.disableDraft(disabledDraftId, harness.auth.accountId, "policy");
+
+        for (const draftId of [deletedDraftId, disabledDraftId, newDraftId()]) {
+          await expect(harness.db.recordDraftVisit(draftId)).resolves.toBeUndefined();
+          expect((await harness.db.findDraftVersion(draftId)).draft).toBeNull();
+        }
+      } finally {
+        await harness.close();
+      }
+    });
+
+    it("leaves a draft migrated from before the retention clock a full window", async () => {
+      const harness = await createHarness();
+
+      try {
+        await harness.resetToDeployedSchema();
+
+        const migratedAt = Date.now();
+        const adopted = harness.openDb();
+        await adopted.initialize(null);
+
+        // The deploy expires nothing: a row written long before the clock
+        // existed still serves the moment the migration lands.
+        expect((await adopted.findDraftVersion(LEGACY_DRAFT_ID)).draft?.title).toBe(
+          "Legacy draft"
+        );
+
+        // And what it has ahead of it is a whole window, anchored at the
+        // migration rather than at whenever the row was last written.
+        let now = migratedAt;
+        const clocked = harness.openDb({ clock: () => now });
+        now = migratedAt + 89 * DAY_MS;
+        expect((await clocked.findDraftVersion(LEGACY_DRAFT_ID)).draft?.id).toBe(
+          LEGACY_DRAFT_ID
+        );
+        now = migratedAt + 91 * DAY_MS;
+        expect((await clocked.findDraftVersion(LEGACY_DRAFT_ID)).draft).toBeNull();
+      } finally {
+        await harness.close();
+      }
+    });
   });
 }
 
