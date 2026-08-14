@@ -118,6 +118,22 @@ export class JsonFilePatchPageDb implements PatchPageDb {
     });
   }
 
+  /**
+   * This driver's stamps all come from the injected clock, including the ones
+   * retention does not care about (`lastUsedAt`, `createdAt`, `disabledAt`,
+   * `deletedAt`), because they are computed in TypeScript right here.
+   *
+   * The Postgres driver stamps those same fields with SQL `now()` and only
+   * `expires_at` from the clock, because there they are column defaults and
+   * `SET x = now()` clauses. So the two drivers agree exactly where it counts —
+   * the retention anchor — and drift on the rest under a wound-forward clock.
+   * Production is wall-clock on both, so this shows up only in tests.
+   *
+   * Deliberate, and deliberately left alone: converging them means either
+   * spelling out every defaulted column in the Postgres INSERTs or giving up
+   * clock control here. Whoever changes one driver's non-retention stamps must
+   * change the other's in the same breath, or the drift becomes a real bug.
+   */
   private nowIso(): string {
     return new Date(this.clock()).toISOString();
   }

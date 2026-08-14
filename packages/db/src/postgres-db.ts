@@ -48,6 +48,14 @@ export class PostgresPatchPageDb implements PatchPageDb {
    * The retention clock's reading, as a value Postgres compares against
    * `expires_at`. Deliberately not SQL `now()`: the clock is injectable, and
    * `now()` would make the window untestable and drift from the JSON driver.
+   *
+   * Only `expires_at` is on this clock here. Every other stamp in this driver
+   * (`last_used_at`, `created_at`, `disabled_at`, `deleted_at`) stays on SQL
+   * `now()`, where it is a column default or a `SET x = now()` clause, while
+   * the JSON driver puts all of its stamps on the injected clock. See the note
+   * on `JsonFilePatchPageDb.nowIso` — the drivers agree on the retention anchor
+   * and drift on the rest under a wound-forward clock, which is deliberate.
+   * Do not "fix" one driver's non-retention stamps without the other's.
    */
   private nowIso(): string {
     return new Date(this.clock()).toISOString();

@@ -615,6 +615,52 @@ function describeUploadContract(
       }
     });
 
+    it("serves a draft at the exact instant its clock reads out, and not past it", async () => {
+      const harness = await createHarness();
+      const draftId = newDraftId();
+      let now = RETENTION_EPOCH;
+      const clocked = harness.openDb({ clock: () => now });
+
+      try {
+        await clocked.recordUpload(uploadInput("create", draftId, harness.auth));
+
+        // The rule is `expiresAt < now`, so the anchor instant itself is still
+        // inside the window. A `<=` anywhere in either driver fails here.
+        now = RETENTION_EPOCH + 90 * DAY_MS;
+        expect((await clocked.findDraftVersion(draftId)).draft?.id).toBe(draftId);
+
+        now += 1;
+        expect((await clocked.findDraftVersion(draftId)).draft).toBeNull();
+      } finally {
+        await harness.close();
+      }
+    });
+
+    it("leaves the clock alone for a visit with exactly the visit window left", async () => {
+      const harness = await createHarness();
+      const draftId = newDraftId();
+      let now = RETENTION_EPOCH;
+      const clocked = harness.openDb({ clock: () => now });
+
+      try {
+        await clocked.recordUpload(uploadInput("create", draftId, harness.auth));
+
+        // Exactly the visit window remains. "Fewer than" is not met, so this is
+        // a no-op — and because a top-up here would land on the value already
+        // stored, the boundary is only visible as the write that never happens.
+        now = RETENTION_EPOCH + 60 * DAY_MS;
+        await clocked.recordDraftVisit(draftId);
+
+        now = RETENTION_EPOCH + 90 * DAY_MS;
+        expect((await clocked.findDraftVersion(draftId)).draft?.id).toBe(draftId);
+
+        now += 1;
+        expect((await clocked.findDraftVersion(draftId)).draft).toBeNull();
+      } finally {
+        await harness.close();
+      }
+    });
+
     it("tops a visited draft up to the visit window when less than it remains", async () => {
       const harness = await createHarness();
       const draftId = newDraftId();

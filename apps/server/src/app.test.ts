@@ -2073,28 +2073,54 @@ describe("PatchPage server", () => {
     }
   });
 
-  it("keeps a draft alive while it is still being read, and lets it go when it is not", async () => {
+  it("keeps a visited draft alive, and lets it go once the visits stop", async () => {
     const clocked = await createClockedApp("visit-topup");
 
     try {
-      const draftId = await publishDraft(clocked.app, "Still being read");
+      const draftId = await publishDraft(clocked.app, "Still visited");
 
-      // Ten days left on the upload's window: this read tops it up to thirty.
+      // Ten days left on the upload's window: this visit tops it up to thirty.
       clocked.advanceDays(80);
       const inWindow = await clocked.app.inject({ method: "GET", url: `/d/${draftId}` });
       expect(inWindow.statusCode).toBe(200);
 
       // Day 95 — past where the upload alone would have ended it. The page is
-      // still here because it was read, and this read extends it again.
+      // still here because it was visited, and this visit extends it again.
       clocked.advanceDays(15);
       const extended = await clocked.app.inject({ method: "GET", url: `/d/${draftId}` });
       expect(extended.statusCode).toBe(200);
-      expect(extended.body).toContain("Still being read");
+      expect(extended.body).toContain("Still visited");
 
-      // Thirty-one days of nobody reading it, and it is gone.
+      // Thirty-one days without a visit, and it is gone.
       clocked.advanceDays(31);
       const abandoned = await clocked.app.inject({ method: "GET", url: `/d/${draftId}` });
       expect(abandoned.statusCode).toBe(404);
+    } finally {
+      await clocked.close();
+    }
+  });
+
+  it("serves a draft whose visit top-up write fails, without moving its clock", async () => {
+    const clocked = await createClockedApp(
+      "visit-write-failure",
+      (file, clock) => new VisitFailingJsonDb(file, { clock })
+    );
+
+    try {
+      const draftId = await publishDraft(clocked.app, "Survives a failed top-up");
+
+      // Ten days left, so this visit is one the clock would move — and the
+      // write throws. The reader still gets the page.
+      clocked.advanceDays(80);
+      const served = await clocked.app.inject({ method: "GET", url: `/d/${draftId}` });
+      expect(served.statusCode).toBe(200);
+      expect(served.body).toContain("Survives a failed top-up");
+
+      // Best-effort means exactly that: the page was served and the clock
+      // genuinely did not move, so the original window still ends it.
+      clocked.advanceDays(11);
+      const expired = await clocked.app.inject({ method: "GET", url: `/d/${draftId}` });
+      expect(expired.statusCode).toBe(404);
     } finally {
       await clocked.close();
     }
@@ -2468,10 +2494,14 @@ const DAY_MS = 24 * 60 * 60 * 1000;
  * clock: the retention clock is the database's, so an app-only clock would move
  * the rate limiters and nothing else.
  */
-async function createClockedApp(label: string): Promise<ClockedApp> {
+async function createClockedApp(
+  label: string,
+  openDb: (file: string, clock: () => number) => JsonFilePatchPageDb = (file, clock) =>
+    new JsonFilePatchPageDb(file, { clock })
+): Promise<ClockedApp> {
   let now = Date.UTC(2026, 0, 1);
   const clock = (): number => now;
-  const db = new JsonFilePatchPageDb(path.join(tempDir, `${label}-db.json`), { clock });
+  const db = openDb(path.join(tempDir, `${label}-db.json`), clock);
   await db.initialize("dev-token");
   const storage = new FileSystemHtmlStorage(path.join(tempDir, `${label}-drafts`));
   const app = createApp({ config: testConfig(), db, storage, clock });
@@ -2502,6 +2532,13 @@ async function publishDraft(
   });
   expect(upload.statusCode).toBe(201);
   return (upload.json() as { draftId: string }).draftId;
+}
+
+/** A store that can serve a draft but cannot record the visit that follows. */
+class VisitFailingJsonDb extends JsonFilePatchPageDb {
+  override async recordDraftVisit(): Promise<void> {
+    throw new Error("Forced visit top-up failure.");
+  }
 }
 
 function testConfig(): ServerConfig {
