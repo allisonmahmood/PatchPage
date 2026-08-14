@@ -104,14 +104,17 @@ Seeding is not a migration: it re-runs on every startup and must stay idempotent
 trust-model cutover removed it, and no sentinel principal is seeded now.)
 
 Two objects are easy to confuse, so they are named here. **`0002_drafts_account_id_index`,
-`0003_drafts_expiry_columns`, `0004_drafts_pinned_at`, and `0006_draft_reports` are
-the shipped additive migrations** — each ships permanently and none supersedes
-another; `0002` exists because ownership lookups scan `drafts` by account, `0004`
-adds the pin plus the partial index the sweep scans, and `0006` adds a whole table
-rather than a column (see "Reports" above). **`0005` is deliberately absent** — it
-is claimed by work in flight, and an ID is immutable once merged, so the list keeps
-a gap rather than renumbering. Apply order is ID order and the ledger records what
-actually ran, so a gap is not a missing step. The **probe migrations in
+`0003_drafts_expiry_columns`, `0004_drafts_pinned_at`,
+`0005_self_service_mint_records`, and `0006_draft_reports` are the shipped
+additive migrations** — each ships permanently and none supersedes another;
+`0002` exists because ownership lookups scan `drafts` by account, `0004` adds the
+pin plus the partial index the sweep scans, `0005` adds the `token_mints` table
+the per-address mint quota counts plus the provenance mark on `accounts`, and
+`0006` adds a whole table rather than a column (see "Reports" above). The list
+ran with `0005` absent for a while, because `0006` merged first and an ID is
+immutable once merged — a gap is legal, since apply order is ID order and the
+ledger records what actually ran. `0005` has since landed and filled it. The
+**probe migrations in
 `src/migration-fixtures.fixture.ts` are test-only** and never ship: they exercise
 a column-level additive step on both drivers without putting a placeholder column
 in the shipped schema. A later agent should not treat a probe as the pattern to

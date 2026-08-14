@@ -36,6 +36,24 @@ describe("getServerConfig", () => {
     }
   });
 
+  it("defaults the self-service mint quota to five per address per day", () => {
+    expect(getServerConfig({}).selfServiceMintsPerIpPerDay).toBe(5);
+    expect(
+      getServerConfig({ PATCHPAGE_SELF_SERVICE_MINTS_PER_IP_PER_DAY: "2" })
+        .selfServiceMintsPerIpPerDay
+    ).toBe(2);
+    expect(
+      getServerConfig({ PATCHPAGE_SELF_SERVICE_MINTS_PER_IP_PER_DAY: "1000000" })
+        .selfServiceMintsPerIpPerDay
+    ).toBe(1_000_000);
+
+    for (const value of ["0", "-1", "+1", "01", "1.5", "1e2", "1000001"]) {
+      expect(() =>
+        getServerConfig({ PATCHPAGE_SELF_SERVICE_MINTS_PER_IP_PER_DAY: value })
+      ).toThrow(/PATCHPAGE_SELF_SERVICE_MINTS_PER_IP_PER_DAY/);
+    }
+  });
+
   it("requires an explicit true boolean to allow self-service tokens", () => {
     expect(getServerConfig({}).allowSelfServiceTokens).toBe(false);
     expect(

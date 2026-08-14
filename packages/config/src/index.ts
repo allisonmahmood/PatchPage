@@ -3,6 +3,7 @@ import { isIP } from "node:net";
 const MAX_TRUST_PROXY_HOPS = 32;
 const MAX_RATE_LIMIT_PER_MINUTE = 10_000;
 const MAX_LIVE_DRAFTS_PER_TOKEN = 1_000_000;
+const MAX_SELF_SERVICE_MINTS_PER_IP_PER_DAY = 1_000_000;
 const IPV4_BITS = 32;
 const IPV6_BITS = 128;
 const IPV4_MAX = (1n << 32n) - 1n;
@@ -51,6 +52,12 @@ export interface ServerConfig {
   protectedApiRateLimitPerMinute: number;
   authenticatedUploadRateLimitPerMinute: number;
   selfServiceMintRateLimitPerMinute: number;
+  /**
+   * How many self-service tokens one source address may be minted per day.
+   * Counted from the database at mint time, so it survives a restart — unlike
+   * the per-minute mint rate above.
+   */
+  selfServiceMintsPerIpPerDay: number;
   draftCreateRateLimitPerMinute: number;
   /**
    * The live-draft ceiling one token may hold. Counted from the database on
@@ -99,6 +106,12 @@ export function getServerConfig(env: NodeJS.ProcessEnv = process.env): ServerCon
       "PATCHPAGE_SELF_SERVICE_MINT_RATE_LIMIT_PER_MINUTE",
       env.PATCHPAGE_SELF_SERVICE_MINT_RATE_LIMIT_PER_MINUTE,
       5
+    ),
+    selfServiceMintsPerIpPerDay: boundedIntegerValue(
+      "PATCHPAGE_SELF_SERVICE_MINTS_PER_IP_PER_DAY",
+      env.PATCHPAGE_SELF_SERVICE_MINTS_PER_IP_PER_DAY,
+      5,
+      MAX_SELF_SERVICE_MINTS_PER_IP_PER_DAY
     ),
     draftCreateRateLimitPerMinute: rateLimitPerMinuteValue(
       "PATCHPAGE_DRAFT_CREATE_RATE_LIMIT_PER_MINUTE",

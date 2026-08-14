@@ -18,6 +18,7 @@ import {
   JSON_MIGRATION_LEDGER_KEY,
   SCHEMA_MIGRATIONS
 } from "./migrations.js";
+import { countsTowardMintQuota } from "./mint-quota.js";
 import { expiryAfterUpload, expiryAfterVisit, isExpired } from "./retention.js";
 import { UploadTargetError } from "./types.js";
 import type { JsonMigrationState, SchemaMigration } from "./migrations.js";
@@ -30,6 +31,8 @@ import type {
   DraftReportRecord,
   DraftVersionLookup,
   DraftVersionRecord,
+  MintSelfServiceTokenInput,
+  MintSelfServiceTokenResult,
   PatchPageDb,
   RecordDraftReportInput,
   RecordUploadInput,
@@ -42,6 +45,16 @@ interface AccountRow {
   name: string;
   createdAt: string;
   updatedAt: string;
+  /** The provenance mark: when this principal was self-service minted, else null. */
+  selfServiceMintedAt: string | null;
+}
+
+interface TokenMintRow {
+  id: string;
+  accountId: string;
+  apiTokenId: string;
+  sourceIp: string | null;
+  createdAt: string;
 }
 
 interface ApiTokenRow {
@@ -75,6 +88,7 @@ interface JsonDbState {
   draftVersions: DraftVersionRecord[];
   uploadEvents: UploadEventRow[];
   draftReports: DraftReportRecord[];
+  tokenMints: TokenMintRow[];
 }
 
 interface LoadedJsonDbState {
@@ -155,7 +169,8 @@ export class JsonFilePatchPageDb implements PatchPageDb {
           accountId: apiToken.accountId,
           accountName: account.name,
           name: apiToken.name,
-          scopes: apiToken.scopes
+          scopes: apiToken.scopes,
+          selfService: account.selfServiceMintedAt !== null
         },
         changed: true
       };
@@ -183,6 +198,65 @@ export class JsonFilePatchPageDb implements PatchPageDb {
       state.apiTokens.push(apiToken);
 
       return { value: { id: apiToken.id, name: apiToken.name }, changed: true };
+    });
+  }
+
+  async countSelfServiceMintsBySourceIp(sourceIp: string | null): Promise<number> {
+    const state = await this.readState();
+    const now = this.clock();
+    return state.tokenMints.filter(
+      (mint) => mint.sourceIp === sourceIp && countsTowardMintQuota(mint.createdAt, now)
+    ).length;
+  }
+
+  async mintSelfServiceToken(
+    input: MintSelfServiceTokenInput
+  ): Promise<MintSelfServiceTokenResult> {
+    return this.mutateState((state) => {
+      const now = this.nowIso();
+      const name = cleanText(input.name) || "Self-service token";
+
+      // Fresh principal, its one token, and the mint record — written together
+      // under the same state mutation, so no reader ever sees a half-mint.
+      const account: AccountRow = {
+        id: newInternalId("acct"),
+        name,
+        createdAt: now,
+        updatedAt: now,
+        selfServiceMintedAt: now
+      };
+      const apiToken: ApiTokenRow = {
+        id: newInternalId("tok"),
+        accountId: account.id,
+        name,
+        tokenHash: sha256(input.token),
+        // Upload only, never admin: a self-service token creates drafts and
+        // updates or deletes the ones it owns, and the admin surface — token
+        // creation included — stays out of its reach.
+        scopes: ["upload"],
+        createdAt: now,
+        lastUsedAt: null,
+        revokedAt: null
+      };
+
+      state.accounts.push(account);
+      state.apiTokens.push(apiToken);
+      state.tokenMints.push({
+        id: newInternalId("mint"),
+        accountId: account.id,
+        apiTokenId: apiToken.id,
+        sourceIp: input.sourceIp,
+        createdAt: now
+      });
+
+      return {
+        value: {
+          accountId: account.id,
+          apiTokenId: apiToken.id,
+          apiTokenName: apiToken.name
+        },
+        changed: true
+      };
     });
   }
 
@@ -908,7 +982,9 @@ function isJsonDbState(value: unknown): value is JsonDbState {
     Array.isArray(value.uploadEvents) &&
     value.uploadEvents.every(isUploadEventRow) &&
     Array.isArray(value.draftReports) &&
-    value.draftReports.every(isDraftReportRecord)
+    value.draftReports.every(isDraftReportRecord) &&
+    Array.isArray(value.tokenMints) &&
+    value.tokenMints.every(isTokenMintRow)
   );
 }
 
@@ -918,7 +994,19 @@ function isAccountRow(value: unknown): value is AccountRow {
     typeof value.id === "string" &&
     typeof value.name === "string" &&
     typeof value.createdAt === "string" &&
-    typeof value.updatedAt === "string"
+    typeof value.updatedAt === "string" &&
+    isNullableString(value.selfServiceMintedAt)
+  );
+}
+
+function isTokenMintRow(value: unknown): value is TokenMintRow {
+  return (
+    isRecord(value) &&
+    typeof value.id === "string" &&
+    typeof value.accountId === "string" &&
+    typeof value.apiTokenId === "string" &&
+    isNullableString(value.sourceIp) &&
+    typeof value.createdAt === "string"
   );
 }
 
@@ -1039,7 +1127,9 @@ function ensureBootstrapState(
       id: "acct_bootstrap",
       name: "Bootstrap Account",
       createdAt: now,
-      updatedAt: now
+      updatedAt: now,
+      // The operator's own principal: seeded, not minted, so it carries no mark.
+      selfServiceMintedAt: null
     });
   }
 

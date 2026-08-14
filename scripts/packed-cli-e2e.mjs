@@ -454,33 +454,82 @@ try {
     stderr: /Missing or invalid API token\./
   });
 
-  // Auto-mint is the only credential-free path now. This server predates the
-  // self-service mint route, so the CLI's refused-mint hard error is what a
-  // tokenless upload must produce: one plain error, no fallback instance, and
-  // nothing written on either side. The happy path is covered at the
-  // publishing seam against a loopback instance that implements the route.
-  console.log("[packed-cli-e2e] proving a tokenless upload fails closed without self-service mint");
-  const mintStateDir = path.join(tempRoot, "cli state mint refused");
+  // Auto-mint is the only credential-free path now, and this server implements
+  // the mint route, so a tokenless upload has to carry itself the whole way: get
+  // a token, save it, announce it without ever printing it, and publish — onto a
+  // fresh principal that is nobody else's.
+  console.log("[packed-cli-e2e] proving a tokenless upload auto-mints and publishes");
+  const mintStateDir = path.join(tempRoot, "cli state auto mint");
   await checkedCall(() => mkdir(mintStateDir));
   const mintEnv = environment({ PATCHPAGE_STATE_DIR: mintStateDir }, [
     "PATCHPAGE_API_TOKEN",
     "PATCHPAGE_API_URL"
   ]);
-  await checkedCall(() =>
-    writeFile(fixturePath, validHtml("Mint refused", "mint-refused-no-fallback"), "utf8")
-  );
-  await assertCliFailureNoMutation({
+  const mintedHtml = validHtml("Auto minted", "auto-minted-self-service-principal");
+  await checkedCall(() => writeFile(fixturePath, mintedHtml, "utf8"));
+  const mintedResult = await runCli(
     cliPath,
-    args: ["upload", fixtureArgument, "--api-url", publicBaseUrl],
-    cwd: consumerDir,
-    env: mintEnv,
-    cliStateDir: mintStateDir,
-    metadataPath,
-    objectDir,
-    expectAuthoritativeNonEmpty: true,
-    expectEmptyCliState: true,
-    stderr: /Could not get a publishing token/
+    ["upload", fixtureArgument, "--api-url", publicBaseUrl],
+    { cwd: consumerDir, env: mintEnv }
+  );
+  const minted = parseUpload(mintedResult);
+  assert.equal(minted.label, "Uploaded draft");
+  assert.equal(minted.versionNumber, 1);
+  assert.ok(
+    mintedResult.stdout.includes(`Minted a new publishing token for ${publicBaseUrl};`),
+    `expected the mint announcement naming the instance:\n${mintedResult.stdout}`
+  );
+  assert.match(
+    mintedResult.stdout,
+    /Publishing here accepts the acceptable use policy: https:\/\//,
+    "expected the mint response's acceptable-use link to be relayed"
+  );
+
+  // The key is on disk, host-keyed and marked as minted.
+  const mintedCredentials = JSON.parse(
+    await checkedCall(() => readFile(path.join(mintStateDir, "credentials.json"), "utf8"))
+  );
+  const mintedToken = mintedCredentials.hosts[publicBaseUrl].token;
+  assert.match(mintedToken, /^pp_[A-Za-z0-9_-]{43}$/, "expected a server-generated token");
+  assert.equal(mintedCredentials.hosts[publicBaseUrl].source, "mint");
+
+  // Returned exactly once: the plaintext reached the key file and nothing else.
+  // Neither stream may carry it, and neither may the instance's own state.
+  assert.ok(
+    !mintedResult.stdout.includes(mintedToken) && !mintedResult.stderr.includes(mintedToken),
+    "the minted token must never be printed"
+  );
+  const metadataAfterMint = await readMetadata(metadataPath);
+  assert.ok(
+    !JSON.stringify(metadataAfterMint).includes(mintedToken),
+    "the instance must keep only the minted token's hash"
+  );
+
+  // A fresh 1:1 principal, not the operator's: the draft it published is owned
+  // by an account that did not exist before this upload.
+  const mintedDraft = metadataAfterMint.drafts.find((draft) => draft.id === minted.draftId);
+  assert.ok(mintedDraft, "expected the auto-minted draft on the instance");
+  assert.notEqual(
+    mintedDraft.accountId,
+    "acct_bootstrap",
+    "an auto-minted draft must not land on the operator's account"
+  );
+  const mintedVersion = metadataAfterMint.draftVersions.find(
+    (version) => version.draftId === minted.draftId
+  );
+  assert.notEqual(
+    mintedVersion.createdByApiTokenId,
+    "tok_bootstrap",
+    "an auto-minted draft must not be published by the operator's token"
+  );
+  await assertStoredDraft(metadataAfterMint, objectDir, {
+    draftId: minted.draftId,
+    expectedHtmlByVersion: [mintedHtml],
+    accountId: mintedDraft.accountId,
+    apiTokenId: mintedVersion.createdByApiTokenId
   });
+  const mintedViewer = await fetchViewer(minted.publicUrl);
+  assertViewer(mintedViewer, minted.draftId, 1, "auto-minted-self-service-principal");
 
   console.log("[packed-cli-e2e] proving --anonymous is a deprecated no-op");
   const deprecatedFlagHtml = validHtml(
@@ -537,13 +586,25 @@ try {
 
   const finalMetadata = await readMetadata(metadataPath);
   // Every draft on the instance has a controlling token from birth: the
-  // tokenless upload path is gone, so nothing here is ownerless.
-  assert.equal(finalMetadata.drafts.length, 4);
-  assert.equal(finalMetadata.draftVersions.length, 5);
-  assert.equal(finalMetadata.uploadEvents.length, 5);
+  // tokenless upload path is gone, so nothing here is ownerless. Exactly one
+  // draft belongs to the auto-minted principal; the rest are the operator's.
+  assert.equal(finalMetadata.drafts.length, 5);
+  assert.equal(finalMetadata.draftVersions.length, 6);
+  assert.equal(finalMetadata.uploadEvents.length, 6);
+  const controllingAccounts = new Set(finalMetadata.drafts.map((draft) => draft.accountId));
   assert.ok(
-    finalMetadata.drafts.every((draft) => draft.accountId === "acct_bootstrap"),
+    finalMetadata.drafts.every((draft) => typeof draft.accountId === "string" && draft.accountId),
     "every draft must carry the controlling account that published it"
+  );
+  assert.deepEqual(
+    [...controllingAccounts].sort(),
+    ["acct_bootstrap", mintedDraft.accountId].sort(),
+    "only the operator and the one auto-minted principal may own drafts here"
+  );
+  assert.equal(
+    finalMetadata.drafts.filter((draft) => draft.accountId === mintedDraft.accountId).length,
+    1,
+    "the auto-minted principal must control exactly the draft it published"
   );
   await assertStoredDraft(finalMetadata, objectDir, {
     draftId: envPrecedence.draftId,
@@ -551,7 +612,7 @@ try {
     accountId: "acct_bootstrap",
     apiTokenId: "tok_bootstrap"
   });
-  assert.equal((await snapshotTree(objectDir)).length, 5);
+  assert.equal((await snapshotTree(objectDir)).length, 6);
 
   console.log(
     "[packed-cli-e2e] PASS: spaced consumer/artifact/state paths and quoted POSIX sh commands"

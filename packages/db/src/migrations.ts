@@ -45,6 +45,9 @@ const JSON_ROW_COLLECTIONS = [
   "uploadEvents"
 ] as const;
 
+/** The JSON collection `0005_self_service_mint_records` introduces. */
+const JSON_TOKEN_MINTS_COLLECTION = "tokenMints";
+
 /**
  * The retention window as of `0003_drafts_expiry_columns`, frozen here on
  * purpose. A merged migration's behavior must not follow a later retuning of
@@ -190,10 +193,53 @@ export const SCHEMA_MIGRATIONS: readonly SchemaMigration[] = [
     }
   },
   {
-    // 0005 is claimed by the self-service mint records in flight; IDs are
-    // immutable once merged, so this keeps its number and leaves the gap. Apply
-    // order is ID order, and the ledger records what ran — a gap is not a
-    // missing step, and a fresh database applies 0001-0004 then 0006 cleanly.
+    id: "0005_self_service_mint_records",
+    // Self-service minting's provenance, in two pieces that answer two
+    // different questions.
+    //
+    // `token_mints` is the mint record: who was handed a token, from where, and
+    // when. It is what the per-IP mint quota counts, which is why it carries
+    // `source_ip` and why the index leads with it — the quota's only query is
+    // "how many rows for this address inside the window". Nullable because a
+    // request need not have a usable address; those mints share one bucket
+    // rather than escaping the count. The row outlives revocation on purpose:
+    // revoked is a state, and where a token came from stays reviewable.
+    //
+    // `accounts.self_service_minted_at` is the provenance mark on the principal
+    // itself. It is derivable from `token_mints` by join, and denormalized
+    // anyway so guardrails can key on "is this principal self-service" without
+    // one — the check sits on the authentication path, which every API request
+    // takes. NULL means operator-created, which is what every pre-existing
+    // account is; the JSON step below fills exactly that.
+    postgres: `
+      ALTER TABLE accounts ADD COLUMN IF NOT EXISTS self_service_minted_at TIMESTAMPTZ;
+
+      CREATE TABLE IF NOT EXISTS token_mints (
+        id TEXT PRIMARY KEY,
+        account_id TEXT NOT NULL REFERENCES accounts(id),
+        api_token_id TEXT NOT NULL REFERENCES api_tokens(id),
+        source_ip TEXT,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+      );
+
+      CREATE INDEX IF NOT EXISTS token_mints_source_ip_created_at_idx
+        ON token_mints(source_ip, created_at);
+    `,
+    json(state) {
+      if (!Array.isArray(state[JSON_TOKEN_MINTS_COLLECTION])) {
+        state[JSON_TOKEN_MINTS_COLLECTION] = [];
+      }
+
+      const accounts = state.accounts;
+      if (!Array.isArray(accounts)) return;
+      for (const account of accounts) {
+        if (!account || typeof account !== "object") continue;
+        const row = account as Record<string, unknown>;
+        if (typeof row.selfServiceMintedAt !== "string") row.selfServiceMintedAt = null;
+      }
+    }
+  },
+  {
     id: "0006_draft_reports",
     // Where a reader's flag on a served draft lands. Reports are operator-review
     // material and nothing else: no trigger reads this table, so no volume of

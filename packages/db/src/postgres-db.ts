@@ -1,6 +1,7 @@
 import pg from "pg";
 import { newInternalId, sha256 } from "@patchpage/core";
 import { SCHEMA_MIGRATIONS } from "./migrations.js";
+import { mintQuotaWindowStart } from "./mint-quota.js";
 import { DRAFT_VISIT_EXTENSION_WINDOW_MS, expiryAfterUpload } from "./retention.js";
 import { UploadTargetError } from "./types.js";
 import type { SchemaMigration } from "./migrations.js";
@@ -13,6 +14,8 @@ import type {
   DraftReportRecord,
   DraftVersionLookup,
   DraftVersionRecord,
+  MintSelfServiceTokenInput,
+  MintSelfServiceTokenResult,
   PatchPageDb,
   RecordDraftReportInput,
   RecordUploadInput,
@@ -56,8 +59,10 @@ export class PostgresPatchPageDb implements PatchPageDb {
    * `expires_at`. Deliberately not SQL `now()`: the clock is injectable, and
    * `now()` would make the window untestable and drift from the JSON driver.
    *
-   * Only `expires_at` is on this clock here. Every other stamp in this driver
-   * (`last_used_at`, `created_at`, `disabled_at`, `deleted_at`) stays on SQL
+   * `expires_at` and `token_mints.created_at` are on this clock here, because
+   * both are anchors a window is measured from — retention's and the mint
+   * quota's. Every other stamp in this driver (`last_used_at`, the remaining
+   * `created_at` columns, `disabled_at`, `deleted_at`) stays on SQL
    * `now()`, where it is a column default or a `SET x = now()` clause, while
    * the JSON driver puts all of its stamps on the injected clock. See the note
    * on `JsonFilePatchPageDb.nowIso` — the drivers agree on the retention anchor
@@ -89,7 +94,8 @@ export class PostgresPatchPageDb implements PatchPageDb {
     const result = await this.pool.query(
       `
         SELECT api_tokens.id, api_tokens.account_id, api_tokens.name, api_tokens.scopes,
-               accounts.name AS account_name
+               accounts.name AS account_name,
+               accounts.self_service_minted_at
         FROM api_tokens
         JOIN accounts ON accounts.id = api_tokens.account_id
         WHERE api_tokens.token_hash = $1
@@ -109,7 +115,8 @@ export class PostgresPatchPageDb implements PatchPageDb {
       accountId: row.account_id,
       accountName: row.account_name,
       name: row.name,
-      scopes: normalizeScopes(row.scopes)
+      scopes: normalizeScopes(row.scopes),
+      selfService: row.self_service_minted_at !== null
     };
   }
 
@@ -126,6 +133,70 @@ export class PostgresPatchPageDb implements PatchPageDb {
     );
 
     return { id, name };
+  }
+
+  async countSelfServiceMintsBySourceIp(sourceIp: string | null): Promise<number> {
+    // `IS NOT DISTINCT FROM` so a null address matches the null rows rather
+    // than matching nothing: unattributable mints share one bucket instead of
+    // each one escaping the tally.
+    const result = await this.pool.query(
+      `
+        SELECT count(*) AS mints
+        FROM token_mints
+        WHERE source_ip IS NOT DISTINCT FROM $1
+          AND created_at >= $2::timestamptz
+      `,
+      [sourceIp, mintQuotaWindowStart(this.clock())]
+    );
+    return Number(result.rows[0]?.mints ?? 0);
+  }
+
+  async mintSelfServiceToken(
+    input: MintSelfServiceTokenInput
+  ): Promise<MintSelfServiceTokenResult> {
+    const accountId = newInternalId("acct");
+    const apiTokenId = newInternalId("tok");
+    const name = cleanText(input.name) || "Self-service token";
+    // The quota counts these rows, so the mint stamp is on the injected clock
+    // for the same reason `expires_at` is — see `nowIso`.
+    const mintedAt = this.nowIso();
+
+    const client = await this.pool.connect();
+    try {
+      await client.query("BEGIN");
+
+      await client.query(
+        `
+          INSERT INTO accounts (id, name, self_service_minted_at)
+          VALUES ($1, $2, $3::timestamptz)
+        `,
+        [accountId, name, mintedAt]
+      );
+
+      await client.query(
+        `
+          INSERT INTO api_tokens (id, account_id, name, token_hash, scopes)
+          VALUES ($1, $2, $3, $4, '["upload"]'::jsonb)
+        `,
+        [apiTokenId, accountId, name, sha256(input.token)]
+      );
+
+      await client.query(
+        `
+          INSERT INTO token_mints (id, account_id, api_token_id, source_ip, created_at)
+          VALUES ($1, $2, $3, $4, $5::timestamptz)
+        `,
+        [newInternalId("mint"), accountId, apiTokenId, input.sourceIp, mintedAt]
+      );
+
+      await client.query("COMMIT");
+      return { accountId, apiTokenId, apiTokenName: name };
+    } catch (error) {
+      await client.query("ROLLBACK").catch(() => undefined);
+      throw error;
+    } finally {
+      client.release();
+    }
   }
 
   async countLiveDraftsByCreatorApiToken(apiTokenId: string): Promise<number> {
