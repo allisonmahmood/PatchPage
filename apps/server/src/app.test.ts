@@ -2609,6 +2609,9 @@ describe("self-service minting", () => {
       expect(body.ok).toBe(true);
       expect(body.token).toMatch(/^pp_[A-Za-z0-9_-]{43}$/);
       expect(body.aupUrl).toBe(ACCEPTABLE_USE_URL);
+      // The pinned success body is exactly these three keys — nothing about the
+      // principal, the mint record, or the quota leaks into it.
+      expect(Object.keys(body).sort()).toEqual(["aupUrl", "ok", "token"]);
       // No credential was offered and none was asked for: this is how a caller
       // with nothing gets its first token.
       expect(mint.headers["cache-control"]).toBe("no-store");
@@ -2643,7 +2646,9 @@ describe("self-service minting", () => {
       const refused = await minting.mint("198.51.100.21");
 
       expect(refused.statusCode).toBe(403);
-      expect(refused.json()).toMatchObject({
+      // Exactly the pinned refusal: no extra key, and `error` carries real copy
+      // rather than being present and empty.
+      expect(refusalBody(refused)).toEqual({
         ok: false,
         code: "self_service_disabled"
       });
@@ -2753,11 +2758,15 @@ describe("self-service minting", () => {
 
       const exceeded = await minting.mint("203.0.113.30");
       expect(exceeded.statusCode).toBe(429);
-      expect(exceeded.json()).toMatchObject({
+      // The pinned refusal plus `quota`, which is the one documented addition —
+      // spelled out so a future change to the shape has to come through here.
+      expect(refusalBody(exceeded)).toEqual({
         ok: false,
         code: "mint_quota_exceeded",
         quota: 2
       });
+      // Copy speaks the rolling window rather than a calendar day.
+      expect((exceeded.json() as { error: string }).error).toMatch(/24 hours/);
 
       // Another address carries its own tally.
       expect((await minting.mint("203.0.113.31")).statusCode).toBe(201);
@@ -2790,7 +2799,9 @@ describe("self-service minting", () => {
 
       const limited = await minting.mint("203.0.113.40");
       expect(limited.statusCode).toBe(429);
-      expect(limited.json()).toMatchObject({
+      // Exactly the pinned refusal. `retryAfterSeconds` must be a positive
+      // number, which is what the CLI relays as the wait.
+      expect(refusalBody(limited)).toEqual({
         ok: false,
         code: "rate_limited",
         retryAfterSeconds: 60
@@ -3277,6 +3288,26 @@ const DAY_MS = 24 * 60 * 60 * 1000;
 
 /** The pinned mint route, spelled out here rather than imported from the app. */
 const MINT_PATH = "/api/tokens/self-service";
+
+/**
+ * A refusal body with `error` checked and removed, so the caller can assert the
+ * rest of the pinned shape exactly.
+ *
+ * Every pinned refusal carries `error`, but its wording is copy that should be
+ * free to improve; what must not drift is that the field is there and says
+ * something. Lifting it out here lets the assertions use `toEqual` — which
+ * catches a field quietly appearing or vanishing — instead of `toMatchObject`,
+ * which would wave both through.
+ */
+function refusalBody(response: InjectedResponse): Record<string, unknown> {
+  const body = response.json() as Record<string, unknown>;
+  expect(typeof body.error).toBe("string");
+  expect((body.error as string).length).toBeGreaterThan(0);
+
+  const pinned = { ...body };
+  delete pinned.error;
+  return pinned;
+}
 
 type MintedToken = { token: string; accountId: string };
 type InjectedResponse = Awaited<ReturnType<ReturnType<typeof createApp>["inject"]>>;

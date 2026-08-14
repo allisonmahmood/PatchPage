@@ -529,7 +529,10 @@ async function mintSelfServiceToken(
   if (recentMints >= quota) {
     return reply.status(429).send({
       ok: false,
-      error: `Mint quota reached: ${quota} self-service tokens per address per day. Reuse the token you already hold, or try again tomorrow.`,
+      // "Within a day", not "tomorrow": the window rolls off each mint 24 hours
+      // after it happened, so the next slot opens on the oldest mint's clock
+      // rather than at midnight.
+      error: `Mint quota reached: ${quota} self-service tokens per address per 24 hours. Reuse the token you already hold, or retry once the oldest of those mints is a day old.`,
       code: "mint_quota_exceeded",
       quota
     });
