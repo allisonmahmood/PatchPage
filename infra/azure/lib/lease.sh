@@ -38,7 +38,7 @@ esac
 
 # --- the workload binding wire format ----------------------------------------
 #
-# Prints the SHA-256 of the `patchpage-operation-binding-v1` tuple, or fails
+# Prints the SHA-256 of the `patchpage-operation-binding-v2` tuple, or fails
 # without printing anything. The digest is written into the operation
 # container's metadata when a deployment seals it, and recomputed and compared
 # by every later flow that takes the lease: it is what stops a correctly-held
@@ -57,20 +57,26 @@ esac
 # truncated digest that reached a metadata comparison would compare equal to
 # another empty digest.
 operation_binding_sha256() {
+  # The five resource-ID inputs are case-folded before hashing for the same
+  # reason every ID gate below case-folds its comparison: Azure echoes IDs
+  # back with whatever casing their creator used, and the seal is computed by
+  # one flow (adoption, from the operator's records) and recomputed by another
+  # (release, composed textually). A raw hash turns that cosmetic difference
+  # into a permanent lease refusal.
   operation_binding_digest="$(
     printf '%s\n' \
-      'patchpage-operation-binding-v1' \
+      'patchpage-operation-binding-v2' \
       "subscription_id=$SUBSCRIPTION_ID" \
       "state_storage_account=$STATE_STORAGE_ACCOUNT" \
       "state_key=$STATE_KEY" \
       "resource_group=$RESOURCE_GROUP" \
       "container_app=$CONTAINER_APP" \
       "acr=$ACR" \
-      "operation_container_id=$EXPECTED_OPERATION_CONTAINER_ID" \
-      "container_app_id=$EXPECTED_CONTAINER_APP_ID" \
-      "acr_id=$EXPECTED_ACR_ID" \
-      "storage_account_id=$EXPECTED_STORAGE_ACCOUNT_ID" \
-      "postgres_server_id=$EXPECTED_POSTGRES_SERVER_ID" |
+      "operation_container_id=$(printf '%s' "$EXPECTED_OPERATION_CONTAINER_ID" | tr '[:upper:]' '[:lower:]')" \
+      "container_app_id=$(printf '%s' "$EXPECTED_CONTAINER_APP_ID" | tr '[:upper:]' '[:lower:]')" \
+      "acr_id=$(printf '%s' "$EXPECTED_ACR_ID" | tr '[:upper:]' '[:lower:]')" \
+      "storage_account_id=$(printf '%s' "$EXPECTED_STORAGE_ACCOUNT_ID" | tr '[:upper:]' '[:lower:]')" \
+      "postgres_server_id=$(printf '%s' "$EXPECTED_POSTGRES_SERVER_ID" | tr '[:upper:]' '[:lower:]')" |
       openssl dgst -sha256 -r 2>/dev/null |
       cut -d ' ' -f1
   )" || return 1

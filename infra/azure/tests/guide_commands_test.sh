@@ -1080,18 +1080,18 @@ key                  = "patchpage-prod.tfstate"' ||
 # of the block instead of echoing the block's own variable back.
 guide_operation_binding_sha256() {
   printf '%s\n' \
-    'patchpage-operation-binding-v1' \
+    'patchpage-operation-binding-v2' \
     "subscription_id=$SUBSCRIPTION_ID" \
     "state_storage_account=$STATE_STORAGE_ACCOUNT" \
     "state_key=$1" \
     "resource_group=$RESOURCE_GROUP" \
     "container_app=$CONTAINER_APP" \
     "acr=$ACR" \
-    "operation_container_id=/subscriptions/$SUBSCRIPTION_ID/resourceGroups/rg-patchpage-tfstate/providers/Microsoft.Storage/storageAccounts/$STATE_STORAGE_ACCOUNT/blobServices/default/containers/patchpage-operations" \
-    "container_app_id=/subscriptions/$SUBSCRIPTION_ID/resourceGroups/$RESOURCE_GROUP/providers/Microsoft.App/containerApps/$CONTAINER_APP" \
-    "acr_id=/subscriptions/$SUBSCRIPTION_ID/resourceGroups/$RESOURCE_GROUP/providers/Microsoft.ContainerRegistry/registries/$ACR" \
-    "storage_account_id=$EXPECTED_STORAGE_ACCOUNT_ID" \
-    "postgres_server_id=$EXPECTED_POSTGRES_SERVER_ID" |
+    "operation_container_id=$(printf '%s' "/subscriptions/$SUBSCRIPTION_ID/resourceGroups/rg-patchpage-tfstate/providers/Microsoft.Storage/storageAccounts/$STATE_STORAGE_ACCOUNT/blobServices/default/containers/patchpage-operations" | tr '[:upper:]' '[:lower:]')" \
+    "container_app_id=$(printf '%s' "/subscriptions/$SUBSCRIPTION_ID/resourceGroups/$RESOURCE_GROUP/providers/Microsoft.App/containerApps/$CONTAINER_APP" | tr '[:upper:]' '[:lower:]')" \
+    "acr_id=$(printf '%s' "/subscriptions/$SUBSCRIPTION_ID/resourceGroups/$RESOURCE_GROUP/providers/Microsoft.ContainerRegistry/registries/$ACR" | tr '[:upper:]' '[:lower:]')" \
+    "storage_account_id=$(printf '%s' "$EXPECTED_STORAGE_ACCOUNT_ID" | tr '[:upper:]' '[:lower:]')" \
+    "postgres_server_id=$(printf '%s' "$EXPECTED_POSTGRES_SERVER_ID" | tr '[:upper:]' '[:lower:]')" |
     openssl dgst -sha256 -r |
     cut -d ' ' -f1
 }
@@ -3972,7 +3972,9 @@ operation_lease_auth_modes_are_pinned() {
 
 # --- the operation-binding wire format ---------------------------------------
 #
-# `patchpage-operation-binding-v1` is the tuple whose SHA-256 is written into
+# `patchpage-operation-binding-v2` is the tuple (v1 hashed resource IDs raw;
+# v2 case-folds the five ID inputs, because Azure echoes IDs with unstable
+# casing and the seal is computed and recomputed by different flows) whose SHA-256 is written into
 # the operation container's metadata when a deployment seals it, and re-derived
 # and compared on every later flow that takes the operation lease. It is a wire
 # format in the strict sense: the digest recorded against a live environment was
@@ -3987,14 +3989,14 @@ operation_lease_auth_modes_are_pinned() {
 # spelled out in GUIDE_BINDING_FIXTURE_* below and are exactly the values the
 # release scenario already uses, so the constant can be recomputed by hand:
 #
-#   printf '%s\n' 'patchpage-operation-binding-v1' subscription_id=... |
+#   printf '%s\n' 'patchpage-operation-binding-v2' subscription_id=... |
 #     openssl dgst -sha256 -r | cut -d ' ' -f1
 #
 # This is deliberately a golden constant rather than a cross-comparison between
 # the copies. Copies agreeing with each other is what a mechanical edit across
 # all of them produces; agreeing with a number written down before the edit is
 # what a mechanical edit cannot produce.
-GUIDE_OPERATION_BINDING_GOLDEN_SHA256=a753a80055615fc8c9f0ec837982c6221142b0bf52a1516189a33436d5552a05
+GUIDE_OPERATION_BINDING_GOLDEN_SHA256=baf54842e2eed774b7aaf76e77d7d823cb9a79ed396961fd0665049c4a885869
 
 # The fixture inputs the golden digest above was computed from. Every field of
 # the tuple is fed by one of these, so no field can change spelling or position
@@ -4018,7 +4020,7 @@ GUIDE_BINDING_FIXTURE_ACR="acrpatchpageabc123"
 # alone on a continued line, single-quoted -- not by the marker appearing
 # anywhere. Prose that names the marker, including the comment above, must not
 # register as a copy of the tuple.
-GUIDE_BINDING_TUPLE_MARKER="patchpage-operation-binding-v1"
+GUIDE_BINDING_TUPLE_MARKER="patchpage-operation-binding-v2"
 
 guide_binding_tuple_pipeline() {
   awk -v marker="$GUIDE_BINDING_TUPLE_MARKER" '
