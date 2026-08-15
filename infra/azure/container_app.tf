@@ -52,10 +52,12 @@ locals {
     false
   )
 
-  app_secret_env = {
+  app_secret_env = merge({
     DATABASE_URL                  = { secret = "database-url", value = local.database_url }
     PATCHPAGE_BOOTSTRAP_API_TOKEN = { secret = "bootstrap-token", value = local.bootstrap_api_token }
-  }
+    }, var.posthog_api_key == null ? {} : {
+    PATCHPAGE_POSTHOG_API_KEY = { secret = "posthog-api-key", value = var.posthog_api_key }
+  })
 
   app_plain_env = merge({
     NODE_ENV                                             = "production"

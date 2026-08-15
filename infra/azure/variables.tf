@@ -380,6 +380,13 @@ variable "allow_self_service_tokens" {
   nullable    = false
 }
 
+variable "posthog_api_key" {
+  description = "PostHog project key server-side analytics reports under. Null leaves analytics off, which is the right posture for a self-hosted instance; the hosted instance sets it so the go-public guardrail 'analytics events are flowing' can hold."
+  type        = string
+  default     = null
+  sensitive   = true
+}
+
 variable "protected_api_rate_limit_per_minute" {
   description = "Protected API attempts allowed per canonical client IP per minute."
   type        = number
