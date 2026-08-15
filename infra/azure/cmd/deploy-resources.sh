@@ -587,7 +587,7 @@ if ! LIVE_OPERATION_CONTAINER_ID="$(
       --account-name "$STATE_STORAGE_ACCOUNT" \
       --container-name "$OPERATION_CONTAINER" \
       --auth-mode key \
-      --include d v \
+      --include dv \
       --num-results '*' \
       --query '[].name' \
       --output tsv

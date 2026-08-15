@@ -75,7 +75,7 @@ if ! private_az account set ||
       --account-name "$STATE_STORAGE_ACCOUNT" \
       --container-name "$OPERATION_CONTAINER" \
       --auth-mode login \
-      --include d v \
+      --include dv \
       --num-results '*' \
       --query '[].name' \
       --output tsv

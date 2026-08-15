@@ -233,7 +233,7 @@ verify_unused_state_key() {
       --container-name "$STATE_CONTAINER" \
       --auth-mode key \
       --prefix "$STATE_KEY" \
-      --include d v \
+      --include dv \
       --num-results '*' \
       --query "[?name=='$STATE_KEY'].name" \
       --output tsv
@@ -344,7 +344,7 @@ if ! OPERATION_CONTAINER_BLOBS="$(
     --account-name "$STATE_STORAGE_ACCOUNT" \
     --container-name "$OPERATION_CONTAINER" \
     --auth-mode key \
-    --include d v \
+    --include dv \
     --num-results '*' \
     --query '[].name' \
     --output tsv

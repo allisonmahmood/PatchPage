@@ -822,7 +822,7 @@ az_infrastructure() {
           ;;
         list)
           case " $* " in
-            *" --account-name $STATE_STORAGE_ACCOUNT --container-name patchpage-operations --auth-mode key --include d v --num-results * --query [].name --output tsv "*)
+            *" --account-name $STATE_STORAGE_ACCOUNT --container-name patchpage-operations --auth-mode key --include dv --num-results * --query [].name --output tsv "*)
               test "$scenario" != "operation_container_nonempty" ||
                 printf '%s\n' "unexpected"
               ;;
