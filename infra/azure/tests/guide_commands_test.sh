@@ -595,11 +595,11 @@ test_state_bootstrap() {
           "$log" ||
           fail "state storage-account deletion lock was not created at exact scope"
         grep -Fqx \
-          "lock list --resource /subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg-patchpage-tfstate/providers/Microsoft.Storage/storageAccounts/patchpagestate --query [?name=='protect-patchpage-tfstate'].[level,id] --output tsv" \
+          "lock list --resource /subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg-patchpage-tfstate/providers/Microsoft.Storage/storageAccounts/patchpagestate --query [?name=='protect-patchpage-tfstate'].[[level,id]] --output tsv" \
           "$log" ||
           fail "state storage-account deletion lock was not inspected before mutation"
         grep -Fqx \
-          'lock show --ids /subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg-patchpage-tfstate/providers/Microsoft.Storage/storageAccounts/patchpagestate/providers/Microsoft.Authorization/locks/protect-patchpage-tfstate --query [level,id] --output tsv' \
+          'lock show --ids /subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg-patchpage-tfstate/providers/Microsoft.Storage/storageAccounts/patchpagestate/providers/Microsoft.Authorization/locks/protect-patchpage-tfstate --query [[level,id]] --output tsv' \
           "$log" ||
           fail "state storage-account deletion lock scope was not verified"
         backend_mode="$(
@@ -912,9 +912,9 @@ key                  = "patchpage-prod.tfstate"' ||
           stage == 3 && /^az storage container metadata update --account-name patchpagestate --name patchpage-operations --auth-mode key --lease-id [0-9a-f-]{36} --metadata patchpage_workload_binding_sha256=[0-9a-f]{64} --output none$/ && $13 == binding_lease_id { stage = 4; next }
           stage == 4 && /^az storage container lease release --account-name patchpagestate --container-name patchpage-operations --auth-mode key --lease-id [0-9a-f-]{36} --output none$/ && $13 == binding_lease_id { stage = 5; next }
           stage == 5 && /^az lock create --name protect-patchpage-drafts --lock-type CanNotDelete --resource .*\/Microsoft\.Storage\/storageAccounts\/patchpagedrafts$/ { stage = 6; next }
-          stage == 6 && /^az lock show --ids .*\/Microsoft\.Storage\/storageAccounts\/patchpagedrafts\/providers\/Microsoft\.Authorization\/locks\/protect-patchpage-drafts --query \[level,id\] --output tsv$/ { stage = 7; next }
+          stage == 6 && /^az lock show --ids .*\/Microsoft\.Storage\/storageAccounts\/patchpagedrafts\/providers\/Microsoft\.Authorization\/locks\/protect-patchpage-drafts --query \[\[level,id\]\] --output tsv$/ { stage = 7; next }
           stage == 7 && /^az lock create --name protect-patchpage-postgres --lock-type CanNotDelete --resource .*\/Microsoft\.DBforPostgreSQL\/flexibleServers\/patchpage-postgres$/ { stage = 8; next }
-          stage == 8 && /^az lock show --ids .*\/Microsoft\.DBforPostgreSQL\/flexibleServers\/patchpage-postgres\/providers\/Microsoft\.Authorization\/locks\/protect-patchpage-postgres --query \[level,id\] --output tsv$/ { stage = 9 }
+          stage == 8 && /^az lock show --ids .*\/Microsoft\.DBforPostgreSQL\/flexibleServers\/patchpage-postgres\/providers\/Microsoft\.Authorization\/locks\/protect-patchpage-postgres --query \[\[level,id\]\] --output tsv$/ { stage = 9 }
           END { exit stage == 9 ? 0 : 1 }
         ' "$log" ||
           fail "deployment did not lease-bind the exact operation container and protect only persistent child resources after apply"
@@ -1371,11 +1371,11 @@ test_app_release() {
         "$log" ||
         fail "app release did not prove the exact operation-container resource ID"
       grep -Fqx \
-        'az lock show --ids /subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg-patchpage-workload/providers/Microsoft.Storage/storageAccounts/patchpagedrafts/providers/Microsoft.Authorization/locks/protect-patchpage-drafts --query [level,id] --output tsv' \
+        'az lock show --ids /subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg-patchpage-workload/providers/Microsoft.Storage/storageAccounts/patchpagedrafts/providers/Microsoft.Authorization/locks/protect-patchpage-drafts --query [[level,id]] --output tsv' \
         "$log" ||
         fail "app release did not prove the exact workload Storage lock"
       grep -Fqx \
-        'az lock show --ids /subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg-patchpage-workload/providers/Microsoft.DBforPostgreSQL/flexibleServers/patchpage-postgres/providers/Microsoft.Authorization/locks/protect-patchpage-postgres --query [level,id] --output tsv' \
+        'az lock show --ids /subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg-patchpage-workload/providers/Microsoft.DBforPostgreSQL/flexibleServers/patchpage-postgres/providers/Microsoft.Authorization/locks/protect-patchpage-postgres --query [[level,id]] --output tsv' \
         "$log" ||
         fail "app release did not prove the exact PostgreSQL lock"
       if grep -Fq 'az storage account show ' "$log"; then
@@ -1811,11 +1811,11 @@ test_app_rollback() {
         "$log" ||
         fail "rollback did not prove the exact operation-container resource ID"
       grep -Fqx \
-        'az lock show --ids /subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg-patchpage-workload/providers/Microsoft.Storage/storageAccounts/patchpagedrafts/providers/Microsoft.Authorization/locks/protect-patchpage-drafts --query [level,id] --output tsv' \
+        'az lock show --ids /subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg-patchpage-workload/providers/Microsoft.Storage/storageAccounts/patchpagedrafts/providers/Microsoft.Authorization/locks/protect-patchpage-drafts --query [[level,id]] --output tsv' \
         "$log" ||
         fail "rollback did not prove the exact workload Storage lock"
       grep -Fqx \
-        'az lock show --ids /subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg-patchpage-workload/providers/Microsoft.DBforPostgreSQL/flexibleServers/patchpage-postgres/providers/Microsoft.Authorization/locks/protect-patchpage-postgres --query [level,id] --output tsv' \
+        'az lock show --ids /subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg-patchpage-workload/providers/Microsoft.DBforPostgreSQL/flexibleServers/patchpage-postgres/providers/Microsoft.Authorization/locks/protect-patchpage-postgres --query [[level,id]] --output tsv' \
         "$log" ||
         fail "rollback did not prove the exact PostgreSQL lock"
       if grep -Fq 'az storage account show ' "$log"; then

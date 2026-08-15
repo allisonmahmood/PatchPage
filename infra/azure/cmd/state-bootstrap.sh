@@ -209,7 +209,7 @@ EXPECTED_STATE_LOCK_ID="$EXPECTED_STATE_STORAGE_ACCOUNT_ID/providers/Microsoft.A
 if ! STATE_EXISTING_LOCKS="$(
   private_az lock list \
     --resource "$EXPECTED_STATE_STORAGE_ACCOUNT_ID" \
-    --query "[?name=='$STATE_LOCK_NAME'].[level,id]" \
+    --query "[?name=='$STATE_LOCK_NAME'].[[level,id]]" \
     --output tsv
 )"; then
   printf 'Could not inspect the existing OpenTofu state deletion lock.\n' >&2
@@ -425,7 +425,7 @@ fi
 if ! STATE_EXISTING_LOCKS="$(
   private_az lock list \
     --resource "$EXPECTED_STATE_STORAGE_ACCOUNT_ID" \
-    --query "[?name=='$STATE_LOCK_NAME'].[level,id]" \
+    --query "[?name=='$STATE_LOCK_NAME'].[[level,id]]" \
     --output tsv
 )"; then
   printf 'Could not inspect the existing OpenTofu state deletion lock.\n' >&2
@@ -464,7 +464,7 @@ fi
 if ! STATE_LOCK_PROPERTIES="$(
   private_az lock show \
     --ids "$EXPECTED_STATE_LOCK_ID" \
-    --query '[level,id]' \
+    --query '[[level,id]]' \
     --output tsv
 )" ||
   test "$(printf '%s\n' "$STATE_LOCK_PROPERTIES" | cut -f1)" != "CanNotDelete" ||

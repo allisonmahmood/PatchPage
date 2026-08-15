@@ -743,7 +743,7 @@ ensure_exact_can_not_delete_lock() {
   protected_lock_properties="$(
     private_az lock show \
       --ids "$expected_protected_lock_id" \
-      --query '[level,id]' \
+      --query '[[level,id]]' \
       --output tsv
   )" ||
     return 1

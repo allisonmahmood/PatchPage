@@ -743,7 +743,7 @@ EOF
   if ! STATE_LOCK_PROPERTIES="$(
     private_az lock show \
       --ids "$EXPECTED_STATE_LOCK_ID" \
-      --query '[level,id]' \
+      --query '[[level,id]]' \
       --output tsv
   )" ||
     test "$(printf '%s\n' "$STATE_LOCK_PROPERTIES" | cut -f1)" != "CanNotDelete" ||
@@ -774,7 +774,7 @@ EOF
   if ! STORAGE_LOCK_PROPERTIES="$(
     private_az lock show \
       --ids "$EXPECTED_STORAGE_LOCK_ID" \
-      --query '[level,id]' \
+      --query '[[level,id]]' \
       --output tsv
   )" ||
     test "$(printf '%s\n' "$STORAGE_LOCK_PROPERTIES" | cut -f1)" != "CanNotDelete" ||
@@ -782,7 +782,7 @@ EOF
     ! POSTGRES_LOCK_PROPERTIES="$(
       private_az lock show \
         --ids "$EXPECTED_POSTGRES_LOCK_ID" \
-        --query '[level,id]' \
+        --query '[[level,id]]' \
         --output tsv
     )" ||
     test "$(printf '%s\n' "$POSTGRES_LOCK_PROPERTIES" | cut -f1)" != "CanNotDelete" ||
