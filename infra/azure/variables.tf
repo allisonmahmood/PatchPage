@@ -33,8 +33,12 @@ variable "public_base_url" {
 
   validation {
     condition = (
+      (var.official_instance || !can(regex(
+        "^https://(?:[a-z0-9-]+\\.)*patchyhq\\.com$",
+        lower(var.public_base_url)
+      ))) &&
       !can(regex(
-        "^https://(?:[a-z0-9-]+\\.)*(?:patchyhq\\.com|example\\.(?:com|net|org)|example|invalid|localhost|local|test|internal|lan|home|home\\.arpa|corp)$",
+        "^https://(?:[a-z0-9-]+\\.)*(?:example\\.(?:com|net|org)|example|invalid|localhost|local|test|internal|lan|home|home\\.arpa|corp)$",
         lower(var.public_base_url)
       )) &&
       !can(regex(
@@ -42,8 +46,15 @@ variable "public_base_url" {
         lower(var.public_base_url)
       ))
     )
-    error_message = "public_base_url must not use a PatchPage maintainer domain, a reserved hostname, or a placeholder value."
+    error_message = "public_base_url must not use a PatchPage maintainer domain (unless official_instance = true), a reserved hostname, or a placeholder value."
   }
+}
+
+variable "official_instance" {
+  description = "True only on the maintainer's own deployment: exempts public_base_url from the maintainer-domain guard so post.patchyhq.com can configure itself. Self-hosters leave this false; the reserved-hostname and placeholder guards apply regardless."
+  type        = bool
+  default     = false
+  nullable    = false
 }
 
 variable "trust_proxy" {

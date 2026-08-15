@@ -160,3 +160,37 @@ run "rejects_home_arpa_origin" {
 
   expect_failures = [var.public_base_url]
 }
+
+run "accepts_maintainer_origin_on_official_instance" {
+  command = plan
+
+  variables {
+    subscription_id   = "00000000-0000-0000-0000-000000000000"
+    public_base_url   = "https://post.patchyhq.com"
+    official_instance = true
+  }
+}
+
+run "official_instance_keeps_placeholder_guard" {
+  command = plan
+
+  variables {
+    subscription_id   = "00000000-0000-0000-0000-000000000000"
+    public_base_url   = "https://replace-with-your-domain.dev"
+    official_instance = true
+  }
+
+  expect_failures = [var.public_base_url]
+}
+
+run "official_instance_keeps_reserved_hostname_guard" {
+  command = plan
+
+  variables {
+    subscription_id   = "00000000-0000-0000-0000-000000000000"
+    public_base_url   = "https://patchpage.home.arpa"
+    official_instance = true
+  }
+
+  expect_failures = [var.public_base_url]
+}
