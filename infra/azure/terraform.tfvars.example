@@ -50,6 +50,7 @@ kill_switch_az_accounts_version = "5.5.2"
 # Application safety defaults. These match the server defaults and may be
 # lowered or raised within the documented validation bounds.
 allow_self_service_tokens                      = false
+# posthog_api_key                              = "phc_..." # unset = analytics off (self-hosted posture)
 max_html_bytes                                 = 524288
 protected_api_rate_limit_per_minute            = 60
 authenticated_upload_rate_limit_per_minute     = 20
