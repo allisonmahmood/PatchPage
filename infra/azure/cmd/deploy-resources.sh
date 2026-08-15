@@ -109,8 +109,11 @@ if ! private_tofu init -input=false -reconfigure -backend-config=backend.hcl >&3
   printf 'OpenTofu initialization failed.\n' >&2
   exit 1
 fi
+# Console evaluations here are read-only and serialized by the operation
+# lease. -lock=false also keeps OpenTofu's "Acquiring/Releasing state lock"
+# chatter off stdout, which these checks compare literally.
 if ! TERRAFORM_SUBSCRIPTION_LITERAL="$(
-  private_tofu console -no-color <<'EOF'
+  private_tofu console -no-color -lock=false <<'EOF'
 var.subscription_id
 EOF
 )"; then
@@ -124,7 +127,7 @@ fi
 unset TERRAFORM_SUBSCRIPTION_LITERAL
 
 if ! TERRAFORM_RESOURCE_GROUP_LITERAL="$(
-  private_tofu console -no-color <<'EOF'
+  private_tofu console -no-color -lock=false <<'EOF'
 "rg-patchpage-${var.environment_name}"
 EOF
 )"; then
@@ -519,7 +522,7 @@ if ! private_tofu apply -input=false "$INITIAL_PLAN" >&3; then
 fi
 tofu_resource_id() {
   printf '%s\n' "$1" |
-    private_tofu console -no-color |
+    private_tofu console -no-color -lock=false |
     jq -er 'select(type == "string" and length > 0)'
 }
 if ! EXPECTED_STORAGE_ACCOUNT_ID="$(

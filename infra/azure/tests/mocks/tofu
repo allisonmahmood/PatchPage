@@ -17,7 +17,7 @@ tofu_deploy() {
       fi
       test "$scenario" != "init_failure"
       ;;
-    "console -no-color")
+    "console -no-color -lock=false")
       IFS= read -r console_expression || return 1
       case "$console_expression" in
         "var.subscription_id")
@@ -205,7 +205,7 @@ tofu_infrastructure() {
     "init -input=false -reconfigure -backend-config=backend.hcl")
       test "$scenario" != "init_failure"
       ;;
-    "console -no-color")
+    "console -no-color -lock=false")
       IFS= read -r console_expression || return 1
       case "$console_expression" in
         "var.subscription_id")

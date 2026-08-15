@@ -201,8 +201,12 @@ infra_change_begin() {
     printf 'OpenTofu initialization failed.\n' >&2
     exit 1
   fi
+  # Every console evaluation in this flow is read-only and already serialized
+  # by the operation lease. -lock=false matters beyond that: with a real
+  # backend, taking the state lock prints "Acquiring/Releasing state lock"
+  # chatter on stdout, and these checks compare stdout literally.
   if ! TERRAFORM_SUBSCRIPTION_LITERAL="$(
-    private_tofu console -no-color <<'EOF'
+    private_tofu console -no-color -lock=false <<'EOF'
 var.subscription_id
 EOF
   )"; then
@@ -215,7 +219,7 @@ EOF
   fi
   unset TERRAFORM_SUBSCRIPTION_LITERAL
   if ! TERRAFORM_RESOURCE_GROUP_LITERAL="$(
-    private_tofu console -no-color <<'EOF'
+    private_tofu console -no-color -lock=false <<'EOF'
 "rg-patchpage-${var.environment_name}"
 EOF
   )"; then
@@ -645,7 +649,7 @@ infra_change_plan_phase() {
   if ! printf '%s\n' "$WORKLOAD_STORAGE_ACCOUNT_NAME" |
     grep -Eq '^[a-z0-9]{3,24}$' ||
     ! TERRAFORM_STORAGE_RETENTION_DAYS="$(
-      private_tofu console -no-color <<'EOF'
+      private_tofu console -no-color -lock=false <<'EOF'
 var.storage_delete_retention_days
 EOF
     )" ||
@@ -1026,7 +1030,7 @@ EOF
     exit 1
   fi
   if ! TERRAFORM_SERVER_IMAGE_LITERAL="$(
-    private_tofu console -no-color <<'EOF'
+    private_tofu console -no-color -lock=false <<'EOF'
 var.server_image
 EOF
   )" ||
