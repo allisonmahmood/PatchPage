@@ -446,7 +446,7 @@ if ! private_az acr build \
   --registry "$ACR" \
   --image "patchpage-server:$INITIAL_BUILD_TAG" \
   --build-arg "REVISION=$TAG" \
-  --file apps/server/Dockerfile \
+  --file ../../apps/server/Dockerfile \
   ../.. >/dev/null 2>&1; then
   printf 'ACR did not complete the server image build successfully.\n' >&2
   exit 1

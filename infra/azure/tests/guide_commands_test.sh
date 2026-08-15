@@ -859,7 +859,7 @@ key                  = "patchpage-prod.tfstate"' ||
           fail "deployment did not reconfigure OpenTofu to the verified backend"
         initial_build_tag="$(
           sed -n \
-            's/^az acr build --registry acrpatchpageabc123 --image patchpage-server:\([^ ]*\) --build-arg REVISION=1111111111111111111111111111111111111111 --file apps\/server\/Dockerfile \.\.\/\.\.$/\1/p' \
+            's/^az acr build --registry acrpatchpageabc123 --image patchpage-server:\([^ ]*\) --build-arg REVISION=1111111111111111111111111111111111111111 --file \.\.\/\.\.\/apps\/server\/Dockerfile \.\.\/\.\.$/\1/p' \
             "$log"
         )"
         printf '%s\n' "$initial_build_tag" |
@@ -1319,7 +1319,7 @@ test_app_release() {
         fail "app release did not prove the expected live ACR login server"
       release_build_tag="$(
         sed -n \
-          "s|^az acr build --registry acrpatchpageabc123 --image patchpage-server:\\([^ ]*\\) --build-arg REVISION=1111111111111111111111111111111111111111 --file apps/server/Dockerfile $scenario_root_canonical$|\\1|p" \
+          "s|^az acr build --registry acrpatchpageabc123 --image patchpage-server:\\([^ ]*\\) --build-arg REVISION=1111111111111111111111111111111111111111 --file $scenario_root_canonical/apps/server/Dockerfile $scenario_root_canonical$|\\1|p" \
           "$log"
       )"
       printf '%s\n' "$release_build_tag" |

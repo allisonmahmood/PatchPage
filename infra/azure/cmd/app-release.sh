@@ -278,7 +278,7 @@ if ! private_az acr build \
   --registry "$ACR" \
   --image "patchpage-server:$RELEASE_BUILD_TAG" \
   --build-arg "REVISION=$TAG" \
-  --file apps/server/Dockerfile \
+  --file "$REPO_ROOT/apps/server/Dockerfile" \
   "$REPO_ROOT" >/dev/null 2>&1; then
   printf 'ACR did not complete the server image build successfully.\n' >&2
   exit 1
