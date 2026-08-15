@@ -114,7 +114,7 @@ verify_operation_container() {
         --account-name "$STATE_STORAGE_ACCOUNT" \
         --container-name "$OPERATION_CONTAINER" \
         --auth-mode "$OPERATION_LEASE_AUTH_MODE" \
-        --include d v \
+        --include dv \
         --num-results '*' \
         --query '[].name' \
         --output tsv

@@ -567,7 +567,7 @@ test_state_bootstrap() {
           "$log" ||
           fail "operation-lease container was not created beside the state container"
         grep -Fqx \
-          'storage blob list --account-name patchpagestate --container-name patchpage-operations --auth-mode key --include d v --num-results * --query [].name --output tsv' \
+          'storage blob list --account-name patchpagestate --container-name patchpage-operations --auth-mode key --include dv --num-results * --query [].name --output tsv' \
           "$log" ||
           fail "operation-lease container was not verified empty"
         grep -Fqx \
@@ -587,7 +587,7 @@ test_state_bootstrap() {
           "$log" ||
           fail "operation principal was not granted exact-container Blob contributor access"
         grep -Fqx \
-          "storage blob list --account-name patchpagestate --container-name tfstate --auth-mode key --prefix patchpage-prod.tfstate --include d v --num-results * --query [?name=='patchpage-prod.tfstate'].name --output tsv" \
+          "storage blob list --account-name patchpagestate --container-name tfstate --auth-mode key --prefix patchpage-prod.tfstate --include dv --num-results * --query [?name=='patchpage-prod.tfstate'].name --output tsv" \
           "$log" ||
           fail "state bootstrap did not prove the backend key lacks current, deleted, or versioned history"
         grep -Fqx \
@@ -1353,7 +1353,7 @@ test_app_release() {
       grep -Fq "az storage container lease renew --account-name patchpagestate --container-name patchpage-operations --auth-mode login --lease-id $lease_id --output none" "$log" ||
         fail "app release did not renew with the exact acquired lease ID"
       grep -Fqx \
-        'az storage blob list --account-name patchpagestate --container-name patchpage-operations --auth-mode login --include d v --num-results * --query [].name --output tsv' \
+        'az storage blob list --account-name patchpagestate --container-name patchpage-operations --auth-mode login --include dv --num-results * --query [].name --output tsv' \
         "$log" ||
         fail "app release did not verify the operation container is empty"
       test "$(grep -Fxc "az containerapp show --ids /subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg-patchpage-workload/providers/Microsoft.App/containerApps/patchpage-app --output json" "$log")" -ge 7 ||
@@ -2366,7 +2366,7 @@ azurerm_container_app.server'
         "$log" ||
         fail "infrastructure change did not release its exact lease with state-account key authorization"
       grep -Fqx \
-        'az storage blob list --account-name patchpagestate --container-name patchpage-operations --auth-mode key --include d v --num-results * --query [].name --output tsv' \
+        'az storage blob list --account-name patchpagestate --container-name patchpage-operations --auth-mode key --include dv --num-results * --query [].name --output tsv' \
         "$log" ||
         fail "infrastructure change did not key-verify the empty operation container"
       if grep -Eq '^az storage (container exists|blob list|container lease) .*--auth-mode login' "$log"; then
