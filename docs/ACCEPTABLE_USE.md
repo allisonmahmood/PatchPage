@@ -10,6 +10,11 @@ constant `ACCEPTABLE_USE_URL`. Every consumer that links this policy — the sel
 mint response, the served-draft footer, and the README — reads that one constant rather
 than repeating the literal, so the URL changes in exactly one place.
 
+The companion [PatchPage privacy notice](https://patchyhq.com/patchpage/privacy) has no
+source copy here: it is maintained in the website repo, and it is where every claim
+about what the service records lives. When the server changes what it stores, what it
+sends to analytics, or how long it keeps any of it, that notice is the file to change.
+
 By publishing a page to the official instance you accept this policy. There is no
 signup and nothing to sign: publishing is acceptance.
 
@@ -40,9 +45,11 @@ Use PatchPage for documents: plans, briefs, reports, notes, write-ups. Do not pu
 - **Sexual content involving minors** — in any form, without exception. This is
   reported to the relevant authorities.
 
-Pages are static documents by design: they cannot run scripts, set cookies, track
-viewers, or collect data. Attempting to work around those restrictions is itself a
-violation of this policy.
+Pages are static documents by design: they cannot run scripts, set cookies, or collect
+data. One thing they can do is load images from other sites, which tells the site
+hosting an image the reader's IP address and browser — publishing remote content in
+order to profile the people who read your page counts as tracking, and is a violation of
+this policy. So is attempting to work around any of these restrictions.
 
 ## Fair-use limits
 
@@ -71,15 +78,18 @@ not to index pages. But anyone with the link can open or reshare it, and a link 
 publicly can still end up in search results. Do not publish secrets, credentials, or
 anything you would not hand to a stranger holding the link.
 
-Published pages are served plain: no banners, no cookies, no tracking, and no login —
-by us or by the page.
+Published pages are served plain: no banners, no cookies, no login, and no tracking by
+us. What the service records when you publish a page, what it deliberately does not
+record when someone reads one, and the one thing a page itself can still reveal about
+its readers, are all set out in the [PatchPage privacy
+notice](https://patchyhq.com/patchpage/privacy).
 
 ## Reports and takedowns
 
 Every published page carries a report link in its footer. Reports go to a human: we
 review them and remove content that violates this policy. Rights holders and anyone
-affected by a page can use the same channel. You can also reach us through the contact
-listed on [patchyhq.com](https://patchyhq.com).
+affected by a page can use the same channel. You can also email us — the contact link is
+on the [published policy](https://patchyhq.com/acceptable-use).
 
 ## Enforcement
 
@@ -98,5 +108,10 @@ regardless (see [SELF_HOSTING.md](SELF_HOSTING.md)).
 ## Changes
 
 We may update this policy. The current version lives at this address and on
-[patchyhq.com](https://patchyhq.com); continued publishing after a change is acceptance
-of the updated policy.
+[patchyhq.com](https://patchyhq.com/acceptable-use), which carries the date it last
+changed; continued publishing after a change is acceptance of the updated policy.
+
+## Contact us
+
+Questions about this policy? Email us — the contact link is on the [published
+policy](https://patchyhq.com/acceptable-use).
