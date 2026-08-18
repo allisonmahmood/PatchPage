@@ -597,9 +597,9 @@ variable "operator_alert_email" {
 }
 
 variable "kill_switch_az_accounts_version" {
-  description = "Az.Accounts version imported into the kill switch Automation account. Connect-AzAccount and Invoke-AzRestMethod both come from this module, so the runbook cannot run without it. Pinned rather than left to the account's defaults so a missing module fails at apply instead of during an incident; bump it deliberately when the pinned version ages out of support."
+  description = "Az.Accounts version imported into the kill switch Automation account. Connect-AzAccount and Invoke-AzRestMethod both come from this module, so the runbook cannot run without it. Pinned so the version is deliberate, not so it is verified: a successful import proves the package extracted, and only the kill-switch fire drill proves the version actually loads in the PowerShell 7.2 sandbox. Run the drill after every change to this value, and prefer the Az.Accounts version the sandbox's built-in Az rollup already pairs with -- a newer pin can shadow a working built-in with one that cannot load."
   type        = string
-  default     = "5.5.2"
+  default     = "2.15.0"
   nullable    = false
 
   validation {

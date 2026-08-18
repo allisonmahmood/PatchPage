@@ -210,11 +210,12 @@ run "kill_switch_stops_the_server_and_cannot_start_it" {
     error_message = "Expected Az.Accounts to be imported into the kill switch Automation account."
   }
 
-  # Pinned to an exact published version, so the import either succeeds at apply
-  # or fails loudly there.
+  # Pinned to the exact version the PS 7.2 sandbox's built-in Az rollup pairs
+  # with. The pin makes the version deliberate; it does not verify it loads --
+  # only the fire drill does that (issue #165).
   assert {
-    condition     = strcontains(azurerm_automation_powershell72_module.az_accounts.module_link[0].uri, "/Az.Accounts/5.5.2")
-    error_message = "Expected the Az.Accounts import to pin an exact PowerShell Gallery version."
+    condition     = strcontains(azurerm_automation_powershell72_module.az_accounts.module_link[0].uri, "/Az.Accounts/2.15.0")
+    error_message = "Expected the Az.Accounts import to pin the sandbox-proven PowerShell Gallery version."
   }
 
   # The runbook calls the Container Apps stop operation and never the start one.
