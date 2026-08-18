@@ -1,5 +1,10 @@
 # The go-public flip
 
+> **Executed 2026-08-18.** The official instance is public; this runbook is
+> kept as the record of how, and for the refusal semantics of the flip command
+> it documents. The pre-flip framing below ("private instance") describes the
+> state the flip started from, deliberately unrewritten.
+
 The one-time operation that turns the maintainer's private PatchPage instance
 into the free public service: a data surgery, an environment change, and a
 first pinned page, in that order.

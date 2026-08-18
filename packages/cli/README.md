@@ -2,13 +2,19 @@
 
 Command-line uploader for [PatchPage](https://github.com/allisonmahmood/PatchPage), a self-hostable service for publishing static HTML drafts behind unlisted, link-viewable URLs. Every upload requires a bearer API token, on every configuration; draft viewer URLs are public and unlisted, so anyone with the link can view the rendered artifact.
 
-The CLI defaults to the host `https://post.patchyhq.com`, which is the maintainer's private instance and issues no tokens to outside callers. To use PatchPage yourself, deploy your own server and point the CLI at it with `--api-url` or the `PATCHPAGE_API_URL` environment variable. See the [self-hosting guide](https://github.com/allisonmahmood/PatchPage/blob/main/docs/SELF_HOSTING.md).
+The CLI defaults to the host `https://post.patchyhq.com` — the free official instance. No signup: the first `upload` mints a publishing key for you, saves it locally, and publishing accepts the [acceptable use policy](https://patchyhq.com/acceptable-use). To run your own server instead, point the CLI at it with `--api-url` or the `PATCHPAGE_API_URL` environment variable; see the [self-hosting guide](https://github.com/allisonmahmood/PatchPage/blob/main/docs/SELF_HOSTING.md).
 
 ## Install and use
 
 Requires Node.js 22 or newer.
 
-Set `PATCHPAGE_SETUP_URL` to your self-hosted origin and provide `PATCHPAGE_SETUP_TOKEN` through a secret environment variable. This scoped workflow pins the intended server, clears inherited credential overrides, verifies the stored token, and exits before upload if authentication or validation fails:
+```sh
+npx --yes patchpage upload ./plan.html
+```
+
+That is the whole hosted flow: a publishing key is minted on first use, the URL prints on success, and uploading the same file again updates the same draft.
+
+For CI and other automation against a server you control, set `PATCHPAGE_SETUP_URL` to your self-hosted origin and provide `PATCHPAGE_SETUP_TOKEN` through a secret environment variable. This scoped workflow pins the intended server, clears inherited credential overrides, verifies the stored token, and exits before upload if authentication or validation fails:
 
 <!-- patchpage-packed-cli-e2e:start -->
 ```sh

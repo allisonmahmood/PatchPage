@@ -325,7 +325,7 @@ Turning the flag back off stops new mints; it does not revoke tokens already min
 
 ### Server-side analytics
 
-Off by default. Leave `PATCHPAGE_POSTHOG_API_KEY` unset and your instance builds no analytics client, opens no connection, and reports nothing — this is the private-instance posture and nothing else in the server changes with it.
+Off by default. Leave `PATCHPAGE_POSTHOG_API_KEY` unset and your instance builds no analytics client, opens no connection, and reports nothing — this is the default posture and nothing else in the server changes with it.
 
 Setting a key turns on capture for seven business events, and only those seven:
 
@@ -750,7 +750,7 @@ After the minting block succeeds, the CLI is already configured for your instanc
 
 ## Pointing the CLI at your instance
 
-The CLI defaults to `https://post.patchyhq.com`, which is the maintainer's private instance and issues no tokens to outside callers. The minting block selects the self-hosted origin explicitly and saves the new credential. On another machine, use this fail-closed quick start with a scoped token in a protected owner-readable file:
+The CLI defaults to `https://post.patchyhq.com`, the free official instance, and would mint a key there on first upload — so the minting block selects the self-hosted origin explicitly and saves the new credential, keeping the setup pointed at your server rather than the default. On another machine, use this fail-closed quick start with a scoped token in a protected owner-readable file:
 
 ```sh
 (
