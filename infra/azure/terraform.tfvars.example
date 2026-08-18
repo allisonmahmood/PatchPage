@@ -42,9 +42,10 @@ operator_alert_email = null
 kill_switch_webhook_expiry = "2036-01-01T00:00:00Z"
 
 # The runbook needs Az.Accounts for Connect-AzAccount and Invoke-AzRestMethod.
-# It is imported explicitly at this exact version rather than inherited from the
-# Automation account's defaults, so a missing module fails at apply instead of
-# during an incident. Bump deliberately when it ages out of support.
+# It is imported explicitly at this exact version so the version is deliberate,
+# not verified: a successful import proves the package extracted, and only the
+# kill-switch fire drill proves it loads in the PowerShell 7.2 sandbox. Run the
+# drill after every change to this value.
 kill_switch_az_accounts_version = "2.15.0"
 
 # Application safety defaults. These match the server defaults and may be
