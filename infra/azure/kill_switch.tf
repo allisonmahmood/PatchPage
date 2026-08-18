@@ -187,6 +187,18 @@ resource "azurerm_automation_runbook" "kill_switch" {
   log_verbose  = false
   log_progress = false
 
+  # azurerm reads runbooks back through a preview Automation API that reports a
+  # PowerShell 7.2 runbook's type as bare "PowerShell" (the runtime moved to a
+  # separate runtime-environment field), so every refresh manufactures a type
+  # change that forces replacement -- which the no-delete gate then refuses,
+  # blocking all infrastructure changes (issue #167). The type is set correctly
+  # at create time and never legitimately changes afterwards; ignoring the
+  # read-back loses nothing. Remove when the provider reads the runtime model
+  # coherently.
+  lifecycle {
+    ignore_changes = [runbook_type]
+  }
+
   content = templatefile("${path.module}/kill-switch-runbook.ps1.tftpl", {
     container_app_id = azurerm_container_app.server.id
     stop_api_version = local.container_app_stop_api_version
