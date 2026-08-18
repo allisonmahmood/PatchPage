@@ -21,20 +21,20 @@ The skill teaches the assistant to produce safe static HTML and publish it. Its 
 The CLI is published to npm as [`patchpage`](https://www.npmjs.com/package/patchpage). Requires Node.js 22 or newer.
 
 ```sh
-npx patchpage upload ./plan.html
+npx --yes patchpage upload ./plan.html
 # Minted a new publishing token for https://post.patchyhq.com; saved to ~/.patchpage/credentials.json.
 # URL: https://post.patchyhq.com/d/k7f2m9x1a3b8
 ```
 
 Uploading the same file again updates the same draft, so the link you shared keeps working. The saved credentials file is the only key to your pages — copy it to another machine to publish from there with the same editing rights. Full command and flag reference: [packages/cli/README.md](packages/cli/README.md).
 
-Every upload carries a bearer publishing key, on every configuration; there is no tokenless upload path and no server setting that restores one. A request with no `Authorization` header is rejected with 401, and an invalid credential is never downgraded to an unauthenticated upload.
+Every upload requires a bearer publishing key, on every configuration; there is no tokenless upload path and no server setting that restores one. A request with no `Authorization` header is rejected with 401, and an invalid credential is never downgraded to an unauthenticated upload.
 
 ## Fair use, and how long pages stay up
 
 The hosted instance is free for everyone, which only works with limits: up to **512 KiB** per page, **5 new publishing keys** per network address per day, **1,000 live pages** per key, and **10 new pages per minute**. A page stays up for at least **90 days** after it was last published or updated, and every visit keeps it alive for at least another **30 days**; a page nobody reads for months eventually expires and is permanently deleted. Republishing before then resets the clock. The [acceptable use policy](https://patchyhq.com/acceptable-use) carries the current numbers and the rules.
 
-**Unlisted, not private.** Links are long, unguessable, never listed by the service, and served `noindex` — but anyone with the link can open or reshare it. Don't publish secrets, credentials, or anything you would not hand to a stranger holding the link.
+**Unlisted, not private.** Draft viewer URLs are public and unlisted: long, unguessable, never listed by the service, and served `noindex` — but anyone with the link can open or reshare it. Don't publish secrets, credentials, or anything you would not hand to a stranger holding the link.
 
 ## Self-hosting
 

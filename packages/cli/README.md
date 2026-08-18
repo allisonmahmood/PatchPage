@@ -9,7 +9,7 @@ The CLI defaults to the host `https://post.patchyhq.com` — the free official i
 Requires Node.js 22 or newer.
 
 ```sh
-npx patchpage upload ./plan.html
+npx --yes patchpage upload ./plan.html
 ```
 
 That is the whole hosted flow: a publishing key is minted on first use, the URL prints on success, and uploading the same file again updates the same draft.

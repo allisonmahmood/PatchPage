@@ -62,10 +62,13 @@ for (const name of ["rootReadme", "cliReadme", "selfHosting", "showcase"]) {
     `${surfacePaths[name]} must describe viewer links as public and unlisted`
   );
   assert.match(text, /self-host/i, `${surfacePaths[name]} must identify the self-hosted mode`);
+  // "Publishing key" is the user-facing name for the bearer token since the
+  // go-public flip; operator surfaces still say "token". Either satisfies the
+  // contract that no upload is credential-free.
   assert.match(
     text,
-    /(?:every|each|all|any) upload[^.]{0,100}(?:requires?|needs?)[^.]{0,60}(?:API )?token|no[^.]{0,60}upload[^.]{0,60}without[^.]{0,30}token|uploads?[^.]{0,60}(?:always )?requires?[^.]{0,40}(?:API )?token/i,
-    `${surfacePaths[name]} must state that every upload requires a token`
+    /(?:every|each|all|any) upload[^.]{0,100}(?:requires?|needs?)[^.]{0,60}(?:(?:API )?token|publishing key)|no[^.]{0,60}upload[^.]{0,60}without[^.]{0,30}(?:token|key)|uploads?[^.]{0,60}(?:always )?requires?[^.]{0,40}(?:(?:API )?token|publishing key)/i,
+    `${surfacePaths[name]} must state that every upload requires a publishing key or token`
   );
   assert.match(
     text,
@@ -81,6 +84,9 @@ for (const name of ["rootReadme", "cliReadme", "selfHosting", "showcase"]) {
   }
 }
 
+// The default host is the free official instance (go-public flip, #125/#126):
+// a first upload mints a publishing key, and publishing accepts the AUP. The
+// retired private-instance framing must not creep back onto any surface.
 for (const name of ["rootReadme", "cliReadme", "showcase"]) {
   const text = visibleText(surfaces[name]);
   assert.match(
@@ -90,16 +96,28 @@ for (const name of ["rootReadme", "cliReadme", "showcase"]) {
   );
   assert.match(
     text,
-    /private instance/i,
-    `${surfacePaths[name]} must identify the maintainer instance`
+    /(?:free )?official instance|official free (?:service|instance)/i,
+    `${surfacePaths[name]} must identify the default host as the official instance`
   );
-  // Both context glossaries avoid "signup" as domain vocabulary, so the
-  // contract enforces the meaning rather than that word: the maintainer
-  // instance hands out no tokens to callers who are not its operator.
   assert.match(
     text,
+    /mint(?:s|ed)?[^.]{0,80}publishing (?:key|token)/i,
+    `${surfacePaths[name]} must state that a publishing key is minted automatically`
+  );
+  assert.match(
+    text,
+    /accept(?:s|ed|ing)?[^.]{0,80}acceptable use polic/i,
+    `${surfacePaths[name]} must state that publishing accepts the acceptable use policy`
+  );
+  assert.doesNotMatch(
+    text,
+    /private instance/i,
+    `${surfacePaths[name]} still carries the retired private-instance framing`
+  );
+  assert.doesNotMatch(
+    text,
     /(?:issues|hands out|offers) no[^.]{0,40}tokens?|does not issue[^.]{0,40}tokens?/i,
-    `${surfacePaths[name]} must say the maintainer instance issues no tokens to outside callers`
+    `${surfacePaths[name]} still claims the instance issues no tokens`
   );
 }
 
