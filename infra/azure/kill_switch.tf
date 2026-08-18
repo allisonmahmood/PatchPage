@@ -145,9 +145,16 @@ resource "azurerm_role_assignment" "kill_switch_stop" {
 # instance is burning money. Both triggers would fire into a job that errors,
 # and the instance would stay up.
 #
-# Pinning it converts that silent runtime failure into a loud apply-time one,
-# and takes a line off the operator's pre-live checklist. The cost is that the
-# version goes stale on its own schedule; see the variable's description.
+# Know what the pin does and does not buy. It makes the version deliberate --
+# an operator chose it, and a plan shows it changing -- but it does NOT make a
+# broken version fail at apply. The module resource's Succeeded provisioning
+# state proves the package extracted, nothing more; whether it loads is decided
+# inside the PowerShell 7.2 sandbox at run time, where an import that needs an
+# assembly the sandbox's .NET cannot resolve dies exactly as silently as a
+# missing module would (issue #165: 5.5.2 imported Succeeded and then failed
+# to load on the first live firing). The kill-switch fire drill in
+# infra/azure/README.md is the only check that proves the runbook runs; repeat
+# it after any change to this pin.
 resource "azurerm_automation_powershell72_module" "az_accounts" {
   name                  = "Az.Accounts"
   automation_account_id = azurerm_automation_account.kill_switch.id

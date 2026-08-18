@@ -45,7 +45,7 @@ kill_switch_webhook_expiry = "2036-01-01T00:00:00Z"
 # It is imported explicitly at this exact version rather than inherited from the
 # Automation account's defaults, so a missing module fails at apply instead of
 # during an incident. Bump deliberately when it ages out of support.
-kill_switch_az_accounts_version = "5.5.2"
+kill_switch_az_accounts_version = "2.15.0"
 
 # Application safety defaults. These match the server defaults and may be
 # lowered or raised within the documented validation bounds.
