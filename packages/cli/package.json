@@ -47,6 +47,6 @@
   },
   "dependencies": {
     "commander": "^15.0.0",
-    "parse5": "^7.3.0"
+    "parse5": "^8.0.1"
   }
 }
