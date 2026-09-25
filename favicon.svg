@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-labelledby="title desc">
+  <title id="title">PatchPage icon</title>
+  <desc id="desc">A rounded red patch with a black outline, black offset shadow, and a small corner mark.</desc>
+  <rect x="114" y="110" width="286" height="286" rx="82" fill="#15130F" transform="rotate(-6 257 253) translate(22 22)"/>
+  <rect x="114" y="110" width="286" height="286" rx="82" fill="#E94B35" stroke="#15130F" stroke-width="30" transform="rotate(-6 257 253)"/>
+  <path d="M256 180H326V250" fill="none" stroke="#15130F" stroke-width="30" stroke-linecap="round" stroke-linejoin="round" transform="rotate(-6 291 215)"/>
+</svg>
