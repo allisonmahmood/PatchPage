@@ -52,6 +52,7 @@ const TRACKED_TEMP_EXEMPTIONS = new Set([
 const TRACKED_HOME_EXEMPTIONS = new Set([
   ".agents/skills/patchpage-mint-token/SKILL.md\u0000~/.patchpage/credentials.json",
   "CHANGELOG.md\u0000~/.patchpage",
+  "README.md\u0000~/.patchpage/credentials.json.",
   "docs/PLAN.md\u0000~/.patchpage",
   "docs/SKILL_DISTRIBUTION.md\u0000~/.claude/skills/",
   "packages/cli/README.md\u0000/home/you/.patchpage",

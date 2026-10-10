@@ -6,6 +6,15 @@ All notable changes to PatchPage are documented in this file. The format is base
 
 ## [Unreleased]
 
+## [0.2.2] - 2026-10-10
+
+### Changed
+
+- The npm README describes the official instance as the free public service it now is:
+  `npx --yes patchpage upload ./plan.html` is the whole hosted flow, with a publishing key
+  minted on first use. The scoped token workflow is now framed for CI against a server you
+  control.
+
 ### Fixed
 
 - Same-page links in a published page now work. A table of contents or top nav made of
