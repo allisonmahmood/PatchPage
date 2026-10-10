@@ -84,6 +84,9 @@ export function renderHome(options: { publicBaseUrl: string }): string {
  * Exactly those two links, and no brand credit: this is someone else's published
  * page, and the spec asks the footer for a report path and the policy behind it.
  * The welcome draft carries the patchyhq.com credit in its own content.
+ *
+ * The document goes into the frame led by the frame's own base URL
+ * (`FRAME_BASE`), so an agent's table of contents scrolls.
  */
 export function renderDraftWrapper(options: {
   draft: DraftRecord;
@@ -156,7 +159,7 @@ export function renderDraftWrapper(options: {
     title="${title}"
     sandbox=""
     referrerpolicy="no-referrer"
-    srcdoc="${escapeAttribute(options.html)}"></iframe>
+    srcdoc="${escapeAttribute(FRAME_BASE + options.html.replace(LEADING_BOM, ""))}"></iframe>
   <footer class="draft-footer">
     <a href="${escapeHtml(ACCEPTABLE_USE_URL)}">Acceptable use</a>
     <span class="sep" aria-hidden="true">&middot;</span>
@@ -166,6 +169,39 @@ export function renderDraftWrapper(options: {
 </body>
 </html>`;
 }
+
+/**
+ * Leads every served draft, giving it the base URL of the frame it is served
+ * in, so its same-page links (`href="#overview"`) scroll instead of reloading
+ * the page.
+ *
+ * A `srcdoc` document's URL is `about:srcdoc`, but without a base of its own
+ * its relative URLs resolve against the wrapper's: `#overview` means
+ * `https://host/d/ID#overview`. That is not the framed document, so the
+ * browser loads the wrapper inside the frame. Against this base it means
+ * `about:srcdoc#overview`, the framed document, so following it is a fragment
+ * navigation: a scroll, with no request and no change to the top URL. That
+ * holds for every link the browser follows, in SVG and shadow roots too. Any
+ * other relative URL stops resolving, where before it pointed at this host; a
+ * single-file draft has nothing there to point at.
+ *
+ * It goes ahead of everything, the doctype included, because the first base
+ * with an `href` is the one that counts. The upload policy rejects `<base>`,
+ * but reads `<noscript>` as text, so a base can still arrive inside one; this
+ * one precedes it. A srcdoc document never renders in quirks mode, so the
+ * doctype it displaces changes nothing. Its one casualty is the attributes of
+ * the upload's own `<head>` tag, which the parser drops once the base has
+ * implied a head.
+ */
+const FRAME_BASE = '<base href="about:srcdoc">';
+
+/**
+ * A byte order mark the upload leads with. The parser discards one only at the
+ * very start of a document, so behind the base it would be text: it would end
+ * the head early and push the upload's `<title>`, `<style>`, and `<meta>` into
+ * the body. It goes before the base does.
+ */
+const LEADING_BOM = /^\uFEFF/;
 
 /**
  * The report page the footer link leads to. Its whole reason for existing is

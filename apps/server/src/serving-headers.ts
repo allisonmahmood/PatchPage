@@ -27,12 +27,18 @@ export const DRAFT_ROBOTS_TAG = "noindex";
  */
 export const NO_REFERRER_POLICY = "no-referrer";
 
+/**
+ * `base-uri about:` admits the `<base href="about:srcdoc">` that leads every
+ * framed draft (see `FRAME_BASE` in render.ts), so its same-page links stay in
+ * the frame. It admits any `about:` URL, none of which reaches the network, and
+ * no network scheme.
+ */
 export const DRAFT_CONTENT_SECURITY_POLICY = [
   "default-src 'none'",
   "style-src 'unsafe-inline'",
   "img-src https: data:",
   "frame-src 'self' about:",
-  "base-uri 'none'",
+  "base-uri about:",
   "form-action 'none'"
 ].join("; ");
 

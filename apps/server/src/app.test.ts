@@ -140,7 +140,8 @@ describe("PatchPage server", () => {
       url: "/api/uploads",
       headers: { authorization: "Bearer dev-token" },
       payload: {
-        html: "<!doctype html><html><head><title>Test Draft</title></head><body><h1>Hello</h1></body></html>",
+        // Led by a byte order mark, which has to give way to the frame's base.
+        html: "\uFEFF<!doctype html><html><head><title>Test Draft</title></head><body><h1>Hello</h1></body></html>",
         filename: "plan.html"
       }
     });
@@ -154,6 +155,9 @@ describe("PatchPage server", () => {
     expect(viewer.body).toContain("Test Draft");
     expect(viewer.body).toContain("class=\"draft-frame\"");
     expect(viewer.body).toContain("&lt;h1&gt;Hello&lt;/h1&gt;");
+    expect(viewer.body).toContain(
+      "srcdoc=\"&lt;base href=&quot;about:srcdoc&quot;&gt;&lt;!doctype html&gt;"
+    );
     expect(viewer.body).not.toContain("patchpage-banner");
 
     await app.close();
@@ -2020,7 +2024,7 @@ describe("PatchPage server", () => {
       expect(response.statusCode).toBe(200);
       expect(response.headers["content-security-policy"]).toBe(
         "default-src 'none'; style-src 'unsafe-inline'; img-src https: data:; " +
-          "frame-src 'self' about:; base-uri 'none'; form-action 'none'"
+          "frame-src 'self' about:; base-uri about:; form-action 'none'"
       );
       expect(response.headers["content-security-policy"]).not.toContain("script");
       expect(response.body).not.toContain("<script");
@@ -2052,7 +2056,7 @@ describe("PatchPage server", () => {
       // And carrying it changed nothing about how a draft is served.
       expect(response.headers["content-security-policy"]).toBe(
         "default-src 'none'; style-src 'unsafe-inline'; img-src https: data:; " +
-          "frame-src 'self' about:; base-uri 'none'; form-action 'none'"
+          "frame-src 'self' about:; base-uri about:; form-action 'none'"
       );
       expect(response.headers["set-cookie"]).toBeUndefined();
     }
