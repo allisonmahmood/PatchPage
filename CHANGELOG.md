@@ -6,6 +6,16 @@ All notable changes to PatchPage are documented in this file. The format is base
 
 ## [Unreleased]
 
+### Fixed
+
+- Same-page links in a published page now work. A table of contents or top nav made of
+  `href="#section"` links used to load the PatchPage page inside the page's own frame
+  instead of scrolling. The framed page now gets `<base href="about:srcdoc">`, so those
+  links resolve to the page itself and following one scrolls to its section. The draft
+  CSP's `base-uri` moves from `'none'` to `about:` to admit that base and nothing on the
+  network. Other relative URLs in a page, which used to point at the PatchPage host and
+  find nothing there, no longer resolve at all; absolute `https://` URLs are unaffected.
+
 ## [0.2.1] - 2026-08-14
 
 ### Changed

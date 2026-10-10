@@ -30,7 +30,7 @@ const expectedViewerCsp = [
   "style-src 'unsafe-inline'",
   "img-src https: data:",
   "frame-src 'self' about:",
-  "base-uri 'none'",
+  "base-uri about:",
   "form-action 'none'"
 ].join("; ");
 const activeChildren = new Set();
