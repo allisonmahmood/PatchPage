@@ -12,4 +12,4 @@ The five canonical triage roles, each label string equal to its name. See `docs/
 
 ### Domain docs
 
-Multi-context — a root `CONTEXT-MAP.md` pointing at one `CONTEXT.md` per context (hosting server, npx publisher). See `docs/agents/domain.md`.
+Multi-context — a root `GLOSSARY-MAP.md` pointing at one `GLOSSARY.md` per context (hosting server, npx publisher). See `docs/agents/domain.md`.
