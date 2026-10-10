@@ -28,7 +28,7 @@ Triage sets one more axis: **which part of the codebase the issue touches**. App
 
 This table and the globs in `.github/labeler.yml` are meant to say the same thing. If you change one, change the other.
 
-The first three mirror the contexts in `CONTEXT-MAP.md`, so triage and the domain docs stay in one vocabulary — see `domain.md`.
+The first three mirror the contexts in `GLOSSARY-MAP.md`, so triage and the domain docs stay in one vocabulary — see `domain.md`.
 
 The bug and feature forms ask the reporter which part of PatchPage is affected. Treat that answer as a hint, not a decision: reporters routinely attribute a validation bug to the CLI when it comes from `packages/core`.
 

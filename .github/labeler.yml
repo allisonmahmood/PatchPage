@@ -1,6 +1,6 @@
 # Path -> area label mapping for .github/workflows/pr-labels.yml
 #
-# The first three areas mirror the contexts in CONTEXT-MAP.md, so pull
+# The first three areas mirror the contexts in GLOSSARY-MAP.md, so pull
 # requests and the domain docs stay in the same vocabulary. `db`, `storage`
 # and `config` roll into `area:server` because docs/agents/domain.md treats
 # them as the hosting context's supporting packages.
