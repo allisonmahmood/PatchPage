@@ -159,9 +159,68 @@ describe("PatchPage server", () => {
       "srcdoc=\"&lt;base href=&quot;about:srcdoc&quot;&gt;&lt;!doctype html&gt;"
     );
     expect(viewer.body).not.toContain("patchpage-banner");
+    expect(viewer.body).toContain(
+      '<link rel="icon" href="/favicon.svg" type="image/svg+xml" sizes="any">'
+    );
 
     await app.close();
     await db.close();
+  });
+
+  it("previews a pasted link as the page's own title, escaped", async () => {
+    const config = testConfig();
+    const db = new JsonFilePatchPageDb(path.join(tempDir, "preview-db.json"));
+    await db.initialize("dev-token");
+    const storage = new FileSystemHtmlStorage(path.join(tempDir, "preview-drafts"));
+    const app = createApp({ config, db, storage });
+
+    const upload = await app.inject({
+      method: "POST",
+      url: "/api/uploads",
+      headers: { authorization: "Bearer dev-token" },
+      payload: { html: '<title>Q3 "plan" &amp; <b>notes</b></title><p>Hi</p>' }
+    });
+    expect(upload.statusCode).toBe(201);
+    const { draftId, versionNumber } = upload.json() as { draftId: string; versionNumber: number };
+    const latestUrl = `http://localhost:3000/d/${draftId}`;
+
+    for (const [url, pageUrl] of [
+      [`/d/${draftId}`, latestUrl],
+      [`/d/${draftId}/v/${versionNumber}`, `${latestUrl}/v/${versionNumber}`]
+    ]) {
+      const viewer = await app.inject({ method: "GET", url });
+      expect(viewer.statusCode).toBe(200);
+      expect(viewer.body).toContain(
+        '<meta property="og:title" content="Q3 &quot;plan&quot; &amp; &lt;b&gt;notes&lt;/b&gt;">'
+      );
+      expect(viewer.body).toContain(`<meta property="og:url" content="${pageUrl}">`);
+      expect(viewer.body).toContain(
+        '<meta property="og:image" content="http://localhost:3000/icon.png">'
+      );
+    }
+
+    await app.close();
+    await db.close();
+  });
+
+  it("serves PatchPage's icon, the repository's own favicon", async () => {
+    const served = await createServedDraft("icon");
+
+    const svg = await served.app.inject({ method: "GET", url: "/favicon.svg" });
+    expect(svg.statusCode).toBe(200);
+    expect(svg.headers["content-type"]).toContain("image/svg+xml");
+    expect(svg.headers["cache-control"]).toBe("public, max-age=86400");
+    expect(svg.body).toBe(await readFile(new URL("../../../favicon.svg", import.meta.url), "utf8"));
+
+    for (const url of ["/icon.png", "/favicon.ico"]) {
+      const png = await served.app.inject({ method: "GET", url });
+      expect(png.statusCode).toBe(200);
+      expect(png.headers["content-type"]).toBe("image/png");
+      expect(png.headers["cache-control"]).toBe("public, max-age=86400");
+      expect(png.rawPayload.subarray(1, 4).toString()).toBe("PNG");
+    }
+
+    await served.close();
   });
 
   it("refuses a tokenless upload under every configuration", async () => {

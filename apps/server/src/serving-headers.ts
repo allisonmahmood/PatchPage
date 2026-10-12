@@ -60,8 +60,14 @@ export const REPORT_PAGE_CONTENT_SECURITY_POLICY = [
   "form-action 'self'"
 ].join("; ");
 
-/** Everything that is not a served draft — API routes included — stays uncached. */
+/**
+ * Everything that is not a served draft or the icon — API routes included —
+ * stays uncached.
+ */
 export const NO_STORE_CACHE_CONTROL = "no-store";
+
+/** The icon rarely changes, and a day-old one is harmless. */
+export const ICON_CACHE_CONTROL = "public, max-age=86400";
 
 const LATEST_DRAFT_CACHE_CONTROL = "public, max-age=60";
 

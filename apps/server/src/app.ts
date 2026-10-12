@@ -24,6 +24,7 @@ import {
 import type { UploadMetadata } from "@patchpage/core";
 import { DisabledAnalytics, type Analytics } from "./analytics.js";
 import { createExpirySweep, type ExpirySweepResult } from "./expiry-sweep.js";
+import { FAVICON_SVG, ICON_PNG } from "./icon.js";
 import { getDraftPublicUrl } from "./public-url.js";
 import {
   createRateLimiters,
@@ -40,6 +41,7 @@ import {
 import {
   DRAFT_CONTENT_SECURITY_POLICY,
   DRAFT_ROBOTS_TAG,
+  ICON_CACHE_CONTROL,
   NO_REFERRER_POLICY,
   NO_STORE_CACHE_CONTROL,
   REPORT_PAGE_CONTENT_SECURITY_POLICY,
@@ -168,7 +170,7 @@ export function createApp(options: CreateAppOptions): FastifyInstance {
 
   app.addHook("onSend", async (_request, reply) => {
     reply.header("X-Content-Type-Options", "nosniff");
-    // Served drafts set their own cache policy; everything else stays uncached.
+    // Served drafts and the icon set their own cache policy; everything else stays uncached.
     if (!reply.hasHeader("Cache-Control")) {
       reply.header("Cache-Control", NO_STORE_CACHE_CONTROL);
     }
@@ -199,6 +201,16 @@ export function createApp(options: CreateAppOptions): FastifyInstance {
   app.get("/", async (_request, reply) => {
     return reply.type("text/html").send(renderHome({ publicBaseUrl: options.config.publicBaseUrl }));
   });
+
+  app.get("/favicon.svg", async (_request, reply) =>
+    reply.header("Cache-Control", ICON_CACHE_CONTROL).type("image/svg+xml").send(FAVICON_SVG)
+  );
+  // `/favicon.ico` is where clients look when a page names no icon.
+  for (const url of ["/icon.png", "/favicon.ico"]) {
+    app.get(url, async (_request, reply) =>
+      reply.header("Cache-Control", ICON_CACHE_CONTROL).type("image/png").send(ICON_PNG)
+    );
+  }
 
   app.get("/healthz", async () => ({ ok: true }));
 
@@ -754,12 +766,18 @@ async function renderDraft(
   }
   reply.header("Content-Security-Policy", DRAFT_CONTENT_SECURITY_POLICY);
   reply.header("Cache-Control", servedDraftCacheControl(versionNumber));
+  const latestUrl = getDraftPublicUrl({
+    draftId: draft.id,
+    publicBaseUrl: options.config.publicBaseUrl
+  });
   return reply.type("text/html").send(
     renderDraftWrapper({
       draft,
       version,
       html,
-      homeUrl: options.config.publicBaseUrl
+      homeUrl: options.config.publicBaseUrl,
+      pageUrl:
+        versionNumber === undefined ? latestUrl : `${latestUrl}/v/${version.versionNumber}`
     })
   );
 }
