@@ -17,6 +17,11 @@ export function getDraftReportPath(draftId: string): string {
   return `/report/${draftId}`;
 }
 
+/** The image a link preview shows, absolute because previews require it. */
+export function getPreviewImageUrl(publicBaseUrl: string): string {
+  return `${normalizeUrl(publicBaseUrl)}/icon.png`;
+}
+
 export function getRequestBaseUrl(request: { protocol: string; hostname: string; port?: number }): string {
   const port = request.port ? `:${request.port}` : "";
   return `${request.protocol}://${request.hostname}${port}`;

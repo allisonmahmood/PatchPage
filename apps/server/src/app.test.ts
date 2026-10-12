@@ -159,9 +159,34 @@ describe("PatchPage server", () => {
       "srcdoc=\"&lt;base href=&quot;about:srcdoc&quot;&gt;&lt;!doctype html&gt;"
     );
     expect(viewer.body).not.toContain("patchpage-banner");
+    expect(viewer.body).toContain('<link rel="icon" href="/favicon.svg" type="image/svg+xml">');
+    expect(viewer.body).toContain('<meta property="og:title" content="Test Draft">');
+    expect(viewer.body).toContain(
+      '<meta property="og:image" content="http://localhost:3000/icon.png">'
+    );
 
     await app.close();
     await db.close();
+  });
+
+  it("serves PatchPage's icon, the repository's own favicon", async () => {
+    const served = await createServedDraft("icon");
+
+    const svg = await served.app.inject({ method: "GET", url: "/favicon.svg" });
+    expect(svg.statusCode).toBe(200);
+    expect(svg.headers["content-type"]).toContain("image/svg+xml");
+    expect(svg.headers["cache-control"]).toBe("public, max-age=86400");
+    expect(svg.body).toBe(await readFile(new URL("../../../favicon.svg", import.meta.url), "utf8"));
+
+    for (const url of ["/icon.png", "/favicon.ico"]) {
+      const png = await served.app.inject({ method: "GET", url });
+      expect(png.statusCode).toBe(200);
+      expect(png.headers["content-type"]).toBe("image/png");
+      expect(png.headers["cache-control"]).toBe("public, max-age=86400");
+      expect(png.rawPayload.subarray(1, 4).toString()).toBe("PNG");
+    }
+
+    await served.close();
   });
 
   it("refuses a tokenless upload under every configuration", async () => {

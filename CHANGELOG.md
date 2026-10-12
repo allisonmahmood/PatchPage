@@ -6,6 +6,12 @@ All notable changes to PatchPage are documented in this file. The format is base
 
 ## [Unreleased]
 
+### Added
+
+- Pages PatchPage serves now carry its icon, and a link pasted into a chat app previews
+  as the page's title under PatchPage's name and icon. The server serves the icon at
+  `/favicon.svg`, and as a PNG at `/icon.png` and `/favicon.ico`.
+
 ## [0.2.2] - 2026-10-10
 
 ### Changed

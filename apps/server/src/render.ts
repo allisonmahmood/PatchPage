@@ -1,6 +1,6 @@
 import { ACCEPTABLE_USE_URL } from "@patchpage/config";
 import type { DraftRecord, DraftVersionRecord } from "@patchpage/db";
-import { getDraftPublicUrl, getDraftReportPath } from "./public-url.js";
+import { getDraftPublicUrl, getDraftReportPath, getPreviewImageUrl } from "./public-url.js";
 
 export function renderHome(options: { publicBaseUrl: string }): string {
   const publicBaseUrl = escapeHtml(options.publicBaseUrl);
@@ -8,6 +8,7 @@ export function renderHome(options: { publicBaseUrl: string }): string {
 
   return htmlPage({
     title: "PatchPage",
+    head: linkPreview("PatchPage", options.publicBaseUrl),
     body: `
       <main class="wrap">
         <header class="doc-head">
@@ -85,6 +86,9 @@ export function renderHome(options: { publicBaseUrl: string }): string {
  * page, and the spec asks the footer for a report path and the policy behind it.
  * The welcome draft carries the patchyhq.com credit in its own content.
  *
+ * The head carries PatchPage's icon, and the link preview a chat app shows when
+ * someone pastes the URL: the page's own title under PatchPage's name and icon.
+ *
  * The document goes into the frame led by the frame's own base URL
  * (`FRAME_BASE`), so an agent's table of contents scrolls.
  */
@@ -94,7 +98,8 @@ export function renderDraftWrapper(options: {
   html: string;
   homeUrl: string;
 }): string {
-  const title = escapeHtml(options.draft.title || "PatchPage Draft");
+  const draftTitle = options.draft.title || "PatchPage Draft";
+  const title = escapeHtml(draftTitle);
   const reportPath = escapeHtml(getDraftReportPath(options.draft.id));
 
   return `<!doctype html>
@@ -103,6 +108,8 @@ export function renderDraftWrapper(options: {
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>${title}</title>
+  ${PAGE_ICONS}
+  ${linkPreview(draftTitle, options.homeUrl)}
   <style>
     html,
     body {
@@ -303,13 +310,34 @@ export function renderNotFound(): string {
   });
 }
 
-function htmlPage(options: { title: string; body: string }): string {
+/**
+ * PatchPage's icon, root-relative like the report link: the SVG for browsers,
+ * the PNG for home screens. See icon.ts.
+ */
+const PAGE_ICONS = `<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+  <link rel="apple-touch-icon" href="/icon.png">`;
+
+/**
+ * The Open Graph tags chat apps read to preview a pasted link: the page's title
+ * under PatchPage's name, with the icon as the image. The title is the one the
+ * page's `<title>` already gives anyone who requests it.
+ */
+function linkPreview(title: string, publicBaseUrl: string): string {
+  return `<meta property="og:site_name" content="PatchPage">
+  <meta property="og:title" content="${escapeHtml(title)}">
+  <meta property="og:type" content="website">
+  <meta property="og:image" content="${escapeHtml(getPreviewImageUrl(publicBaseUrl))}">
+  <meta name="twitter:card" content="summary">`;
+}
+
+function htmlPage(options: { title: string; head?: string; body: string }): string {
   return `<!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>${escapeHtml(options.title)}</title>
+  ${PAGE_ICONS}${options.head ? `\n  ${options.head}` : ""}
   <style>
     :root {
       --paper: #fffdf4;
