@@ -1,6 +1,6 @@
 {
   "name": "patchpage",
-  "version": "0.2.2",
+  "version": "0.2.3",
   "description": "Upload static HTML drafts to PatchPage.",
   "type": "module",
   "license": "MIT",

@@ -6,6 +6,8 @@ All notable changes to PatchPage are documented in this file. The format is base
 
 ## [Unreleased]
 
+## [0.2.3] - 2026-10-12
+
 ### Added
 
 - Pages PatchPage serves now carry its icon, and a link pasted into a chat app previews
