@@ -766,12 +766,18 @@ async function renderDraft(
   }
   reply.header("Content-Security-Policy", DRAFT_CONTENT_SECURITY_POLICY);
   reply.header("Cache-Control", servedDraftCacheControl(versionNumber));
+  const latestUrl = getDraftPublicUrl({
+    draftId: draft.id,
+    publicBaseUrl: options.config.publicBaseUrl
+  });
   return reply.type("text/html").send(
     renderDraftWrapper({
       draft,
       version,
       html,
-      homeUrl: options.config.publicBaseUrl
+      homeUrl: options.config.publicBaseUrl,
+      pageUrl:
+        versionNumber === undefined ? latestUrl : `${latestUrl}/v/${version.versionNumber}`
     })
   );
 }

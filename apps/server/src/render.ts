@@ -8,7 +8,11 @@ export function renderHome(options: { publicBaseUrl: string }): string {
 
   return htmlPage({
     title: "PatchPage",
-    head: linkPreview("PatchPage", options.publicBaseUrl),
+    head: linkPreview({
+      title: "PatchPage",
+      url: options.publicBaseUrl,
+      publicBaseUrl: options.publicBaseUrl
+    }),
     body: `
       <main class="wrap">
         <header class="doc-head">
@@ -97,6 +101,8 @@ export function renderDraftWrapper(options: {
   version: DraftVersionRecord;
   html: string;
   homeUrl: string;
+  /** The URL the reader asked for, latest or a version, for the link preview. */
+  pageUrl: string;
 }): string {
   const draftTitle = options.draft.title || "PatchPage Draft";
   const title = escapeHtml(draftTitle);
@@ -109,7 +115,7 @@ export function renderDraftWrapper(options: {
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>${title}</title>
   ${PAGE_ICONS}
-  ${linkPreview(draftTitle, options.homeUrl)}
+  ${linkPreview({ title: draftTitle, url: options.pageUrl, publicBaseUrl: options.homeUrl })}
   <style>
     html,
     body {
@@ -312,9 +318,11 @@ export function renderNotFound(): string {
 
 /**
  * PatchPage's icon, root-relative like the report link: the SVG for browsers,
- * the PNG for home screens. See icon.ts.
+ * the PNG ahead of it for browsers without SVG icons (Safari before 26) and for
+ * home screens. See icon.ts.
  */
-const PAGE_ICONS = `<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+const PAGE_ICONS = `<link rel="icon" href="/icon.png" type="image/png" sizes="512x512">
+  <link rel="icon" href="/favicon.svg" type="image/svg+xml" sizes="any">
   <link rel="apple-touch-icon" href="/icon.png">`;
 
 /**
@@ -322,11 +330,12 @@ const PAGE_ICONS = `<link rel="icon" href="/favicon.svg" type="image/svg+xml">
  * under PatchPage's name, with the icon as the image. The title is the one the
  * page's `<title>` already gives anyone who requests it.
  */
-function linkPreview(title: string, publicBaseUrl: string): string {
+function linkPreview(options: { title: string; url: string; publicBaseUrl: string }): string {
   return `<meta property="og:site_name" content="PatchPage">
-  <meta property="og:title" content="${escapeHtml(title)}">
+  <meta property="og:title" content="${escapeHtml(options.title)}">
+  <meta property="og:url" content="${escapeHtml(options.url)}">
   <meta property="og:type" content="website">
-  <meta property="og:image" content="${escapeHtml(getPreviewImageUrl(publicBaseUrl))}">
+  <meta property="og:image" content="${escapeHtml(getPreviewImageUrl(options.publicBaseUrl))}">
   <meta name="twitter:card" content="summary">`;
 }
 
