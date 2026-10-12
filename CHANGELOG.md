@@ -6,6 +6,15 @@ All notable changes to PatchPage are documented in this file. The format is base
 
 ## [Unreleased]
 
+### Security
+
+- The upload checker bounds the work a page can ask of it. Some pages under the size
+  limit took the HTML parser tens of seconds, and the server answered nothing else in the
+  meantime. A page now fails validation when it nests elements more than 512 deep, gives
+  an element more than 256 attributes, or needs too much repair of elements closed out of
+  order. The worst page now checks in about a tenth of a second, and a page over the size
+  limit is rejected before it is parsed. `patchpage validate` applies the same bounds.
+
 ## [0.2.2] - 2026-10-10
 
 ### Changed
