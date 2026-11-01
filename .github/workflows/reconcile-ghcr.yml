@@ -249,7 +249,7 @@ jobs:
           echo "tar-path=$tar_path" >> "$GITHUB_OUTPUT"
       - name: Upload exact replay server image raw tar
         id: image-artifact
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           path: ${{ steps.image.outputs.tar-path }}
           if-no-files-found: error
@@ -263,7 +263,7 @@ jobs:
           {"tag":"${{ matrix.tag }}","version":"${{ matrix.version }}","revision":"${{ matrix.revision }}","artifactId":"${{ steps.image-artifact.outputs.artifact-id }}","filename":"${{ steps.image.outputs.filename }}","sha256":"${{ steps.image.outputs.sha256 }}","imageId":"${{ steps.image.outputs.image-id }}","configId":"${{ steps.image.outputs.config-id }}"}
           JSON
       - name: Upload replay handoff
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           path: ${{ runner.temp }}/reconcile-handoff-${{ matrix.version }}.json
           if-no-files-found: error
@@ -633,7 +633,7 @@ jobs:
           NODE
           echo "result-path=$result_path" >> "$GITHUB_OUTPUT"
       - name: Upload immutable replay publication result
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           path: ${{ steps.publish-image.outputs.result-path }}
           if-no-files-found: error
