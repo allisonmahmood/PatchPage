@@ -175,7 +175,7 @@ jobs:
       - run: pnpm test
       - run: pnpm --filter patchpage build
       - name: Download the isolated npm CLI
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           artifact-ids: ${{ needs.prepare-npm.outputs.npm-cli-artifact-id }}
           path: ${{ runner.temp }}/npm-cli
@@ -329,18 +329,18 @@ jobs:
         with:
           node-version: 24.18.0
       - name: Download the exact tested tarball
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           artifact-ids: ${{ needs.verify.outputs.package-artifact-id }}
           path: ${{ runner.temp }}/patchpage-package
           skip-decompress: true
       - name: Download the pinned publishing CLI
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           artifact-ids: ${{ needs.prepare-npm.outputs.npm-cli-artifact-id }}
           path: ${{ runner.temp }}/npm-cli
       - name: Download the exact npm publisher
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           artifact-ids: ${{ needs.verify.outputs.publisher-artifact-id }}
           path: ${{ runner.temp }}/npm-publisher
@@ -529,7 +529,7 @@ jobs:
       config-digest: ${{ steps.publish-image.outputs.config-digest }}
     steps:
       - name: Download the immutable verified server image artifact
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           artifact-ids: ${{ needs.verify-server-image.outputs.image-artifact-id }}
           path: ${{ runner.temp }}/server-image
