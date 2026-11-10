@@ -2,12 +2,18 @@ import { ACCEPTABLE_USE_URL } from "@patchpage/config";
 import type { DraftRecord, DraftVersionRecord } from "@patchpage/db";
 import { getDraftPublicUrl, getDraftReportPath, getPreviewImageUrl } from "./public-url.js";
 
+// Search engines index the home page, not the drafts (those are noindex), so it carries a
+// title and description Bing accepts: about 50–60 and 120–160 characters.
+const HOME_DESCRIPTION =
+  "PatchPage turns one static HTML file into a public, unlisted review link. Publish with npx patchpage upload; published pages stay out of search engines.";
+
 export function renderHome(options: { publicBaseUrl: string }): string {
   const publicBaseUrl = escapeHtml(options.publicBaseUrl);
   const shellPublicBaseUrl = escapeHtml(quoteShellArgument(options.publicBaseUrl));
 
   return htmlPage({
-    title: "PatchPage",
+    title: "PatchPage: turn one HTML file into a public review link",
+    description: HOME_DESCRIPTION,
     head: linkPreview({
       title: "PatchPage",
       url: options.publicBaseUrl,
@@ -339,13 +345,22 @@ function linkPreview(options: { title: string; url: string; publicBaseUrl: strin
   <meta name="twitter:card" content="summary">`;
 }
 
-function htmlPage(options: { title: string; head?: string; body: string }): string {
+function htmlPage(options: {
+  title: string;
+  description?: string;
+  head?: string;
+  body: string;
+}): string {
   return `<!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>${escapeHtml(options.title)}</title>
+  <title>${escapeHtml(options.title)}</title>${
+    options.description
+      ? `\n  <meta name="description" content="${escapeHtml(options.description)}">`
+      : ""
+  }
   ${PAGE_ICONS}${options.head ? `\n  ${options.head}` : ""}
   <style>
     :root {

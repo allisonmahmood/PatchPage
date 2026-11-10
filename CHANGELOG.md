@@ -6,6 +6,11 @@ All notable changes to PatchPage are documented in this file. The format is base
 
 ## [Unreleased]
 
+### Fixed
+
+- The home page has a descriptive title and a meta description. Bing Webmaster Tools
+  flagged its title, "PatchPage", as too short.
+
 ## [0.2.3] - 2026-10-12
 
 ### Added
